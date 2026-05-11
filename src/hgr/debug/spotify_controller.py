@@ -122,6 +122,15 @@ class SpotifyController:
         self._active_device_cache: bool | None = None
         self._active_device_cache_until: float = 0.0
         self._active_device_cache_seconds: float = 3.0
+        # Stale-while-revalidate latch for is_active_device_available().
+        # When the 3 s cache expires while a hand is in frame, we used
+        # to fire the 50-300 ms /me/player HTTP call on the calling
+        # (UI) thread inside the gesture router's hot path -- visible
+        # camera lag spikes every 3 s once Spotify started playing.
+        # Now the call kicks the refresh on a background thread and
+        # returns the previous cached value; the next gesture frame
+        # reads the fresh result.
+        self._active_device_refresh_in_flight: bool = False
         self._load_credentials()
         self._load_tokens()
 
@@ -570,10 +579,39 @@ class SpotifyController:
         now = time.monotonic()
         if self._active_device_cache is not None and now < self._active_device_cache_until:
             return self._active_device_cache
-        result = self.get_player_state() is not None
-        self._active_device_cache = result
+        # Cache miss. get_player_state() is a 50-300 ms HTTP call --
+        # this method is called per gesture frame from
+        # SpotifyGestureRouter._can_control_without_focus while a
+        # hand is in frame, and the gesture loop runs on the UI
+        # thread, so a sync call here freezes the camera display for
+        # the duration of the request. Push the cache fence forward
+        # so we don't spawn a second refresh while the first is
+        # still in flight, kick the refresh on a daemon thread, and
+        # return the previous cached value (defaulting to False on
+        # first call so we don't pretend a device is available
+        # before the very first probe has finished).
         self._active_device_cache_until = now + self._active_device_cache_seconds
-        return result
+        if not self._active_device_refresh_in_flight:
+            self._active_device_refresh_in_flight = True
+
+            def _refresh() -> None:
+                try:
+                    fresh = self.get_player_state() is not None
+                    self._active_device_cache = fresh
+                except Exception:
+                    pass
+                finally:
+                    self._active_device_refresh_in_flight = False
+
+            try:
+                threading.Thread(
+                    target=_refresh,
+                    name="spotify-active-device-probe",
+                    daemon=True,
+                ).start()
+            except Exception:
+                self._active_device_refresh_in_flight = False
+        return bool(self._active_device_cache) if self._active_device_cache is not None else False
 
     def invalidate_active_device_cache(self) -> None:
         # Called from focus_or_open_window paths after we deliberately
