@@ -14,6 +14,10 @@ _MIN_CORRECTION_CHARS = 20
 _DEFAULT_INTERVAL_SECONDS = 4.0
 _DEFAULT_IDLE_SECONDS = 0.5
 _LONG_IDLE_SECONDS = 2.0
+# Idle-trigger mode: correction only fires after the user has been
+# silent (no append() in this long) for this many seconds. 0 = old
+# interval-based behaviour. Set to a real value to switch modes.
+_DEFAULT_IDLE_TRIGGER_SECONDS = 10.0
 
 
 @dataclass
@@ -30,11 +34,20 @@ class GrammarCorrector:
         server: LlamaServer,
         interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
         min_idle_seconds: float = _DEFAULT_IDLE_SECONDS,
+        idle_trigger_seconds: float = _DEFAULT_IDLE_TRIGGER_SECONDS,
         on_correction: Optional[Callable[[CorrectionResult], None]] = None,
     ) -> None:
         self._server = server
         self._interval = max(2.0, float(interval_seconds))
         self._min_idle = max(0.0, float(min_idle_seconds))
+        # When > 0 the corrector waits for this much silence (no
+        # append() activity) before pulling a chunk. Each new
+        # append() resets _last_append, so a fresh utterance during
+        # the wait cancels the trigger and the timer restarts. The
+        # idle-triggered chunk takes EVERYTHING in the buffer in
+        # one shot -- the user has clearly paused so a sentence
+        # boundary isn't required.
+        self._idle_trigger = max(0.0, float(idle_trigger_seconds))
         self._on_correction = on_correction
         self._lock = threading.Lock()
         self._buffer = ""
@@ -76,6 +89,14 @@ class GrammarCorrector:
             self._last_append = time.monotonic()
             if self._chunk_in_flight is not None:
                 self._tail_since_chunk += text
+                # Idle-trigger mode: any new audio mid-correction
+                # means the user kept talking before the LLM
+                # finished. Abort the in-flight correction so we
+                # don't replace text on top of what they're still
+                # typing. The buffer's growing content will be
+                # picked up on the next idle-trigger fire.
+                if self._idle_trigger > 0:
+                    self._chunk_stale = True
 
     def sync_replace(self, chars_to_remove: int, new_tail: str) -> None:
         with self._lock:
@@ -125,7 +146,10 @@ class GrammarCorrector:
         self.reset()
         self._thread = threading.Thread(target=self._run_loop, name="hgr-grammar-corrector", daemon=True)
         self._thread.start()
-        print(f"[grammar] corrector started (interval={self._interval:.1f}s)")
+        if self._idle_trigger > 0:
+            print(f"[grammar] corrector started (idle-trigger={self._idle_trigger:.1f}s, abort-on-resume=on)")
+        else:
+            print(f"[grammar] corrector started (interval={self._interval:.1f}s)")
         return True
 
     def stop(self) -> None:
@@ -134,15 +158,76 @@ class GrammarCorrector:
         self._thread = None
         if thread is not None and thread.is_alive():
             thread.join(timeout=2.0)
+        # Final pass: if there's still uncorrected text in the
+        # buffer when dictation ends, kick a one-off correction so
+        # the user's last thought gets cleaned up too. Async on a
+        # daemon thread so stop() doesn't block its caller on the
+        # 1-3 s LLM round-trip; if the app shuts down before the
+        # thread finishes, nothing depends on it.
+        self._spawn_final_pass()
+
+    def _spawn_final_pass(self) -> None:
+        if not self._server.available:
+            return
+        with self._lock:
+            if self._chunk_in_flight is not None:
+                # An idle-triggered correction is already in flight;
+                # let _run_loop's normal apply path handle it. Don't
+                # double-fire.
+                return
+            if not self._buffer or len(self._buffer) < _MIN_CORRECTION_CHARS:
+                return
+            chunk = self._buffer
+            self._buffer = ""
+            self._chunk_in_flight = chunk
+            self._tail_since_chunk = ""
+            self._chunk_stale = False
+        callback = self._on_correction
+
+        def _worker() -> None:
+            corrected: Optional[str] = None
+            try:
+                corrected = self._server.correct(chunk)
+            except Exception as exc:
+                print(f"[grammar] final-pass correct() raised: {exc}")
+            if not corrected or corrected.strip() == chunk.strip():
+                print(f"[grammar] final-pass: no change ({len(chunk)} chars)")
+                self.mark_correction_done()
+                return
+            if self.is_chunk_stale():
+                # User started dictating again after we kicked off
+                # the final pass -- their typing wins.
+                self.mark_correction_done()
+                return
+            if callback is None:
+                self.mark_correction_done()
+                return
+            try:
+                callback(CorrectionResult(original=chunk, corrected=corrected))
+            except Exception as exc:
+                print(f"[grammar] final-pass callback raised: {exc}")
+            self.mark_correction_done()
+
+        try:
+            threading.Thread(target=_worker, name="hgr-grammar-final-pass", daemon=True).start()
+        except Exception:
+            self.mark_correction_done()
 
     def _run_loop(self) -> None:
         last_idle_log = 0.0
         while not self._stop_event.is_set():
             if self._stop_event.wait(timeout=1.0):
                 break
-            elapsed = time.monotonic() - self._last_run
-            if elapsed < self._interval:
-                continue
+            # In idle-trigger mode the gating is purely "has the
+            # user been silent long enough?"; the per-interval
+            # throttle would just delay the first correction by up
+            # to _interval seconds past the idle threshold for no
+            # benefit. _take_chunk_to_boundary still won't return
+            # a chunk while one is in flight, so we can't spin.
+            if self._idle_trigger <= 0:
+                elapsed = time.monotonic() - self._last_run
+                if elapsed < self._interval:
+                    continue
             chunk = self._take_chunk_to_boundary()
             if not chunk:
                 now = time.monotonic()
@@ -198,6 +283,22 @@ class GrammarCorrector:
             if len(self._buffer) < _MIN_CORRECTION_CHARS:
                 return ""
             idle = time.monotonic() - self._last_append
+            # Idle-trigger mode: only run after the configured
+            # silence threshold. Each new append() resets the
+            # timer, so the user dictating again mid-wait cancels
+            # the trigger naturally. When fired, take the whole
+            # buffer in one shot -- a long pause means "I'm done
+            # with this thought," not "wait for a period."
+            if self._idle_trigger > 0:
+                if idle < self._idle_trigger:
+                    return ""
+                chunk = self._buffer
+                self._buffer = ""
+                self._chunk_in_flight = chunk
+                self._tail_since_chunk = ""
+                self._chunk_stale = False
+                return chunk
+            # --- Interval mode (legacy) below ---
             if idle < self._min_idle:
                 return ""
             boundary = _find_last_sentence_boundary(self._buffer)
