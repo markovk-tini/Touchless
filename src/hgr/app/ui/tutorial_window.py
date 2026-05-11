@@ -684,11 +684,22 @@ class TutorialWindow(QDialog):
     # thread and decides what to do (complete the step / schedule
     # the next attempt).
     _voice_media_check_signal = Signal(bool, bool)
+    # Cross-thread bridge for the PERIODIC Spotify-playback poll
+    # the voice_command step uses to recognise "the user is already
+    # playing music" -- whether they voice-commanded it or hit space
+    # in Spotify by hand. The slot completes the step iff playing=True;
+    # it deliberately does NOT have a 'settle for voice success'
+    # fallback (the one-shot _voice_media_check path owns that).
+    _spotify_periodic_poll_signal = Signal(bool)
 
     def __init__(self, config: AppConfig, parent=None) -> None:
         super().__init__(parent)
-        # Connect the off-thread media-check bridge to its slot.
+        # Connect the off-thread media-check bridges to their slots.
         self._voice_media_check_signal.connect(self._on_voice_media_check_result)
+        self._spotify_periodic_poll_signal.connect(self._on_spotify_periodic_poll)
+        # Throttle / single-flight state for the periodic poll.
+        self._spotify_poll_inflight: bool = False
+        self._spotify_poll_last_at: float = 0.0
         self.config = config
         self._camera_index: Optional[int] = None
         self._launched_from_settings = False
@@ -3157,6 +3168,52 @@ class TutorialWindow(QDialog):
         # and try the final-pass check.
         QTimer.singleShot(2000, self._check_voice_media_playing_final)
 
+    def _maybe_periodic_spotify_poll(self, now: float) -> None:
+        """Per-frame callable: spawn a background Spotify-playback
+        check at most every ~3 s while the user is on the
+        voice_command step with Spotify present. The result slot
+        only completes the step on playing=True, so polling can't
+        time-out the user out of the step."""
+        if self._step_completed:
+            return
+        if self._practice_steps[self._step_index].key != "voice_command":
+            return
+        if not bool(getattr(self, "_has_spotify", False)):
+            return
+        if self._spotify_poll_inflight:
+            return
+        if now - self._spotify_poll_last_at < 3.0:
+            return
+        self._spotify_poll_last_at = now
+        self._spotify_poll_inflight = True
+
+        def _worker() -> None:
+            playing = False
+            try:
+                playing = self._is_spotify_playing_safe()
+            except Exception:
+                playing = False
+            try:
+                self._spotify_periodic_poll_signal.emit(bool(playing))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True, name="spotify-periodic-poll").start()
+
+    def _on_spotify_periodic_poll(self, playing: bool) -> None:
+        """GUI-thread slot for the periodic Spotify poll. Completes
+        the step ONLY when the playback API confirms a song is
+        playing; otherwise just clears the in-flight latch so the
+        next tick can fire."""
+        self._spotify_poll_inflight = False
+        if not playing:
+            return
+        if self._step_completed:
+            return
+        if self._practice_steps[self._step_index].key != "voice_command":
+            return
+        self._complete_step(f"Spotify is playing! Part {self._step_index + 1}/5 completed!")
+
     def _is_spotify_playing_safe(self) -> bool:
         """Wrap SpotifyController.get_playback_state in a try/except
         so a missing token / offline network doesn't crash the
@@ -3683,18 +3740,18 @@ class TutorialWindow(QDialog):
                 visual_ready = True
             spotify_present = bool(getattr(self, "_has_spotify", False))
             if spotify_present:
-                # Spotify branch: do NOT call _is_spotify_playing_safe()
-                # synchronously here -- this slot runs at debug-frame
-                # rate, and SpotifyController.get_playback_state() is a
-                # blocking HTTP call that can take 100-5000 ms each.
-                # That was the per-frame UI freeze the user reported as
-                # "live view super lagging after song starts playing".
-                # The async _check_voice_media_playing path already
-                # owns the "is the song actually playing?" decision and
-                # completes the step via _on_voice_media_check_result;
-                # all we keep here is the cheap text-based fallback so
-                # a successful voice command still moves the user along
-                # even if the playback-state check is offline / 401'd.
+                # Periodic OFF-thread Spotify-playback poll. Throttled
+                # to once every ~3 s; the result slot only completes
+                # the step on playing=True. Covers the case the user
+                # mentioned: "i played a song on spotify and its not
+                # allowing to go next" -- whether they got there via
+                # a voice command, the Spotify hotkey, or clicking
+                # play in the desktop app. We deliberately don't call
+                # _is_spotify_playing_safe() inline (blocking HTTP).
+                self._maybe_periodic_spotify_poll(now)
+                # Cheap text-fallback for offline / 401 cases where
+                # the playback API can't confirm but the voice path
+                # clearly succeeded.
                 if "spotify" in voice_heard and ("execut" in voice_control or "play" in voice_control):
                     self._complete_step("Completed! Swipe right to move on!")
             else:
