@@ -4877,6 +4877,18 @@ class GestureWorker(QObject):
             toggled = self.volume_controller.toggle_mute()
             if toggled is not None:
                 current_muted = toggled
+                # Re-seat the 120 ms _read_system_mute cache to the
+                # post-toggle value. Without this, the next frame
+                # within the cache window reads the STALE pre-toggle
+                # value back, then self._volume_muted gets overwritten
+                # with the old state, then a frame later the cache
+                # expires and re-reads the actual new state -- a
+                # spurious False→True→False flicker on the payload's
+                # volume_muted field. The tutorial volume step counts
+                # those as two transitions, so one shaka press
+                # completes the "mute twice" requirement on its own.
+                self._mute_cache_value = bool(toggled)
+                self._mute_cache_until = time.monotonic() + 0.12
                 self.command_detected.emit("Volume mute toggled")
                 self._record_action("volume_mute_on" if toggled else "volume_mute_off", "muted" if toggled else "unmuted")
             else:
@@ -5116,6 +5128,13 @@ class GestureWorker(QObject):
                     toggled = self.volume_controller.toggle_mute()
                     fired = toggled is not None
                     if fired:
+                        # Match the volume-pose path: re-seat the
+                        # _read_system_mute cache to the post-toggle
+                        # value so the next frame within the 120 ms
+                        # cache window doesn't return the stale
+                        # pre-toggle state.
+                        self._mute_cache_value = bool(toggled)
+                        self._mute_cache_until = time.monotonic() + 0.12
                         try:
                             self.command_detected.emit("Volume mute toggled")
                         except Exception:

@@ -598,7 +598,12 @@ class _TutorialStartingPill(QWidget):
         self.setAutoFillBackground(False)
         self._label = "Starting tutorial"
         self._timer = QTimer(self)
-        self._timer.setInterval(40)
+        # PreciseTimer at 60 fps so the wave dots advance at a steady
+        # cadence on Windows. The default CoarseTimer rounds to ~15.6
+        # ms (the system tick), turning a 40 ms interval into uneven
+        # 30 / 45 ms ticks that read as "freezing then jumping".
+        self._timer.setTimerType(Qt.PreciseTimer)
+        self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
         self.setFixedSize(self._WIDTH, self._HEIGHT)
         self.setVisible(False)
@@ -670,9 +675,20 @@ class _TutorialStartingPill(QWidget):
 class TutorialWindow(QDialog):
     tutorial_closed = Signal(bool, bool, bool)
     gesture_guide_requested = Signal(bool)
+    # Cross-thread bridge for the voice-command media-playing
+    # check. The Spotify Web API call + chrome window scan run on
+    # a daemon thread (they used to block the GUI thread for
+    # 100-300 ms each, which made the live view lag and prevented
+    # right-swipe-to-advance from being detected). The worker
+    # emits (is_playing, is_final_pass); the slot runs on the GUI
+    # thread and decides what to do (complete the step / schedule
+    # the next attempt).
+    _voice_media_check_signal = Signal(bool, bool)
 
     def __init__(self, config: AppConfig, parent=None) -> None:
         super().__init__(parent)
+        # Connect the off-thread media-check bridge to its slot.
+        self._voice_media_check_signal.connect(self._on_voice_media_check_result)
         self.config = config
         self._camera_index: Optional[int] = None
         self._launched_from_settings = False
@@ -1234,9 +1250,8 @@ class TutorialWindow(QDialog):
         # matches what the completion check actually verifies.
         target = "Spotify" if getattr(self, "_has_spotify", False) else "YouTube"
         return (
-            "Hold left-hand one until the microphone appears at the "
-            f"bottom middle of your monitor, then say: “Play "
-            f"[a song] on {target}”."
+            "Hold left-hand one until the microphone appears below, "
+            f"then say: “Play [a song] on {target}”."
         )
 
     def _voice_command_header_text(self, hold_active: bool) -> str:
@@ -1558,8 +1573,9 @@ class TutorialWindow(QDialog):
             ),
             (
                 "Replay this tutorial anytime",
-                "Settings → Tutorial. Or record your own gesture: Settings → "
-                "Custom Gesture (Beta).",
+                "You can come back to this tour whenever you want — Settings → "
+                "Tutorial. Same place to record your own custom gesture under "
+                "Settings → Custom Gesture (Beta).",
             ),
         ]
         tips_card = QFrame()
@@ -1623,19 +1639,33 @@ class TutorialWindow(QDialog):
         )
         self._completion_more_tips_button.setObjectName("completionMoreTips")
         self._completion_more_tips_button.setCursor(Qt.PointingHandCursor)
+        # WA_StyledBackground forces Qt to use the QSS-painted
+        # background instead of the platform's native button look,
+        # which on Windows draws square-cornered chrome OVER the
+        # QSS border-radius and made this button read as sharp box
+        # edges even though border-radius was set.
+        self._completion_more_tips_button.setAttribute(
+            Qt.WA_StyledBackground, True
+        )
         self._completion_more_tips_button.setStyleSheet(
             f"QPushButton#completionMoreTips {{ "
             f"  color: {accent}; "
-            f"  background: transparent; "
-            f"  border: 1px solid rgba(29,233,182,0.30); "
-            f"  border-radius: 999px; "
-            f"  padding: 7px 18px; "
+            f"  background-color: transparent; "
+            f"  border: 1.5px solid rgba(29,233,182,0.45); "
+            # Half the button height ≈ pill cap. 18 px matches the
+            # natural button height with the 8/22 padding below.
+            f"  border-radius: 18px; "
+            f"  padding: 8px 22px; "
             f"  font-size: 13px; "
             f"  font-weight: 700; "
+            f"  outline: none; "
             f"}}"
             f"QPushButton#completionMoreTips:hover {{ "
-            f"  border: 1px solid {accent}; "
-            f"  background: rgba(29,233,182,0.08); "
+            f"  border: 1.5px solid {accent}; "
+            f"  background-color: rgba(29,233,182,0.10); "
+            f"}}"
+            f"QPushButton#completionMoreTips:pressed {{ "
+            f"  background-color: rgba(29,233,182,0.16); "
             f"}}"
         )
         self._completion_more_tips_button.clicked.connect(
@@ -2173,7 +2203,10 @@ class TutorialWindow(QDialog):
                 "\u2022 RIGHT hand, peace sign with index + middle TOUCHING (closed peace sign), ring + pinky curled, thumb relaxed.\n"
                 "\u2022 Hold the pose to enter volume mode — the volume bar appears on screen.\n"
                 "\u2022 Move your hand UP to raise volume, DOWN to lower. Bigger moves = bigger jumps.\n"
-                "\u2022 Mute / unmute: while volume mode is on, pinch thumb to index tip.\n\n"
+                "\u2022 Mute / unmute: hold a SHAKA \u2014 thumb and pinky extended outwards while "
+                "index, middle, and ring fingers are curled in. Palm facing towards "
+                "the monitor. Release the pose between toggles \u2014 it has to fire "
+                "twice (mute, then unmute) to count.\n\n"
                 "To complete: raise the volume, lower it, then mute and unmute once."
             ),
             "play_pause": (
@@ -3042,46 +3075,87 @@ class TutorialWindow(QDialog):
                         QTimer.singleShot(3000, self._check_voice_media_playing)
 
     def _check_voice_media_playing(self) -> None:
-        """First-pass media-played check. Branches on Spotify
-        presence: if installed, ask the Spotify Web API for the
-        current playback state; otherwise look for a YouTube tab in
-        Chrome."""
+        """First-pass media-played check. Runs the Spotify Web API
+        call on a BACKGROUND thread because get_playback_state()
+        blocks for 100–300 ms while it does its HTTP round-trip —
+        on the GUI thread that stalled the live view long enough
+        that right-swipe-to-advance couldn't be detected and the
+        user had to click Next manually.
+
+        Result is posted back to the GUI thread via
+        `_voice_media_check_signal`, which then completes the step
+        or schedules the final-attempt timer."""
         if self._step_completed:
             return
         if self._practice_steps[self._step_index].key != "voice_command":
             return
         spotify_present = bool(getattr(self, "_has_spotify", False))
-        if spotify_present:
-            if self._is_spotify_playing_safe():
-                self._complete_step(f"Spotify is playing! Part {self._step_index + 1}/5 completed!")
-                return
-        else:
-            if self._chrome_controller.has_youtube_open():
-                self._complete_step(f"YouTube opened in Chrome! Part {self._step_index + 1}/5 completed!")
-                return
-        # Either Spotify isn't playing yet or the YouTube tab isn't
-        # up — give it another 2 s before falling back.
-        QTimer.singleShot(2000, self._check_voice_media_playing_final)
+
+        def _worker(final_pass: bool) -> None:
+            playing = False
+            try:
+                if spotify_present:
+                    playing = self._is_spotify_playing_safe()
+                else:
+                    playing = self._chrome_controller.has_youtube_open()
+            except Exception:
+                playing = False
+            try:
+                self._voice_media_check_signal.emit(bool(playing), bool(final_pass))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, args=(False,), daemon=True, name="voice-media-check").start()
 
     def _check_voice_media_playing_final(self) -> None:
-        """Final media-played check. Same branch as the first pass,
-        but if neither Spotify-playing nor YouTube-open succeeds we
-        still mark the step completed because the voice command
-        itself was heard — better than leaving the user stuck."""
+        """Same as the first pass but with `final_pass=True` so the
+        receiving slot marks the step done unconditionally when the
+        worker reports no media detected."""
         if self._step_completed:
             return
         if self._practice_steps[self._step_index].key != "voice_command":
             return
         spotify_present = bool(getattr(self, "_has_spotify", False))
-        if spotify_present:
-            if self._is_spotify_playing_safe():
+
+        def _worker() -> None:
+            playing = False
+            try:
+                if spotify_present:
+                    playing = self._is_spotify_playing_safe()
+                else:
+                    playing = self._chrome_controller.has_youtube_open()
+            except Exception:
+                playing = False
+            try:
+                self._voice_media_check_signal.emit(bool(playing), True)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True, name="voice-media-check-final").start()
+
+    def _on_voice_media_check_result(self, playing: bool, final_pass: bool) -> None:
+        """Slot for the off-thread media-playing check. Runs on the
+        GUI thread (signal/slot auto-marshals). Completes the step
+        if media is playing; otherwise either schedules the
+        second-pass check (final_pass=False) or settles for "voice
+        command was heard" (final_pass=True)."""
+        if self._step_completed:
+            return
+        if self._practice_steps[self._step_index].key != "voice_command":
+            return
+        spotify_present = bool(getattr(self, "_has_spotify", False))
+        if playing:
+            if spotify_present:
                 self._complete_step(f"Spotify is playing! Part {self._step_index + 1}/5 completed!")
-                return
-        else:
-            if self._chrome_controller.has_youtube_open():
+            else:
                 self._complete_step(f"YouTube opened in Chrome! Part {self._step_index + 1}/5 completed!")
-                return
-        self._complete_step(f"Voice command detected. Part {self._step_index + 1}/5 completed!")
+            return
+        if final_pass:
+            self._complete_step(f"Voice command detected. Part {self._step_index + 1}/5 completed!")
+            return
+        # First pass didn't see media yet — give it another 2 s
+        # and try the final-pass check.
+        QTimer.singleShot(2000, self._check_voice_media_playing_final)
 
     def _is_spotify_playing_safe(self) -> bool:
         """Wrap SpotifyController.get_playback_state in a try/except
@@ -3455,8 +3529,16 @@ class TutorialWindow(QDialog):
                 progress_bits.append(" lower volume")
                 self._set_step_progress("".join(progress_bits))
             elif not mute_done:
+                # Colored counter like the fist step: red 0/2 →
+                # orange 1/2 → green 2/2. The mute event itself is
+                # toggle-only (a held shaka pose flips the system
+                # mute once and then has to be released-and-redone
+                # to count again), so progress can't be cheated by
+                # holding the pose.
+                color = self._progress_color(mute_count, mute_target)
                 self._set_step_progress(
-                    f"Pinch thumb to index tip to mute / unmute. {mute_count}/{mute_target} completed."
+                    f"Now do a shaka with palm towards the monitor to mute. "
+                    f"Mute toggles <span style='color:{color};'>{mute_count}/{mute_target}</span>"
                 )
             else:
                 self._set_step_progress("All three! Swipe right to move on!")
@@ -3601,12 +3683,19 @@ class TutorialWindow(QDialog):
                 visual_ready = True
             spotify_present = bool(getattr(self, "_has_spotify", False))
             if spotify_present:
-                # Spotify branch: command success text already
-                # records "play"/"spotify" matches; if the playback
-                # state is currently playing the step is done.
-                if self._last_voice_success_text and self._is_spotify_playing_safe():
-                    self._complete_step("Completed! Swipe right to move on!")
-                elif "spotify" in voice_heard and ("execut" in voice_control or "play" in voice_control):
+                # Spotify branch: do NOT call _is_spotify_playing_safe()
+                # synchronously here -- this slot runs at debug-frame
+                # rate, and SpotifyController.get_playback_state() is a
+                # blocking HTTP call that can take 100-5000 ms each.
+                # That was the per-frame UI freeze the user reported as
+                # "live view super lagging after song starts playing".
+                # The async _check_voice_media_playing path already
+                # owns the "is the song actually playing?" decision and
+                # completes the step via _on_voice_media_check_result;
+                # all we keep here is the cheap text-based fallback so
+                # a successful voice command still moves the user along
+                # even if the playback-state check is offline / 401'd.
+                if "spotify" in voice_heard and ("execut" in voice_control or "play" in voice_control):
                     self._complete_step("Completed! Swipe right to move on!")
             else:
                 if "youtube" in self._last_voice_success_text and "chrome" in self._last_voice_success_text:
