@@ -28,22 +28,25 @@ class DictationEvent:
 _SAMPLE_RATE = 16000
 _BLOCK_MS = 100
 _BLOCK_SAMPLES = _SAMPLE_RATE * _BLOCK_MS // 1000
-_SILENCE_COMMIT_MS = 800
+_SILENCE_COMMIT_MS = 1000
 _MAX_UTTERANCE_MS = 30000
 _MIN_SPEECH_MS = 500
 _RMS_SILENCE_THRESHOLD = 0.003
 _MODEL_ID = "deepdml/faster-whisper-large-v3-turbo-ct2"
 
-_DEFAULT_HOTWORDS = (
-    "Docker Kubernetes Python JavaScript TypeScript GitHub AWS Azure "
-    "Anthropic OpenAI PyTorch TensorFlow MediaPipe PySide macOS Linux"
-)
+# Hotwords bias the decoder toward listed terms. A tech-heavy
+# default list used to live here, but it was net-negative for
+# natural prose dictation: when the user said something acoustically
+# close to a hotword, the bias pushed the wrong term into the output.
+# Leave it empty by default; power users can opt in with
+# HGR_WHISPER_HOTWORDS="Qwen Llama vcpkg ..." for their own jargon.
+_DEFAULT_HOTWORDS = ""
 
 
 def _resolve_hotwords() -> Optional[str]:
     raw = os.getenv("HGR_WHISPER_HOTWORDS")
     if raw is None:
-        return _DEFAULT_HOTWORDS
+        raw = _DEFAULT_HOTWORDS
     raw = raw.strip()
     return raw or None
 
@@ -184,8 +187,19 @@ class WhisperStreamer:
                 condition_on_previous_text=False,
                 vad_filter=True,
                 vad_parameters={
-                    "min_silence_duration_ms": 500,
-                    "speech_pad_ms": 200,
+                    # Keep brief mid-sentence pauses (~700 ms or less)
+                    # inside a single segment so the model has the
+                    # full clause's acoustic context. Without this,
+                    # short pauses split a sentence into two segments
+                    # and word boundaries on either side of the
+                    # pause come out garbled.
+                    "min_silence_duration_ms": 700,
+                    # Pad each detected speech region by 400 ms so
+                    # trailing consonants ('-ing', '-ed') and leading
+                    # hard letters aren't clipped at the segment edge
+                    # -- those clips are what makes whisper drop the
+                    # tail of a word or hear 'thin' instead of 'thing'.
+                    "speech_pad_ms": 400,
                     "threshold": 0.5,
                 },
                 without_timestamps=True,
