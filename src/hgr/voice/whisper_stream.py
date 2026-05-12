@@ -161,16 +161,39 @@ class WhisperStreamer:
 
     def _transcribe(self, audio: np.ndarray) -> List[str]:
         assert self._model is not None
+        # Accuracy levers, tuned per device so CPU users don't pay
+        # the full GPU-size beam search:
+        #   * beam_size: 5 on GPU (industry default; ~2-4 % WER win over
+        #     greedy), 2 on CPU (small lift, ~1.5-2× slower than greedy
+        #     which we can absorb at typical dictation cadence).
+        #   * vad_filter=True with a short min_silence: strips silence
+        #     and ambient noise before the decoder ever sees it, which
+        #     is the single biggest source of whisper hallucinations
+        #     ("thank you for watching", "subtitles by...", etc.).
+        #     Also makes CPU faster on average because we don't decode
+        #     the dead air.
+        #   * compression_ratio_threshold + log_prob_threshold: faster-
+        #     whisper's anti-hallucination gates. Segments that look
+        #     like garbled repetition or low-confidence noise are
+        #     rejected at the decoder level.
+        beam_size = 5 if self._device == "cuda" else 2
         with self._model_lock:
             segments, _info = self._model.transcribe(
                 audio,
                 language="en",
-                beam_size=1,
+                beam_size=beam_size,
                 temperature=0.0,
                 condition_on_previous_text=False,
-                vad_filter=False,
+                vad_filter=True,
+                vad_parameters={
+                    "min_silence_duration_ms": 500,
+                    "speech_pad_ms": 200,
+                    "threshold": 0.5,
+                },
                 without_timestamps=True,
                 no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
+                log_prob_threshold=-1.0,
                 hotwords=self._hotwords,
                 repetition_penalty=1.1,
             )
