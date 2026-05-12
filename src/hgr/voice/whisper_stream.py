@@ -28,7 +28,7 @@ class DictationEvent:
 _SAMPLE_RATE = 16000
 _BLOCK_MS = 100
 _BLOCK_SAMPLES = _SAMPLE_RATE * _BLOCK_MS // 1000
-_SILENCE_COMMIT_MS = 2000
+_SILENCE_COMMIT_MS = 800
 _MAX_UTTERANCE_MS = 30000
 _MIN_SPEECH_MS = 500
 _RMS_SILENCE_THRESHOLD = 0.003
@@ -161,22 +161,20 @@ class WhisperStreamer:
 
     def _transcribe(self, audio: np.ndarray) -> List[str]:
         assert self._model is not None
-        # Accuracy levers, tuned per device so CPU users don't pay
-        # the full GPU-size beam search:
-        #   * beam_size: 5 on GPU (industry default; ~2-4 % WER win over
-        #     greedy), 2 on CPU (small lift, ~1.5-2× slower than greedy
-        #     which we can absorb at typical dictation cadence).
-        #   * vad_filter=True with a short min_silence: strips silence
-        #     and ambient noise before the decoder ever sees it, which
-        #     is the single biggest source of whisper hallucinations
-        #     ("thank you for watching", "subtitles by...", etc.).
-        #     Also makes CPU faster on average because we don't decode
-        #     the dead air.
-        #   * compression_ratio_threshold + log_prob_threshold: faster-
-        #     whisper's anti-hallucination gates. Segments that look
-        #     like garbled repetition or low-confidence noise are
-        #     rejected at the decoder level.
-        beam_size = 5 if self._device == "cuda" else 2
+        # Accuracy levers tuned per device. Latency-rebalanced 2026-05-12
+        # after the user reported 10-15 s output times with beam_size=5
+        # + 2 s silence-commit; halving target was 5-7 s.
+        #   * beam_size: 3 on GPU (keeps ~75 % of the WER win that 5
+        #     gave over greedy, at ~60 % of the inference time),
+        #     1 on CPU (greedy is the only thing CPU users can afford
+        #     and still feel responsive; VAD pre-filter + hallucination
+        #     thresholds carry the accuracy load instead).
+        #   * vad_filter=True (kept): strips silence/ambient noise
+        #     before the decoder. Biggest single accuracy win, AND
+        #     speeds up decode because we don't transcribe dead air.
+        #   * compression_ratio_threshold + log_prob_threshold (kept):
+        #     decoder-level anti-hallucination gates.
+        beam_size = 3 if self._device == "cuda" else 1
         with self._model_lock:
             segments, _info = self._model.transcribe(
                 audio,
