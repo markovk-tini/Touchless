@@ -72,8 +72,16 @@ def main() -> int:
 
     def _build_window() -> MainWindow:
         w = MainWindow(config)
-        if icon_path is not None:
-            w.setWindowIcon(QIcon(str(icon_path)))
+        # NOTE: do NOT call w.setWindowIcon(QIcon(str(icon_path)))
+        # here. MainWindow.__init__ already sets the window icon to
+        # the tray-state-bordered variant (grey at startup) and wires
+        # the tray's icon_changed signal to setWindowIcon so it
+        # updates on engine state transitions. Overwriting with the
+        # unmodified app icon here clobbered the grey OFF-state ring
+        # until the first state change re-set it via signal.
+        # app.setWindowIcon above still provides the base icon that
+        # MainWindow reads via QApplication.windowIcon() for the
+        # tray's renderer.
         return w
 
     TouchlessSplash.run_with(_build_window, config.accent_color, app)
