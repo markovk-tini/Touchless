@@ -221,7 +221,22 @@ class TouchlessTrayIcon(QObject):
 
     def _refresh_icon(self) -> None:
         border = _state_border_color(self._state)
-        self._tray.setIcon(_render_bordered_icon(self._base_icon, border))
+        new_icon = _render_bordered_icon(self._base_icon, border)
+        self._tray.setIcon(new_icon)
+        # Force the Windows system tray (Shell_NotifyIcon path) to
+        # actually repaint. Qt's QSystemTrayIcon.setIcon issues
+        # NIM_MODIFY, but Explorer.exe sometimes ignores it and
+        # keeps showing the previous icon until something else
+        # triggers a refresh -- which is why the colour swap
+        # appeared not to happen. A hide() + show() pair forces
+        # NIM_DELETE + NIM_ADD, which always repaints. The flicker
+        # is ~50 ms and only fires on state change.
+        if self._tray.isVisible():
+            try:
+                self._tray.hide()
+                self._tray.show()
+            except Exception:
+                pass
 
     def _refresh_tooltip(self) -> None:
         if self._state == "off":
