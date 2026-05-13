@@ -120,12 +120,34 @@ class GpuVideoWidget(QWidget):
         # diverge, paint events are coalescing somewhere.
         self._paint_count = 0
         self._paint_log_at = 0.0
+        # Fullscreen-aware lite paint mode. When True, paintEvent
+        # skips _draw_landmarks entirely -- the skeleton, bbox,
+        # banner, and mouse-overlay strokes are the expensive part
+        # of each paint (anti-aliased QPen polylines on the GPU),
+        # and during a fullscreen game DWM's GPU compositor is busy
+        # with the game so we want each paint to be as cheap as
+        # possible. The camera frame itself still draws -- detection
+        # is unaffected because it runs on the worker thread off
+        # raw frames, not off this widget's paint.
+        self._lite_paint_mode = False
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(220, 140)
         # Disable Qt's automatic background fill — we paint the
         # whole rect ourselves in paintEvent.
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WA_NoSystemBackground, True)
+
+    def set_lite_paint_mode(self, enabled: bool) -> None:
+        """Toggle the fullscreen-aware lite paint path. Called from
+        the live-view receivers when a game / fullscreen app appears
+        and disappears. Idempotent."""
+        new_value = bool(enabled)
+        if new_value == self._lite_paint_mode:
+            return
+        self._lite_paint_mode = new_value
+        # Force one paint so the change is visible immediately
+        # (otherwise the next paint waits for the next frame).
+        self.update()
 
     # ----- public API used by the receivers ------------------
 
@@ -262,7 +284,15 @@ class GpuVideoWidget(QWidget):
         target = self._aspect_target()
         if self._image is not None and not self._image.isNull():
             painter.drawImage(target, self._image)
-            self._draw_landmarks(painter, target)
+            # Skip the overlay drawing in lite paint mode -- the
+            # skeleton, bbox, banner and mouse-overlay strokes are
+            # the expensive part of each paint, and during a
+            # fullscreen game we want each paint cheap so DWM can
+            # actually composite us alongside the game. Detection
+            # is unaffected; only the visible-on-screen overlay
+            # disappears.
+            if not self._lite_paint_mode:
+                self._draw_landmarks(painter, target)
         elif self._idle_text:
             painter.setPen(QPen(self._idle_color, 1))
             painter.setFont(self._idle_font)

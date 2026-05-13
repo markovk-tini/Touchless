@@ -462,6 +462,12 @@ class _EngineRunner:
 class GestureWorker(QObject):
     status_changed = Signal(str)
     command_detected = Signal(str)
+    # Granular debug-log events that don't map cleanly to a finished
+    # action. Examples emitted today: "Voice heard: '<text>'",
+    # "Voice command not recognized", "Spotify not running — launching".
+    # The home page's debug log subscribes via _on_engine_log_message
+    # and pipes these into the same widget command_detected feeds.
+    engine_log = Signal(str)
     camera_selected = Signal(str)
     error_occurred = Signal(str)
     running_state_changed = Signal(bool)
@@ -3308,8 +3314,37 @@ class GestureWorker(QObject):
                     process = info.process_name or ""
             except Exception:
                 process = ""
+        was_active = self._fullscreen_foreground_active
         self._fullscreen_foreground_active = active
         self._fullscreen_foreground_process = process
+        # Process priority transition. When a fullscreen app
+        # (typically a game) grabs the foreground, Windows applies
+        # the foreground-boost policy to that process and drops
+        # ours -- combined with DWM throttling the GPU compositor
+        # of background windows, that's what produces the visible
+        # 1-2 s live-view lag the user reported. Boosting our
+        # process to ABOVE_NORMAL_PRIORITY_CLASS while fullscreen
+        # is up keeps the camera reader + paint threads scheduled
+        # promptly. Restored to NORMAL when the game goes away.
+        if active and not was_active:
+            self._apply_process_priority(above_normal=True)
+        elif was_active and not active:
+            self._apply_process_priority(above_normal=False)
+
+    @staticmethod
+    def _apply_process_priority(*, above_normal: bool) -> None:
+        import sys
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            # ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+            # NORMAL_PRIORITY_CLASS       = 0x00000020
+            target = 0x00008000 if above_normal else 0x00000020
+            ctypes.windll.kernel32.SetPriorityClass(handle, target)
+        except Exception:
+            pass
 
     def _swap_engine_safely(self) -> None:
         # Build the new engine first, then hand it to the runner; the
@@ -7979,11 +8014,51 @@ class GestureWorker(QObject):
                     transcript_mode=transcript_mode,
                 )
                 heard_text = result.heard_text
+                # Engine-log: surface what the listener heard, even if
+                # downstream processing fails or finds no intent. Gives
+                # the user immediate feedback that the mic IS picking
+                # them up and helps debug "I said X but nothing
+                # happened" reports.
+                if heard_text and heard_text.strip():
+                    try:
+                        self.engine_log.emit(f"Voice heard: \"{heard_text.strip()[:120]}\"")
+                    except Exception:
+                        pass
+                elif result.success is False:
+                    try:
+                        self.engine_log.emit("Voice listen ended (nothing heard)")
+                    except Exception:
+                        pass
                 if mode in {"general", "selection"} and result.success:
                     _push_status("processing", command_text=result.heard_text)
                     context = VoiceCommandContext(preferred_app=preferred_target) if mode == "general" else None
                     try:
                         execution = self.voice_processor.execute(result.heard_text, context=context)
+                        # Engine-log: whether the processor matched an
+                        # intent. Distinguishes "we heard you but
+                        # didn't understand" from "we heard you and
+                        # did X" — both flow through this path today
+                        # with no visible difference in the log.
+                        try:
+                            ex_intent = getattr(execution, "intent", None)
+                            ex_target = str(getattr(execution, "target", "") or "")
+                            ex_success = bool(getattr(execution, "success", False))
+                            if ex_intent is None:
+                                self.engine_log.emit(
+                                    f"Voice command not recognized: \"{heard_text.strip()[:80]}\""
+                                )
+                            else:
+                                intent_app = str(getattr(ex_intent, "app_name", "") or "")
+                                intent_action = str(getattr(ex_intent, "action", "") or "")
+                                verb = "executed" if ex_success else "attempted (failed)"
+                                detail = (
+                                    f"{intent_app} {intent_action}".strip()
+                                    or ex_target
+                                    or "command"
+                                )
+                                self.engine_log.emit(f"Voice command {verb}: {detail}")
+                        except Exception:
+                            pass
                         try:
                             from ...telemetry import track as _track
                             # Pull intent app + action so the dashboard

@@ -526,6 +526,17 @@ class LiveViewWindow(QMainWindow):
             import time as _time
             if (_time.monotonic() - capture_ts) > 0.12:
                 return
+        # Lite-paint switch: when a game / fullscreen app has
+        # foreground, skip the overlay-drawing in the video widget
+        # so each paint is cheap and DWM can actually composite us
+        # alongside the game's GPU work. Detection is unaffected.
+        worker = self._worker
+        if worker is not None:
+            fullscreen = bool(getattr(worker, "_fullscreen_foreground_active", False))
+            try:
+                self.video_label.set_lite_paint_mode(fullscreen)
+            except Exception:
+                pass
         self._last_frame = frame
         self._render_frame()
         # Update the latency + display-rate readout. The label
