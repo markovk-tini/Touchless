@@ -34,7 +34,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 # dark-theme taskbars.
 _BORDER_ACTIVE = QColor(29, 233, 182)    # mint   (engine running, gestures on)
 _BORDER_PAUSED = QColor(255, 138, 61)    # orange (gestures paused, mid-warning)
-_BORDER_OFF = QColor(160, 160, 160)       # medium grey -- enough lightness contrast against the dark blue icon body to stand out, dark enough to read on a light-theme taskbar too
+_BORDER_OFF = QColor(190, 190, 198)       # silver grey -- bright enough to read on a dark Win11 taskbar, slight cool tint so it has visual identity instead of fading into the icon's neutral edges
 
 
 def _state_border_color(state: str) -> QColor:
@@ -153,6 +153,17 @@ class TouchlessTrayIcon(QObject):
     def show(self) -> None:
         if self.is_supported():
             self._tray.show()
+            # Force-refresh the icon AFTER the first show so Windows
+            # picks up our state-bordered version even if it had a
+            # cached unbordered icon from a previous launch. Without
+            # this, the initial OFF state often rendered as the base
+            # Touchless icon (no grey ring) while the later
+            # state-change paths (mint, orange) worked fine because
+            # they always go through _refresh_icon's hide/show.
+            try:
+                self._refresh_icon()
+            except Exception:
+                pass
 
     def hide(self) -> None:
         self._tray.hide()
