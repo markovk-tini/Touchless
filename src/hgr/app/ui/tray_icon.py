@@ -67,11 +67,14 @@ def _render_bordered_icon(base_icon: QIcon, border_color: QColor) -> QIcon:
         painter = QPainter(out)
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            # Ring thickness: ~22 % of width, min 3 px. At 16 px tray
-            # that's 3-4 px (very visible as a coloured frame); at
-            # 256 px notification popovers it's 56 px (still tasteful,
-            # the hand inset preserves recognition).
-            ring = max(3, int(round(size * 0.22)))
+            # Ring thickness tuned so the hand stays the dominant
+            # visual: ~12 % of width, min 2 px. At 16 px tray that's
+            # 2 px (still readable as a thin coloured frame thanks
+            # to the saturated palette) and the hand inside is
+            # 12 px = recognisable. Earlier 22 % shrank the hand to
+            # 8 px on tray, which the user reported as 'can barely
+            # see touchless icon'.
+            ring = max(2, int(round(size * 0.12)))
             radius = max(2, int(round(size * 0.18)))
             # Filled coloured rounded-rect background.
             painter.setBrush(border_color)
@@ -96,6 +99,11 @@ class TouchlessTrayIcon(QObject):
     resume_requested = Signal()  # user clicked "Resume Gestures"
     settings_requested = Signal()
     quit_requested = Signal()
+    # Emitted whenever the rendered state icon changes. MainWindow
+    # wires this to setWindowIcon so the TASKBAR entry mirrors the
+    # tray's state cue -- user always sees the colour at a glance
+    # without having to expand the hidden-tray popout.
+    icon_changed = Signal(object)
 
     PAUSE_SECONDS = 30 * 60  # 30 minutes
 
@@ -237,6 +245,20 @@ class TouchlessTrayIcon(QObject):
                 self._tray.show()
             except Exception:
                 pass
+        # Push the new icon to listeners so the taskbar (window
+        # icon) also reflects the state cue. Tray-only would force
+        # the user to expand the hidden-icons popout to see state.
+        try:
+            self.icon_changed.emit(new_icon)
+        except Exception:
+            pass
+
+    def current_icon(self) -> QIcon:
+        """Return the currently-rendered bordered icon. Useful for
+        wiring up the MainWindow's window icon at construction time
+        before the first state-change signal fires."""
+        border = _state_border_color(self._state)
+        return _render_bordered_icon(self._base_icon, border)
 
     def _refresh_tooltip(self) -> None:
         if self._state == "off":

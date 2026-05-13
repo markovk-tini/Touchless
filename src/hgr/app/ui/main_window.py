@@ -5376,6 +5376,13 @@ class MainWindow(QMainWindow):
             self._tray_icon.resume_requested.connect(self._on_tray_resume)
             self._tray_icon.settings_requested.connect(self._on_tray_settings)
             self._tray_icon.quit_requested.connect(self._on_tray_quit)
+            # Mirror the tray's state icon onto the window icon so the
+            # TASKBAR entry (much more visible than the hidden-tray
+            # popout) shows the same colour cue. Also set it once
+            # synchronously now so the taskbar starts in the right
+            # state instead of waiting for the first state change.
+            self._tray_icon.icon_changed.connect(self.setWindowIcon)
+            self.setWindowIcon(self._tray_icon.current_icon())
             self._tray_icon.show()
         except Exception:
             self._tray_icon = None
