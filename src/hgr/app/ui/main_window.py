@@ -15286,7 +15286,12 @@ Admin elevation
             else:
                 self._set_home_camera_display_text(f"{len(self._discovered_cameras)} available - choose here")
         else:
-            self._set_home_camera_display_text("No camera found", enabled=False)
+            # No local cameras AND no phone source. KEEP the combo
+            # enabled (enabled=True) so the user can click it open
+            # and pick 'Connect Phone (QR)' to add a phone source
+            # without leaving the start page. Wording matches the
+            # first dropdown row ('No camera detected').
+            self._set_home_camera_display_text("No camera detected", enabled=True)
         # Settings → Camera status line, mirrored from the home card.
         if hasattr(self, "camera_page_status"):
             if phone_qr_active:
@@ -15363,7 +15368,11 @@ Admin elevation
         if mics:
             self._set_home_microphone_display_text(f"{mics[0]} (auto)")
             return
-        self._set_home_microphone_display_text("No microphone found", enabled=False)
+        # KEEP the combo enabled so the user can click open and pick
+        # 'Connect Phone (QR)' to add a phone-mic source without
+        # leaving the start page. Wording matches the dropdown's
+        # first row ('No microphone detected').
+        self._set_home_microphone_display_text("No microphone detected", enabled=True)
 
     def _on_action_history_expand_toggled(self, expanded: bool) -> None:
         """Expand the home Log panel to fill whatever vertical room the
