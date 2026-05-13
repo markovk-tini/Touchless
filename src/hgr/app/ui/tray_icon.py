@@ -34,7 +34,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 # dark-theme taskbars.
 _BORDER_ACTIVE = QColor(29, 233, 182)    # mint   (engine running, gestures on)
 _BORDER_PAUSED = QColor(255, 138, 61)    # orange (gestures paused, mid-warning)
-_BORDER_OFF = QColor(220, 220, 220)       # light grey (engine off; light enough to read on a dark Win11 taskbar)
+_BORDER_OFF = QColor(160, 160, 160)       # medium grey -- enough lightness contrast against the dark blue icon body to stand out, dark enough to read on a light-theme taskbar too
 
 
 def _state_border_color(state: str) -> QColor:
