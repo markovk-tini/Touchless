@@ -44,36 +44,44 @@ def _state_border_color(state: str) -> QColor:
 
 
 def _render_bordered_icon(base_icon: QIcon, border_color: QColor) -> QIcon:
-    """Paint a thick coloured rectangle border on top of the app
-    icon and return a fresh QIcon. The body of the icon is untouched
-    so users still recognise the Touchless hand silhouette; the
-    border is the state cue."""
+    """Render a state icon: thick coloured ring around the
+    Touchless hand. The hand stays recognisable; the ring is
+    the state cue.
+
+    Approach: paint a filled rounded-rect of the state colour as
+    the BACKGROUND, then paint the hand icon ON TOP, slightly
+    inset so the colour shows as a thick ring. This is way more
+    visible at 16-22 px tray sizes than a thin stroked border,
+    which gets eaten by anti-aliasing on small icons."""
     composed = QIcon()
     for size in (16, 22, 24, 32, 48, 64, 128, 256):
+        # Bypass Qt's icon-cache scaling by asking for the EXACT
+        # pixel size we want -- otherwise QIcon may hand back a
+        # pre-rendered cached pixmap that was already coloured
+        # for a previous border state.
         src_pixmap = base_icon.pixmap(size, size)
         if src_pixmap.isNull():
             continue
-        out = QPixmap(src_pixmap.size())
+        out = QPixmap(size, size)
         out.fill(Qt.transparent)
         painter = QPainter(out)
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.drawPixmap(0, 0, src_pixmap)
-            # Border thickness scales with icon size so the cue is
-            # readable on both 16 px tray and 128 px notification
-            # popovers. Minimum 2 px so small sizes still show.
-            stroke = max(2, int(round(src_pixmap.width() * 0.10)))
-            pen = QPen(border_color, stroke)
-            pen.setJoinStyle(Qt.MiterJoin)
-            painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
-            half = stroke / 2.0
-            painter.drawRect(
-                int(half),
-                int(half),
-                int(src_pixmap.width() - stroke),
-                int(src_pixmap.height() - stroke),
-            )
+            # Ring thickness: ~22 % of width, min 3 px. At 16 px tray
+            # that's 3-4 px (very visible as a coloured frame); at
+            # 256 px notification popovers it's 56 px (still tasteful,
+            # the hand inset preserves recognition).
+            ring = max(3, int(round(size * 0.22)))
+            radius = max(2, int(round(size * 0.18)))
+            # Filled coloured rounded-rect background.
+            painter.setBrush(border_color)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(0, 0, size, size, radius, radius)
+            # Hand icon drawn ON TOP, inset by the ring thickness on
+            # each side so the colour shows as a uniform ring around
+            # the silhouette.
+            inner_size = max(1, size - 2 * ring)
+            painter.drawPixmap(ring, ring, inner_size, inner_size, src_pixmap)
         finally:
             painter.end()
         composed.addPixmap(out)
