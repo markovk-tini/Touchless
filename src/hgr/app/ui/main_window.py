@@ -89,6 +89,7 @@ from ..overlays.overlay import HelloOverlay, ScreenDrawOverlay, DrawingSettingsD
 from .mini_live_viewer import MiniLiveViewer
 from .live_view_window import LiveViewWindow
 from .tutorial_window import TutorialWindow
+from .window_chrome import apply_touchless_chrome
 
 
 SECTION_INSTRUCTIONS = 0
@@ -736,7 +737,17 @@ class _WalkthroughTargetGlow(QWidget):
             return
         try:
             target_size = target.size()
-            top_left_in_parent = target.mapTo(parent, QPoint(0, 0))
+            # mapTo() traverses the parent chain widget-by-widget,
+            # which historically didn't reconcile QScrollArea's
+            # viewport offset properly — when the user scrolled the
+            # settings sidebar, the glow stayed at its OLD position
+            # because mapTo returned stale coordinates relative to the
+            # un-scrolled widget tree. Going through global (screen)
+            # coordinates always traverses correctly because Qt
+            # accounts for every layer (including scroll viewport
+            # translation) when computing global → local.
+            top_left_global = target.mapToGlobal(QPoint(0, 0))
+            top_left_in_parent = parent.mapFromGlobal(top_left_global)
             pad = self._PADDING
             self.setGeometry(
                 top_left_in_parent.x() - pad,
@@ -744,6 +755,30 @@ class _WalkthroughTargetGlow(QWidget):
                 target_size.width() + pad * 2,
                 target_size.height() + pad * 2,
             )
+            # Hide the glow if the target has been scrolled outside
+            # its enclosing QScrollArea viewport. Without this, the
+            # glow's last computed position would render even when the
+            # target itself is invisible (because the viewport clips
+            # the button but the free-floating glow is a sibling that
+            # doesn't get clipped). Walk up to the nearest QScrollArea
+            # ancestor; if the target's visible-in-parent region
+            # doesn't intersect that scroll area's viewport, hide.
+            from PySide6.QtWidgets import QScrollArea
+            scroll_area = target.parent()
+            while scroll_area is not None and not isinstance(scroll_area, QScrollArea):
+                scroll_area = scroll_area.parent()
+            if scroll_area is not None:
+                viewport_rect_global = QRect(
+                    scroll_area.viewport().mapToGlobal(QPoint(0, 0)),
+                    scroll_area.viewport().size(),
+                )
+                target_rect_global = QRect(
+                    top_left_global,
+                    target_size,
+                )
+                visible = viewport_rect_global.intersects(target_rect_global)
+                if self.isVisible() != visible:
+                    self.setVisible(visible)
         except Exception:
             pass
 
@@ -806,6 +841,7 @@ class ColorPickerButton(QPushButton):
 class StartTutorialDialog(QDialog):
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
+        apply_touchless_chrome(self)
         self.config = config
         if getattr(self.config, "tutorial_prompt_version", 0) < CURRENT_TUTORIAL_PROMPT_VERSION:
             self.config.show_start_instructions_prompt = True
@@ -814,16 +850,6 @@ class StartTutorialDialog(QDialog):
         self.choice: Optional[str] = None
         self.setModal(True)
         self.setWindowTitle("Touchless")
-        # Show the Touchless logo next to the title in the OS title
-        # bar / Alt-Tab list. Qt would normally inherit the
-        # QApplication-level icon, but a top-level QDialog created
-        # without a parent in some launch paths (e.g., the splash
-        # transition before MainWindow is shown) doesn't pick it up
-        # — set it explicitly here.
-        from PySide6.QtWidgets import QApplication
-        app_icon = QApplication.windowIcon()
-        if not app_icon.isNull():
-            self.setWindowIcon(app_icon)
         self.setMinimumWidth(380)
         self.setObjectName("startTutorialDialog")
         # Hug the content vertically — no extra slack below the buttons.
@@ -1036,14 +1062,11 @@ class WalkthroughStartDialog(QDialog):
 
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
+        apply_touchless_chrome(self)
         self.config = config
         self.choice: Optional[str] = None
         self.setModal(True)
         self.setWindowTitle("Touchless")
-        from PySide6.QtWidgets import QApplication
-        app_icon = QApplication.windowIcon()
-        if not app_icon.isNull():
-            self.setWindowIcon(app_icon)
         self.setMinimumWidth(420)
         self.setObjectName("startTutorialDialog")
         self.setSizeGripEnabled(False)
@@ -1231,6 +1254,7 @@ class WalkthroughStartDialog(QDialog):
 class CameraSelectionDialog(QDialog):
     def __init__(self, config: AppConfig, cameras: list[CameraInfo], prompt_text: str, parent=None):
         super().__init__(parent)
+        apply_touchless_chrome(self)
         self.config = config
         self.cameras = cameras
         self.selected_camera_index: Optional[int] = None
@@ -1511,27 +1535,50 @@ class GestureMediaWidget(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # Remember the original source pixmap (full resolution) so
+        # set_scale_factor() can re-scale crisply when the card is
+        # expanded. Without this, scaling an already-downscaled
+        # pixmap up to expanded size would produce a blurry result.
+        self._source_pixmap: QPixmap | None = None
+        # Native (1.0×) dimensions — set per media kind below. Used
+        # by set_scale_factor() to compute the expanded size while
+        # preserving the original aspect ratio (videos are 16:9-ish,
+        # images are square; one fixed expand size would distort
+        # one or the other).
+        self._native_width = 220
+        self._native_height = 220
         media_path = self._resolve_media_path()
         suffix = media_path.suffix.lower() if media_path is not None else ""
         if media_path is not None and suffix in {".png", ".jpg", ".jpeg", ".webp"}:
-            self.setFixedSize(220, 220)
+            # Smaller default per user UX feedback — the 220×220
+            # cards took up too much vertical room in the control
+            # guide. 160×160 keeps the image readable and lets more
+            # cards fit on screen at once. The expand-card button
+            # uses set_scale_factor() to grow this proportionally
+            # to ~400×400 when the user wants a close look.
+            self._native_width = 160
+            self._native_height = 160
+            self.setFixedSize(self._native_width, self._native_height)
             label = QLabel()
             label.setAlignment(Qt.AlignCenter)
-            label.setFixedSize(220, 220)
+            label.setFixedSize(self._native_width, self._native_height)
             label.setStyleSheet("background: rgba(10, 28, 39, 0.72); border-radius: 14px;")
             pixmap = QPixmap(str(media_path))
             if not pixmap.isNull():
-                label.setPixmap(pixmap.scaled(220, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                self._source_pixmap = pixmap
+                label.setPixmap(pixmap.scaled(self._native_width, self._native_height, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             else:
                 label.setText(media_path.name)
             self._image_label = label
             layout.addWidget(label)
         elif media_path is not None and suffix in {".mp4", ".mov", ".m4v", ".avi"} and _HAS_QT_MEDIA:
-            video_width = 220
-            video_height = 124
-            self.setFixedSize(video_width, video_height)
+            # Same downsize for videos. 160×90 holds the 16:9 aspect
+            # ratio every dynamic-gesture clip is recorded in.
+            self._native_width = 160
+            self._native_height = 90
+            self.setFixedSize(self._native_width, self._native_height)
             video_widget = QVideoWidget()
-            video_widget.setFixedSize(video_width, video_height)
+            video_widget.setFixedSize(self._native_width, self._native_height)
             video_widget.setStyleSheet("background: rgba(10, 28, 39, 0.72); border-radius: 14px;")
             layout.addWidget(video_widget)
             self._video_widget = video_widget
@@ -1549,11 +1596,60 @@ class GestureMediaWidget(QFrame):
             self._loop_timer.setSingleShot(True)
             self._loop_timer.timeout.connect(self._restart_video)
         else:
-            self.setFixedSize(220, 220)
+            # Fallback sketch follows the same compact default.
+            self._native_width = 160
+            self._native_height = 160
+            self.setFixedSize(self._native_width, self._native_height)
             fallback = GestureSketchWidget(gesture_key)
-            fallback.setFixedSize(220, 220)
+            fallback.setFixedSize(self._native_width, self._native_height)
             self._fallback = fallback
             layout.addWidget(fallback, 0, Qt.AlignCenter)
+
+    def set_scale_factor(self, factor: float) -> None:
+        """Scale the media to `factor` × its native size while
+        preserving the original aspect ratio (videos stay 16:9,
+        images stay square). Called by GestureGuideCard when the
+        user toggles the per-card expand button. factor=1.0 is the
+        default state; factor=2.0 doubles every dimension.
+
+        The maximumWidth cap from __init__ is also widened here so
+        the QFrame's parent layout actually lets the widget grow
+        past 240 px when scaled up.
+        """
+        try:
+            factor = max(0.5, min(4.0, float(factor)))
+        except Exception:
+            factor = 1.0
+        new_w = max(2, int(round(self._native_width * factor)))
+        new_h = max(2, int(round(self._native_height * factor)))
+        # Drop the maximumWidth cap so the layout doesn't refuse the
+        # larger size, then re-apply a generous cap that covers any
+        # plausible factor up to 4×.
+        self.setMaximumWidth(max(new_w, 240))
+        self.setFixedSize(new_w, new_h)
+        # Inner widgets resize too — without this they keep their
+        # original size and the QFrame just gets transparent margin.
+        if self._image_label is not None:
+            try:
+                self._image_label.setFixedSize(new_w, new_h)
+                if self._source_pixmap is not None and not self._source_pixmap.isNull():
+                    self._image_label.setPixmap(
+                        self._source_pixmap.scaled(
+                            new_w, new_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                        )
+                    )
+            except Exception:
+                pass
+        if self._video_widget is not None:
+            try:
+                self._video_widget.setFixedSize(new_w, new_h)
+            except Exception:
+                pass
+        if self._fallback is not None:
+            try:
+                self._fallback.setFixedSize(new_w, new_h)
+            except Exception:
+                pass
 
     def _resolve_media_path(self) -> Path | None:
         candidate_name = self._image_name or self._video_name
@@ -1638,6 +1734,42 @@ class GestureMediaWidget(QFrame):
 
 
 class GestureGuideCard(QFrame):
+    """Gesture reference card with two layered toggles:
+
+    - **Show more / Show less** (inline link): the detailed how-to /
+      requirements text is hidden by default; the user expands it
+      with a click. Keeps each card at a scannable height when
+      reading the full guide top-to-bottom.
+    - **Expand card (⤢ / ⤣ button top-right + click on the media)**:
+      grows the card to ~3× its normal height + width, bumps the
+      media size and the typography. Lets the user zoom in on a
+      specific gesture without leaving the guide. Works the same
+      in the standalone Control Guide tab and inside the tutorial
+      walkthrough.
+    """
+
+    # Sizing for the two card states. Width is constrained by the
+    # parent layout (the cards live inside a QVBoxLayout); only
+    # the height + media scale factor + font sizes change between
+    # states. Media uses set_scale_factor() so videos stay 16:9
+    # and images stay square — the previous attempt that called
+    # setFixedSize(square) on every card distorted the videos.
+    # Native sizes are now 160×160 (image) / 160×90 (video), so the
+    # collapsed cards stay compact. Expanded uses 2.5× → 400×400
+    # image / 400×225 video, which is big enough to read the
+    # gesture detail clearly without overflowing the gesture-guide
+    # column inside the typical settings window width.
+    _COLLAPSED_MEDIA_SCALE = 1.0
+    _EXPANDED_MEDIA_SCALE = 2.5
+    _COLLAPSED_DETAIL_MAX = 90
+    _EXPANDED_DETAIL_MAX = 360
+    _COLLAPSED_TITLE_PT = 14
+    _EXPANDED_TITLE_PT = 22
+    _COLLAPSED_SUB_PT = 11
+    _EXPANDED_SUB_PT = 16
+    _COLLAPSED_BODY_PT = 11
+    _EXPANDED_BODY_PT = 15
+
     def __init__(
         self,
         *,
@@ -1652,54 +1784,244 @@ class GestureGuideCard(QFrame):
         super().__init__(parent)
         self.setObjectName("innerCard")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(16)
+        outer = QVBoxLayout(self)
+        # Tighter padding + spacing on the card overall so the
+        # collapsed view doesn't waste vertical room. Inner text
+        # column further trims its inter-label spacing below.
+        outer.setContentsMargins(10, 8, 10, 8)
+        outer.setSpacing(4)
 
-        media = GestureMediaWidget(image_name=image_name, video_name=video_name, gesture_key=gesture_key)
-        layout.addWidget(media, 0, Qt.AlignTop)
+        # Top row: expand-card button anchored top-right above
+        # everything else. Lives in its own row so it doesn't push
+        # the title or media around when toggled. Diagonal
+        # expand-arrows glyph (↗↙) reads more naturally than the
+        # square-bracket arrows; smaller frame keeps it from
+        # dominating the top of the collapsed card.
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(0)
+        top_row.addStretch(1)
+        self._expand_card_button = QPushButton("↗")
+        self._expand_card_button.setObjectName("gestureCardExpand")
+        self._expand_card_button.setFixedSize(22, 22)
+        self._expand_card_button.setCursor(Qt.PointingHandCursor)
+        self._expand_card_button.setToolTip("Expand this card")
+        self._expand_card_button.setStyleSheet(
+            "QPushButton#gestureCardExpand {"
+            "  background: rgba(255,255,255,0.06);"
+            "  color: rgba(232,246,255,0.85);"
+            "  border: 1px solid rgba(255,255,255,0.18);"
+            "  border-radius: 5px;"
+            "  font-size: 12px;"
+            "  font-weight: 700;"
+            "  padding: 0;"
+            "}"
+            "QPushButton#gestureCardExpand:hover {"
+            "  background: rgba(29,233,182,0.16);"
+            "  border: 1px solid rgba(29,233,182,0.45);"
+            "  color: #E8F6FF;"
+            "}"
+        )
+        self._expand_card_button.clicked.connect(self._toggle_expand)
+        top_row.addWidget(self._expand_card_button, 0, Qt.AlignTop | Qt.AlignRight)
+        outer.addLayout(top_row)
+
+        # Main horizontal row: media + text column. Same as before,
+        # just wrapped in `outer` so the top-row expand button sits
+        # above it without disturbing the alignment. Tighter spacing
+        # for collapsed-state readability.
+        body_row = QHBoxLayout()
+        body_row.setContentsMargins(0, 0, 0, 0)
+        body_row.setSpacing(12)
+
+        self._media = GestureMediaWidget(
+            image_name=image_name, video_name=video_name, gesture_key=gesture_key
+        )
+        # Click on the media also toggles expand — mirrors the
+        # button's behaviour so users find the affordance naturally.
+        # mousePressEvent is overridden in-place; the underlying
+        # QFrame mouse handling we're replacing was a no-op.
+        def _media_press(event, widget=self._media, owner=self):
+            if event.button() == Qt.LeftButton:
+                owner._toggle_expand()
+                event.accept()
+                return
+            # Forward unhandled buttons to QFrame's default so
+            # right-click / etc. continues to work normally.
+            QFrame.mousePressEvent(widget, event)
+        self._media.mousePressEvent = _media_press  # type: ignore[assignment]
+        self._media.setCursor(Qt.PointingHandCursor)
+        body_row.addWidget(self._media, 0, Qt.AlignTop)
         # Flag used by GestureGuideSection to decide whether
         # expanding it during walkthrough would trigger the multi-
         # decoder freeze. Only video cards qualify.
         self._card_uses_video = video_name is not None
 
         text_layout = QVBoxLayout()
-        text_layout.setSpacing(8)
+        # Tight inter-label spacing for the collapsed-state look —
+        # title / action / brief-how-to / "Show more" stack with
+        # minimal gaps so the card stays compact. Expanded state's
+        # extra room comes from the larger media + scroll box; the
+        # layout spacing stays small either way.
+        text_layout.setSpacing(4)
+        text_layout.setContentsMargins(0, 0, 0, 0)
 
-        title_label = QLabel(title)
-        title_label.setObjectName("gestureCardTitle")
-        title_label.setWordWrap(True)
+        self._title_label = QLabel(title)
+        self._title_label.setObjectName("gestureCardTitle")
+        self._title_label.setWordWrap(True)
 
-        action_label = QLabel(f"Action: {action}")
-        action_label.setObjectName("gestureCardSubtitle")
-        action_label.setWordWrap(True)
+        self._action_label = QLabel(f"Action: {action}")
+        self._action_label.setObjectName("gestureCardSubtitle")
+        self._action_label.setWordWrap(True)
 
-        how_header = QLabel("How to do it")
-        how_header.setObjectName("gestureCardSubtitle")
+        # Brief how-to shown in the default (collapsed-details)
+        # state. Auto-extracted from the full how_to: take the first
+        # paragraph (text up to the first blank line), strip the
+        # "How To:" prefix if present. Falls back to the full text
+        # for short descriptions that have no paragraph break.
+        # Caller can override by passing how_to with its own
+        # paragraph structure — current cards use a `How To: ...\n\n
+        # Requirements: ...` pattern which extracts cleanly.
+        brief_how_to_text = (how_to or "").split("\n\n", 1)[0].strip()
+        if brief_how_to_text.lower().startswith("how to:"):
+            brief_how_to_text = brief_how_to_text[len("how to:"):].strip()
+        elif brief_how_to_text.lower().startswith("how to do it:"):
+            brief_how_to_text = brief_how_to_text[len("how to do it:"):].strip()
+        self._brief_label = QLabel(brief_how_to_text)
+        self._brief_label.setObjectName("gestureCardBody")
+        self._brief_label.setWordWrap(True)
+        self._brief_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._brief_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
-        detail_label = QLabel(how_to)
-        detail_label.setObjectName("gestureCardBody")
-        detail_label.setWordWrap(True)
-        detail_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        detail_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        self._how_header = QLabel("Full how-to & requirements")
+        self._how_header.setObjectName("gestureCardSubtitle")
 
-        desc_scroll = QScrollArea()
-        desc_scroll.setFrameShape(QFrame.NoFrame)
-        desc_scroll.setWidgetResizable(True)
-        desc_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        desc_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        desc_scroll.setMaximumHeight(90)
-        desc_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
-        desc_scroll.setWidget(detail_label)
-        desc_scroll.setStyleSheet("background: transparent; border: none;")
+        self._detail_label = QLabel(how_to)
+        self._detail_label.setObjectName("gestureCardBody")
+        self._detail_label.setWordWrap(True)
+        self._detail_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._detail_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
-        text_layout.addWidget(title_label)
-        text_layout.addWidget(action_label)
-        text_layout.addSpacing(2)
-        text_layout.addWidget(how_header)
-        text_layout.addWidget(desc_scroll)
+        self._desc_scroll = QScrollArea()
+        self._desc_scroll.setFrameShape(QFrame.NoFrame)
+        self._desc_scroll.setWidgetResizable(True)
+        self._desc_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._desc_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._desc_scroll.setMaximumHeight(self._COLLAPSED_DETAIL_MAX)
+        self._desc_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        self._desc_scroll.setWidget(self._detail_label)
+        self._desc_scroll.setStyleSheet("background: transparent; border: none;")
+
+        # Show more / show less link below the action line; the
+        # detailed how-to text starts hidden so the card stays
+        # compact at first glance.
+        self._show_more_button = QPushButton("Show more…")
+        self._show_more_button.setObjectName("gestureCardShowMore")
+        self._show_more_button.setCursor(Qt.PointingHandCursor)
+        self._show_more_button.setStyleSheet(
+            "QPushButton#gestureCardShowMore {"
+            "  background: transparent;"
+            "  color: rgba(29,233,182,0.92);"
+            "  border: none;"
+            "  text-align: left;"
+            "  padding: 0;"
+            "  font-size: 12px;"
+            "  font-weight: 600;"
+            "  text-decoration: underline;"
+            "}"
+            "QPushButton#gestureCardShowMore:hover {"
+            "  color: #1DE9B6;"
+            "}"
+        )
+        self._show_more_button.clicked.connect(self._toggle_details)
+
+        text_layout.addWidget(self._title_label)
+        text_layout.addWidget(self._action_label)
+        text_layout.addWidget(self._brief_label)
+        text_layout.addWidget(self._show_more_button, 0, Qt.AlignLeft)
+        text_layout.addWidget(self._how_header)
+        text_layout.addWidget(self._desc_scroll)
         text_layout.addStretch(1)
-        layout.addLayout(text_layout, 1)
+        body_row.addLayout(text_layout, 1)
+        outer.addLayout(body_row)
+
+        # State init — collapsed details, collapsed card. The
+        # _apply_states helper sizes everything from these flags so
+        # we don't duplicate the same setMaximumHeight / font code
+        # in two places.
+        self._details_expanded = False
+        self._card_expanded = False
+        self._apply_states()
+
+    def _toggle_details(self) -> None:
+        self._details_expanded = not self._details_expanded
+        self._apply_states()
+
+    def _toggle_expand(self) -> None:
+        self._card_expanded = not self._card_expanded
+        # Expanding the card implicitly reveals the details too —
+        # if the user wanted a closer look at the gesture, they
+        # probably want the full how-to as well.
+        if self._card_expanded:
+            self._details_expanded = True
+        self._apply_states()
+
+    def _apply_states(self) -> None:
+        # The brief paragraph is always visible at the top — it's
+        # the "straightforward explanation" mentioned in user
+        # feedback. The full how-to + requirements is hidden behind
+        # the "Show more" toggle. Hiding the brief when the full is
+        # showing would mean the same first sentence reads twice
+        # (once in brief, once at the top of the full text), so we
+        # swap them: brief visible when collapsed, hidden when full
+        # is showing.
+        details_visible = bool(self._details_expanded)
+        self._brief_label.setVisible(not details_visible)
+        self._desc_scroll.setVisible(details_visible)
+        self._how_header.setVisible(details_visible)
+        self._show_more_button.setText("Show less" if details_visible else "Show more…")
+
+        # Sizing for collapsed vs expanded card state. Media uses
+        # set_scale_factor (preserves aspect ratio); we only scale
+        # font sizes + detail-scrollbox max height + media here.
+        is_expanded = bool(self._card_expanded)
+        media_scale = self._EXPANDED_MEDIA_SCALE if is_expanded else self._COLLAPSED_MEDIA_SCALE
+        try:
+            self._media.set_scale_factor(media_scale)
+        except Exception:
+            pass
+        detail_max = self._EXPANDED_DETAIL_MAX if is_expanded else self._COLLAPSED_DETAIL_MAX
+        self._desc_scroll.setMaximumHeight(detail_max)
+        title_pt = self._EXPANDED_TITLE_PT if is_expanded else self._COLLAPSED_TITLE_PT
+        sub_pt = self._EXPANDED_SUB_PT if is_expanded else self._COLLAPSED_SUB_PT
+        body_pt = self._EXPANDED_BODY_PT if is_expanded else self._COLLAPSED_BODY_PT
+        for label, pt in (
+            (self._title_label, title_pt),
+            (self._action_label, sub_pt),
+            (self._how_header, sub_pt),
+            (self._detail_label, body_pt),
+            (self._brief_label, body_pt),
+        ):
+            font = label.font()
+            font.setPointSize(pt)
+            label.setFont(font)
+        # Toggle button glyph + tooltip so the user knows what the
+        # button does in either state. Outward-pointing arrow when
+        # collapsed (it expands), inward-pointing when expanded
+        # (it collapses).
+        if is_expanded:
+            self._expand_card_button.setText("↙")
+            self._expand_card_button.setToolTip("Collapse this card")
+        else:
+            self._expand_card_button.setText("↗")
+            self._expand_card_button.setToolTip("Expand this card")
+        # Ask the layout to re-evaluate — without updateGeometry
+        # the parent scroll area doesn't notice the new sizes until
+        # the next resize / repaint.
+        try:
+            self.updateGeometry()
+        except Exception:
+            pass
 
 
 class VoiceCommandCard(QFrame):
@@ -1888,7 +2210,7 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
                 "How To: Face your left palm toward the monitor, extend only the index finger, and keep your thumb, middle, "
                 "ring, and pinky fingers closed. Hold the pose steady for roughly half a second until Touchless beeps and the "
                 "voice overlay appears.\n\n"
-                "Requirements: A working microphone and the whisper.cpp model files bundled with the app. After Touchless confirms "
+                "Requirements: A working microphone. After Touchless confirms "
                 "the pose, speak a command such as 'open YouTube on Google Chrome'. Use the left-hand fist gesture at any "
                 "time to cancel listening."
             ),
@@ -1901,7 +2223,7 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: Face your left palm toward the monitor, extend the index and middle fingers in a V shape, and "
                 "keep the thumb, ring, and pinky closed. Hold the pose steady for about half a second to toggle dictation.\n\n"
-                "Requirements: A working microphone and a text field, chat box, or document that currently has keyboard "
+                "Requirements: A working microphone and a text field that has keyboard "
                 "focus — dictation types into whichever window was active when you started. Dictation runs continuously "
                 "until you perform left-hand two a second time to stop, or perform the left-hand fist to cancel."
             ),
@@ -1914,9 +2236,7 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: Face your left palm toward the monitor. Extend the index, middle, and ring fingers and keep them "
                 "separated; fold the thumb and pinky. Hold the pose for about half a second to toggle mouse mode.\n\n"
-                "Requirements: None — mouse mode can be toggled at any time. When mouse mode is on, use your right "
-                "hand open-palm to move the cursor and pinch thumb-to-index for left click or thumb-to-middle for "
-                "right click (see Mouse Clicks, Mouse Scroll, and Mouse Demo)."
+                "Requirements: None — mouse mode can be toggled at any time."
             ),
             gesture_key="left_three",
             image_name="Left Three.png",
@@ -1927,9 +2247,7 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: Face your left palm toward the monitor. Extend the index, middle, ring, and pinky fingers and "
                 "fold the thumb across the palm. Hold the pose steady for about half a second.\n\n"
-                "Requirements: None to toggle — but while drawing mode is on, you unlock the Drawing, Erasing, Clear "
-                "Canvas, Undo Drawing, and Drawing Settings Wheel gestures. Toggle drawing mode off with the same gesture "
-                "when you're done; otherwise drawing gestures will keep intercepting your right hand."
+                "Requirements: None — drawing mode can be toggled at any time."
             ),
             gesture_key="four",
             image_name="Left Hand Four.png",
@@ -1940,9 +2258,7 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: Face your left palm toward the monitor and close all five fingers into a tight, compact fist. "
                 "Hold the pose clearly so Touchless reads it as a fist rather than a partially curled hand.\n\n"
-                "Requirements: Only useful while a voice process is active. It cancels listening, cancels the "
-                "recognize/process stage, and stops dictation immediately. If nothing voice-related is running, the "
-                "gesture does nothing."
+                "Requirements: Only useful while a voice command or dictation is active. Otherwise the gesture does nothing."
             ),
             gesture_key="fist",
             image_name="LeftFist.png",
@@ -1953,8 +2269,7 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: Face your right palm toward the monitor, extend the index and middle fingers in a V shape, and "
                 "keep the thumb, ring, and pinky closed. Hold the pose steady for about one second.\n\n"
-                "Requirements: Spotify must be installed on the system. If Spotify is already running, Touchless brings it to "
-                "the front; otherwise it launches it."
+                "Requirements: Spotify must be installed."
             ),
             gesture_key="two",
             image_name="Two.png",
@@ -1965,9 +2280,7 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: Face your right palm toward the monitor and close all five fingers into a tight, compact fist. "
                 "Hold the pose steady for about half a second to trigger a play/pause toggle.\n\n"
-                "Requirements: Something must be playing or paused. The gesture sends a global media-key event, so it "
-                "controls whichever app currently owns media focus — Spotify, a Chrome tab playing YouTube, or any other "
-                "media player."
+                "Requirements: Something must be playing or paused (Spotify, YouTube, or any other media player)."
             ),
             gesture_key="fist",
             image_name="Fist.png",
@@ -1979,8 +2292,7 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
                 "How To: Face your right palm toward the monitor. Extend the thumb and pinky outward (like a 'call me' "
                 "shape) while keeping the index, middle, and ring fingers folded. Hold the pose clearly for about half a "
                 "second.\n\n"
-                "Requirements: None. The gesture toggles the master system volume mute state, not individual apps. You'll "
-                "see the system volume overlay flash to confirm."
+                "Requirements: None — toggles the system mute state."
             ),
             gesture_key="mute",
             image_name="Mute.png",
@@ -1992,9 +2304,9 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
                 "How To: Face your right palm toward the monitor and make the wheel pose (thumb, index, and pinky "
                 "extended; middle and ring folded). Hold for about one second until the wheel opens. Move your hand "
                 "toward a slice and keep it there for one second to confirm that action.\n\n"
-                "Requirements: The active window determines which wheel appears — Chrome/YouTube opens the Chrome wheel "
-                "(refresh, back/forward, close tab, mute tab, share video), anything else opens the Spotify wheel (add to "
-                "playlist, queue, like, shuffle). To close the wheel without selecting, lower your hand or move it away."
+                "Requirements: The wheel that opens depends on which app is focused — Chrome/YouTube → Chrome wheel "
+                "(refresh, back/forward, close tab, mute tab, share). Anything else → Spotify wheel (add to playlist, "
+                "queue, like, shuffle). To close without selecting, move your hand away."
             ),
             gesture_key="wheel_pose",
             image_name="Wheel Pose.png",
@@ -2007,12 +2319,27 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
                 "thumb, middle, and ring fingers folded — a 'rock on' or horns shape. Hold the pose steady for about one "
                 "second until the screen utility wheel opens. Move your hand toward a slice and hold for one second to "
                 "confirm.\n\n"
-                "Requirements: None to open. Slices are: full screenshot, custom area screenshot, full screen recording, "
-                "custom area recording, save the last 30 seconds as a clip, and save the last 1 minute as a clip. Output "
-                "paths can be configured in Settings → Save Locations."
+                "Requirements: None. Slices are: full screenshot, custom area screenshot, full screen recording, "
+                "custom area recording, save last 30 seconds as a clip, save last 1 minute as a clip. Output paths "
+                "can be configured in Settings → Save Locations."
             ),
             gesture_key="mute",
             image_name="ScreenWheel.png",
+        ),
+        GestureGuideCard(
+            title="Close Window",
+            action="Close the active window (sends Alt+F4 to the focused app)",
+            how_to=(
+                "How To: Face your RIGHT palm toward the monitor with the camera-side surface visible. Curl the index, "
+                "middle, ring, and pinky fingers in toward the palm. Extend ONLY the thumb out to the side, parallel to "
+                "the ground (not pointing up like a thumbs-up — Touchless rejects thumbs-up so it doesn't fire on "
+                "everyday gestures). Hold the pose for about one second to confirm; the hand bbox turns green and the "
+                "gesture name 'close' appears in the live view when Touchless sees the pose.\n\n"
+                "Requirements: A window must be focused. Some windows (system dialogs, fullscreen games) ignore close "
+                "events — the gesture fires but the window doesn't close."
+            ),
+            gesture_key="open_hand",
+            image_name="close.png",
         ),
     ]
 
@@ -2026,8 +2353,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "How To: Start with your right hand open and palm facing the monitor, positioned toward the right side "
                 "of your camera frame. Move your hand smoothly and confidently to the left in one clean horizontal "
                 "motion. Keep the palm open throughout the swipe and avoid bobbing up or down.\n\n"
-                "Requirements: Either Spotify or Chrome must be the focused app. In Spotify it goes to the previous track; "
-                "in Chrome it navigates to the previous page in history."
+                "Requirements: Spotify or Chrome must be the focused app."
             ),
             gesture_key="open_hand",
             video_name="SwipeLeft.mp4",
@@ -2039,8 +2365,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "How To: Start with your right hand open and palm facing the monitor, positioned toward the left side "
                 "of your camera frame. Move your hand smoothly and confidently to the right in one clean horizontal "
                 "motion. Keep the palm open throughout and avoid up-and-down drift.\n\n"
-                "Requirements: Either Spotify or Chrome must be the focused app. In Spotify it skips to the next track; "
-                "in Chrome it navigates forward in history (if a forward page exists)."
+                "Requirements: Spotify or Chrome must be the focused app."
             ),
             gesture_key="open_hand",
             video_name="SwipeRight.mp4",
@@ -2052,9 +2377,9 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "How To: Face your right palm toward the monitor. Extend the index and middle fingers together (touching) "
                 "and fold the thumb, ring, and pinky. Hold the pose until the volume overlay appears. Then move your hand "
                 "up to raise volume or down to lower it, all while keeping the pose.\n\n"
-                "Requirements: If Spotify or Chrome is playing audio, the overlay shows two bars — move your palm slightly "
-                "left of your start position to select the app bar, or slightly right to select the system bar. Up/down "
-                "adjusts whichever bar is highlighted. Drop the pose to close the overlay."
+                "Requirements: None for system volume. When Spotify or Chrome is playing, the overlay shows two bars — "
+                "move your palm slightly left of your start position to control the app bar, slightly right for the "
+                "system bar. Drop the pose to close the overlay."
             ),
             gesture_key="volume_pose",
             video_name="VolControl.mp4",
@@ -2066,8 +2391,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "How To: With your right hand, extend only the index finger (other fingers folded, like pointing). Trace "
                 "a small smooth circle in the air with your fingertip — roughly the size of a coaster. The motion must "
                 "close into a loop, not just a partial arc.\n\n"
-                "Requirements: Chrome or Spotify must be the focused app. In Chrome this reloads the current tab. In "
-                "Spotify it cycles through repeat modes (off → repeat all → repeat one → off)."
+                "Requirements: Chrome or Spotify must be the focused app."
             ),
             gesture_key="one",
             video_name="Repeat.mp4",
@@ -2089,9 +2413,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "• The cursor briefly steadies the moment a pinch starts so the click lands exactly "
                 "where you were aiming.\n"
                 "• Turn mouse mode OFF: make the same left-hand three-finger pose again.\n\n"
-                "Requirements: Mouse mode must be on — the right hand only drives the cursor while "
-                "mouse mode is active. Pinch with the other three fingers OPEN, not in a fist (a fist "
-                "won’t register). Tap-style pinches click; held pinches drag."
+                "Requirements: Mouse mode must be on. Tap-style pinches click; held pinches drag."
             ),
             gesture_key="open_hand",
             video_name="Mouse Clicks.mp4",
@@ -2113,10 +2435,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "around the anchor keeps tiny tremors from scrolling.\n"
                 "• To leave scroll mode and resume cursor control, simply break the "
                 "two-finger-together pose (open the fingers apart, or curl them).\n\n"
-                "Requirements: Mouse mode must already be ON. Don’t pinch — a thumb-pinch "
-                "will be read as a click, not a scroll. The wheel “horns” pose (thumb + "
-                "index + pinky out) also works as a scroll trigger when you’re already inside "
-                "mouse mode."
+                "Requirements: Mouse mode must be on."
             ),
             gesture_key="volume_pose",
             video_name="Mouse Demo.mp4",
@@ -2135,9 +2454,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "pinch to drag.\n"
                 "• Two-finger together (peace closed) enters scroll mode — then move up/down.\n"
                 "• Toggle off with LEFT hand three again.\n\n"
-                "Requirements: A working webcam, both hands available, and mouse mode active for the "
-                "right-hand actions. Left hand stays free as the toggle while you’re using "
-                "the cursor."
+                "Requirements: Mouse mode active for the right-hand actions."
             ),
             gesture_key="open_hand",
             video_name="Mouse Demo.mp4",
@@ -2149,8 +2466,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "How To: Hold both hands in the camera frame with palms facing the monitor. Start with your hands close "
                 "together in front of your chest. Then spread both hands outward and apart in one smooth motion and hold "
                 "the spread position briefly.\n\n"
-                "Requirements: Both hands must be visible to the camera for the full motion. A window must be active "
-                "(focused) — the gesture maximizes whichever window currently has focus."
+                "Requirements: A window must be focused."
             ),
             gesture_key="open_hand",
             video_name="Maximize.mp4",
@@ -2161,8 +2477,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: Hold both hands in the camera frame with palms facing the monitor, spread apart. Bring both "
                 "hands together in one smooth pinching motion until they are close together, and hold briefly.\n\n"
-                "Requirements: Both hands must remain visible for the full motion. A window must be active — the gesture "
-                "minimizes whichever window currently has focus."
+                "Requirements: A window must be focused."
             ),
             gesture_key="open_hand",
             video_name="Minimize.mp4",
@@ -2173,8 +2488,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: Hold both hands visible with palms facing the monitor. From either a spread-apart or "
                 "pinched-together position, move your hands to a medium distance apart and hold the pose briefly.\n\n"
-                "Requirements: Both hands must remain visible. The active window must be maximized or minimized — "
-                "restoring a normal-sized window has no visible effect."
+                "Requirements: The focused window must currently be maximized or minimized."
             ),
             gesture_key="open_hand",
             video_name="restore.mp4",
@@ -2186,9 +2500,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "How To: With your right hand, extend only the index finger (other fingers folded, like pointing). Move "
                 "your fingertip through the air — the stroke follows your index fingertip in real time. To stop a stroke, "
                 "lift the hand out of the frame or switch to a different pose.\n\n"
-                "Requirements: Drawing mode must be on — toggle it with the left-hand four static gesture first. Stroke "
-                "color, thickness, and brush type can be changed via the Drawing Settings Wheel. The canvas floats above "
-                "all other windows until you clear it or turn off drawing mode."
+                "Requirements: Drawing mode must be on (left-hand four)."
             ),
             gesture_key="one",
             video_name="Drawing.mp4",
@@ -2200,9 +2512,8 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "How To: While drawing mode is active, open the Drawing Settings Wheel (right-hand wheel pose), move to "
                 "the eraser slice, and hold to confirm. Then use the pointer pose — index finger extended — and move "
                 "your hand over any strokes you want to erase.\n\n"
-                "Requirements: Drawing mode must be on (left-hand four) and eraser mode must be selected from the "
-                "Drawing Settings Wheel. Eraser size can be adjusted in the same wheel. Switch back to the brush from "
-                "that wheel when you're done erasing."
+                "Requirements: Drawing mode must be on (left-hand four), and eraser mode must be selected from the "
+                "Drawing Settings Wheel."
             ),
             gesture_key="fist",
             video_name="Erasing.mp4",
@@ -2213,8 +2524,8 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: While drawing mode is active, perform the clear canvas gesture (see the video) and hold it "
                 "until the canvas clears. All strokes disappear at once.\n\n"
-                "Requirements: Drawing mode must be on (left-hand four). This is destructive — Undo Drawing cannot bring "
-                "cleared strokes back, so use it only when you want a fresh canvas."
+                "Requirements: Drawing mode must be on (left-hand four). This is destructive — Undo Drawing cannot "
+                "bring cleared strokes back."
             ),
             gesture_key="fist",
             video_name="ClearCanvas.mp4",
@@ -2225,8 +2536,7 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
             how_to=(
                 "How To: While drawing mode is active, perform the undo gesture (see the video). Each confirmation "
                 "removes the most recent stroke; repeat to undo multiple strokes in order.\n\n"
-                "Requirements: Drawing mode must be on (left-hand four) and at least one stroke must exist on the canvas. "
-                "Undo cannot restore strokes cleared by Clear Canvas."
+                "Requirements: Drawing mode must be on (left-hand four), and at least one stroke must exist on the canvas."
             ),
             gesture_key="one",
             video_name="UndoDraw.mp4",
@@ -2238,8 +2548,8 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
                 "How To: While drawing mode is on, make the wheel pose with your right hand (thumb, index, pinky "
                 "extended; middle and ring folded) and hold it steady. The drawing settings wheel opens. Move toward a "
                 "slice and hold for about one second to confirm the selection.\n\n"
-                "Requirements: Drawing mode must be on (left-hand four) — otherwise the wheel pose opens the Spotify or "
-                "Chrome wheel instead. Slices include color picker, brush size, brush type, and eraser toggle."
+                "Requirements: Drawing mode must be on (left-hand four). Slices include color picker, brush size, "
+                "brush type, and eraser toggle."
             ),
             gesture_key="wheel_pose",
             video_name="DrawingSettingsWheel.mp4",
@@ -2292,12 +2602,29 @@ def build_gesture_guide_scroll_area(parent=None) -> QScrollArea:
     return scroll
 
 
-class CaptureMonitorDialog(QWidget):
+class CaptureMonitorDialog(QDialog):
+    """Modal monitor-picker for screenshot / clip / record actions.
+
+    Used to inherit from QWidget — but the call site does
+    `dialog.exec()` which QWidget doesn't provide, so on every
+    invocation Python raised `AttributeError: 'CaptureMonitorDialog'
+    has no attribute 'exec'`. Qt's slot dispatcher swallowed the
+    exception silently, the dialog appeared because of its own
+    show()-side wiring, but the caller never got the user's
+    selection back. Result: user clicks a monitor, the dialog
+    closes, but the screenshot / clip never runs — and nothing in
+    the log because the AttributeError is eaten upstream.
+
+    Switching the base to QDialog fixes both ends in one line:
+    .exec() now works, and accept()/reject() drive the standard
+    Accepted/Rejected return values the caller already checks for.
+    """
     selection_made = Signal(QRect)
     canceled = Signal()
 
     def __init__(self, config: AppConfig, action_label: str, options: list[tuple[str, QRect]], parent=None):
         super().__init__(None)
+        apply_touchless_chrome(self)
         self.config = config
         self.selected_region: QRect | None = None
         self._cursor_global: QPoint | None = None
@@ -2518,14 +2845,19 @@ class CaptureMonitorDialog(QWidget):
         self._completed = True
         self.selected_region = QRect(region.normalized())
         self.selection_made.emit(QRect(self.selected_region))
-        self.close()
+        # accept() returns QDialog.Accepted from exec() — what the
+        # caller _choose_full_capture_region checks for to know the
+        # user confirmed a selection (vs canceled / closed).
+        self.accept()
 
     def _cancel(self) -> None:
         if self._completed:
             return
         self._completed = True
         self.canceled.emit()
-        self.close()
+        # reject() returns QDialog.Rejected — same caller treats
+        # this as "user backed out, don't take the screenshot".
+        self.reject()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if not self._completed:
@@ -3841,6 +4173,7 @@ class _MouseMonitorChoiceDialog(QDialog):
 
     def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        apply_touchless_chrome(self)
         self._config = config
         self.setWindowTitle("Mouse Monitor")
         self.setObjectName("mouseMonitorChoiceDialog")
@@ -4104,15 +4437,12 @@ class CameraPreviewDialog(QDialog):
 
     def __init__(self, config: AppConfig, camera_index: int, camera_label: str = "", parent=None) -> None:
         super().__init__(parent)
+        apply_touchless_chrome(self)
         self.config = config
         self._camera_index = int(camera_index)
         self._camera_label = str(camera_label or f"Camera {camera_index}")
         self._cap = None
         self.setWindowTitle("Camera Preview")
-        from PySide6.QtWidgets import QApplication
-        app_icon = QApplication.windowIcon()
-        if not app_icon.isNull():
-            self.setWindowIcon(app_icon)
         self.setObjectName("cameraPreviewDialog")
         self.setModal(False)
         self.resize(720, 560)
@@ -4370,6 +4700,7 @@ class TouchlessNotice(QDialog):
         cancel_label: str | None = None,
     ) -> None:
         super().__init__(parent)
+        apply_touchless_chrome(self)
         self._kind = kind
         self.setWindowTitle(title)
         # Tool window: still has a close button, won't show its own
@@ -4579,6 +4910,7 @@ class TouchlessPrivacyDialog(QDialog):
 
     def __init__(self, parent) -> None:
         super().__init__(parent)
+        apply_touchless_chrome(self)
         self._analytics_choice = False
         self._details_open = False
         # Window/taskbar title is just "Touchless" — the question
@@ -5028,6 +5360,25 @@ class MainWindow(QMainWindow):
         # the user has 'Tracking quality' enabled in Settings →
         # Camera → Live View Overlays.
         self.tracking_quality_pill = TrackingQualityPill()
+        # System tray icon. Body stays the regular Touchless hand
+        # icon; only the border colour swaps to indicate state
+        # (mint = active, amber = paused, grey = engine off). Menu
+        # offers Pause Gestures (30 min), Settings, Quit. Signals
+        # wire into the existing gesture-toggle / show / app-quit
+        # paths below.
+        from .tray_icon import TouchlessTrayIcon
+        try:
+            base_icon = QApplication.windowIcon()
+            if base_icon.isNull():
+                base_icon = self.windowIcon()
+            self._tray_icon = TouchlessTrayIcon(base_icon, parent=self)
+            self._tray_icon.pause_requested.connect(self._on_tray_pause)
+            self._tray_icon.resume_requested.connect(self._on_tray_resume)
+            self._tray_icon.settings_requested.connect(self._on_tray_settings)
+            self._tray_icon.quit_requested.connect(self._on_tray_quit)
+            self._tray_icon.show()
+        except Exception:
+            self._tray_icon = None
         # Active clip-export worker thread, if any. Held so we can
         # query state and so Python doesn't garbage-collect it
         # while it's still running.
@@ -6983,6 +7334,7 @@ class MainWindow(QMainWindow):
         inner_layout.addWidget(self._build_general_overlay_section())
         inner_layout.addWidget(self._build_general_system_modes_section())
         inner_layout.addWidget(self._build_general_spotify_section())
+        inner_layout.addWidget(self._build_general_startup_section())
 
         # Bottom Save button removed — only the top-right one
         # remains. General still uses the DEFERRED-save model:
@@ -7604,6 +7956,78 @@ class MainWindow(QMainWindow):
 
         return card
 
+    def _build_general_startup_section(self) -> "QFrame":
+        card, body = self._make_general_section(
+            "Startup",
+            "Control whether Touchless launches when you sign in.",
+            details=(
+                "When enabled, Windows starts Touchless automatically "
+                "at sign-in. The app launches in the system tray "
+                "(look for the hand icon next to the clock) -- you "
+                "won't see a main window unless you click the tray "
+                "icon. Engine + gestures remain off until you press "
+                "Start, so nothing runs without your explicit OK on "
+                "first login. Setting is per-user (HKCU); no admin "
+                "rights required."
+            ),
+        )
+        from ...utils import autostart
+        from PySide6.QtWidgets import QCheckBox
+
+        checkbox_qss = self._general_checkbox_qss()
+        # Reconcile config <-> actual registry on every render: if
+        # the user toggled this off via msconfig / Task Manager, the
+        # config still says True but the registry is empty. Trust
+        # the registry as the source of truth for the UI baseline.
+        actual = autostart.is_enabled()
+        try:
+            self.config.auto_start_on_login = bool(actual)
+        except Exception:
+            pass
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        checkbox = QCheckBox("Start Touchless when I sign in")
+        checkbox.setStyleSheet(checkbox_qss)
+        checkbox.setToolTip(
+            "Add Touchless to the Windows startup list so it launches "
+            "automatically at sign-in. Toggling this off removes the "
+            "registry entry."
+        )
+        checkbox.setChecked(actual)
+        checkbox.setEnabled(autostart.is_supported())
+        self._register_general_baseline("auto_start_on_login", actual)
+
+        def _on_autostart_toggled(state: int) -> None:
+            new_value = bool(state)
+            # Auto-start is a side-effect setting: the registry
+            # write is what actually matters, the config field is
+            # just a UI baseline so the checkbox restores correctly
+            # next launch. Write through immediately rather than
+            # deferring to the Save Changes button -- there's no
+            # 'cancel' for a registry mutation anyway.
+            ok = autostart.set_enabled(new_value)
+            if not ok and new_value:
+                # Registry write failed (rare -- no admin needed for
+                # HKCU). Revert the checkbox so the UI matches truth.
+                checkbox.blockSignals(True)
+                checkbox.setChecked(False)
+                checkbox.blockSignals(False)
+                return
+            try:
+                self.config.auto_start_on_login = new_value
+                save_config(self.config)
+            except Exception:
+                pass
+            self._register_general_baseline("auto_start_on_login", new_value)
+
+        checkbox.stateChanged.connect(_on_autostart_toggled)
+        row.addWidget(checkbox)
+        row.addStretch(1)
+        body.addLayout(row)
+        self._general_controls["auto_start_on_login"] = checkbox
+        return card
+
     def _build_general_system_modes_section(self) -> "QFrame":
         """Per-mode card layout that mirrors the Camera tab: each
         mode gets its own short summary + 'Show more...' expandable
@@ -7962,6 +8386,16 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # Allow this inner scroll to shrink very small. Without this,
+        # the bindings table + poses list push the scroll's minimum
+        # size hint past the settings viewport, which makes the
+        # OUTER content_scroll engage and scroll the page header
+        # (title + Save Changes) out of view. Capping the min height
+        # at 120 keeps the panel's minimumSizeHint within the
+        # viewport so the outer scroll never engages — the inner
+        # scroll absorbs overflow, and the header stays pinned.
+        scroll.setMinimumHeight(120)
+        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         scroll.setStyleSheet(
             f"""
             QScrollArea#gestureBindsScroll,
@@ -11187,6 +11621,12 @@ class MainWindow(QMainWindow):
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setFocusPolicy(Qt.StrongFocus)
         scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # See _build_gesture_binds_panel for the rationale — cap the
+        # min height so the panel's minimumSizeHint fits inside the
+        # outer settings viewport, keeping the header (title + Save
+        # Changes) pinned at the top while the inner scroll handles
+        # all content overflow.
+        scroll.setMinimumHeight(120)
 
         scroll_content = QWidget()
         scroll_content.setObjectName("saveLocationsScrollContent")
@@ -12370,6 +12810,23 @@ Admin elevation
         from PySide6.QtWidgets import QApplication as _QApplication
         _QApplication.processEvents()
 
+        # If the engine is currently running, freeze its pipeline
+        # while the tutorial is open — same pattern used by the
+        # custom-gesture recorder. Tutorial runs its own MediaPipe
+        # pass on its own camera handle, so running the main pipeline
+        # in parallel is wasted CPU AND would let gestures fire real
+        # actions in the middle of demonstrating poses to the tutorial.
+        # Tracked on self so _on_tutorial_closed knows whether to unfreeze.
+        self._tutorial_paused_engine = False
+        worker = getattr(self, "_worker", None)
+        if worker is not None and hasattr(worker, "set_pipeline_frozen"):
+            try:
+                if getattr(worker, "is_running", False):
+                    worker.set_pipeline_frozen(True)
+                    self._tutorial_paused_engine = True
+            except Exception:
+                pass
+
         if self.tutorial_window is None:
             self.tutorial_window = TutorialWindow(self.config, self)
             self.tutorial_window.tutorial_closed.connect(self._on_tutorial_closed)
@@ -12397,93 +12854,43 @@ Admin elevation
             self.last_action_label.setText("Last action: opened tutorial")
 
     def _show_tutorial_launching_pill(self) -> None:
-        """Center a 'Tutorial Launching...' pill (with animated
-        dots) over the main window so the user gets immediate
-        visual feedback during tutorial-window construction."""
-        pill = getattr(self, "_tutorial_launching_pill", None)
-        if pill is None:
-            pill = QLabel(self)
-            pill.setObjectName("tutorialLaunchingPill")
-            pill.setAlignment(Qt.AlignCenter)
-            pill.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-            pill.setStyleSheet(
-                """
-                QLabel#tutorialLaunchingPill {
-                    background: rgba(11, 61, 145, 0.94);
-                    border: 1px solid rgba(29, 233, 182, 0.85);
-                    border-radius: 22px;
-                    padding: 14px 32px;
-                    color: #E5F6FF;
-                    font-size: 17px;
-                    font-weight: 700;
-                    letter-spacing: 0.5px;
-                }
-                """
-            )
-            pill.setVisible(False)
-            effect = QGraphicsOpacityEffect(pill)
-            effect.setOpacity(1.0)
-            pill.setGraphicsEffect(effect)
-            self._tutorial_launching_pill = pill
-            self._tutorial_launching_pill_effect = effect
-            self._tutorial_launching_dot_count = 0
-            self._tutorial_launching_dot_timer = QTimer(self)
-            self._tutorial_launching_dot_timer.setInterval(350)
-            self._tutorial_launching_dot_timer.timeout.connect(
-                self._tick_tutorial_launching_dots
-            )
-
-        self._tutorial_launching_pill_effect.setOpacity(1.0)
-        self._tutorial_launching_dot_count = 0
-        self._tick_tutorial_launching_dots()
-        self._tutorial_launching_pill.setVisible(True)
-        self._tutorial_launching_pill.raise_()
-        self._tutorial_launching_dot_timer.start()
-
-    def _tick_tutorial_launching_dots(self) -> None:
-        pill = getattr(self, "_tutorial_launching_pill", None)
-        if pill is None:
-            return
-        dots = "." * (self._tutorial_launching_dot_count % 4)
-        # Pad to 3 dots so the pill width doesn't jitter as the
-        # animation cycles.
-        padded = dots.ljust(3)
-        pill.setText(f"Tutorial Launching{padded}")
-        pill.adjustSize()
-        self._position_tutorial_launching_pill()
-        self._tutorial_launching_dot_count += 1
-
-    def _position_tutorial_launching_pill(self) -> None:
-        pill = getattr(self, "_tutorial_launching_pill", None)
-        if pill is None:
-            return
-        pw = pill.width()
-        ph = pill.height()
-        cx = (self.width() - pw) // 2
-        cy = (self.height() - ph) // 2
-        pill.move(max(0, cx), max(0, cy))
+        """Show the same blue progress-bar pill used for app start and
+        save processing while the tutorial window spins up. Reuses
+        ProcessingOverlay so the user sees one consistent "long-running
+        work" affordance everywhere except voice (which has its own
+        bottom-center dots overlay). The progress bar's idle creep
+        means the bar visibly advances even without explicit checkpoints
+        from the tutorial-window construction path."""
+        try:
+            self.processing_overlay.show_processing("Loading tutorial")
+        except Exception:
+            pass
 
     def _hide_tutorial_launching_pill(self) -> None:
-        pill = getattr(self, "_tutorial_launching_pill", None)
-        if pill is None or not pill.isVisible():
-            return
-        timer = getattr(self, "_tutorial_launching_dot_timer", None)
-        if timer is not None:
-            timer.stop()
-        effect = getattr(self, "_tutorial_launching_pill_effect", None)
-        if effect is None:
-            pill.setVisible(False)
-            return
-        anim = QPropertyAnimation(effect, b"opacity")
-        anim.setDuration(220)
-        anim.setStartValue(effect.opacity())
-        anim.setEndValue(0.0)
-        anim.setEasingCurve(QEasingCurve.OutCubic)
-        anim.finished.connect(lambda: pill.setVisible(False))
-        self._tutorial_launching_pill_anim = anim  # keep a ref
-        anim.start()
+        try:
+            self.processing_overlay.complete_and_hide()
+        except Exception:
+            try:
+                self.processing_overlay.hide_processing()
+            except Exception:
+                pass
 
     def _on_tutorial_closed(self, completed: bool, auto_start: bool, launched_from_settings: bool) -> None:
+        # Resume the live pipeline if open_tutorial paused it. The
+        # auto-start path (completed + not from_settings) wants the
+        # engine fully running, so unfreeze even when start_engine
+        # is about to fire — start_engine is a no-op for an
+        # already-running worker and the unfreeze restores normal
+        # dispatch.
+        if getattr(self, "_tutorial_paused_engine", False):
+            worker = getattr(self, "_worker", None)
+            if worker is not None and hasattr(worker, "set_pipeline_frozen"):
+                try:
+                    worker.set_pipeline_frozen(False)
+                except Exception:
+                    pass
+            self._tutorial_paused_engine = False
+
         if launched_from_settings:
             self.show_settings_page(SECTION_TUTORIAL)
             self.last_action_label.setText(
@@ -14658,11 +15065,22 @@ Admin elevation
             else self.config.preferred_camera_index
         )
         home_combo = getattr(self, "home_camera_combo", None)
+        # When zero local cameras AND no paired phone, the
+        # "Auto-select first available camera" label is misleading
+        # -- there is nothing to auto-select. Swap the first row to
+        # "No camera detected" in that case so the user knows the
+        # gap is real, then keep the "Connect Phone (QR)" shortcut
+        # so they have a path forward without leaving the start
+        # screen.
+        no_cameras = (not self._discovered_cameras) and (not phone_paired)
         for combo in combos:
             is_home = combo is home_combo
             combo.blockSignals(True)
             combo.clear()
-            combo.addItem("Auto-select first available camera", None)
+            if no_cameras:
+                combo.addItem("No camera detected", None)
+            else:
+                combo.addItem("Auto-select first available camera", None)
             for camera in self._discovered_cameras:
                 combo.addItem(camera.display_name, camera.index)
             if phone_paired:
@@ -14775,16 +15193,54 @@ Admin elevation
         if not value:
             return
         stamp = time.strftime("%H:%M:%S")
-        line = f"[{stamp}] {value}"
         entries = getattr(self, "_home_debug_log_entries", None)
         if not isinstance(entries, list):
             entries = []
             self._home_debug_log_entries = entries
-        entries.append(line)
+        # Parallel lists track the un-decorated message + run count for
+        # each log line so we can collapse rapid repeats ("Volume mute
+        # toggled" 4× in 5 s) into a single line with "(×N)" suffix —
+        # otherwise the home log fills up with spam from any cooldown-
+        # less gesture the user holds, drowning useful entries.
+        raw_values = getattr(self, "_home_debug_log_raw_values", None)
+        if not isinstance(raw_values, list):
+            raw_values = []
+            self._home_debug_log_raw_values = raw_values
+        counts = getattr(self, "_home_debug_log_counts", None)
+        if not isinstance(counts, list):
+            counts = []
+            self._home_debug_log_counts = counts
+        # Normalize lengths in case state ever gets out of sync.
+        if len(raw_values) != len(entries) or len(counts) != len(entries):
+            raw_values = list(raw_values) + [None] * (len(entries) - len(raw_values))
+            counts = list(counts) + [1] * (len(entries) - len(counts))
+            self._home_debug_log_raw_values = raw_values
+            self._home_debug_log_counts = counts
+
+        widget = getattr(self, "home_debug_log", None)
         max_entries = max(20, int(getattr(self, "_home_debug_log_max_entries", 250) or 250))
+
+        if raw_values and raw_values[-1] == value:
+            # Same message as the last entry — collapse instead of
+            # appending. Bump the count, refresh the timestamp, and
+            # rewrite the widget's last line in place.
+            counts[-1] += 1
+            n = counts[-1]
+            new_line = f"[{stamp}] {value} (×{n})"
+            entries[-1] = new_line
+            if isinstance(widget, QPlainTextEdit):
+                self._sync_home_debug_log_widget()
+            return
+
+        # New distinct message — append fresh.
+        line = f"[{stamp}] {value}"
+        entries.append(line)
+        raw_values.append(value)
+        counts.append(1)
         if len(entries) > max_entries:
             del entries[:-max_entries]
-        widget = getattr(self, "home_debug_log", None)
+            del raw_values[:-max_entries]
+            del counts[:-max_entries]
         if isinstance(widget, QPlainTextEdit):
             scrollbar = widget.verticalScrollBar()
             should_follow = scrollbar.value() >= max(0, scrollbar.maximum() - 8)
@@ -15245,11 +15701,15 @@ Admin elevation
             else getattr(self.config, "preferred_microphone_name", None)
         )
         home_combo = getattr(self, "home_microphone_combo", None)
+        no_mics = (not self._discovered_microphones) and (not phone_paired)
         for combo in combos:
             is_home = combo is home_combo
             combo.blockSignals(True)
             combo.clear()
-            combo.addItem("Auto-select default microphone", None)
+            if no_mics:
+                combo.addItem("No microphone detected", None)
+            else:
+                combo.addItem("Auto-select default microphone", None)
             if phone_paired:
                 combo.addItem("Phone Microphone (QR)", self._PHONE_MICROPHONE_DROPDOWN_VALUE)
             for device_name in self._discovered_microphones:
@@ -15552,6 +16012,84 @@ Admin elevation
         except Exception:
             pass
 
+    def _maybe_show_spotify_reauth_toast(self) -> None:
+        """One-shot 'reconnect Spotify' toast. Fires when the
+        controller's refresh token has been rejected by Spotify's
+        auth server (revoked / expired / password-changed). After
+        showing once the flag clears; it re-arms only if Spotify
+        rejects another refresh, so the toast doesn't spam."""
+        worker = getattr(self, "_worker", None)
+        controller = getattr(worker, "spotify_controller", None) if worker is not None else None
+        if controller is None:
+            return
+        if not bool(getattr(controller, "needs_reauth", False)):
+            return
+        if getattr(self, "_spotify_reauth_toast_in_flight", False):
+            return
+        self._spotify_reauth_toast_in_flight = True
+        try:
+            controller.clear_reauth_flag()
+        except Exception:
+            pass
+
+        def _show() -> None:
+            try:
+                message = (
+                    "Your Spotify session has expired and needs to "
+                    "reconnect.\n\n"
+                    "Heads up: Spotify controls require reconnecting "
+                    "every once in a while — Spotify periodically "
+                    "expires its sign-in tokens, especially after a "
+                    "password change or a long break. Click Reconnect "
+                    "to sign back in; it takes about 5 seconds and "
+                    "happens in your browser."
+                )
+                dlg = TouchlessNotice(
+                    self,
+                    "Reconnect Spotify",
+                    message,
+                    kind="warn",
+                )
+                dlg.exec()
+                # If the user clicked through, route them to the
+                # existing PKCE auth flow (same one the first-active
+                # prompt uses).
+                self._begin_spotify_authorization_flow()
+            except Exception:
+                pass
+            finally:
+                self._spotify_reauth_toast_in_flight = False
+
+        QTimer.singleShot(0, _show)
+
+    def _begin_spotify_authorization_flow(self) -> None:
+        """Run the PKCE authorize-full-scopes flow on a worker
+        thread so the UI doesn't block on the browser round-trip.
+        Fires _on_spotify_auth_done back on the GUI thread when the
+        user finishes (or cancels)."""
+        worker = getattr(self, "_worker", None)
+        controller = getattr(worker, "spotify_controller", None) if worker is not None else None
+        if controller is None:
+            return
+
+        def _auth_worker() -> None:
+            try:
+                ok = bool(controller.authorize_full_scopes(timeout_seconds=180.0))
+                msg = controller.message or ("connected" if ok else "auth cancelled")
+            except Exception as exc:
+                ok = False
+                msg = f"auth error: {exc}"
+            try:
+                QTimer.singleShot(0, lambda: self._on_spotify_auth_done(ok, msg))
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=_auth_worker,
+            daemon=True,
+            name="hgr-spotify-reauth",
+        ).start()
+
     def _maybe_show_spotify_first_active_prompt(self) -> None:
         """First-time Spotify-active gate. Called from the engine
         debug-frame handler whenever we see Spotify running. The
@@ -15565,16 +16103,23 @@ Admin elevation
             return
         if bool(getattr(self.config, "spotify_first_active_prompt_shown", False)):
             return
-        # Respect the General → Overlay → Text pop-ups toggle. Do
-        # NOT latch the prompt-shown flag here — if popups are
-        # re-enabled later the user still gets the first-time
-        # prompt the next time Spotify is detected.
-        if not self._should_show_text_popups():
-            return
+        # Connect-Spotify is an authorization prompt, NOT a transient
+        # text pop-up — it's required for the feature to work and the
+        # user can't dismiss it via gesture. Intentionally bypasses
+        # _should_show_text_popups so the overlay-popups toggle and
+        # gaming-mode suppression don't hide it.
+        # Resolve a controller from the worker if one's up; otherwise
+        # spin up a one-shot SpotifyController so the prompt still
+        # fires from the proactive startup path (engine not yet
+        # started) and from any other early-init code path.
         worker = getattr(self, "_worker", None)
         controller = getattr(worker, "spotify_controller", None) if worker is not None else None
         if controller is None:
-            return
+            try:
+                from ..integration.noop_engine import SpotifyController as _SpotifyController
+                controller = _SpotifyController()
+            except Exception:
+                return
         try:
             if bool(getattr(controller, "has_authorization", False)):
                 # Already authorised in a prior run — silently
@@ -15592,6 +16137,38 @@ Admin elevation
         # frame finishes processing (and the engine isn't blocked
         # waiting on a synchronous QDialog.exec from inside a slot).
         QTimer.singleShot(0, self._show_spotify_first_active_prompt)
+
+    def _check_spotify_at_startup(self) -> None:
+        """One-shot check at app launch: if Spotify is currently
+        running on the system AND the user has no saved auth, fire
+        the first-active prompt without waiting for the engine to
+        observe a Spotify window. Covers the "Spotify was already
+        open before I started Touchless" case the per-frame
+        spotify_window_open path used to miss when the engine
+        wasn't started yet.
+
+        Cheap to run: _has_real_spotify_process iterates psutil
+        and short-circuits on the first matching exe. has_authorization
+        is a cached property read from the on-disk token file."""
+        if bool(getattr(self.config, "spotify_first_active_prompt_shown", False)):
+            return
+        try:
+            from ..integration.noop_engine import SpotifyController as _SpotifyController
+            controller = _SpotifyController()
+            if bool(getattr(controller, "has_authorization", False)):
+                # Already authorised — latch and skip.
+                self.config.spotify_first_active_prompt_shown = True
+                try:
+                    save_config(self.config)
+                except Exception:
+                    pass
+                return
+            if not controller._has_real_spotify_process():
+                return
+        except Exception:
+            return
+        # Spotify is running, user has no tokens — pop the prompt.
+        self._maybe_show_spotify_first_active_prompt()
 
     def _show_spotify_first_active_prompt(self) -> None:
         try:
@@ -15902,6 +16479,17 @@ Admin elevation
             try:
                 from ... import telemetry as _telemetry
                 _telemetry.track("engine_started")
+                # Stamp engine-start so engine_stopped can compute the
+                # active duration. "App open" time (session_seconds on
+                # app_session_ended) measures window-visible time;
+                # this measures gesture-detection-ACTIVE time. The two
+                # diverge whenever the user has the app open but the
+                # engine off (e.g. browsing Settings).
+                # Wraps the stamp here (not earlier in the method) so
+                # the walkthrough / tutorial early-returns at the top
+                # of start_engine never leave a stale stamp pointing
+                # at the PREVIOUS run's start time.
+                self._engine_started_at = time.monotonic()
             except Exception:
                 pass
 
@@ -16039,17 +16627,79 @@ Admin elevation
             # progress_callback advances the pill's progress bar at
             # each internal pump point during __init__ -- the user
             # sees stepped real progress instead of frozen animation.
-            self._worker = GestureWorker(
-                self.config,
-                camera_index_override=worker_override,
-                progress_callback=self._set_starting_splash_progress,
-            )
+            #
+            # Wrapping the constructor in try/except so a construction
+            # failure (DirectML init, MediaPipe import, camera open,
+            # missing redistributable, antivirus block) surfaces as a
+            # user-visible error dialog instead of an exception that
+            # Qt logs to stderr and then leaves the UI in "Press Start
+            # to connect" forever. Without this catch, testers on
+            # certain hardware report "main app doesn't start" with
+            # nothing diagnostic on screen. The error message includes
+            # the exception type + message + a short traceback hint so
+            # the user can paste it back for follow-up.
+            try:
+                self._worker = GestureWorker(
+                    self.config,
+                    camera_index_override=worker_override,
+                    progress_callback=self._set_starting_splash_progress,
+                )
+            except Exception as exc:
+                import traceback as _tb
+                tb_text = _tb.format_exc()
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[engine] GestureWorker construction failed: "
+                        f"{type(exc).__name__}: {exc!s}\n{tb_text}\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                self._worker = None
+                try:
+                    self.processing_overlay.hide_processing()
+                except Exception:
+                    pass
+                self.status_label.setText("Status: engine failed to start")
+                self.last_action_label.setText(
+                    f"Last action: start failed ({type(exc).__name__})"
+                )
+                self.start_button.setEnabled(True)
+                self.end_button.setEnabled(False)
+                QMessageBox.critical(
+                    self,
+                    "Touchless — engine failed to start",
+                    f"Touchless couldn't start the gesture engine on this machine.\n\n"
+                    f"{type(exc).__name__}: {exc!s}\n\n"
+                    f"Common causes: antivirus quarantine on a bundled DLL, "
+                    f"missing Microsoft Visual C++ Redistributable, camera "
+                    f"already in use by another app, or GPU driver issue.\n\n"
+                    f"Tip: run Touchless.exe from a Command Prompt to capture "
+                    f"the full traceback, then send it to support.",
+                )
+                # Telemetry the failure so the dashboard's errors tab
+                # surfaces these without needing the user to fish them
+                # out of stderr.
+                try:
+                    from ... import telemetry as _telemetry
+                    _telemetry.track_error("gesture_worker_init", exc)
+                except Exception:
+                    pass
+                return
             try:
                 QApplication.processEvents()
             except Exception:
                 pass
             self._worker.status_changed.connect(self._on_status_changed)
             self._worker.command_detected.connect(self._on_command_detected)
+            # Granular debug-log messages (voice heard, command
+            # processed/not-recognized, action precondition failures).
+            # Older worker builds may not expose this signal — guard.
+            try:
+                self._worker.engine_log.connect(self._on_engine_log_message)
+            except AttributeError:
+                pass
             self._worker.camera_selected.connect(self._on_camera_selected)
             self._worker.error_occurred.connect(self._on_error)
             self._worker.running_state_changed.connect(self._on_running_state_changed)
@@ -16170,7 +16820,20 @@ Admin elevation
     def stop_engine(self) -> None:
             try:
                 from ... import telemetry as _telemetry
-                _telemetry.track("engine_stopped")
+                # Carry engine_seconds on the engine_stopped event —
+                # mirrors session_seconds on app_session_ended. Lets
+                # the dashboard compute "Running time" (engine active)
+                # vs "Open time" (window visible) separately. Skips
+                # the property when start time was never stamped
+                # (defensive — engine_stopped fires from defensive
+                # paths that don't always pair with a start).
+                started_at = getattr(self, "_engine_started_at", None)
+                if started_at is not None:
+                    engine_seconds = max(0.0, time.monotonic() - float(started_at))
+                    _telemetry.track("engine_stopped", {"engine_seconds": round(engine_seconds, 1)})
+                    self._engine_started_at = None
+                else:
+                    _telemetry.track("engine_stopped")
             except Exception:
                 pass
             self._hide_mini_live_viewer()
@@ -16453,6 +17116,84 @@ Admin elevation
             self.live_view_window.set_gestures_enabled(enabled)
         state = "enabled" if enabled else "disabled"
         self.last_action_label.setText(f"Last action: gestures {state}")
+        self._refresh_tray_state()
+
+    def _refresh_tray_state(self) -> None:
+        tray = getattr(self, "_tray_icon", None)
+        if tray is None:
+            return
+        worker = self._worker
+        engine_running = worker is not None and bool(getattr(worker, "is_running", False))
+        gestures_enabled = bool(getattr(worker, "gestures_enabled", True)) if worker is not None else False
+        try:
+            tray.set_engine_state(engine_running=engine_running, gestures_enabled=gestures_enabled)
+        except Exception:
+            pass
+
+    def _on_tray_pause(self) -> None:
+        # User clicked "Pause Gestures (30 min)" in the tray menu.
+        # Flip the worker's gestures-enabled to False; the tray's
+        # own 30 min auto-resume timer fires resume_requested when
+        # the window elapses, so we don't need our own timer here.
+        worker = self._worker
+        if worker is None:
+            return
+        try:
+            worker.set_gestures_enabled(False)
+        except Exception:
+            return
+        if self.mini_live_viewer is not None:
+            self.mini_live_viewer.set_gestures_enabled(False)
+        if self.live_view_window is not None:
+            self.live_view_window.set_gestures_enabled(False)
+        self.last_action_label.setText("Last action: gestures paused (30 min)")
+        self._refresh_tray_state()
+
+    def _on_tray_resume(self) -> None:
+        worker = self._worker
+        if worker is None:
+            return
+        try:
+            worker.set_gestures_enabled(True)
+        except Exception:
+            return
+        if self.mini_live_viewer is not None:
+            self.mini_live_viewer.set_gestures_enabled(True)
+        if self.live_view_window is not None:
+            self.live_view_window.set_gestures_enabled(True)
+        self.last_action_label.setText("Last action: gestures resumed")
+        self._refresh_tray_state()
+
+    def _on_tray_settings(self) -> None:
+        # Bring the main window to front. Restore if minimised.
+        try:
+            if self.isMinimized():
+                self.showNormal()
+            else:
+                self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+
+    def _on_tray_quit(self) -> None:
+        # Hard-exit: hide the tray, close the main window, and
+        # ask Qt to quit cleanly. Single-instance lock releases on
+        # app exit so a fresh launch is allowed immediately.
+        tray = getattr(self, "_tray_icon", None)
+        if tray is not None:
+            try:
+                tray.hide()
+            except Exception:
+                pass
+        try:
+            self._allow_real_close = True
+        except Exception:
+            pass
+        try:
+            QApplication.quit()
+        except Exception:
+            pass
 
     def _handle_mini_live_viewer_enlarge(self) -> None:
         self._hide_mini_live_viewer()
@@ -16483,6 +17224,10 @@ Admin elevation
             self.start_button.setEnabled(not is_running)
             self.end_button.setEnabled(is_running)
             self.debugger_button.setEnabled(True)
+            # Tray icon mirrors engine state: green-border when
+            # running + gestures on, amber when paused, grey when
+            # engine is off entirely.
+            self._refresh_tray_state()
             # Engine is up — hide the "Starting Touchless" splash
             # pill. Honour a minimum-show window of 1.2 s so even
             # fast engine starts (warm caches, ~200 ms init) leave
@@ -16541,6 +17286,21 @@ Admin elevation
             if pill.isVisible():
                 pill.hide_pill()
 
+    def _on_engine_log_message(self, message: str) -> None:
+        """Granular debug-log events from the worker.
+
+        These don't map to a finished action (so they shouldn't update
+        last_action_label), but they're useful for debugging — voice
+        listener heard X, command was/wasn't recognized, an action
+        attempt failed a precondition, etc. We just append them to the
+        home debug log, where the dedup logic in _append_home_debug_log
+        collapses any rapid repeats into a single "(×N)" line.
+        """
+        text = str(message or "").strip()
+        if not text:
+            return
+        self._append_home_debug_log(text)
+
     def _on_command_detected(self, command: str) -> None:
         action_text = str(command or "").strip() or "none"
         self._skip_home_last_action_debug = True
@@ -16556,58 +17316,103 @@ Admin elevation
         # subscribed — publish_event is a no-op in any of those.
         self._publish_phone_event_for_action(action_text)
 
-    def _on_drawing_overlay_toggle(self, filename: str) -> None:
+    def _on_drawing_overlay_toggle(self, filename: str, resolved_path: str = "") -> None:
         """Handle the worker's drawing_overlay_toggle_requested signal.
         Toggles the always-on-top transparent overlay window:
           - currently hidden, OR showing a different drawing
-              → load `filename` and show it.
+              → load resolved path and show it.
           - already showing this drawing
               → hide.
-        Resolution rule: bare filenames join with the configured
-        drawings save dir; absolute paths use as-is. Non-existent
-        files surface a 'Last action' message but don't pop dialogs
-        (the gesture firing on a missing file shouldn't disrupt
-        whatever the user is doing in their foreground app)."""
-        from .drawing_overlay_window import DrawingOverlayWindow, resolve_drawing_path
+
+        Resolution priority:
+          1. Engine-supplied `resolved_path` (baked in at gesture
+             creation time by the wizard's validation flow) — if it
+             still exists, use it directly. Most common path.
+          2. Persistent cache hit for this filename (legacy gestures
+             promoted to a path on first fire).
+          3. Configured `drawings_save_dir` join.
+          4. Whole-system SystemIndex search. Multiple matches →
+             modeless chooser pill (rare fallback for legacy
+             gestures or files that moved after creation)."""
+        from .drawing_overlay_window import (
+            DrawingOverlayWindow,
+            resolve_drawing_path,
+            search_drawings_by_filename,
+        )
 
         if not hasattr(self, "_drawing_overlay_window") or self._drawing_overlay_window is None:
             self._drawing_overlay_window = DrawingOverlayWindow(parent=self)
 
-        overlay = self._drawing_overlay_window
-        # Resolve once so we can detect "user asked for the same file
-        # again" and treat that as a hide.
-        resolved = resolve_drawing_path(
-            filename,
-            getattr(self.config, "drawings_save_dir", "") or "",
-        )
+        resolved: Optional[Path] = None
+
+        # Step 1: engine-supplied resolved path (set at creation time).
+        if resolved_path:
+            candidate = Path(resolved_path)
+            try:
+                if candidate.is_file():
+                    resolved = candidate
+            except OSError:
+                resolved = None
+
+        # Step 2: cache hit (for legacy gestures that don't have
+        # `path` in their payload).
+        cache = self._drawing_path_cache() if resolved is None else None
+        if resolved is None and cache is not None:
+            resolved = cache.lookup(filename)
+
+        # Step 3: configured drawings dir.
+        if resolved is None:
+            resolved = resolve_drawing_path(
+                filename,
+                getattr(self.config, "drawings_save_dir", "") or "",
+            )
+
+        # Step 4: filesystem search. Multiple matches → chooser pill
+        # (legacy fallback — newly-created gestures resolve duplicates
+        # at the wizard stage).
+        if resolved is None and filename:
+            matches = search_drawings_by_filename(filename)
+            if len(matches) == 1:
+                resolved = matches[0]
+                if cache is not None:
+                    cache.remember(filename, resolved)
+            elif len(matches) > 1:
+                self._open_drawing_chooser(filename, matches)
+                self.last_action_label.setText(
+                    f"Last action: multiple drawings called {filename} — choose one"
+                )
+                return
+
         if resolved is None:
             self.last_action_label.setText(
                 f"Last action: drawing not found: {filename or '(empty)'}"
             )
             return
 
+        self._present_drawing_overlay(resolved)
+
+    def _present_drawing_overlay(self, resolved: "Path") -> None:
+        """Show, hide-on-repeat, or swap the overlay to `resolved`.
+        Split out from _on_drawing_overlay_toggle_requested so the
+        chooser pill's `choice_made` callback can reuse the same
+        visibility logic after the user picks."""
+        overlay = self._drawing_overlay_window
         already_showing_same = (
             overlay.isVisible()
             and overlay.current_path is not None
             and Path(overlay.current_path) == resolved
         )
+        worker = getattr(self, "_worker", None)
         if already_showing_same:
             overlay.hide()
-            # Reset the engine's accumulated pinch transform so the
-            # next drawing shown starts at its natural fit instead
-            # of inheriting the offsets the user dragged this one to.
-            worker = getattr(self, "_worker", None)
             if worker is not None and hasattr(worker, "reset_pinch_grab_state"):
                 try:
                     worker.reset_pinch_grab_state()
                 except Exception:
                     pass
-            self.last_action_label.setText(f"Last action: hid drawing overlay")
+            self.last_action_label.setText("Last action: hid drawing overlay")
             return
 
-        # Showing a new (or different) drawing — clear any leftover
-        # pinch-grab transform from a previous overlay session.
-        worker = getattr(self, "_worker", None)
         if worker is not None and hasattr(worker, "reset_pinch_grab_state"):
             try:
                 worker.reset_pinch_grab_state()
@@ -16621,6 +17426,120 @@ Admin elevation
             self.last_action_label.setText(
                 f"Last action: failed to load drawing: {resolved.name}"
             )
+
+    def _drawing_path_cache(self):
+        """Lazily build + load the filename→path cache. Returns None
+        if construction fails (e.g. no writable registry dir) — the
+        caller treats that as a cache miss and falls through to the
+        search-and-prompt path."""
+        cache = getattr(self, "_drawing_path_cache_obj", None)
+        if cache is not None:
+            return cache
+        try:
+            from ...custom_gestures.drawing_resolution_cache import DrawingPathCache
+            cache = DrawingPathCache()
+            cache.load()
+            self._drawing_path_cache_obj = cache
+            return cache
+        except Exception:
+            self._drawing_path_cache_obj = None
+            return None
+
+    def _open_drawing_chooser(self, filename: str, matches: list) -> None:
+        """Show the modeless disambiguation chooser. Installs a
+        voice intercept on the engine so utterances like "A",
+        "let's do B", "show me C" route to the pill while it's
+        open. Clears the intercept on pick or cancel."""
+        from .drawing_chooser_pill import DrawingChooserPill
+
+        pill = getattr(self, "_drawing_chooser_pill", None)
+        if pill is None:
+            pill = DrawingChooserPill(parent=self)
+            pill.choice_made.connect(self._on_drawing_choice_made)
+            pill.cancelled.connect(self._on_drawing_choice_cancelled)
+            self._drawing_chooser_pill = pill
+        # Remember the filename so the choice handler can write the
+        # picked path back into the cache.
+        self._drawing_chooser_pending_filename = str(filename or "")
+        pill.show_choices(filename, matches)
+
+        # Install voice intercept on the engine. The intercept stays
+        # active for the lifetime of the pill — every utterance
+        # routed to it tries to match a letter.
+        worker = getattr(self, "_worker", None)
+        if worker is not None and hasattr(worker, "set_voice_intercept"):
+            try:
+                worker.set_voice_intercept(self._voice_intercept_for_chooser)
+            except Exception:
+                pass
+
+    def _voice_intercept_for_chooser(self, heard_text: str) -> bool:
+        """Pull a single letter out of `heard_text` and forward it to
+        the active chooser. Vocabulary covers natural variants like
+        "A", "open A", "show me B", "let's do C", "I think A",
+        "launch B". Returns True only when a live row was selected."""
+        import re
+        pill = getattr(self, "_drawing_chooser_pill", None)
+        if pill is None or not pill.is_active():
+            return False
+        text = (heard_text or "").strip().lower()
+        if not text:
+            return False
+        visible = pill.visible_letters()
+        if not visible:
+            return False
+        letter_class = "".join(visible).lower()
+        # Allow any standard pickup verb, optional politeness words,
+        # then the letter on a word boundary. Letter alone also OK.
+        pattern = (
+            r"\b(?:open|show(?:\s+me)?|pick|use|do|launch|select|"
+            r"i\s+(?:think|guess|want)|let'?s\s+do|that(?:'s|\s+is)?|"
+            r"go\s+with|choose)?\s*"
+            rf"([{letter_class}])\b"
+        )
+        m = re.search(pattern, text)
+        if not m:
+            m = re.fullmatch(rf"\s*([{letter_class}])\s*\.?", text)
+            if not m:
+                return False
+        return pill.select_by_letter(m.group(1))
+
+    def _clear_drawing_chooser_intercept(self) -> None:
+        worker = getattr(self, "_worker", None)
+        if worker is not None and hasattr(worker, "set_voice_intercept"):
+            try:
+                worker.set_voice_intercept(None)
+            except Exception:
+                pass
+
+    def _on_drawing_choice_made(self, chosen_path) -> None:
+        """User picked a row (click or voice). Write the path back
+        to the cache and show the overlay."""
+        self._clear_drawing_chooser_intercept()
+        filename = getattr(self, "_drawing_chooser_pending_filename", "") or ""
+        self._drawing_chooser_pending_filename = ""
+        if not isinstance(chosen_path, Path):
+            try:
+                chosen_path = Path(str(chosen_path))
+            except Exception:
+                return
+        cache = self._drawing_path_cache()
+        if cache is not None and filename:
+            try:
+                cache.remember(filename, chosen_path)
+            except Exception:
+                pass
+        if not hasattr(self, "_drawing_overlay_window") or self._drawing_overlay_window is None:
+            from .drawing_overlay_window import DrawingOverlayWindow
+            self._drawing_overlay_window = DrawingOverlayWindow(parent=self)
+        self._present_drawing_overlay(chosen_path)
+
+    def _on_drawing_choice_cancelled(self) -> None:
+        """User let the chooser time out or pressed Esc — drop the
+        intercept and leave the cache unchanged."""
+        self._clear_drawing_chooser_intercept()
+        self._drawing_chooser_pending_filename = ""
+        self.last_action_label.setText("Last action: drawing chooser dismissed")
 
     def _on_drawing_overlay_grab_transform(self, dx: float, dy: float, scale: float) -> None:
         """Forward the worker's pinch-grab transform to whichever
@@ -17427,11 +18346,18 @@ Admin elevation
         )
         # Helper: pop the bottom-center "Saved in: <path>" pill on
         # any save outcome that ended with a real file on disk.
-        # Discards skip it (no file to point at).
+        # Discards skip it (no file to point at). The click_target
+        # makes the pill clickable — left-click opens the saved
+        # file in its native handler (image viewer / video player /
+        # Explorer for folders), or falls back to opening the
+        # parent folder if the file's been deleted in the interim.
         def _show_saved_pill(final_path: Path) -> None:
             try:
                 self.saved_location_overlay.show_saved(
-                    f"Saved in: {final_path}", total_ms=3000, fade_ms=600
+                    f"Saved in: {final_path}",
+                    total_ms=3000,
+                    fade_ms=600,
+                    click_target=final_path,
                 )
             except Exception:
                 pass
@@ -17712,16 +18638,74 @@ Admin elevation
     def _start_ffmpeg_process(self, command: list[str]) -> subprocess.Popen | None:
         if not command:
             return None
+        # stderr=PIPE (was DEVNULL) so a fast-failing ffmpeg
+        # (codec/format/device mismatch on the tester's machine) leaves
+        # a readable diagnostic instead of vanishing silently. The
+        # process is long-running for screen-record, so we don't drain
+        # the PIPE — we just check whether it died within ~150 ms and
+        # log whatever stderr it left behind. Once we're past the
+        # startup window the PIPE buffer (64 KB on Windows) eventually
+        # fills and ffmpeg blocks; that's acceptable because the user
+        # will hit Stop or close the app long before that happens, and
+        # _stop_ffmpeg_process kills the process either way.
         try:
-            return subprocess.Popen(
+            process = subprocess.Popen(
                 command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except Exception:
+        except Exception as exc:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[ffmpeg] Popen failed: {type(exc).__name__}: {exc!s}\n"
+                    f"[ffmpeg] command: {command!r}\n"
+                )
+                _sys.stderr.flush()
+            except Exception:
+                pass
             return None
+        # Quick liveness check — give ffmpeg ~150 ms to die if it's
+        # going to die from an immediate startup error (wrong dshow
+        # device, unsupported pix_fmt, missing input file, etc.). If
+        # it survives that window it's running normally.
+        try:
+            try:
+                process.wait(timeout=0.15)
+            except subprocess.TimeoutExpired:
+                return process  # still alive, the normal happy path
+            # ffmpeg exited within the startup window — read whatever
+            # stderr we have and surface it.
+            try:
+                err_bytes = process.stderr.read() if process.stderr is not None else b""
+            except Exception:
+                err_bytes = b""
+            err_text = err_bytes.decode("utf-8", errors="replace")
+            tail = err_text[-2048:]
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[ffmpeg] startup failed: returncode={process.returncode}\n"
+                    f"[ffmpeg] command: {command!r}\n"
+                    f"[ffmpeg] stderr (last 2KB):\n{tail}\n"
+                )
+                _sys.stderr.flush()
+            except Exception:
+                pass
+            # Stash on self so screen-record callers can show a
+            # popup with the actual ffmpeg error message.
+            try:
+                self._last_ffmpeg_startup_error = (
+                    f"ffmpeg exit {process.returncode}: "
+                    f"{tail.strip().splitlines()[-1] if tail.strip() else 'no stderr captured'}"
+                )
+            except Exception:
+                pass
+            return None
+        except Exception:
+            return process
     def _stop_ffmpeg_process(self, process: subprocess.Popen | None, *, timeout: float = 8.0) -> None:
         if process is None:
             return
@@ -17823,6 +18807,28 @@ Admin elevation
         y = max(0, int(relative.y()))
         w = max(2, int(target_region.width()))
         h = max(2, int(target_region.height()))
+        # Clamp w/h so the crop rectangle stays inside the capture
+        # frame. Multi-monitor layouts with monitors at negative
+        # coordinates (e.g. left monitor at x=-1920) plus DPI scaling
+        # can produce a target_region that extends past the captured
+        # frame's right or bottom edge by a few pixels. ffmpeg's
+        # crop filter rejects out-of-bounds rectangles with
+        # "Invalid too big or non positive size for width '...' or
+        # height '...'" and returns non-zero, killing the export.
+        # Clamping here turns those edge cases into a valid crop that
+        # captures up to the frame boundary.
+        cap_w = max(2, int(capture_region.width()))
+        cap_h = max(2, int(capture_region.height()))
+        if x + w > cap_w:
+            w = max(2, cap_w - x)
+        if y + h > cap_h:
+            h = max(2, cap_h - y)
+        # Even dimensions — libx264 + yuv420p require it. An odd
+        # width or height ffmpeg-errors with "width not divisible by 2".
+        if w % 2 != 0:
+            w -= 1
+        if h % 2 != 0:
+            h -= 1
         return f"crop={w}:{h}:{x}:{y}"
 
         def _save_screenshot_pixmap(self, pixmap: QPixmap) -> Path | None:
@@ -18784,10 +19790,20 @@ Admin elevation
                 ),
                 str(output_path),
             ]
+            # Capture ffmpeg's stderr instead of /dev/nulling it —
+            # was the root cause of "monitor picker closes, nothing
+            # happens, no log info" reports from multi-monitor testers.
+            # On their machines ffmpeg was failing (codec / region
+            # bounds / save folder permission), but we discarded the
+            # diagnostic and only returned (False, None, 0.0), which
+            # the GUI swallowed into a tiny last_action_label update.
+            # Now: ffmpeg's stderr is captured, printed to OUR stderr
+            # on non-zero exit, and surfaced through the export result
+            # so the GUI's failure dialog can show it to the user.
             completed = subprocess.run(
                 command,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if (
@@ -18797,6 +19813,33 @@ Admin elevation
             ):
                 actual_seconds = min(float(duration_seconds), max(0.0, total_duration))
                 return (True, output_path, actual_seconds)
+            # Failure — print ffmpeg's own stderr so the diagnostic
+            # survives even when the caller doesn't surface it. Tail
+            # the last 4 KB so a multi-minute encode log doesn't blow
+            # up the console.
+            try:
+                import sys as _sys
+                stderr_text = (completed.stderr or b"").decode("utf-8", errors="replace")
+                tail = stderr_text[-4096:]
+                _sys.stderr.write(
+                    f"[clip-export] ffmpeg returned {completed.returncode}\n"
+                    f"[clip-export] command: {command!r}\n"
+                    f"[clip-export] output_path: {output_path} "
+                    f"(exists={output_path.exists()}, "
+                    f"size={output_path.stat().st_size if output_path.exists() else 0})\n"
+                    f"[clip-export] ffmpeg stderr (last 4KB):\n{tail}\n"
+                )
+                _sys.stderr.flush()
+                # Stash the last failure on self so the GUI thread's
+                # _on_clip_export_finished_main_thread can surface it
+                # in its QMessageBox instead of the generic "no output
+                # produced" copy.
+                self._last_ffmpeg_clip_error = (
+                    f"ffmpeg exit {completed.returncode}: "
+                    f"{tail.strip().splitlines()[-1] if tail.strip() else 'no stderr captured'}"
+                )
+            except Exception:
+                pass
             return (False, None, 0.0)
         finally:
             self._cleanup_ffmpeg_clip_cache_files()
@@ -19269,10 +20312,42 @@ Admin elevation
         buffered_seconds = self._buffered_clip_seconds()
         if buffered_seconds <= 0.0:
             seg_seconds = int(round(float(self._clip_cache_segment_seconds)))
-            self.last_action_label.setText(
-                "Last action: clip not ready yet — keep recording for at least "
-                f"{seg_seconds}s after Start before requesting a clip"
+            # Previously: silent bail with just a last_action_label
+            # update at the bottom of the home page. Multiple testers
+            # reported the symptom as "monitor picker closes, then
+            # nothing happens, no log info" — they didn't see the
+            # tiny label update and there was no popup explaining
+            # why the clip didn't save. Real root cause on those
+            # machines: their engine never started (separate bug
+            # with its own error popup wired up earlier this
+            # session), so the clip cache was empty. Surface that
+            # explicitly here so the user understands the cause
+            # rather than thinking clip is broken.
+            engine_running = bool(
+                self._worker is not None
+                and getattr(self._worker, "is_running", False)
             )
+            if engine_running:
+                msg = (
+                    f"Clip not ready yet — Touchless needs to record at least "
+                    f"{seg_seconds} seconds of footage before a clip can be saved. "
+                    "Keep using the app for a few more seconds, then try again."
+                )
+                title = "Clip — buffer warming up"
+            else:
+                msg = (
+                    "Touchless can only save a clip while the engine is running. "
+                    "Click Start on the home page, use the app for at least "
+                    f"{seg_seconds} seconds, then try the clip gesture again."
+                )
+                title = "Clip — engine not running"
+            self.last_action_label.setText(
+                f"Last action: clip not ready yet — {msg.lower()}"
+            )
+            try:
+                QMessageBox.information(self, title, msg)
+            except Exception:
+                pass
             return
         # Show the processing pill labeled with the smaller of
         # requested vs buffered so the overlay text matches what
@@ -19358,13 +20433,78 @@ Admin elevation
         output_path = result.get("output_path")
         actual_seconds = float(result.get("actual_seconds", 0.0) or 0.0)
         error = result.get("error")
+        # Failure paths used to only update last_action_label, which
+        # users on multi-monitor systems missed entirely — the symptom
+        # they reported was "monitor picker closes, nothing happens,
+        # no log info". Now: log the error to stderr (visible when
+        # Touchless.exe is launched from cmd.exe) AND pop a real
+        # message box. Together these turn "nothing happens" into a
+        # concrete failure with details that can be sent to support.
         if error:
+            try:
+                import sys as _sys
+                _sys.stderr.write(f"[clip] export failed: {error}\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
             self.last_action_label.setText(
                 f"Last action: clip export failed ({error})"
             )
+            try:
+                QMessageBox.warning(
+                    self,
+                    "Clip — export failed",
+                    f"Touchless couldn't save the clip.\n\n{error}\n\n"
+                    "Tip: launch Touchless.exe from a Command Prompt to see "
+                    "the full traceback — that helps narrow down whether it's "
+                    "a codec, save-folder permission, or screen-grab issue.",
+                )
+            except Exception:
+                pass
             return
         if not success or output_path is None:
-            self.last_action_label.setText("Last action: no recent clip available yet")
+            # Pull the ffmpeg-specific failure detail if _run_clip_export_ffmpeg
+            # stashed one. Falls back to a generic message when the
+            # opencv export path failed or the ffmpeg path never set
+            # the field (e.g. earlier than the subprocess.run call).
+            ffmpeg_detail = getattr(self, "_last_ffmpeg_clip_error", None) or ""
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    "[clip] export returned success=False (no exception raised, "
+                    f"output_path={output_path!r}, actual_seconds={actual_seconds})\n"
+                )
+                if ffmpeg_detail:
+                    _sys.stderr.write(f"[clip] last ffmpeg error: {ffmpeg_detail}\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
+            self.last_action_label.setText("Last action: clip export returned no output")
+            try:
+                detail_block = (
+                    f"\n\nffmpeg said: {ffmpeg_detail}\n"
+                    if ffmpeg_detail else ""
+                )
+                QMessageBox.warning(
+                    self,
+                    "Clip — no output produced",
+                    "Touchless couldn't produce a clip file. This usually means "
+                    "the ffmpeg subprocess returned without writing the output "
+                    "file (codec issue, region size out of bounds, or a save-"
+                    "folder permission problem)."
+                    + detail_block
+                    + "\nTip: launch Touchless.exe from a Command Prompt and try "
+                    "the clip again — the console will show the full ffmpeg "
+                    "command and stderr it produced.",
+                )
+            except Exception:
+                pass
+            # Clear the latched ffmpeg error so the next attempt
+            # doesn't inherit a stale detail.
+            try:
+                self._last_ffmpeg_clip_error = None
+            except Exception:
+                pass
             return
         auto_save = bool(result.get("auto_save", False))
         if auto_save:
@@ -19387,9 +20527,26 @@ Admin elevation
             pass
     def _start_screen_recording_ffmpeg(self, region: QRect) -> bool:
         if not self._ffmpeg_ready():
+            try:
+                QMessageBox.warning(
+                    self, "Screen recording — ffmpeg unavailable",
+                    "Screen recording needs ffmpeg, which Touchless couldn't "
+                    "find or use on this machine. The bundled installer should "
+                    "include it; if it's gone, the install may be corrupted."
+                )
+            except Exception:
+                pass
             return False
         region = self._normalized_record_region(region)
         if region.isNull() or region.width() <= 1 or region.height() <= 1:
+            try:
+                QMessageBox.warning(
+                    self, "Screen recording — invalid region",
+                    "The selected recording region is empty or too small. "
+                    f"width={region.width()} height={region.height()}"
+                )
+            except Exception:
+                pass
             return False
         output_path = self._record_output_specs()[0][0]
         command = [
@@ -19400,8 +20557,34 @@ Admin elevation
             *self._ffmpeg_encoder_args(purpose="record", fps=self._screen_record_fps),
             str(output_path),
         ]
+        # Reset the stashed startup error before launch so this
+        # attempt's diagnostic doesn't get confused with a previous
+        # failure left behind.
+        self._last_ffmpeg_startup_error = None
         process = self._start_ffmpeg_process(command)
         if process is None:
+            # Surface whatever _start_ffmpeg_process captured. Without
+            # this popup, the user sees no feedback at all — recording
+            # gesture fires, no on-screen recording indicator appears,
+            # nothing in the log. The diagnostic captured by
+            # _start_ffmpeg_process via stderr=PIPE makes the failure
+            # actionable.
+            detail = getattr(self, "_last_ffmpeg_startup_error", None) or ""
+            detail_block = f"\n\nffmpeg said: {detail}\n" if detail else ""
+            try:
+                QMessageBox.warning(
+                    self, "Screen recording — couldn't start",
+                    "Touchless tried to start a screen recording but ffmpeg "
+                    "exited immediately. This is usually a screen-capture "
+                    "device mismatch (gdigrab / dshow), a region out of "
+                    "bounds for the current monitor layout, or a save-folder "
+                    "permission problem."
+                    + detail_block
+                    + "\nTip: launch Touchless.exe from a Command Prompt and "
+                    "try again — full ffmpeg output goes to the console."
+                )
+            except Exception:
+                pass
             return False
         self._screen_record_process = process
         self._screen_record_backend = "ffmpeg"
@@ -19969,6 +21152,12 @@ Admin elevation
         if last_action and last_action != prev_action and not has_auth:
             self._maybe_show_spotify_first_active_prompt()
         self._prev_spotify_last_action_seen = last_action
+        # Reauth-needed toast. When a stored Spotify refresh token
+        # gets rejected (revoked, expired, password changed), the
+        # controller flips needs_reauth=True. Surface a one-shot
+        # toast so the user knows controls have stopped working,
+        # then clear the flag so we don't spam.
+        self._maybe_show_spotify_reauth_toast()
         drawing_target = str(info.get("drawing_render_target", self._drawing_render_target) or self._drawing_render_target)
         self._set_drawing_render_target(drawing_target)
         request_token = int(info.get("drawing_request_token", 0) or 0)
@@ -20392,6 +21581,14 @@ Admin elevation
             # the privacy prompt so the toast doesn't sit behind
             # a modal the user is busy reading.
             QTimer.singleShot(1400, self._maybe_show_update_success_toast)
+            # First-time Spotify-active prompt — proactive check at
+            # startup. The per-frame engine path (in the debug-frame
+            # handler) only fires once the engine starts; this
+            # covers "Spotify was already running before I started
+            # Touchless" without requiring the user to start the
+            # engine first. Deferred until after the privacy modal
+            # has had a chance to land + dismiss.
+            QTimer.singleShot(2200, self._check_spotify_at_startup)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         try:
@@ -21916,6 +23113,20 @@ def _stop_screen_recording(self) -> bool:
             painter.end()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        # Close button minimises to the tray instead of quitting, so
+        # the user's gestures keep working in the background. Use
+        # the tray menu's "Quit Touchless" to fully exit -- that
+        # sets _allow_real_close=True before invoking close, which
+        # bypasses this branch.
+        tray = getattr(self, "_tray_icon", None)
+        if (
+            not getattr(self, "_allow_real_close", False)
+            and tray is not None
+            and tray.is_supported()
+        ):
+            event.ignore()
+            self.hide()
+            return
         self.stop_engine()
         self._hide_mini_live_viewer()
         self.draw_overlay.hide_overlay()
@@ -21973,8 +23184,45 @@ def _stop_screen_recording(self) -> bool:
             import uuid as _uuid
             from ... import telemetry as _telemetry
             from ... import __version__ as _APP_VERSION
-            if not getattr(self.config, "analytics_install_id", ""):
-                self.config.analytics_install_id = _uuid.uuid4().hex
+            # Prefer the MachineGuid+username-derived install_id so a
+            # single user gets ONE row in the analytics dashboard
+            # regardless of: app version, settings.json wipes, source
+            # rebuilds, fresh installs, "reset data" cycles. Falls
+            # back to a random uuid4 on non-Windows or if the registry
+            # read fails — same behaviour as before.
+            #
+            # Migration: if we already have a stored random uuid4 from
+            # an older session and the derived ID is available, switch
+            # to the derived one. We latch a one-time flag so the
+            # switch only happens once — if the user later manually
+            # pins a specific id, we won't overwrite it on every
+            # launch. Old events under the random uuid stay in D1
+            # under their original install_id; the user can backfill
+            # them with a single UPDATE if they want history merged.
+            derived = _telemetry.derive_stable_install_id()
+            stored = str(getattr(self.config, "analytics_install_id", "") or "")
+            new_id: str | None = None
+            # Old install_id that we're about to retire — kept so we
+            # can fold its historic events into the new derived ID via
+            # /api/consolidate on a background thread. Covers two
+            # cases: (1) the original uuid4-to-derived migration when
+            # the new build first runs on an old install, and (2) a
+            # SALT BUMP in derive_stable_install_id() (e.g. v1→v2 when
+            # we dropped the username from the hash) — at that point
+            # the previously-stored derived hash no longer matches
+            # the freshly-computed one, so we re-migrate and fold.
+            # No `not migrated` latch: stored == derived is the only
+            # condition that means "no migration needed this launch."
+            ghost_id_to_fold: str = ""
+            if not stored:
+                new_id = derived or _uuid.uuid4().hex
+            elif derived and stored != derived:
+                ghost_id_to_fold = stored
+                new_id = derived
+            if new_id is not None:
+                self.config.analytics_install_id = new_id
+                if derived and new_id == derived:
+                    setattr(self.config, "analytics_install_id_migrated_to_derived", True)
                 try:
                     save_config(self.config)
                 except Exception:
@@ -21987,7 +23235,49 @@ def _stop_screen_recording(self) -> bool:
             _telemetry.set_client(client)
             self._telemetry = client
             self._session_started_at = time.monotonic()
-            _telemetry.track("app_session_started")
+            # Snapshot the user's current custom-gesture inventory at
+            # session start so the dashboard knows how many gestures
+            # each install has authored. Sent on the start event
+            # (which the bug-1 fix guarantees fires once per session
+            # after opt-in) so the count is fresh per session — the
+            # dashboard takes the MAX across sessions to track the
+            # high-water mark.
+            try:
+                from ...custom_gestures.registry import GestureRegistry as _Registry
+                _reg = _Registry()
+                _reg.load()
+                _custom_gesture_count = len(_reg.list())
+            except Exception:
+                _custom_gesture_count = 0
+            _telemetry.track(
+                "app_session_started",
+                {"custom_gesture_count": int(_custom_gesture_count)},
+            )
+            # If we just migrated FROM a random uuid4 TO the derived ID,
+            # auto-fold the previous ID's historic events into the new
+            # one. Runs on a background thread so the synchronous HTTP
+            # round-trip doesn't stall startup. Older ghost IDs from
+            # earlier settings.json wipes are not folded here (we don't
+            # remember them); use the dashboard's "Consolidate installs"
+            # button for those — one click cleans them all up at once.
+            if ghost_id_to_fold and derived:
+                try:
+                    import threading as _threading
+                    def _do_fold() -> None:
+                        try:
+                            client.consolidate(
+                                target_install_id=derived,
+                                merge_ids=[ghost_id_to_fold],
+                            )
+                        except Exception:
+                            pass
+                    _threading.Thread(
+                        target=_do_fold,
+                        name="telemetry-consolidate",
+                        daemon=True,
+                    ).start()
+                except Exception:
+                    pass
             # Catch unhandled Python exceptions and forward them as
             # anonymous error_caught events. Keeps the original
             # excepthook chained so the traceback still prints to

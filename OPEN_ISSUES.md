@@ -62,6 +62,23 @@ Current focus. Historical issues (from prior sessions, not yet all verified on c
 
 ## Section 4 — Roadmap (next features)
 
+Planned-work / polish backlog has moved to [`Touchless to-do.md`](Touchless%20to-do.md). This section is reserved for architectural-level roadmap notes that don't fit the to-do format.
+
+### 4.1 Custom gesture macros (queued)
+
+User asked for custom gestures to be able to record + replay a macro (e.g. "open this app, click that button"). Scoped down for now during the b7 QoL pass; ship later as a proper feature.
+
+**Shape:**
+- New gesture-action type `macro` (alongside the existing `app_action`, `voice_action`, etc.).
+- Recorder UI in the Custom Gestures panel: "Record macro" button → captures sequenced events for N seconds:
+  - Mouse clicks (button + screen coords + timing)
+  - Keystrokes
+  - App focus events (foreground window name, to handle "open this app first")
+- Replay engine: on gesture fire, replay the sequence with the captured timing.
+- Per-step timing: optional `wait until window X exists` between steps so timing doesn't break on slow machines.
+- Storage: JSON sidecar in the custom-gestures directory alongside the existing classifier weights.
+
+**Why deferred:** macro recording + a reliable replay engine is its own multi-file feature. The b7 QoL bundle stayed focused on tray icon + autostart + dropdown polish + Spotify reauth.
 
 ---
 

@@ -148,10 +148,10 @@ class AppConfig:
     # because mouse mode runs off the right hand (left hand is the
     # toggle pose), so a center-right placement matches where the
     # right hand naturally rests in the mirrored camera view.
-    mouse_control_box_center_x: float = 0.67
+    mouse_control_box_center_x: float = 0.82
     mouse_control_box_center_y: float = 0.55
-    mouse_control_box_area: float = 0.18
-    mouse_control_box_aspect_power: float = 0.40
+    mouse_control_box_area: float = 0.14
+    mouse_control_box_aspect_power: float = 0.25
     # Which monitor mouse-mode controls. None = all monitors (the
     # full virtual desktop, the historical default). 0..N-1 = a
     # specific monitor's index in QGuiApplication.screens(). The
@@ -161,12 +161,20 @@ class AppConfig:
     # mouse-box on the camera frame still spans the same area but
     # the cursor output gets clamped to the chosen monitor's region.
     mouse_active_monitor_index: Optional[int] = None
-    # Anonymous install UUID for usage telemetry. Generated on
-    # first launch when missing and persisted across sessions so
-    # the analytics dashboard can compute "active install" /
-    # retention numbers. Not a personal identifier — random
-    # uuid4 only.
+    # Anonymous install UUID for usage telemetry. Now derived
+    # deterministically from SHA-256(salt + Windows MachineGuid +
+    # username) so a single user gets ONE install_id forever — survives
+    # settings.json wipes, app updates, reinstalls, source rebuilds.
+    # Falls back to a random uuid4 on non-Windows or if the registry
+    # read fails. Persisted across sessions so the analytics dashboard
+    # can compute "active install" / retention numbers. Not a personal
+    # identifier — one-way SHA-256, salted.
     analytics_install_id: str = ""
+    # Latched True after the legacy random uuid4 install_id has been
+    # replaced with the MachineGuid-derived value once. Prevents the
+    # one-time migration from re-firing every launch in case the user
+    # later manually pins a different install_id.
+    analytics_install_id_migrated_to_derived: bool = False
     # Privacy & data flags. Both are opt-in.
     #   privacy_disclosure_shown: latched True after the user
     #     clicks "Got it" on the first-run privacy dialog. Stops
@@ -193,6 +201,14 @@ class AppConfig:
     # launches call restoreGeometry on this blob to reproduce the
     # user's last size + position + maximized state.
     main_window_geometry_b64: str = ""
+    # Auto-start on Windows login. When True, a registry Run key
+    # under HKCU\Software\Microsoft\Windows\CurrentVersion\Run is
+    # written pointing at the installed Touchless.exe so the app
+    # launches at sign-in (minimised to tray if the tray icon is
+    # supported). Toggled by the General Settings checkbox; the
+    # registry write happens through autostart.py, NOT through
+    # this field directly -- the field is just a UI baseline.
+    auto_start_on_login: bool = False
     drawings_save_dir: str = field(default_factory=lambda: str(default_save_directory("drawings")))
     screenshots_save_dir: str = field(default_factory=lambda: str(default_save_directory("screenshots")))
     screen_recordings_save_dir: str = field(default_factory=lambda: str(default_save_directory("screen_recordings")))
@@ -295,6 +311,14 @@ class AppConfig:
     overlay_text_popups_enabled: bool = True
     overlay_gaming_mode_enabled: bool = False
     overlay_gaming_live_view_disabled: bool = False
+    # Per-overlay toggles for the gesture live-view window. These
+    # show / hide compact diagnostic pills layered on the camera
+    # feed (top-right of the video panel). Default off so a clean
+    # live view is the out-of-the-box experience; users who care
+    # about diagnostics enable them in Settings → Camera.
+    live_view_show_fps: bool = False
+    live_view_show_latency: bool = False
+    live_view_show_tracking_quality: bool = False
 
 
 DEFAULT_CONFIG = AppConfig()
@@ -333,12 +357,46 @@ def load_config() -> AppConfig:
             values["mouse_control_box_center_x"] = DEFAULT_CONFIG.mouse_control_box_center_x
         if abs(float(values.get("mouse_control_box_center_x", 0.0)) - 0.62) < 1e-6:
             values["mouse_control_box_center_x"] = DEFAULT_CONFIG.mouse_control_box_center_x
+        # 0.67 was the previous default — bumped to 0.78 so the red
+        # control box sits much closer to the right edge of the camera
+        # frame (user feedback: reach-out hand naturally lands far to
+        # the right of the camera FOV, so center should follow). Users
+        # who have explicitly tuned the box past 0.67 are left alone.
+        if abs(float(values.get("mouse_control_box_center_x", 0.0)) - 0.67) < 1e-6:
+            values["mouse_control_box_center_x"] = DEFAULT_CONFIG.mouse_control_box_center_x
+        # 0.78 → 0.82: another small right shift requested after live
+        # testing. Same migration pattern — users who had the 0.78
+        # default get bumped to 0.82; users who explicitly chose any
+        # other value are left alone.
+        if abs(float(values.get("mouse_control_box_center_x", 0.0)) - 0.78) < 1e-6:
+            values["mouse_control_box_center_x"] = DEFAULT_CONFIG.mouse_control_box_center_x
         if abs(float(values.get("mouse_control_box_center_y", 0.0)) - 0.56) < 1e-6:
             values["mouse_control_box_center_y"] = DEFAULT_CONFIG.mouse_control_box_center_y
         if abs(float(values.get("mouse_control_box_area", 0.0)) - 0.31) < 1e-6:
             values["mouse_control_box_area"] = DEFAULT_CONFIG.mouse_control_box_area
         if abs(float(values.get("mouse_control_box_area", 0.0)) - 0.36) < 1e-6:
             values["mouse_control_box_area"] = DEFAULT_CONFIG.mouse_control_box_area
+        # 0.18 → 0.12: previous default produced a red box that was
+        # visibly wider than the green Monitor 1 outline drawn inside
+        # it. New default matches the displayed monitor width on a
+        # single-monitor setup. The tracker scales the effective area
+        # up for multi-monitor desktops automatically (see
+        # mouse_gesture._box_rect_in_camera), so multi-monitor users
+        # still get a wider box without needing to retune the slider.
+        if abs(float(values.get("mouse_control_box_area", 0.0)) - 0.18) < 1e-6:
+            values["mouse_control_box_area"] = DEFAULT_CONFIG.mouse_control_box_area
+        # 0.12 → 0.14: bumped slightly to compensate for the new
+        # squarer aspect (the box is less wide, so slight area bump
+        # restores comfortable hand-reach without re-stretching).
+        if abs(float(values.get("mouse_control_box_area", 0.0)) - 0.12) < 1e-6:
+            values["mouse_control_box_area"] = DEFAULT_CONFIG.mouse_control_box_area
+        # 0.40 → 0.25: aspect_power lowered so the camera box is
+        # more square (matches natural hand-reach ergonomics) instead
+        # of stretched 16:9. Visual aspect for a single-monitor user
+        # drops from ~1.78 to ~1.16, giving the upright shape the
+        # user specifically requested.
+        if abs(float(values.get("mouse_control_box_aspect_power", 0.0)) - 0.40) < 1e-6:
+            values["mouse_control_box_aspect_power"] = DEFAULT_CONFIG.mouse_control_box_aspect_power
 
         return AppConfig(**values)
     except Exception:

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import json
 import os
 import platform
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -27,6 +29,18 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_TTL_SECONDS = 3500.0
 SW_RESTORE = 9
+
+# Default Spotify app client_id, baked into every shipped Touchless
+# build. Spotify treats client_id as PUBLIC — embedding it is the
+# documented practice for desktop apps that can't keep a secret.
+# Auth flow is PKCE (Proof Key for Code Exchange) so no client_secret
+# is required: each user's auth dance uses a per-session
+# code_verifier instead, and refresh tokens work the same way.
+# Override via env var (TOUCHLESS_SPOTIFY_CLIENT_ID / CLIENT_ID) or
+# a .env file in repo root / ~/Documents/Touchless/ for dev work
+# against a different Spotify dev-console app.
+_DEFAULT_SPOTIFY_CLIENT_ID = "7763a7c443604776b0060da01428686f"
+_DEFAULT_SPOTIFY_REDIRECT_URI = "http://127.0.0.1:5000/callback"
 
 SPOTIFY_SCOPES = (
     "user-read-playback-state",
@@ -131,6 +145,13 @@ class SpotifyController:
         # returns the previous cached value; the next gesture frame
         # reads the fresh result.
         self._active_device_refresh_in_flight: bool = False
+        # Flips True when a stored refresh token fails (Spotify
+        # revoked it server-side, the user changed password, or the
+        # token simply aged out). The MainWindow polls this in its
+        # per-frame debug handler and surfaces a one-shot 'reconnect
+        # Spotify' toast so the user knows controls have silently
+        # stopped working.
+        self._needs_reauth: bool = False
         self._load_credentials()
         self._load_tokens()
 
@@ -579,6 +600,20 @@ class SpotifyController:
         now = time.monotonic()
         if self._active_device_cache is not None and now < self._active_device_cache_until:
             return self._active_device_cache
+        # Short-circuit when the user has no Spotify auth: every
+        # subsequent get_player_state() call would return None +
+        # spam self._message ("spotify token not found"), and the
+        # background refresh thread would keep spinning up uselessly.
+        # The per-frame poll from SpotifyGestureRouter would then make
+        # the status overlay flash "spotify not authorized" on every
+        # frame even when the user is doing nothing. False here is
+        # the same answer is_active_device_available would have
+        # eventually returned anyway — just skipping the wasted
+        # HTTP round-trips and the noise that comes with them.
+        if not self.has_authorization:
+            self._active_device_cache = False
+            self._active_device_cache_until = now + self._active_device_cache_seconds
+            return False
         # Cache miss. get_player_state() is a 50-300 ms HTTP call --
         # this method is called per gesture frame from
         # SpotifyGestureRouter._can_control_without_focus while a
@@ -922,17 +957,33 @@ class SpotifyController:
         return f"{prefix} ({status})"
 
     def authorize_full_scopes(self, *, port: int = 5000, timeout_seconds: float = 180.0) -> bool:
-        if not self._client_id or not self._client_secret:
-            self._message = "spotify credentials not found"
+        """Open Spotify's OAuth flow in the user's browser using
+        PKCE (Proof Key for Code Exchange). PKCE eliminates the
+        need for a client_secret — each authorization derives proof
+        from a per-session code_verifier instead. This is the
+        standard for desktop apps; the client_id alone is enough.
+
+        On success, writes the resulting access + refresh tokens to
+        the user's token file (`auth_token.json`) so subsequent
+        launches skip the dance until the refresh token expires."""
+        if not self._client_id:
+            self._message = "spotify client id not configured"
             return False
         import http.server
-        import secrets
         import socketserver
         import threading
         import webbrowser
 
         redirect_uri = self._redirect_uri or f"http://127.0.0.1:{port}/callback"
         state = secrets.token_urlsafe(16)
+        # PKCE: generate a high-entropy code_verifier (43-128 chars,
+        # URL-safe) and derive the challenge as base64url(SHA256(verifier)).
+        # The verifier is held in memory until the token exchange step,
+        # at which point Spotify checks SHA256(verifier) == challenge
+        # to prove the same client started + finished the flow.
+        code_verifier = secrets.token_urlsafe(64)[:128]
+        challenge_bytes = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        code_challenge = base64.urlsafe_b64encode(challenge_bytes).decode("ascii").rstrip("=")
         auth_params = {
             "client_id": self._client_id,
             "response_type": "code",
@@ -940,6 +991,8 @@ class SpotifyController:
             "scope": " ".join(SPOTIFY_SCOPES),
             "state": state,
             "show_dialog": "true",
+            "code_challenge_method": "S256",
+            "code_challenge": code_challenge,
         }
         auth_url = f"{SPOTIFY_AUTH_URL}?{urllib_parse.urlencode(auth_params)}"
 
@@ -990,22 +1043,23 @@ class SpotifyController:
             self._message = f"spotify auth failed: {result.get('error') or 'no code'}"
             return False
 
-        token_pair = f"{self._client_id}:{self._client_secret}".encode("utf-8")
-        encoded = base64.b64encode(token_pair).decode("utf-8")
+        # PKCE token exchange: send client_id + code_verifier in the
+        # POST body. Spotify recomputes SHA256(code_verifier) and
+        # checks it against the challenge it stored from the
+        # authorize step. No Basic auth header (no client_secret).
         data = urllib_parse.urlencode(
             {
                 "grant_type": "authorization_code",
                 "code": result["code"],
                 "redirect_uri": redirect_uri,
+                "client_id": self._client_id,
+                "code_verifier": code_verifier,
             }
         ).encode("utf-8")
         request = urllib_request.Request(
             SPOTIFY_TOKEN_URL,
             data=data,
-            headers={
-                "Authorization": f"Basic {encoded}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
         try:
@@ -1098,23 +1152,48 @@ class SpotifyController:
         return tuple(ordered)
 
     def _load_credentials(self) -> None:
-        env_client_id = os.getenv("CLIENT_ID") or os.getenv("SPOTIFY_CLIENT_ID")
+        """Resolve client_id + redirect_uri for the Spotify OAuth
+        flow. Resolution order:
+          1. Env vars (TOUCHLESS_SPOTIFY_CLIENT_ID / CLIENT_ID).
+          2. First .env file in `_env_paths` that defines CLIENT_ID.
+          3. Embedded defaults (`_DEFAULT_SPOTIFY_CLIENT_ID`) — this
+             is what shipped builds use. The client_id is public per
+             Spotify's documentation; no secret is required because
+             the auth flow is PKCE.
+
+        client_secret is loaded for backwards compatibility (legacy
+        non-PKCE refresh tokens from older Touchless installs can
+        still be refreshed using the secret path) but is NOT
+        required for new auth flows."""
+        env_client_id = (
+            os.getenv("TOUCHLESS_SPOTIFY_CLIENT_ID")
+            or os.getenv("CLIENT_ID")
+            or os.getenv("SPOTIFY_CLIENT_ID")
+        )
         env_client_secret = os.getenv("CLIENT_SECRET") or os.getenv("SPOTIFY_CLIENT_SECRET")
         env_redirect_uri = os.getenv("REDIRECT_URI") or os.getenv("SPOTIFY_REDIRECT_URI")
-        if env_client_id and env_client_secret:
+        if env_client_id:
             self._client_id = env_client_id
-            self._client_secret = env_client_secret
-            self._redirect_uri = env_redirect_uri or "http://127.0.0.1:5000/callback"
+            self._client_secret = env_client_secret  # may be None — fine for PKCE
+            self._redirect_uri = env_redirect_uri or _DEFAULT_SPOTIFY_REDIRECT_URI
             return
 
         for path in self._env_paths:
             values = self._parse_env_file(path)
-            if values.get("CLIENT_ID") and values.get("CLIENT_SECRET"):
+            if values.get("CLIENT_ID"):
                 self._env_path = path
                 self._client_id = values["CLIENT_ID"]
-                self._client_secret = values["CLIENT_SECRET"]
-                self._redirect_uri = values.get("REDIRECT_URI", "http://127.0.0.1:5000/callback")
+                self._client_secret = values.get("CLIENT_SECRET")  # optional
+                self._redirect_uri = values.get("REDIRECT_URI", _DEFAULT_SPOTIFY_REDIRECT_URI)
                 return
+
+        # Fall through to embedded defaults so shipped builds (with
+        # no .env on disk) can still authenticate every user via
+        # the PKCE flow. No secret is shipped — Spotify's PKCE
+        # mode doesn't need one.
+        self._client_id = _DEFAULT_SPOTIFY_CLIENT_ID
+        self._client_secret = None
+        self._redirect_uri = _DEFAULT_SPOTIFY_REDIRECT_URI
 
     def _load_tokens(self) -> None:
         for path in self._token_paths:
@@ -1147,8 +1226,11 @@ class SpotifyController:
             pass
 
     def _ensure_authenticated(self) -> bool:
-        if not self._client_id or not self._client_secret:
-            self._message = "spotify credentials not found"
+        # PKCE auth doesn't require a client_secret — client_id alone
+        # is enough. Legacy installs that have both can still use the
+        # secret path during refresh (_refresh_access_token handles it).
+        if not self._client_id:
+            self._message = "spotify client id not configured"
             return False
         if self._access_token and not self._token_expired():
             return True
@@ -1176,24 +1258,36 @@ class SpotifyController:
         return (time.time() - self._token_issue_time) >= TOKEN_TTL_SECONDS
 
     def _refresh_access_token(self) -> bool:
-        if not self._refresh_token or not self._client_id or not self._client_secret:
+        """Refresh the access token using the stored refresh token.
+
+        Tries PKCE-style refresh first (client_id-only POST body) —
+        the standard for tokens minted by the PKCE auth flow. Falls
+        back to the classic Basic-auth refresh path only when a
+        client_secret is present (covers legacy tokens minted by
+        older Touchless builds before the PKCE switch).
+        """
+        if not self._refresh_token or not self._client_id:
             self._message = "spotify refresh unavailable"
             return False
-        token_pair = f"{self._client_id}:{self._client_secret}".encode("utf-8")
-        encoded = base64.b64encode(token_pair).decode("utf-8")
         data = urllib_parse.urlencode(
             {
                 "grant_type": "refresh_token",
                 "refresh_token": self._refresh_token,
+                "client_id": self._client_id,
             }
         ).encode("utf-8")
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        # Backwards-compat: if a client_secret IS configured (dev
+        # .env with both keys), use the classic Basic-auth header.
+        # Legacy refresh tokens minted by the pre-PKCE flow need it.
+        if self._client_secret:
+            token_pair = f"{self._client_id}:{self._client_secret}".encode("utf-8")
+            encoded = base64.b64encode(token_pair).decode("utf-8")
+            headers["Authorization"] = f"Basic {encoded}"
         request = urllib_request.Request(
             SPOTIFY_TOKEN_URL,
             data=data,
-            headers={
-                "Authorization": f"Basic {encoded}",
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -1201,6 +1295,12 @@ class SpotifyController:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib_error.HTTPError as exc:
             self._message = f"spotify auth refresh failed ({exc.code})"
+            # 400 / 401 from /api/token = refresh token is dead
+            # (revoked, expired, or the Spotify app's client_id
+            # rotated). Surface this so the UI can prompt for
+            # re-auth instead of failing silently every gesture.
+            if exc.code in (400, 401):
+                self._needs_reauth = True
             return False
         except Exception:
             self._message = "spotify auth refresh failed"
@@ -1211,7 +1311,23 @@ class SpotifyController:
         self._token_issue_time = time.time()
         self._save_tokens()
         self._message = "spotify token refreshed"
+        # A successful refresh clears the reauth-needed flag if it
+        # was set; the user is back to good standing.
+        self._needs_reauth = False
         return bool(self._access_token)
+
+    @property
+    def needs_reauth(self) -> bool:
+        """True when a stored refresh token has been rejected. The
+        UI uses this to surface a one-shot 'reconnect Spotify' toast.
+        Clears automatically on the next successful auth."""
+        return bool(self._needs_reauth)
+
+    def clear_reauth_flag(self) -> None:
+        """Called by the UI after surfacing the reauth toast so the
+        same flag-flip doesn't re-fire on every subsequent gesture
+        frame. Re-arms only on the next refresh failure."""
+        self._needs_reauth = False
 
     def _request_json(
         self,
@@ -1271,13 +1387,30 @@ class SpotifyController:
             # server already executed the action), so we want to
             # distinguish "client gave up reading the response" from
             # "Spotify rejected it".
+            #
+            # Rate-limited: when the user isn't signed in to Spotify
+            # OR has revoked the token, every per-frame is_active_
+            # device probe lands here and prints the same exception,
+            # which spams the console with hundreds of identical
+            # "[spotify] request GET /me/player raised ..." lines per
+            # minute. Cap to one print per (method, path, exception
+            # type) every 30 seconds so the diagnostic survives but
+            # the noise dies.
             try:
                 import sys as _sys
-                _sys.stderr.write(
-                    f"[spotify] request {method} {path} raised "
-                    f"{type(exc).__name__}: {exc!s}\n"
-                )
-                _sys.stderr.flush()
+                key = f"{method}:{path}:{type(exc).__name__}"
+                now_mono = time.monotonic()
+                last = getattr(self, "_request_log_last_at", None)
+                if last is None:
+                    last = {}
+                    self._request_log_last_at = last
+                if now_mono - last.get(key, 0.0) >= 30.0:
+                    last[key] = now_mono
+                    _sys.stderr.write(
+                        f"[spotify] request {method} {path} raised "
+                        f"{type(exc).__name__}: {exc!s}\n"
+                    )
+                    _sys.stderr.flush()
             except Exception:
                 pass
             self._message = f"spotify request failed: {type(exc).__name__}"
