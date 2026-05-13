@@ -18,6 +18,8 @@ class LiveViewWindow(QMainWindow):
 
     def __init__(self, config: AppConfig, worker: Optional[object] = None):
         super().__init__()
+        from .window_chrome import apply_touchless_chrome
+        apply_touchless_chrome(self)
         self.config = config
         self._worker: Optional[object] = None
         self._last_frame = None
@@ -526,6 +528,19 @@ class LiveViewWindow(QMainWindow):
             import time as _time
             if (_time.monotonic() - capture_ts) > 0.12:
                 return
+        # Game / fullscreen display throttle. Worker FPS stays at ~30
+        # while the OpenGL paint contends with the game for GPU and
+        # the user sees 1-2 s of camera lag. Cap paint cadence at ~12
+        # fps while fullscreen is active so each paint has time to
+        # complete and the queue doesn't back up.
+        worker = self._worker
+        if worker is not None and bool(getattr(worker, "_fullscreen_foreground_active", False)):
+            import time as _time
+            last_paint_at = getattr(self, "_last_paint_at_for_fullscreen", 0.0)
+            now_paint = _time.monotonic()
+            if now_paint - float(last_paint_at) < 0.080:
+                return
+            self._last_paint_at_for_fullscreen = now_paint
         self._last_frame = frame
         self._render_frame()
         # Update the latency + display-rate readout. The label
