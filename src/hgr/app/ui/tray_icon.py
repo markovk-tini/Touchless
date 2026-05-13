@@ -29,10 +29,12 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 
 # Tray-icon colour palette. Matches the rest of the app's accent
-# colours so the tray is visually part of the family.
+# colours so the tray is visually part of the family. Each is
+# fully opaque so the cue stays readable on either light- or
+# dark-theme taskbars.
 _BORDER_ACTIVE = QColor(29, 233, 182)    # mint   (engine running, gestures on)
 _BORDER_PAUSED = QColor(255, 138, 61)    # orange (gestures paused, mid-warning)
-_BORDER_OFF = QColor(150, 150, 150, 230)  # grey  (app open but engine not running)
+_BORDER_OFF = QColor(220, 220, 220)       # light grey (engine off; light enough to read on a dark Win11 taskbar)
 
 
 def _state_border_color(state: str) -> QColor:
@@ -67,12 +69,10 @@ def _render_bordered_icon(base_icon: QIcon, border_color: QColor) -> QIcon:
         painter = QPainter(out)
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            # Ring thickness ~4 % of width (a notch thinner than the
-            # previous 6 %). Hand body fills ~92 % of icon area --
-            # the Touchless silhouette is overwhelmingly dominant
-            # and the ring is just a slim frame. Min 2 px so the
-            # cue survives at the smallest tray sizes.
-            ring = max(2, int(round(size * 0.04)))
+            # Ring thickness ~4 % of width. Min 3 px so the cue
+            # actually shows up on 16-32 px tray icons (2 px got
+            # lost against a dark Windows 11 taskbar).
+            ring = max(3, int(round(size * 0.04)))
             radius = max(2, int(round(size * 0.18)))
             # Filled coloured rounded-rect background.
             painter.setBrush(border_color)
