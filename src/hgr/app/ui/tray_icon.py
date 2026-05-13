@@ -30,9 +30,9 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 # Tray-icon colour palette. Matches the rest of the app's accent
 # colours so the tray is visually part of the family.
-_BORDER_ACTIVE = QColor(29, 233, 182)    # mint (engine running, gestures on)
-_BORDER_PAUSED = QColor(245, 180, 80)    # amber (gestures paused)
-_BORDER_OFF = QColor(127, 127, 127, 200)  # grey (engine off)
+_BORDER_ACTIVE = QColor(29, 233, 182)    # mint   (engine running, gestures on)
+_BORDER_PAUSED = QColor(255, 220, 90)    # yellow (gestures paused, mid-warning)
+_BORDER_OFF = QColor(255, 138, 61)       # orange (app open but engine not running)
 
 
 def _state_border_color(state: str) -> QColor:
@@ -67,14 +67,12 @@ def _render_bordered_icon(base_icon: QIcon, border_color: QColor) -> QIcon:
         painter = QPainter(out)
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            # Ring thickness tuned so the hand stays the dominant
-            # visual: ~12 % of width, min 2 px. At 16 px tray that's
-            # 2 px (still readable as a thin coloured frame thanks
-            # to the saturated palette) and the hand inside is
-            # 12 px = recognisable. Earlier 22 % shrank the hand to
-            # 8 px on tray, which the user reported as 'can barely
-            # see touchless icon'.
-            ring = max(2, int(round(size * 0.12)))
+            # Ring thickness ~6 % of width (halved from the earlier
+            # 12 %). Hand body is now ~88 % of icon area which keeps
+            # the silhouette dominant; the ring is a slim coloured
+            # frame around it. Min 2 px so the ring still shows on
+            # tiny tray sizes.
+            ring = max(2, int(round(size * 0.06)))
             radius = max(2, int(round(size * 0.18)))
             # Filled coloured rounded-rect background.
             painter.setBrush(border_color)
