@@ -18,8 +18,6 @@ class MiniLiveViewer(QWidget):
 
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
         self.config = config
         self._worker: Optional[object] = None
         self._last_frame = None
@@ -417,22 +415,6 @@ class MiniLiveViewer(QWidget):
             import time as _time
             if (_time.monotonic() - capture_ts) > 0.12:
                 return
-        # Game / fullscreen display throttle. The worker's _fps stays
-        # at ~30 even when the live view visibly lags 1-2 s, because
-        # the engine processes frames fine but the GpuVideoWidget's
-        # OpenGL paint is fighting the game for GPU time. Cap the
-        # paint cadence at ~12 fps while a fullscreen app is in front
-        # so each paint has ~80 ms to complete and the queue doesn't
-        # back up. The user still sees their hand move in real time,
-        # just at a coarser cadence; the game gets the GPU back.
-        worker = self._worker
-        if worker is not None and bool(getattr(worker, "_fullscreen_foreground_active", False)):
-            import time as _time
-            last_paint_at = getattr(self, "_last_paint_at_for_fullscreen", 0.0)
-            now_paint = _time.monotonic()
-            if now_paint - float(last_paint_at) < 0.080:
-                return
-            self._last_paint_at_for_fullscreen = now_paint
         self._last_frame = frame
         self._render_frame()
         # Update top-left HUD latency EWMA when enabled. Same 0.8/0.2
