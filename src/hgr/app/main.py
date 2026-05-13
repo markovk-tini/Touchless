@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
@@ -23,22 +24,23 @@ def _resolve_app_icon():
 
 def main() -> int:
     # Bail before constructing the Qt app if another Touchless is
-    # already running — the existing instance gets focus, this
-    # process exits silently. Common case: user double-clicks the
-    # desktop shortcut while Touchless is minimized to tray.
-    if not acquire_single_instance():
+    # already running. When the bailing instance was launched via
+    # a Jump-List task (Pause / Settings / Quit), `args` carries
+    # the corresponding flag and acquire() PostMessages it to the
+    # running instance before returning False.
+    if not acquire_single_instance(sys.argv[1:]):
         return 0
 
     # Tell Windows this process is its own app, not a generic
     # Python interpreter, so the taskbar groups our windows under
-    # the Touchless icon instead of the python.exe icon. Only
-    # matters for source / dev runs -- the PyInstaller-built
-    # Touchless.exe carries its icon directly in the binary and
-    # Windows uses that. Safe no-op on non-Windows / older builds.
+    # the Touchless icon instead of the python.exe icon. MUST happen
+    # before the first window is created or Windows caches the
+    # wrong grouping. The same AUMID is used by the Jump List below.
+    app_user_model_id = "Touchless.App.MarkovK"
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "Touchless.App.MarkovK"
+            app_user_model_id
         )
     except Exception:
         pass
@@ -46,6 +48,20 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationDisplayName(APP_NAME)
     app.setApplicationName(APP_NAME)
+
+    # Install the taskbar Jump List. Only attempts in frozen builds
+    # where sys.executable is Touchless.exe (each task re-launches
+    # the exe with a flag). Source runs use python.exe whose path
+    # isn't a sensible IShellLink target, so we skip silently.
+    if getattr(sys, "frozen", False):
+        try:
+            from .jumplist import install_jumplist
+            install_jumplist(
+                app_user_model_id=app_user_model_id,
+                exe_path=Path(sys.executable),
+            )
+        except Exception:
+            pass
 
     icon_path = _resolve_app_icon()
     if icon_path is not None:

@@ -5386,6 +5386,17 @@ class MainWindow(QMainWindow):
             self._tray_icon.show()
         except Exception:
             self._tray_icon = None
+        # Jump-List action receiver. The taskbar right-click menu's
+        # tasks each re-launch Touchless.exe with a flag; the
+        # bailing second instance PostMessages a registered Win32
+        # message ID to our main window; nativeEvent below
+        # intercepts those and dispatches the same handlers the
+        # tray menu uses.
+        try:
+            from ..single_instance import action_message_id_map
+            self._jumplist_action_messages = action_message_id_map()
+        except Exception:
+            self._jumplist_action_messages = {}
         # Active clip-export worker thread, if any. Held so we can
         # query state and so Python doesn't garbage-collect it
         # while it's still running.
@@ -9338,20 +9349,35 @@ class MainWindow(QMainWindow):
         if wizard.exec() != QDialog.DialogCode.Accepted or wizard.result_payload is None:
             return
         result = wizard.result_payload
+        gesture_type = wizard.gesture_type()
         # Pass the worker if it's running so the recorder can share its
         # frame stream — otherwise the recorder opens its own camera so
         # the user doesn't have to start the main live viewer first.
         worker = getattr(self, "_worker", None)
         try:
-            recorder = RecordingWindow(
-                worker=worker,
-                accent_color=accent,
-                name=result.name,
-                description=result.description,
-                action=result.action,
-                parent=self,
-                config=self.config,
-            )
+            if gesture_type == "dynamic":
+                from .dynamic_gesture_recorder_window import (
+                    DynamicGestureRecorderWindow,
+                )
+                recorder = DynamicGestureRecorderWindow(
+                    worker=worker,
+                    accent_color=accent,
+                    name=result.name,
+                    description=result.description,
+                    action=result.action,
+                    parent=self,
+                    config=self.config,
+                )
+            else:
+                recorder = RecordingWindow(
+                    worker=worker,
+                    accent_color=accent,
+                    name=result.name,
+                    description=result.description,
+                    action=result.action,
+                    parent=self,
+                    config=self.config,
+                )
         except Exception as exc:
             import traceback
             tb = traceback.format_exc()
@@ -17210,6 +17236,47 @@ Admin elevation
             QApplication.quit()
         except Exception:
             pass
+
+    def nativeEvent(self, eventType, message):  # noqa: N802 (Qt API name)
+        """Intercept Jump-List action messages posted to our HWND
+        by the bailing second-instance process. Each registered
+        message ID maps back to one of the tray-menu handlers, so
+        the right-click-on-taskbar tasks fire the same code path."""
+        try:
+            if eventType in (b"windows_generic_MSG", "windows_generic_MSG"):
+                action_map = getattr(self, "_jumplist_action_messages", None)
+                if action_map:
+                    import ctypes
+                    from ctypes import wintypes
+                    class _MSG(ctypes.Structure):
+                        _fields_ = [
+                            ("hwnd", wintypes.HWND),
+                            ("message", wintypes.UINT),
+                            ("wParam", wintypes.WPARAM),
+                            ("lParam", wintypes.LPARAM),
+                            ("time", wintypes.DWORD),
+                            ("pt_x", wintypes.LONG),
+                            ("pt_y", wintypes.LONG),
+                        ]
+                    msg = _MSG.from_address(int(message))
+                    action = action_map.get(int(msg.message))
+                    if action is not None:
+                        self._dispatch_jumplist_action(action)
+                        return True, 0
+        except Exception:
+            pass
+        return super().nativeEvent(eventType, message)
+
+    def _dispatch_jumplist_action(self, action: str) -> None:
+        """Map a Jump-List action flag onto the corresponding tray
+        handler so the right-click task does the same thing as the
+        tray menu entry."""
+        if action == "--touchless-pause-30":
+            self._on_tray_pause()
+        elif action == "--touchless-settings":
+            self._on_tray_settings()
+        elif action == "--touchless-quit":
+            self._on_tray_quit()
 
     def _handle_mini_live_viewer_enlarge(self) -> None:
         self._hide_mini_live_viewer()

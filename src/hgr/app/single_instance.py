@@ -33,14 +33,64 @@ _ERROR_ALREADY_EXISTS = 183
 _SW_SHOWNORMAL = 1
 _SW_RESTORE = 9
 
+# Mapping between command-line arg (used by the Jump List shortcuts)
+# and the registered window-message name we use to deliver the action
+# to the running instance. RegisterWindowMessageW returns the same
+# integer ID for a given name in every process, so the bailing
+# second instance and the running first instance see the same ID.
+_ACTION_MESSAGE_NAMES = {
+    "--touchless-pause-30":  "Touchless_Action_Pause30_2C4EE680",
+    "--touchless-settings":  "Touchless_Action_Settings_2C4EE680",
+    "--touchless-quit":      "Touchless_Action_Quit_2C4EE680",
+}
+
 
 _handle: int | None = None
 
 
-def acquire() -> bool:
+def action_message_id(action_arg: str) -> int | None:
+    """Resolve the Win32 RegisterWindowMessage ID for one of our
+    Jump-List action args. Returns None if the arg isn't one we
+    recognise or if the registration fails. Both the sender and the
+    receiver call this; the result is per-process-stable but
+    consistent across processes on the same OS instance."""
+    if sys.platform != "win32":
+        return None
+    name = _ACTION_MESSAGE_NAMES.get(action_arg)
+    if name is None:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+        user32.RegisterWindowMessageW.restype = wintypes.UINT
+        msg_id = user32.RegisterWindowMessageW(name)
+        return int(msg_id) if msg_id else None
+    except Exception:
+        return None
+
+
+def action_message_id_map() -> dict[int, str]:
+    """Build {win32-message-id: action-arg} so the running instance
+    can install a single nativeEvent filter that matches incoming
+    messages back to the action it should perform."""
+    out: dict[int, str] = {}
+    for arg in _ACTION_MESSAGE_NAMES:
+        msg_id = action_message_id(arg)
+        if msg_id is not None:
+            out[msg_id] = arg
+    return out
+
+
+def acquire(args: list[str] | None = None) -> bool:
     """Try to acquire the single-instance lock. Returns True if
     this is the only Touchless instance, False if another is
-    already running. Caller should exit on False."""
+    already running. Caller should exit on False.
+
+    When False is about to be returned and `args` contains one of
+    the Jump-List action flags, post the corresponding Win32
+    message to the running instance's main window before bailing
+    so the user's right-click-task fires the same action as the
+    tray menu."""
     global _handle
     if sys.platform != "win32":
         return True
@@ -62,13 +112,42 @@ def acquire() -> bool:
             return True
         if kernel32.GetLastError() == _ERROR_ALREADY_EXISTS:
             # Mutex existed before our call: another Touchless is
-            # already running. Try to focus its window so the
-            # user knows where it went, then signal "don't start".
+            # already running. Forward any Jump-List action arg to
+            # it (PostMessageW), focus its window for visibility,
+            # then signal "don't start".
+            if args:
+                for arg in args:
+                    if arg in _ACTION_MESSAGE_NAMES:
+                        _post_action_to_running(arg)
+                        break
             _focus_existing_window()
             return False
         return True
     except Exception:
         return True
+
+
+def _post_action_to_running(action_arg: str) -> None:
+    """Fire-and-forget PostMessageW to the running Touchless's main
+    window with the action's registered message ID. The running
+    instance's nativeEvent filter (installed on MainWindow) picks
+    it up and dispatches the same handler the tray menu uses."""
+    msg_id = action_message_id(action_arg)
+    if msg_id is None:
+        return
+    try:
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowW.restype = wintypes.HWND
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        ]
+        user32.PostMessageW.restype = wintypes.BOOL
+        hwnd = user32.FindWindowW(None, "Touchless")
+        if hwnd:
+            user32.PostMessageW(hwnd, msg_id, 0, 0)
+    except Exception:
+        pass
 
 
 def _focus_existing_window() -> None:
