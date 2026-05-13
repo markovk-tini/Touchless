@@ -29,6 +29,20 @@ def main() -> int:
     if not acquire_single_instance():
         return 0
 
+    # Tell Windows this process is its own app, not a generic
+    # Python interpreter, so the taskbar groups our windows under
+    # the Touchless icon instead of the python.exe icon. Only
+    # matters for source / dev runs -- the PyInstaller-built
+    # Touchless.exe carries its icon directly in the binary and
+    # Windows uses that. Safe no-op on non-Windows / older builds.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Touchless.App.MarkovK"
+        )
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setApplicationDisplayName(APP_NAME)
     app.setApplicationName(APP_NAME)
