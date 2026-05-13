@@ -508,13 +508,10 @@ class GestureWorker(QObject):
     # stopped reacting while a recording window is open.
     frozen_state_changed = Signal(bool)
     # Custom-gesture "show_overlay_drawing" action: emitted when a
-    # bound gesture fires. Carries (filename, resolved_path) — the
-    # wizard now resolves duplicates at creation time and bakes the
-    # absolute path into the action payload, so the main window
-    # can use `resolved_path` directly without re-searching. The
-    # `filename` is kept for display and as a fallback resolution
-    # path for legacy gestures or files that moved after creation.
-    drawing_overlay_toggle_requested = Signal(str, str)
+    # bound gesture fires, carrying the user-typed filename. The
+    # main window resolves it against the configured drawings dir
+    # and toggles a transparent always-on-top overlay window.
+    drawing_overlay_toggle_requested = Signal(str)
     # Pinch-grab transform updates for the visible drawing overlay.
     # Carries absolute (cumulative-since-overlay-shown) values
     # â€” dx_norm, dy_norm in normalised screen units, and scale as a
@@ -530,16 +527,6 @@ class GestureWorker(QObject):
     _LOW_FPS_AUTO_THRESHOLD = 18.0
     _LOW_FPS_AUTO_ENTER_SECONDS = 4.0
     _LOW_FPS_AUTO_EXIT_SECONDS = 6.0
-    # Pre-emptive engage when a fullscreen app is detected, regardless
-    # of current FPS. Games and other heavy fullscreen apps spike GPU
-    # contention faster than our 4 s FPS-trend detector can react, so
-    # the user saw a visible 1-2 s lag on game launch. Engaging on
-    # fullscreen-detected instead of waiting for FPS to crash means
-    # the live view gets the lighter pipeline before the lag is
-    # perceptible. 1.0 s tolerance to absorb transient brief
-    # fullscreen events (UAC dialogs, Alt-Tab, etc.) without
-    # thrashing the engine swap.
-    _FULLSCREEN_PRE_EMPT_ENTER_SECONDS = 1.0
     _FORCED_TEST_FPS_TARGET = 10.0
     _NORMAL_PROCESS_WIDTH = 960
     _LOW_FPS_PROCESS_WIDTH = 384
@@ -555,13 +542,10 @@ class GestureWorker(QObject):
     _FULLSCREEN_POLL_INTERVAL = 1.0
     # Drawing pen-lift hold duration. When the user opens their
     # thumb, the pen lifts after this many seconds of continuous
-    # open-thumb detection. 0.08 s (~2-3 frames at 30 fps) feels
-    # instant from the user's perspective. Rotation wobble that
-    # used to false-flicker thumb_open_now is now handled at the
-    # detection layer by using palm_distance (rotation-invariant)
-    # instead of thumb_index_distance — so the hold no longer needs
-    # to absorb rotation flicker.
-    _DRAWING_THUMB_OPEN_HOLD_SECONDS = 0.08
+    # open-thumb detection. 0.20 s is short enough to feel
+    # immediate (~6 frames at 30 fps) but long enough that brief
+    # rotation wobble during a stroke can't trigger a false lift.
+    _DRAWING_THUMB_OPEN_HOLD_SECONDS = 0.20
     # Suggestion overlay: triggered when measured FPS stays below 15 for
     # longer than 10 seconds. After the user dismisses (X, left-fist, or
     # auto-dismiss), we wait this many seconds before re-offering.
@@ -824,11 +808,6 @@ class GestureWorker(QObject):
         self._youtube_control_text = "youtube idle"
         self._youtube_mode_info = "off"
         self._youtube_mode_prev_active = False
-        # Tracks whether the tutorial auto-activated YouTube mode in
-        # the voice_command step so set_tutorial_context(False) can
-        # tear it back down without disturbing user-initiated forced
-        # mode (held 'four') in a shared-worker tutorial session.
-        self._tutorial_forced_youtube_on = False
         self._chrome_mode_prev_active = False
         self._last_chrome_action_counter = 0
         self._last_spotify_action_counter = 0
@@ -888,15 +867,6 @@ class GestureWorker(QObject):
         self._prime_voice_runtime_async()
         self._voice_control_text = self.voice_listener.message
         self._voice_heard_text = "-"
-        # Optional one-shot intercept for short utterances that
-        # belong to a modeless UI choice (currently used by the
-        # show_overlay_drawing disambiguation pill). Main window
-        # sets this when a chooser opens and clears it on close.
-        # Called with the raw heard text; returns True if the
-        # utterance was consumed by the UI and shouldn't be passed
-        # to the regular voice_processor.
-        self._voice_intercept_lock = threading.Lock()
-        self._voice_intercept = None  # type: Optional[Callable[[str], bool]]
         self._voice_candidate = "neutral"
         self._voice_candidate_since = 0.0
         self._voice_cooldown_until = 0.0
@@ -1005,15 +975,6 @@ class GestureWorker(QObject):
         self._window_expand_candidate_since = 0.0
         self._window_contract_candidate_since = 0.0
         self._window_close_candidate_since = 0.0
-        # When True, the user's right hand is currently holding the
-        # close-window pose (palm + thumb out, other 4 fingers folded).
-        # _build_debug_payload reads this flag and overrides
-        # stable_label = "close" so the live-view bbox turns green
-        # and shows the gesture name — same visual feedback the
-        # static-recognizer poses get for free. Without this, the
-        # close action fires (window closes) but the user gets no
-        # in-frame confirmation that Touchless saw the pose.
-        self._window_close_pose_active_flag = False
         self._window_gesture_cooldown_until = 0.0
         self._window_pair_smoothed_distance: float | None = None
         self._window_pair_last_seen_at = 0.0
@@ -1828,19 +1789,11 @@ class GestureWorker(QObject):
         # on landmark 8 to make the cursor feel fidgety when the
         # user holds their finger still while drawing. Apply a
         # second per-cursor EMA with a velocity-adaptive alpha:
-        #   - slow motion (< 0.004 normalized, ~2.5 px on 640-wide)
-        #     -> alpha 0.34 (heavy smoothing, suppresses jitter)
-        #   - fast motion (> 0.024 normalized, ~15 px / fast stroke)
-        #     -> alpha 0.94 (near-direct passthrough, minimal lag)
-        #   - between -> linear ramp
-        #
-        # Previous curve (alpha 0.30 -> 0.85) made fast strokes feel
-        # like they were "dragging behind then over-adjusting" — 15%
-        # lag compounded across multiple frames at high speed is
-        # very noticeable. The new upper bound (0.94) keeps cursor
-        # within ~1 frame of the hand at fast motion. Slow band is
-        # bumped slightly (0.30 -> 0.34) so hover/aim feels more
-        # responsive without losing meaningful jitter suppression.
+        #   - slow motion (< 0.005 normalized, ~3 px on 640-wide)
+        #     â†’ alpha 0.30 (heavy smoothing, suppresses jitter)
+        #   - fast motion (> 0.030 normalized, ~19 px / fast stroke)
+        #     â†’ alpha 0.85 (near-passthrough, preserves response)
+        #   - between â†’ linear ramp
         # First frame after the cursor was None (drawing mode just
         # entered or hand just re-acquired) snaps to the current
         # value with no smoothing so the cursor doesn't visibly
@@ -1853,55 +1806,49 @@ class GestureWorker(QObject):
             dx = cursor_x - px
             dy = cursor_y - py
             motion = (dx * dx + dy * dy) ** 0.5
-            if motion < 0.004:
-                alpha = 0.34
-            elif motion > 0.024:
-                alpha = 0.94
+            if motion < 0.005:
+                alpha = 0.30
+            elif motion > 0.030:
+                alpha = 0.85
             else:
-                t = (motion - 0.004) / (0.024 - 0.004)
-                alpha = 0.34 + (0.94 - 0.34) * t
+                t = (motion - 0.005) / (0.030 - 0.005)
+                alpha = 0.30 + (0.85 - 0.30) * t
             self._drawing_cursor_norm = (px + alpha * dx, py + alpha * dy)
         if self._drawing_lift_pose_active(hand_reading):
             self._drawing_tool = "hover"
             self._drawing_control_text = f"drawing hover ({self._drawing_render_target})"
             self._camera_draw_last_point = None
             return
-        # Pen-lift trigger: open the thumb and the pen lifts.
-        # "Open" here means the thumb tip is geometrically far from
-        # the palm center — i.e. the thumb is pointing OUTWARDS, away
-        # from the palm. We use palm_distance (tip-to-palm, normalized
-        # by palm scale) as the primary signal because it's rotation-
-        # INVARIANT: rotating the whole hand doesn't change how far the
-        # thumb is from its own palm. The previous check used
-        # thumb_index_distance which DID wobble during rotation, so
-        # the 0.20 s timer kept resetting and lift felt sluggish
-        # (the user reported ~1 s of perceived lag while drawing
-        # with a rotated hand).
+        # Pen-lift trigger: open the thumb for >= 0.20 s and the
+        # pen lifts. Detection requires multiple corroborating
+        # signals so a rotated single-finger pose (where the
+        # state classifier sometimes mis-labels the thumb as
+        # fully_open with low openness) doesn't false-fire.
         #
-        # Signals (AND-ed):
-        #   - thumb.state == "fully_open"   (classifier agreement)
-        #   - thumb.openness >= 0.55        (rejects borderline reads;
-        #                                    looser than before — the
-        #                                    geometric check carries
-        #                                    the weight now)
-        #   - thumb.curl    <= 0.40         (not curled across palm)
-        #   - thumb.palm_distance >= 0.70   (geometric: thumb tip is
-        #                                    actually splayed away
-        #                                    from the palm — stable
-        #                                    under hand rotation)
+        # All four conditions must hold:
+        #   - thumb.state == "fully_open" (classifier's call)
+        #   - thumb.openness >= 0.65          (visibly open, not borderline)
+        #   - thumb.curl    <= 0.35           (not curled across the palm)
+        #   - spreads.thumb_index distance >= 0.55
+        #     (the thumb is actually splayed away from the index;
+        #      a folded thumb sits close to the index regardless
+        #      of what the classifier thinks)
+        #
+        # User screenshot showed the failing case: state=fully_open,
+        # openness=0.54, curl=0.46, spread=0.46 â€” all four signals
+        # in the borderline band. The new AND-of-four rejects it.
         thumb = hand_reading.fingers.get("thumb")
         thumb_state = getattr(thumb, "state", None) if thumb is not None else None
         thumb_openness = float(getattr(thumb, "openness", 0.0) or 0.0) if thumb is not None else 0.0
         thumb_curl = float(getattr(thumb, "curl", 0.0) or 0.0) if thumb is not None else 1.0
-        thumb_palm_distance = (
-            float(getattr(thumb, "palm_distance", 0.0) or 0.0) if thumb is not None else 0.0
-        )
+        spread_ti = hand_reading.spreads.get("thumb_index") if hasattr(hand_reading, "spreads") else None
+        thumb_index_distance = float(getattr(spread_ti, "distance", 0.0) or 0.0) if spread_ti is not None else 0.0
         thumb_open_now = (
             thumb is not None
             and thumb_state == "fully_open"
-            and thumb_openness >= 0.55
-            and thumb_curl <= 0.40
-            and thumb_palm_distance >= 0.70
+            and thumb_openness >= 0.65
+            and thumb_curl <= 0.35
+            and thumb_index_distance >= 0.55
         )
 
         erase_active = self._drawing_erase_pose_active(prediction, hand_reading)
@@ -3055,40 +3002,21 @@ class GestureWorker(QObject):
 
     def _handle_window_control_gestures(self, hand_reading, hand_handedness: str | None, now: float) -> bool:
         if hand_handedness != "Right" or hand_reading is None:
-            self._window_close_pose_active_flag = False
             self._reset_window_gesture_state(clear_cooldown=False)
             return False
         if now < self._window_gesture_cooldown_until:
-            self._window_close_pose_active_flag = False
             return False
         controller = self.voice_processor.desktop_controller
-        close_active = self._window_close_pose_active(hand_reading)
-        # Mirror the live close-pose state onto the flag every frame
-        # so the debug-payload override flips to "close" the instant
-        # the user starts holding the pose, not after the 1-second
-        # confirmation window. The bbox-green / label-shown feedback
-        # is most useful BEFORE the action fires — it tells the
-        # user "yes, I see your pose, keep holding to confirm".
-        self._window_close_pose_active_flag = close_active
-        if close_active:
+        if self._window_close_pose_active(hand_reading):
             if self._window_close_candidate_since <= 0.0:
                 self._window_close_candidate_since = now
             if now - self._window_close_candidate_since >= 1.0:
-                # Route through the binding pipeline so the user can
-                # rebind the close-window pose to a different action
-                # (or rebind close_active_window to a different pose)
-                # via Settings → Gesture Binds.
-                bound_action_id = None
-                try:
-                    bound_action_id = action_bound_to_pose(self.config, "close_window")
-                except Exception:
-                    bound_action_id = None
-                if not bound_action_id:
-                    bound_action_id = "close_active_window"
-                success = bool(self._dispatch_action(bound_action_id, now))
+                success = controller.close_active_window()
+                self._chrome_control_text = controller.message
+                self._spotify_control_text = controller.message
                 if success:
+                    self.command_detected.emit(controller.message)
                     self._window_gesture_cooldown_until = now + 2.0
-                self._window_close_pose_active_flag = False
                 self._reset_window_gesture_state(clear_cooldown=False)
                 return True
             return True
@@ -3288,25 +3216,6 @@ class GestureWorker(QObject):
         if not self._tutorial_mode_enabled:
             self.chrome_router.reset()
             self.spotify_router.reset()
-            if self._tutorial_forced_youtube_on:
-                self.youtube_router.reset()
-                self._tutorial_forced_youtube_on = False
-
-    def force_youtube_mode_for_tutorial(self) -> bool:
-        # Tutorial-only: auto-activate YouTube mode after the user
-        # successfully plays a YouTube video via the voice_command
-        # step. The corresponding cleanup happens in
-        # set_tutorial_context(False) above so the mode never leaks
-        # past tutorial close (matters when the tutorial shares the
-        # main app's worker rather than spawning its own).
-        try:
-            now = time.monotonic()
-            activated = self.youtube_router.force_on(now=now, controller=self.youtube_controller)
-        except Exception:
-            activated = False
-        if activated:
-            self._tutorial_forced_youtube_on = True
-        return activated
 
     def _cursor_to_active_monitor(self, x: float, y: float) -> tuple[float, float]:
         """Remap a normalized cursor position [0,1] from "covers the
@@ -3439,8 +3348,8 @@ class GestureWorker(QObject):
         if getattr(self.config, "low_fps_mode", False):
             return
         # Only auto-engage when a fullscreen app (typically a game) has
-        # foreground focus. Without this gate, transient stalls during
-        # normal desktop use would thrash the engine.
+        # foreground focus and is starving us of CPU. Without this gate,
+        # transient stalls during normal desktop use would thrash the engine.
         fullscreen = self._fullscreen_foreground_active
         if not fullscreen:
             if self._low_fps_auto_engaged:
@@ -3449,21 +3358,6 @@ class GestureWorker(QObject):
                 self._low_fps_below_since = None
                 self._low_fps_above_since = None
             return
-        # PRE-EMPTIVE engage: as soon as a fullscreen app has been on
-        # screen for ~1 s, drop into low-fps mode regardless of what
-        # the FPS counter reads. By the time the FPS-trend detector
-        # noticed (after 4 s sub-18-fps), the user had already seen
-        # 1-2 s of visible camera lag. Engaging on fullscreen-detected
-        # heads that off before it's perceptible.
-        if not self._low_fps_auto_engaged:
-            if self._low_fps_below_since is None:
-                self._low_fps_below_since = now
-            elif (now - self._low_fps_below_since) >= self._FULLSCREEN_PRE_EMPT_ENTER_SECONDS:
-                self._engage_auto_low_fps()
-                return
-        # FPS-trend fallback for the rare case the pre-empt didn't fire
-        # (e.g., very short pre-empt window not yet elapsed and FPS is
-        # already in the toilet). Same thresholds as before.
         fps = self._fps
         if fps <= 0.0:
             return
@@ -3474,10 +3368,7 @@ class GestureWorker(QObject):
             elif not self._low_fps_auto_engaged and (now - self._low_fps_below_since) >= self._LOW_FPS_AUTO_ENTER_SECONDS:
                 self._engage_auto_low_fps()
         else:
-            # Don't reset _low_fps_below_since here -- the pre-empt
-            # timer above also uses it as a 'how long has fullscreen
-            # been active?' counter, and resetting on a single high-
-            # fps tick would defer pre-empt engagement.
+            self._low_fps_below_since = None
             if self._low_fps_auto_engaged:
                 if self._low_fps_above_since is None:
                     self._low_fps_above_since = now
@@ -4877,24 +4768,8 @@ class GestureWorker(QObject):
             self._volume_init_palm_x = None
             self._update_volume_overlay()
             return
-        # Previously: blocked the mute toggle for 500 ms after a
-        # right-hand swipe to avoid the swipe arc being misclassified
-        # as a mute pose. That block was the cause of the "mute is
-        # detected but action doesn't fire" bug in main-app usage:
-        # users naturally chain a swipe (navigate) followed by a mute
-        # attempt, and the block silently dropped the mute. Removed
-        # because the volume_gesture's three internal dedup layers
-        # already prevent the swipe-misclassified-as-mute case:
-        #   1) static_recognizer's stable_label requires N frames of
-        #      consistent classification before stable_gesture flips
-        #      to 'mute' — transient classification noise during a
-        #      swipe arc never reaches the trigger;
-        #   2) _mute_gesture_latched ensures one toggle per continuous
-        #      gesture hold;
-        #   3) mute_cooldown_seconds=1.0 caps the rate of toggles
-        #      across separate gesture events.
-        # Kept _mute_block_until field initialized to 0.0 below so any
-        # external reader (tests, debug overlays) doesn't NameError.
+        if hand_handedness == "Right" and result.prediction.dynamic_label in {"swipe_left", "swipe_right"}:
+            self._mute_block_until = max(self._mute_block_until, now + 0.5)
 
         features = None
         candidate_scores = {}
@@ -5270,20 +5145,6 @@ class GestureWorker(QObject):
                 # Wheel overlays are stateful. Skipping for now â€” see
                 # docstring above.
                 fired = False
-            elif action_id == "close_active_window":
-                try:
-                    controller = self.voice_processor.desktop_controller
-                    success = bool(controller.close_active_window())
-                    if success:
-                        self._chrome_control_text = controller.message
-                        self._spotify_control_text = controller.message
-                        try:
-                            self.command_detected.emit(controller.message)
-                        except Exception:
-                            pass
-                    fired = success
-                except Exception:
-                    fired = False
             elif action_id.startswith("custom_action:"):
                 name = action_id.split(":", 1)[1]
                 # Reuse the runner's already-loaded registry instead of
@@ -5516,18 +5377,16 @@ class GestureWorker(QObject):
         except Exception:
             return False
 
-    def _custom_runner_image_overlay_handler(self, filename: str, resolved_path: str = "") -> None:
+    def _custom_runner_image_overlay_handler(self, filename: str) -> None:
         """Bridge from the custom-gesture runner (worker thread) to
-        the main window (GUI thread). Emits a Qt signal — the
+        the main window (GUI thread). Just emits a Qt signal â€” the
         receiver runs on the GUI thread because Qt picks a queued
-        connection across threads — and main_window does the
-        overlay-widget mutation there. Logs to recent-actions so
-        the user can see the fire in the same activity feed as
-        built-in gestures."""
+        connection across threads â€” and main_window does the actual
+        path resolution and overlay-widget mutation there.
+        Logs to recent-actions so the user can see the fire in the
+        same activity feed as built-in gestures."""
         try:
-            self.drawing_overlay_toggle_requested.emit(
-                str(filename or ""), str(resolved_path or "")
-            )
+            self.drawing_overlay_toggle_requested.emit(str(filename or ""))
         except Exception:
             pass
         try:
@@ -5537,30 +5396,6 @@ class GestureWorker(QObject):
             )
         except Exception:
             pass
-
-    def set_voice_intercept(self, callback) -> None:
-        """Install a one-shot voice intercept. The next heard
-        utterance is passed to `callback(text) -> bool`; if it
-        returns True the utterance is consumed (UI handled it)
-        and the regular voice_processor pipeline is bypassed.
-        Pass `None` to clear. Thread-safe."""
-        with self._voice_intercept_lock:
-            self._voice_intercept = callback
-
-    def _consume_voice_intercept(self, heard_text: str) -> bool:
-        """Atomic check-and-call: if an intercept is installed,
-        invoke it with `heard_text`. Returns True if the intercept
-        consumed the utterance. The intercept stays installed
-        across multiple utterances — main_window clears it when
-        the owning UI closes."""
-        with self._voice_intercept_lock:
-            cb = self._voice_intercept
-        if cb is None:
-            return False
-        try:
-            return bool(cb(heard_text))
-        except Exception:
-            return False
 
     def reset_pinch_grab_state(self) -> None:
         """Clear cumulative transform + active mode. Called by
@@ -6649,16 +6484,6 @@ class GestureWorker(QObject):
         payload_stable_label = prediction.stable_label
         payload_dynamic_label = dynamic_display
         banner_text = prediction.stable_label if prediction.stable_label != "neutral" else prediction.raw_label
-        # Close-window pose is detected ad-hoc in
-        # _handle_window_control_gestures (NOT by the static
-        # recognizer), so the static labels above stay "neutral"
-        # while the user holds the pose. Override here so the
-        # live-view bbox turns green and shows "close" — exactly
-        # like every other recognised gesture.
-        if getattr(self, "_window_close_pose_active_flag", False):
-            payload_stable_label = "close"
-            payload_raw_label = "close"
-            banner_text = "close"
         if self._drawing_mode_enabled:
             payload_raw_label = "neutral"
             payload_stable_label = "neutral"
@@ -8154,23 +7979,7 @@ class GestureWorker(QObject):
                     transcript_mode=transcript_mode,
                 )
                 heard_text = result.heard_text
-                # One-shot UI intercept (e.g. drawing-chooser pill).
-                # If the utterance is consumed by a modeless chooser,
-                # short-circuit the voice_processor + don't surface
-                # any "command not understood" feedback.
-                if (mode in {"general", "selection"} and result.success
-                        and self._consume_voice_intercept(result.heard_text)):
-                    payload = {
-                        "event": "result",
-                        "mode": mode,
-                        "success": True,
-                        "target": "voice",
-                        "heard_text": result.heard_text,
-                        "control_text": "ok",
-                        "info_text": "",
-                        "display_text": result.heard_text,
-                    }
-                elif mode in {"general", "selection"} and result.success:
+                if mode in {"general", "selection"} and result.success:
                     _push_status("processing", command_text=result.heard_text)
                     context = VoiceCommandContext(preferred_app=preferred_target) if mode == "general" else None
                     try:
