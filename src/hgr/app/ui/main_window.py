@@ -6453,6 +6453,12 @@ class MainWindow(QMainWindow):
             SECTION_GESTURE_BINDS, SECTION_CAMERA, SECTION_MICROPHONE,
             SECTION_SAVE_LOCATIONS, SECTION_COLORS, SECTION_TUTORIAL,
             SECTION_UPDATES,
+            # Newer tabs that were missing from search indexing -- General
+            # (Mouse / Overlay / System Modes / Spotify / Startup) and
+            # About (legal / credits) -- both still navigable via the
+            # tab buttons themselves now that they're in the tuple.
+            SECTION_GENERAL,
+            SECTION_ABOUT,
         )
         # 1. Gesture / voice cards inside the Control Guide. For each
         # GestureGuideCard / VoiceCommandCard in any panel, walk up
@@ -6514,7 +6520,9 @@ class MainWindow(QMainWindow):
         # child as a "subsection" entry. Lets users type 'phone'
         # and jump to the phone-camera card.
         for nav_idx, section_id in enumerate(
-            (SECTION_CAMERA, SECTION_MICROPHONE, SECTION_SAVE_LOCATIONS, SECTION_COLORS, SECTION_TUTORIAL, SECTION_UPDATES, SECTION_INSTRUCTIONS)
+            (SECTION_CAMERA, SECTION_MICROPHONE, SECTION_SAVE_LOCATIONS,
+             SECTION_COLORS, SECTION_TUTORIAL, SECTION_UPDATES,
+             SECTION_INSTRUCTIONS, SECTION_GENERAL, SECTION_ABOUT)
         ):
             panel = self.settings_content_stack.widget(section_id)
             if panel is None:
@@ -6620,6 +6628,88 @@ class MainWindow(QMainWindow):
                 "phone microphone qr pair connect iphone",
                 SECTION_MICROPHONE,
                 getattr(self, "phone_camera_qr_button_mic", None),
+            ),
+            # ---- Camera tab: Live View Overlay checkboxes -------------
+            # The HUD toggles that drive the top-left FPS / Latency
+            # overlay and the bottom-centre tracking-quality pill.
+            (
+                "Camera: Show FPS in Live View",
+                "fps frames per second performance hud overlay live view counter",
+                SECTION_CAMERA,
+                getattr(self, "live_view_fps_checkbox", None),
+            ),
+            (
+                "Camera: Show Display Latency",
+                "latency lag ms milliseconds hud overlay live view display",
+                SECTION_CAMERA,
+                getattr(self, "live_view_latency_checkbox", None),
+            ),
+            (
+                "Camera: Show Tracking Quality",
+                "tracking quality good marginal no hand seen confidence pill chip overlay",
+                SECTION_CAMERA,
+                getattr(self, "live_view_tracking_quality_checkbox", None),
+            ),
+            # ---- General tab: Mouse + Overlay + System Modes ----------
+            (
+                "General: Mouse Sensitivity",
+                "mouse sensitivity speed control box area cursor",
+                SECTION_GENERAL,
+                self._general_controls.get("mouse_control_box_area"),
+            ),
+            (
+                "General: Mouse Active Monitor",
+                "mouse monitor display screen multi multimonitor active",
+                SECTION_GENERAL,
+                self._general_controls.get("mouse_active_monitor_index"),
+            ),
+            (
+                "General: Camera View Overlay",
+                "camera view thumbnail mini live viewer corner overlay show hide",
+                SECTION_GENERAL,
+                self._general_controls.get("overlay_camera_view_enabled"),
+            ),
+            (
+                "General: Text Pop-ups",
+                "text popups toasts notifications save prompts hint pills",
+                SECTION_GENERAL,
+                self._general_controls.get("overlay_text_popups_enabled"),
+            ),
+            (
+                "General: Gaming Overlay (auto-hide pop-ups)",
+                "gaming mode auto hide popups game detection valorant fortnite",
+                SECTION_GENERAL,
+                self._general_controls.get("overlay_gaming_mode_enabled"),
+            ),
+            (
+                "General: Gaming Live View (auto-hide camera)",
+                "gaming live view auto hide camera thumbnail game detection",
+                SECTION_GENERAL,
+                self._general_controls.get("overlay_gaming_live_view_disabled"),
+            ),
+            (
+                "General: Low FPS Mode",
+                "low fps mode degrade fallback performance slower framerate auto",
+                SECTION_GENERAL,
+                self._general_controls.get("low_fps_mode"),
+            ),
+            (
+                "General: Lite Mode",
+                "lite mode model light fast complexity speed performance",
+                SECTION_GENERAL,
+                self._general_controls.get("lite_mode"),
+            ),
+            (
+                "General: GPU Mode",
+                "gpu mode hardware acceleration directml onnx fast",
+                SECTION_GENERAL,
+                self._general_controls.get("gpu_mode"),
+            ),
+            (
+                "General: Start on Sign-In (Auto-Start)",
+                "autostart auto start startup launch login sign in boot registry run",
+                SECTION_GENERAL,
+                self._general_controls.get("auto_start_on_login"),
             ),
         ]
         # Save Locations: one entry per output kind (drawings, screenshots,
@@ -7167,12 +7257,12 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(controls_title)
 
         capabilities = [
-            ("Spotify",   "Play, pause, skip, shuffle, and adjust volume. Or just say “play X on Spotify”."),
-            ("Chrome",    "Search, switch tabs, refresh. Or say “search X on Chrome”."),
-            ("Mouse",     "Move the cursor with your hand. Pinch to click. Two fingers up to scroll."),
-            ("Volume",    "Change system volume, mute, and unmute with a hand gesture."),
-            ("Voice",     "Hold a left-hand gesture to start listening. Speak commands or dictate text."),
-            ("Drawing",   "Sketch over your screen or the camera feed. Save as a PNG."),
+            ("Apps",                "Control Spotify, Chrome, and YouTube with gestures or voice — play, pause, skip, search, switch tabs."),
+            ("System",              "Mouse cursor + click + scroll, system volume / mute, and window control (close, minimize, maximize, restore)."),
+            ("Open Apps & Files",   "Voice: “open Notepad”, “open notes.docx”, “open Documents”. Or bind any file or shell command to a custom gesture."),
+            ("Voice & Dictation",   "Hold a left-hand gesture to issue voice commands or dictate text into the focused field with grammar correction."),
+            ("Drawing & Capture",   "Sketch over your screen, save as PNG, show saved drawings as overlays. Capture clips or screenshots with a gesture."),
+            ("Gestures",            "Built-in static (held poses) and dynamic (motion) gestures, plus your own custom poses bound to almost any action."),
         ]
         cap_grid = QGridLayout()
         cap_grid.setHorizontalSpacing(SPACE_LG)
@@ -9365,6 +9455,7 @@ class MainWindow(QMainWindow):
                     name=result.name,
                     description=result.description,
                     action=result.action,
+                    duration_mode=result.duration_mode or "fixed_short",
                     parent=self,
                     config=self.config,
                 )
