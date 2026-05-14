@@ -1809,7 +1809,10 @@ class GestureGuideCard(QFrame):
         top_row.addStretch(1)
         self._expand_card_button = QPushButton()
         self._expand_card_button.setObjectName("gestureCardExpand")
-        self._expand_card_button.setFixedSize(26, 26)
+        # Narrower than tall so the button feels like an icon button,
+        # not a square chip. Width tuned to barely contain the 16 px
+        # icon + 1 px breathing room on each side.
+        self._expand_card_button.setFixedSize(22, 24)
         self._expand_card_button.setCursor(Qt.PointingHandCursor)
         self._expand_card_button.setToolTip("Expand this card")
         # Diagonal-arrow icon (matches the user-supplied image) --
@@ -2183,17 +2186,16 @@ def _build_voice_command_cards() -> list[VoiceCommandCard]:
 
 
 def _make_section_chevron_icon(*, expand: bool, color: str = "#FFFFFF", size: int = 20) -> "QIcon":
-    """Generate a small diagonal-arrow icon matching the user's
-    requested expand/collapse glyph (the second image in the
-    attached set: solid rounded-square button with two outward
-    arrows for expand, inward arrows for collapse).
+    """Diagonal-arrow expand/collapse glyph.
 
-    `expand=True`  → top-right + bottom-left arrows pointing OUT
-                     to corners (used when the section is currently
-                     COLLAPSED → click expands).
-    `expand=False` → arrows pointing IN from the same two corners
-                     toward the centre (currently EXPANDED → click
-                     collapses).
+    expand=True  -> two arrows pointing OUTWARD to top-right + bottom-
+                    left corners. Shafts start near centre, tips at the
+                    corners. Means 'click to expand'.
+    expand=False -> two arrows pointing INWARD from those corners
+                    toward the centre, but the tips STOP well before
+                    the centre so there's a clear empty diamond of
+                    space between them (per user feedback). Means
+                    'click to collapse'.
     """
     from PySide6.QtGui import QIcon, QPainter, QPen, QPixmap, QColor
     pix = QPixmap(size, size)
@@ -2201,39 +2203,45 @@ def _make_section_chevron_icon(*, expand: bool, color: str = "#FFFFFF", size: in
     painter = QPainter(pix)
     painter.setRenderHint(QPainter.Antialiasing, True)
     pen = QPen(QColor(color))
-    stroke_w = max(1.6, size * 0.12)
+    stroke_w = max(1.6, size * 0.13)
     pen.setWidthF(stroke_w)
     pen.setCapStyle(Qt.RoundCap)
     pen.setJoinStyle(Qt.RoundJoin)
     painter.setPen(pen)
-    margin = size * 0.20            # arrowhead distance from icon edge
-    near = size * 0.50              # inner end of the diagonal lines
-    head = size * 0.20              # length of each arrowhead leg
-    near_inset = size * 0.10        # how far past 'near' to draw the head
+    edge = size * 0.18              # corner inset (where corner ends sit)
+    head = size * 0.22              # arrowhead leg length
     if expand:
-        # Top-right arrowhead at (size-margin, margin); shaft to (near, near).
-        tx, ty = size - margin, margin
-        painter.drawLine(int(near + near_inset), int(near - near_inset), int(tx), int(ty))
+        # Shafts start near centre; tips at the corners.
+        inner = size * 0.42         # near-centre end of each shaft
+        # Top-right diagonal (shaft from near-centre UP-RIGHT to corner).
+        sx, sy = inner, size - inner
+        tx, ty = size - edge, edge
+        painter.drawLine(int(sx), int(sy), int(tx), int(ty))
         painter.drawLine(int(tx), int(ty), int(tx - head), int(ty))
         painter.drawLine(int(tx), int(ty), int(tx), int(ty + head))
-        # Bottom-left arrowhead at (margin, size-margin); shaft to (near, near).
-        bx, by = margin, size - margin
-        painter.drawLine(int(near - near_inset), int(near + near_inset), int(bx), int(by))
+        # Bottom-left diagonal (mirror).
+        sx2, sy2 = size - inner, inner
+        bx, by = edge, size - edge
+        painter.drawLine(int(sx2), int(sy2), int(bx), int(by))
         painter.drawLine(int(bx), int(by), int(bx + head), int(by))
         painter.drawLine(int(bx), int(by), int(bx), int(by - head))
     else:
-        # Top-right -> centre; head at centre pointing IN toward (near, near).
-        tx, ty = size - margin, margin
-        painter.drawLine(int(tx), int(ty), int(near + near_inset), int(near - near_inset))
-        cx, cy = int(near + near_inset), int(near - near_inset)
-        painter.drawLine(cx, cy, cx - head, cy)
-        painter.drawLine(cx, cy, cx, cy + head)
-        # Bottom-left -> centre.
-        bx, by = margin, size - margin
-        painter.drawLine(int(bx), int(by), int(near - near_inset), int(near + near_inset))
-        cx, cy = int(near - near_inset), int(near + near_inset)
-        painter.drawLine(cx, cy, cx + head, cy)
-        painter.drawLine(cx, cy, cx, cy - head)
+        # Shafts start at corners and stop short of centre so a clear
+        # gap remains between the two inward arrowheads. inner=0.34
+        # leaves a ~0.32*size diamond in the middle of the icon.
+        inner = size * 0.34
+        # Top-right corner -> down-left, tip at (size-inner, inner).
+        cx, cy = size - edge, edge
+        tx, ty = size - inner, inner
+        painter.drawLine(int(cx), int(cy), int(tx), int(ty))
+        painter.drawLine(int(tx), int(ty), int(tx + head), int(ty))
+        painter.drawLine(int(tx), int(ty), int(tx), int(ty - head))
+        # Bottom-left corner -> up-right (mirror).
+        bx, by = edge, size - edge
+        ex, ey = inner, size - inner
+        painter.drawLine(int(bx), int(by), int(ex), int(ey))
+        painter.drawLine(int(ex), int(ey), int(ex - head), int(ey))
+        painter.drawLine(int(ex), int(ey), int(ex), int(ey + head))
     painter.end()
     return QIcon(pix)
 
