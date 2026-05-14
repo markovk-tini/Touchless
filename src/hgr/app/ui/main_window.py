@@ -1903,6 +1903,14 @@ class GestureGuideCard(QFrame):
         self._detail_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
         self._desc_scroll = QScrollArea()
+        # Object name so the app stylesheet's
+        # QScrollArea#gestureCardDescScroll rules can override the
+        # default-Qt black scrollbar with the accent-green one used
+        # by the outer Control Guide scroll. Without it the inner
+        # detail scrollbar rendered as the OS-default grey on light
+        # themes / black on dark, which the user flagged as the
+        # 'actual black scrollbar' that didn't match the design.
+        self._desc_scroll.setObjectName("gestureCardDescScroll")
         self._desc_scroll.setFrameShape(QFrame.NoFrame)
         self._desc_scroll.setWidgetResizable(True)
         self._desc_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -13481,6 +13489,50 @@ Admin elevation
         QScrollArea#gestureGuideScroll QScrollBar::sub-page:vertical {{
             background: transparent;
         }}
+        /* Inner card description scrollbar: long how-to text inside
+           an expanded gesture card scrolls in its own QScrollArea
+           (gestureCardDescScroll). Without explicit rules this fell
+           back to the OS-default scrollbar (black on dark Win11),
+           which the user flagged as 'the actual black one'. Style
+           it the same accent-green as the outer Control Guide
+           scrollbar but slimmer (8 px vs 14 px) so a nested
+           scrollbar doesn't compete visually with the outer one. */
+        QScrollArea#gestureCardDescScroll QScrollBar:vertical {{
+            background: rgba(255,255,255,0.04);
+            width: 8px;
+            border-radius: 4px;
+            margin: 1px 0;
+        }}
+        QScrollArea#gestureCardDescScroll QScrollBar::handle:vertical {{
+            background: {self.config.accent_color};
+            min-height: 26px;
+            border-radius: 4px;
+        }}
+        QScrollArea#gestureCardDescScroll QScrollBar::handle:vertical:hover {{
+            background: {self.config.accent_color};
+        }}
+        QScrollArea#gestureCardDescScroll QScrollBar::add-line:vertical,
+        QScrollArea#gestureCardDescScroll QScrollBar::sub-line:vertical {{
+            height: 0px;
+        }}
+        QScrollArea#gestureCardDescScroll QScrollBar::add-page:vertical,
+        QScrollArea#gestureCardDescScroll QScrollBar::sub-page:vertical {{
+            background: transparent;
+        }}
+        /* Tooltip styling. Default Qt tooltip on Windows renders as
+           a stark pale-yellow / black rectangle that clashes with
+           the Touchless dark theme -- the user flagged this as the
+           'black rectangle on hover'. Re-style globally so any
+           tooltip surface matches the app palette. */
+        QToolTip {{
+            background-color: {self.config.surface_color};
+            color: {self.config.text_color};
+            border: 1px solid {accent_outline_strong};
+            border-radius: 8px;
+            padding: 6px 10px;
+            font-size: 12px;
+            font-weight: 600;
+        }}
         QScrollArea#saveLocationsScroll, QScrollArea#saveLocationsScroll > QWidget,
         QScrollArea#saveLocationsScroll QWidget#qt_scrollarea_viewport,
         QWidget#saveLocationsScrollContent {{
@@ -13632,6 +13684,12 @@ Admin elevation
             padding: 12px 18px;
             font-weight: 800;
             min-width: 110px;
+            /* outline:none kills the dashed focus rectangle Qt
+               draws around the keyboard-focused button. On the dark
+               theme it reads as a black rectangle inside the
+               button, which the user flagged as 'a black rectangle
+               appearing on hover/click'. */
+            outline: none;
         }}
         /* Back button: kept primary-blue per the b5 design — it's a
            "leave this page" affordance so it pops against the rest
@@ -13644,6 +13702,7 @@ Admin elevation
             padding: 12px 18px;
             font-weight: 800;
             min-width: 110px;
+            outline: none;
         }}
         QPushButton[settingsPanelButton="true"][hgrHover="true"],
         QPushButton[settingsPanelButton="true"]:hover,
@@ -13731,10 +13790,12 @@ Admin elevation
             color: {self.config.text_color};
             border: 1px solid {accent_outline};
             border-radius: 14px;
-            padding: 12px 18px;
-            font-weight: 800;
+            padding: 10px 16px;
+            font-weight: 700;
+            font-size: 13px;
             text-align: center;
             min-width: 110px;
+            outline: none;
         }}
         QStackedWidget#settingsContentStack QPushButton#gestureGuideSectionButton[hgrHover="true"],
         QStackedWidget#settingsContentStack QPushButton#gestureGuideSectionButton:hover {{
