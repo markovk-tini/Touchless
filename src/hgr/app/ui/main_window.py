@@ -2155,11 +2155,72 @@ def _build_voice_command_cards() -> list[VoiceCommandCard]:
     ]
 
 
+def _make_section_chevron_icon(*, expand: bool, color: str = "#FFFFFF", size: int = 20) -> "QIcon":
+    """Generate a small diagonal-arrow icon matching the user's
+    requested expand/collapse glyph (the second image in the
+    attached set: solid rounded-square button with two outward
+    arrows for expand, inward arrows for collapse).
+
+    `expand=True`  → top-right + bottom-left arrows pointing OUT
+                     to corners (used when the section is currently
+                     COLLAPSED → click expands).
+    `expand=False` → arrows pointing IN from the same two corners
+                     toward the centre (currently EXPANDED → click
+                     collapses).
+    """
+    from PySide6.QtGui import QIcon, QPainter, QPen, QPixmap, QColor
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    pen = QPen(QColor(color))
+    stroke_w = max(1.6, size * 0.12)
+    pen.setWidthF(stroke_w)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    margin = size * 0.20            # arrowhead distance from icon edge
+    near = size * 0.50              # inner end of the diagonal lines
+    head = size * 0.20              # length of each arrowhead leg
+    near_inset = size * 0.10        # how far past 'near' to draw the head
+    if expand:
+        # Top-right arrowhead at (size-margin, margin); shaft to (near, near).
+        tx, ty = size - margin, margin
+        painter.drawLine(int(near + near_inset), int(near - near_inset), int(tx), int(ty))
+        painter.drawLine(int(tx), int(ty), int(tx - head), int(ty))
+        painter.drawLine(int(tx), int(ty), int(tx), int(ty + head))
+        # Bottom-left arrowhead at (margin, size-margin); shaft to (near, near).
+        bx, by = margin, size - margin
+        painter.drawLine(int(near - near_inset), int(near + near_inset), int(bx), int(by))
+        painter.drawLine(int(bx), int(by), int(bx + head), int(by))
+        painter.drawLine(int(bx), int(by), int(bx), int(by - head))
+    else:
+        # Top-right -> centre; head at centre pointing IN toward (near, near).
+        tx, ty = size - margin, margin
+        painter.drawLine(int(tx), int(ty), int(near + near_inset), int(near - near_inset))
+        cx, cy = int(near + near_inset), int(near - near_inset)
+        painter.drawLine(cx, cy, cx - head, cy)
+        painter.drawLine(cx, cy, cx, cy + head)
+        # Bottom-left -> centre.
+        bx, by = margin, size - margin
+        painter.drawLine(int(bx), int(by), int(near - near_inset), int(near + near_inset))
+        cx, cy = int(near - near_inset), int(near + near_inset)
+        painter.drawLine(cx, cy, cx + head, cy)
+        painter.drawLine(cx, cy, cx, cy - head)
+    painter.end()
+    return QIcon(pix)
+
+
 class GestureGuideSection(QFrame):
     """Collapsible section in the Control Guide. Originally just for
     GestureGuideCard rows, now also accepts VoiceCommandCard rows
     via the same `cards` list (any QWidget works since we just
     stack them in a QVBoxLayout)."""
+
+    # Cached icons -- generated once per process and reused on every
+    # toggle so we don't spawn a fresh QPainter on each click.
+    _ICON_EXPAND = None
+    _ICON_COLLAPSE = None
 
     def __init__(self, title: str, cards: list, parent=None):
         super().__init__(parent)
@@ -2168,11 +2229,18 @@ class GestureGuideSection(QFrame):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(10)
 
-        self.header_button = QPushButton(f"▶  {title}")
+        if GestureGuideSection._ICON_EXPAND is None:
+            GestureGuideSection._ICON_EXPAND = _make_section_chevron_icon(expand=True, size=22)
+            GestureGuideSection._ICON_COLLAPSE = _make_section_chevron_icon(expand=False, size=22)
+
+        self.header_button = QPushButton(title)
         self.header_button.setObjectName("gestureGuideSectionButton")
         self.header_button.setProperty("settingsPanelButton", True)
         self.header_button.setCheckable(True)
         self.header_button.setChecked(False)
+        self.header_button.setIcon(GestureGuideSection._ICON_EXPAND)
+        from PySide6.QtCore import QSize as _QSize
+        self.header_button.setIconSize(_QSize(20, 20))
         self.header_button.clicked.connect(self._toggle_expanded)
         outer.addWidget(self.header_button)
 
@@ -2206,7 +2274,15 @@ class GestureGuideSection(QFrame):
         # all — child paints don't trigger overlay work. Dropdown
         # toggling can be a plain visibility flip again.
         self.content.setVisible(bool(checked))
-        self.header_button.setText(f"{'▼' if checked else '▶'}  {self.header_button.text()[3:]}")
+        # Swap the diagonal-arrow icon: outward arrows when
+        # collapsed (click expands), inward arrows when expanded
+        # (click collapses). Title text stays untouched.
+        new_icon = (
+            GestureGuideSection._ICON_COLLAPSE
+            if checked else GestureGuideSection._ICON_EXPAND
+        )
+        if new_icon is not None:
+            self.header_button.setIcon(new_icon)
 
 
 def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
@@ -6218,10 +6294,39 @@ class MainWindow(QMainWindow):
         # scrolling — so the actual fix has to come from the stack
         # reporting accurate hints, which is what _CurrentSizedStack does.
         content_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        accent = self.config.accent_color or "#1DE9B6"
         content_scroll.setStyleSheet(
             "QScrollArea#settingsContentScroll, QScrollArea#settingsContentScroll > QWidget,"
             " QScrollArea#settingsContentScroll QWidget#qt_scrollarea_viewport"
             " { background: transparent; border: none; }"
+            # Outer scrollbar is now the SOLE visible scrollbar on
+            # the four panels that used to wrap their content in a
+            # local QScrollArea (Instructions / General / Control
+            # Guide / Save Locations). Width 13 px so it reads as
+            # the primary scroll affordance; accent green to match
+            # the rest of the app instead of the OS-default black.
+            " QScrollArea#settingsContentScroll QScrollBar:vertical {"
+            "   background: rgba(255,255,255,0.05);"
+            "   width: 13px;"
+            "   border-radius: 6px;"
+            "   margin: 2px 0;"
+            " }"
+            f" QScrollArea#settingsContentScroll QScrollBar::handle:vertical {{"
+            f"   background: {accent};"
+            f"   min-height: 36px;"
+            f"   border-radius: 6px;"
+            f" }}"
+            f" QScrollArea#settingsContentScroll QScrollBar::handle:vertical:hover {{"
+            f"   background: {accent};"
+            f" }}"
+            " QScrollArea#settingsContentScroll QScrollBar::add-line:vertical,"
+            " QScrollArea#settingsContentScroll QScrollBar::sub-line:vertical {"
+            "   height: 0px;"
+            " }"
+            " QScrollArea#settingsContentScroll QScrollBar::add-page:vertical,"
+            " QScrollArea#settingsContentScroll QScrollBar::sub-page:vertical {"
+            "   background: transparent;"
+            " }"
         )
         content_scroll.viewport().setStyleSheet("background: transparent;")
 
@@ -7185,6 +7290,11 @@ class MainWindow(QMainWindow):
             "voice — no touch required. Your camera and microphone do "
             "the work, and everything runs locally on your machine.",
         )
+        # NOTE: the local `scroll` QScrollArea above is kept solely
+        # to leave its stylesheet block harmless if anything else
+        # references it. We do NOT add it to the panel's layout --
+        # the outer settingsContentScroll handles vertical overflow
+        # so we don't double up on visible scrollbars.
         inner_layout.addWidget(card1)
 
         # ---- Card 2: Get started -----------------------------------
@@ -7320,7 +7430,7 @@ class MainWindow(QMainWindow):
         inner_layout.addWidget(more_card)
 
         inner_layout.addStretch(1)
-        layout.addWidget(scroll, 1)
+        layout.addWidget(inner, 1)
         return panel
 
     def _make_instructions_card(
@@ -7461,7 +7571,10 @@ class MainWindow(QMainWindow):
         self._general_save_button = None
 
         inner_layout.addStretch(1)
-        layout.addWidget(scroll, 1)
+        # Outer settingsContentScroll handles vertical overflow; the
+        # local QScrollArea is no longer wrapping anything so there's
+        # only one visible scrollbar on this panel.
+        layout.addWidget(inner, 1)
         return panel
 
     # ----- General panel: section helper -----------------------------------
@@ -8300,8 +8413,11 @@ class MainWindow(QMainWindow):
         info_layout.addWidget(note)
         layout.addWidget(info_box, 0)
 
-        scroll = build_gesture_guide_scroll_area()
-        layout.addWidget(scroll, 1)
+        # Bypass build_gesture_guide_scroll_area's inner QScrollArea
+        # so we only have ONE visible scrollbar (the outer green
+        # settingsContentScroll). The function builds the content
+        # widget separately, so we just use that directly.
+        layout.addWidget(build_gesture_guide_content_widget(), 1)
         return panel
 
     def _build_custom_gesture_panel(self) -> QWidget:
@@ -11880,8 +11996,9 @@ class MainWindow(QMainWindow):
 
         scroll_layout.addStretch(1)
 
-        scroll.setWidget(scroll_content)
-        layout.addWidget(scroll, 1)
+        # Outer settingsContentScroll handles overflow; inner scroll
+        # is bypassed so this panel shows only ONE green scrollbar.
+        layout.addWidget(scroll_content, 1)
         return panel
 
     def _on_save_locations_mouse_monitor_changed(self, _index: int) -> None:
