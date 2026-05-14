@@ -1770,6 +1770,12 @@ class GestureGuideCard(QFrame):
     _COLLAPSED_BODY_PT = 11
     _EXPANDED_BODY_PT = 15
 
+    # Cached expand / collapse diagonal-arrow icons (matching the
+    # user-supplied image). Generated once per process and reused on
+    # every toggle so we don't spawn a fresh QPainter on each click.
+    _ICON_EXPAND = None
+    _ICON_COLLAPSE = None
+
     def __init__(
         self,
         *,
@@ -1801,25 +1807,31 @@ class GestureGuideCard(QFrame):
         top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(0)
         top_row.addStretch(1)
-        self._expand_card_button = QPushButton("↗")
+        self._expand_card_button = QPushButton()
         self._expand_card_button.setObjectName("gestureCardExpand")
-        self._expand_card_button.setFixedSize(22, 22)
+        self._expand_card_button.setFixedSize(26, 26)
         self._expand_card_button.setCursor(Qt.PointingHandCursor)
         self._expand_card_button.setToolTip("Expand this card")
+        # Diagonal-arrow icon (matches the user-supplied image) --
+        # outward arrows when the card is collapsed (click expands),
+        # inward arrows when expanded (click collapses).
+        if GestureGuideCard._ICON_EXPAND is None:
+            GestureGuideCard._ICON_EXPAND = _make_section_chevron_icon(expand=True, size=18, color="#E8F6FF")
+            GestureGuideCard._ICON_COLLAPSE = _make_section_chevron_icon(expand=False, size=18, color="#E8F6FF")
+        self._expand_card_button.setIcon(GestureGuideCard._ICON_EXPAND)
+        from PySide6.QtCore import QSize as _QSize
+        self._expand_card_button.setIconSize(_QSize(16, 16))
         self._expand_card_button.setStyleSheet(
             "QPushButton#gestureCardExpand {"
             "  background: rgba(255,255,255,0.06);"
-            "  color: rgba(232,246,255,0.85);"
             "  border: 1px solid rgba(255,255,255,0.18);"
-            "  border-radius: 5px;"
-            "  font-size: 12px;"
-            "  font-weight: 700;"
+            "  border-radius: 6px;"
             "  padding: 0;"
+            "  outline: none;"
             "}"
             "QPushButton#gestureCardExpand:hover {"
             "  background: rgba(29,233,182,0.16);"
             "  border: 1px solid rgba(29,233,182,0.45);"
-            "  color: #E8F6FF;"
             "}"
         )
         self._expand_card_button.clicked.connect(self._toggle_expand)
@@ -1993,6 +2005,21 @@ class GestureGuideCard(QFrame):
         # set_scale_factor (preserves aspect ratio); we only scale
         # font sizes + detail-scrollbox max height + media here.
         is_expanded = bool(self._card_expanded)
+        # Swap the per-card expand button icon to match state: inward
+        # arrows when expanded (= click collapses), outward arrows when
+        # collapsed (= click expands).
+        try:
+            new_icon = (
+                GestureGuideCard._ICON_COLLAPSE
+                if is_expanded else GestureGuideCard._ICON_EXPAND
+            )
+            if new_icon is not None:
+                self._expand_card_button.setIcon(new_icon)
+                self._expand_card_button.setToolTip(
+                    "Collapse this card" if is_expanded else "Expand this card"
+                )
+        except Exception:
+            pass
         media_scale = self._EXPANDED_MEDIA_SCALE if is_expanded else self._COLLAPSED_MEDIA_SCALE
         try:
             self._media.set_scale_factor(media_scale)
@@ -2217,11 +2244,6 @@ class GestureGuideSection(QFrame):
     via the same `cards` list (any QWidget works since we just
     stack them in a QVBoxLayout)."""
 
-    # Cached icons -- generated once per process and reused on every
-    # toggle so we don't spawn a fresh QPainter on each click.
-    _ICON_EXPAND = None
-    _ICON_COLLAPSE = None
-
     def __init__(self, title: str, cards: list, parent=None):
         super().__init__(parent)
         self.setObjectName("gestureGuideSection")
@@ -2229,18 +2251,11 @@ class GestureGuideSection(QFrame):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(10)
 
-        if GestureGuideSection._ICON_EXPAND is None:
-            GestureGuideSection._ICON_EXPAND = _make_section_chevron_icon(expand=True, size=22)
-            GestureGuideSection._ICON_COLLAPSE = _make_section_chevron_icon(expand=False, size=22)
-
-        self.header_button = QPushButton(title)
+        self.header_button = QPushButton(f"▶  {title}")
         self.header_button.setObjectName("gestureGuideSectionButton")
         self.header_button.setProperty("settingsPanelButton", True)
         self.header_button.setCheckable(True)
         self.header_button.setChecked(False)
-        self.header_button.setIcon(GestureGuideSection._ICON_EXPAND)
-        from PySide6.QtCore import QSize as _QSize
-        self.header_button.setIconSize(_QSize(20, 20))
         self.header_button.clicked.connect(self._toggle_expanded)
         outer.addWidget(self.header_button)
 
@@ -2274,15 +2289,7 @@ class GestureGuideSection(QFrame):
         # all — child paints don't trigger overlay work. Dropdown
         # toggling can be a plain visibility flip again.
         self.content.setVisible(bool(checked))
-        # Swap the diagonal-arrow icon: outward arrows when
-        # collapsed (click expands), inward arrows when expanded
-        # (click collapses). Title text stays untouched.
-        new_icon = (
-            GestureGuideSection._ICON_COLLAPSE
-            if checked else GestureGuideSection._ICON_EXPAND
-        )
-        if new_icon is not None:
-            self.header_button.setIcon(new_icon)
+        self.header_button.setText(f"{'▼' if checked else '▶'}  {self.header_button.text()[3:]}")
 
 
 def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
