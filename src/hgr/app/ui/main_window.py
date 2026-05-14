@@ -2043,15 +2043,14 @@ class GestureGuideCard(QFrame):
             font = label.font()
             font.setPointSize(pt)
             label.setFont(font)
-        # Toggle button glyph + tooltip so the user knows what the
-        # button does in either state. Outward-pointing arrow when
-        # collapsed (it expands), inward-pointing when expanded
-        # (it collapses).
+        # Tooltip tracks state. The PAINTED diagonal-arrow QIcon set
+        # earlier (and swapped above for is_expanded) is the only
+        # visual; NEVER reintroduce a text glyph here -- it ends up
+        # rendering ALONGSIDE the icon and the button looks like it
+        # has two arrow indicators.
         if is_expanded:
-            self._expand_card_button.setText("↙")
             self._expand_card_button.setToolTip("Collapse this card")
         else:
-            self._expand_card_button.setText("↗")
             self._expand_card_button.setToolTip("Expand this card")
         # Ask the layout to re-evaluate — without updateGeometry
         # the parent scroll area doesn't notice the new sizes until
