@@ -1812,7 +1812,10 @@ class GestureGuideCard(QFrame):
         # Narrower than tall so the button feels like an icon button,
         # not a square chip. Width tuned to barely contain the 16 px
         # icon + 1 px breathing room on each side.
-        self._expand_card_button.setFixedSize(22, 24)
+        # Width reduced to ~2/3 of the prior 22 px (per user) so the
+        # button reads as a slim icon button. Height kept similar so
+        # the tap target stays vertically comfortable.
+        self._expand_card_button.setFixedSize(15, 22)
         self._expand_card_button.setCursor(Qt.PointingHandCursor)
         self._expand_card_button.setToolTip("Expand this card")
         # Diagonal-arrow icon (matches the user-supplied image) --
@@ -1823,7 +1826,9 @@ class GestureGuideCard(QFrame):
             GestureGuideCard._ICON_COLLAPSE = _make_section_chevron_icon(expand=False, size=18, color="#E8F6FF")
         self._expand_card_button.setIcon(GestureGuideCard._ICON_EXPAND)
         from PySide6.QtCore import QSize as _QSize
-        self._expand_card_button.setIconSize(_QSize(16, 16))
+        # Icon size shrunk to match the narrower button. 12 px fits
+        # the 15 px button width with breathing room.
+        self._expand_card_button.setIconSize(_QSize(12, 12))
         self._expand_card_button.setStyleSheet(
             "QPushButton#gestureCardExpand {"
             "  background: rgba(255,255,255,0.06);"
@@ -2208,10 +2213,21 @@ def _make_section_chevron_icon(*, expand: bool, color: str = "#FFFFFF", size: in
     pen.setJoinStyle(Qt.RoundJoin)
     painter.setPen(pen)
     edge = size * 0.18              # corner inset (where corner ends sit)
-    head = size * 0.22              # arrowhead leg length
+    # head is now redefined below at 0.34 -- see comment about
+    # 'mostly arrowhead' rebalance.
+    # Rebalanced per user: 'mostly arrowhead and not the straight
+    # line'. Heads bumped from 0.22 -> 0.34 of icon width; shafts
+    # shortened. Both icons also leave a clear empty diamond in the
+    # middle (the previous expand variant had two shafts crossing
+    # almost at the centre, so the user saw them touching).
+    head = size * 0.34
     if expand:
-        # Shafts start near centre; tips at the corners.
-        inner = size * 0.42         # near-centre end of each shaft
+        # Shafts start further FROM centre so the two shafts don't
+        # touch in the middle. inner=0.36 puts the bottom-left
+        # start at (0.36, 0.64) and the top-right shaft's start at
+        # (0.64, 0.36) -- ~0.28*size apart along the anti-diagonal,
+        # a visible gap.
+        inner = size * 0.36
         # Top-right diagonal (shaft from near-centre UP-RIGHT to corner).
         sx, sy = inner, size - inner
         tx, ty = size - edge, edge
@@ -2225,10 +2241,10 @@ def _make_section_chevron_icon(*, expand: bool, color: str = "#FFFFFF", size: in
         painter.drawLine(int(bx), int(by), int(bx + head), int(by))
         painter.drawLine(int(bx), int(by), int(bx), int(by - head))
     else:
-        # Shafts start at corners and stop short of centre so a clear
-        # gap remains between the two inward arrowheads. inner=0.34
-        # leaves a ~0.32*size diamond in the middle of the icon.
-        inner = size * 0.34
+        # Shafts start at corners and stop well short of centre so a
+        # clear gap remains. inner=0.32 leaves a ~0.36*size diamond
+        # of empty space between the two inward arrowheads.
+        inner = size * 0.32
         # Top-right corner -> down-left, tip at (size-inner, inner).
         cx, cy = size - edge, edge
         tx, ty = size - inner, inner
