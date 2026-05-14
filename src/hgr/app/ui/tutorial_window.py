@@ -585,8 +585,11 @@ class _TutorialStartingPill(QWidget):
     """Bottom-centred pill shown over the tutorial dialog while the
     session is spinning up. Paints exactly like the desktop
     ProcessingOverlay (translucent blue panel, teal border, label
-    on top, animated wave dots below) but as a child widget of the
-    dialog -- no top-level translucency / DWM games needed."""
+    on top, thin progress bar at the bottom) but as a child widget
+    of the dialog -- no top-level translucency / DWM games needed.
+    Per the app's loading-affordance policy: progress bar for
+    starting app / tutorial / processing saves; dots reserved for
+    voice and incidental status."""
 
     _WIDTH = 220
     _HEIGHT = 88
@@ -597,6 +600,15 @@ class _TutorialStartingPill(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAutoFillBackground(False)
         self._label = "Starting tutorial"
+        # Progress fields mirror the desktop ProcessingOverlay so the
+        # bar visibly creeps forward even without explicit checkpoints
+        # from the tutorial-spin-up path. Cap at 0.92 so the bar never
+        # "completes" until hide_pill() is called.
+        self._progress = 0.0
+        self._progress_target = 0.0
+        self._progress_idle_creep_rate = 0.05  # fraction/sec
+        self._progress_idle_creep_cap = 0.92
+        self._last_tick_time = time.monotonic()
         self._timer = QTimer(self)
         # PreciseTimer at 60 fps so the wave dots advance at a steady
         # cadence on Windows. The default CoarseTimer rounds to ~15.6
@@ -610,6 +622,11 @@ class _TutorialStartingPill(QWidget):
 
     def show_pill(self, label: str = "Starting tutorial") -> None:
         self._label = str(label or "Starting tutorial")
+        # Reset the progress fields on every show so a re-opened tutorial
+        # doesn't inherit the previous run's leftover bar position.
+        self._progress = 0.0
+        self._progress_target = 0.0
+        self._last_tick_time = time.monotonic()
         self.setVisible(True)
         self.raise_()
         self._timer.start()
@@ -625,23 +642,22 @@ class _TutorialStartingPill(QWidget):
             self.update()
 
     def _tick(self) -> None:
+        # Idle creep + ease-toward-target, matching ProcessingOverlay so
+        # the bar visibly advances during the tutorial spin-up even if
+        # nothing calls set_progress() explicitly. dt is clamped so a
+        # paused-by-debugger jump doesn't blow the bar past the cap.
+        now = time.monotonic()
+        dt = max(0.0, min(0.5, now - self._last_tick_time))
+        self._last_tick_time = now
+        self._progress_target = min(
+            self._progress_idle_creep_cap,
+            self._progress_target + self._progress_idle_creep_rate * dt,
+        )
+        # Ease current toward target by ~30 % each frame — smooth without
+        # being floaty.
+        self._progress += (self._progress_target - self._progress) * 0.30
         if self.isVisible():
-            self.repaint()
-
-    def _draw_loading_dots(self, painter: QPainter, cx: float, cy: float, accent: QColor) -> None:
-        # Verbatim copy of VoiceStatusOverlay._draw_loading_dots.
-        painter.setPen(Qt.NoPen)
-        phase = time.monotonic() * 6.0
-        for index in range(5):
-            wave = max(0.0, math.sin(phase - index * 0.48))
-            pulse = 0.38 + 0.62 * wave
-            dot = QColor(accent)
-            dot.setAlpha(int(90 + 150 * pulse))
-            painter.setBrush(dot)
-            x = cx + (index - 2) * 14
-            y = cy - 2 - 6 * wave
-            size = 8.0 + 3.0 * pulse
-            painter.drawEllipse(QRectF(x - size / 2.0, y - size / 2.0, size, size))
+            self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802 — Qt API name
         painter = QPainter(self)
@@ -667,9 +683,22 @@ class _TutorialStartingPill(QWidget):
         label_rect = QRectF(rect.left() + 12, rect.top() + 14, rect.width() - 24, 24)
         painter.drawText(label_rect, Qt.AlignCenter, self._label)
 
-        dots_cx = rect.center().x()
-        dots_cy = rect.bottom() - 22
-        self._draw_loading_dots(painter, dots_cx, dots_cy, accent)
+        # Progress bar — same geometry / palette as ProcessingOverlay so
+        # the two pills read as one visual family.
+        bar_h = 6.0
+        bar_y = rect.bottom() - 20
+        bar_left = rect.left() + 18
+        bar_right = rect.right() - 18
+        bar_w = bar_right - bar_left
+        track = QColor(accent.red(), accent.green(), accent.blue(), 55)
+        fill = QColor(accent.red(), accent.green(), accent.blue(), 235)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(track)
+        painter.drawRoundedRect(QRectF(bar_left, bar_y, bar_w, bar_h), bar_h / 2.0, bar_h / 2.0)
+        fill_w = bar_w * float(self._progress)
+        if fill_w > 0.5:
+            painter.setBrush(fill)
+            painter.drawRoundedRect(QRectF(bar_left, bar_y, fill_w, bar_h), bar_h / 2.0, bar_h / 2.0)
 
 
 class TutorialWindow(QDialog):
@@ -694,6 +723,8 @@ class TutorialWindow(QDialog):
 
     def __init__(self, config: AppConfig, parent=None) -> None:
         super().__init__(parent)
+        from .window_chrome import apply_touchless_chrome
+        apply_touchless_chrome(self)
         # Connect the off-thread media-check bridges to their slots.
         self._voice_media_check_signal.connect(self._on_voice_media_check_result)
         self._spotify_periodic_poll_signal.connect(self._on_spotify_periodic_poll)
@@ -713,6 +744,22 @@ class TutorialWindow(QDialog):
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
+        # Focus-guard timer for the voice_command step. Spotify (and
+        # Chrome on the YouTube branch) steal foreground focus the
+        # moment they start playing, leaving the tutorial behind
+        # whichever window the user just summoned. The single
+        # _reclaim_tutorial_focus call wired to step completion only
+        # fires AFTER the engine confirms playback — between the
+        # voice-command and the polling-detects-playback edge, the
+        # user is stuck looking at Spotify. This timer polls the
+        # foreground window every 500 ms while on the voice_command
+        # step and force-foregrounds the tutorial whenever the
+        # foreground HWND isn't ours. 500 ms is the sweet spot
+        # between responsiveness (sub-second handback) and
+        # background-cost (less than 0.1% CPU on idle ticks).
+        self._focus_guard_timer = QTimer(self)
+        self._focus_guard_timer.setInterval(500)
+        self._focus_guard_timer.timeout.connect(self._focus_guard_tick)
         self._last_dynamic_label = "neutral"
         self._swipe_counts = {"swipe_left": 0, "swipe_right": 0}
         # Timestamp of the most-recent swipe-count increment. Used by
@@ -917,9 +964,17 @@ class TutorialWindow(QDialog):
         title_wrap.setSpacing(4)
         self.hero_label = QLabel("Touchless Tutorial")
         self.hero_label.setObjectName("tutorialHero")
-        self.hero_subtitle = QLabel("Practice the main controls one step at a time with live hand tracking.")
+        # Static subtitle removed per UX feedback — was always the
+        # same "Practice the main controls..." string on every step
+        # and added noise to the header. Step-specific copy is shown
+        # inside the body card (step.title + step.description). Kept
+        # as a hidden zero-height QLabel so existing show()/hide()
+        # callers don't NameError.
+        self.hero_subtitle = QLabel("")
         self.hero_subtitle.setObjectName("tutorialSubtitle")
         self.hero_subtitle.setWordWrap(True)
+        self.hero_subtitle.setVisible(False)
+        self.hero_subtitle.setMaximumHeight(0)
         title_wrap.addWidget(self.hero_label)
         title_wrap.addWidget(self.hero_subtitle)
         header_layout.addLayout(title_wrap, 1)
@@ -1045,6 +1100,14 @@ class TutorialWindow(QDialog):
         self.example_button = QPushButton("Show Example")
         self.example_button.clicked.connect(self._open_step_example)
         example_row.addWidget(self.example_button, 0, Qt.AlignLeft)
+        # "Show full instructions" — pops the same text the instruction
+        # scrollbox holds into a large, tall modal dialog so users who
+        # find the inline scrollbox cramped on long-step pages (e.g.
+        # mouse_mode with 6+ numbered steps) can read everything at
+        # once. Triggers the same content; just gives it more height.
+        self.expand_instructions_button = QPushButton("Show full instructions")
+        self.expand_instructions_button.clicked.connect(self._open_full_instructions_dialog)
+        example_row.addWidget(self.expand_instructions_button, 0, Qt.AlignLeft)
         example_row.addStretch(1)
         info_layout.addLayout(example_row)
 
@@ -1377,6 +1440,68 @@ class TutorialWindow(QDialog):
 
         return intro_text, selected_cards
 
+    def _open_full_instructions_dialog(self) -> None:
+        """Pop the current step's full instruction text into a tall
+        modal dialog so users can read every step without fighting the
+        inline scrollbox. Triggered by the "Show full instructions"
+        button next to "Show Example". The dialog shows whatever
+        text the inline instruction_box currently holds (so it tracks
+        per-step content automatically) — no separate copy to maintain.
+        """
+        if self._show_completion_page:
+            return
+        try:
+            step = self._practice_steps[self._step_index]
+            title = step.title
+        except Exception:
+            title = "Instructions"
+        instructions = ""
+        try:
+            instructions = self.instruction_box.text() or ""
+        except Exception:
+            pass
+        if not instructions.strip():
+            instructions = "No detailed instructions available for this step."
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{title} — Full Instructions")
+        dialog.setModal(True)
+        dialog.resize(680, 520)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+        header = QLabel(f"{title} — Full Instructions")
+        header.setStyleSheet(
+            f"color: {self.config.accent_color or '#1DE9B6'}; "
+            "font-size: 18px; font-weight: 700;"
+        )
+        layout.addWidget(header)
+        body = QLabel(instructions)
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.PlainText)
+        body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        body.setStyleSheet(
+            "color: rgba(232,246,255,0.95); font-size: 14px; "
+            "line-height: 160%; padding: 8px;"
+        )
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(body)
+        scroll.setStyleSheet("background: transparent; border: none;")
+        layout.addWidget(scroll, 1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        close_btn.setStyleSheet(
+            f"QPushButton {{ background: {self.config.accent_color or '#1DE9B6'}; "
+            "color: #0a162b; border: none; border-radius: 8px; "
+            "padding: 8px 18px; font-weight: 700; }}"
+        )
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+        dialog.exec()
+
     def _open_step_example(self) -> None:
         if self._show_completion_page:
             return
@@ -1526,7 +1651,9 @@ class TutorialWindow(QDialog):
 
         self.completion_disclaimer_label = QLabel(
             "Some things that aren't obvious from the UI. The full "
-            "gesture reference is below; swipe right when you're ready."
+            "gesture reference is below.\n\n"
+            "Swipe RIGHT to finish the tutorial, or swipe LEFT to "
+            "go back to the previous step."
         )
         self.completion_disclaimer_label.setObjectName("tutorialInstructionBox")
         self.completion_disclaimer_label.setWordWrap(True)
@@ -2010,6 +2137,16 @@ class TutorialWindow(QDialog):
 
     def _stop_session(self) -> None:
         self._timer.stop()
+        # Focus guard only ran during the voice_command step but
+        # stop it defensively here too so a session that ends while
+        # on that step doesn't leave the timer firing in the
+        # background (the foreground check would still cost some
+        # microseconds per tick even with the early-return when
+        # step_key != voice_command).
+        try:
+            self._focus_guard_timer.stop()
+        except Exception:
+            pass
         owned_worker = self._worker if self._owns_worker else None
         self._disconnect_worker()
         if owned_worker is not None:
@@ -2131,6 +2268,10 @@ class TutorialWindow(QDialog):
         # leak across navigation. Re-initialized lazily in the
         # volume handler the next time the step runs.
         self._volume_step_state = None
+        # Volume-step gate on the engine: leaving the volume step
+        # (in either direction) MUST lift the mute block so post-
+        # tutorial dictation / normal-mode use can mute as usual.
+        self._set_engine_tutorial_mute_block(False)
         if self._voice_overlay is not None:
             self._voice_overlay.hide_overlay()
         self._apply_step_content()
@@ -2138,6 +2279,23 @@ class TutorialWindow(QDialog):
 
     def _apply_step_content(self) -> None:
         step = self._practice_steps[self._step_index]
+        # Focus-guard timer is only useful during the voice_command
+        # step (where Spotify / Chrome steal focus). Start it here
+        # whenever we land on that step, stop it on every other
+        # step / on the completion page so we don't burn cycles
+        # checking the foreground during silent steps.
+        if step.key == "voice_command" and not self._show_completion_page:
+            try:
+                if not self._focus_guard_timer.isActive():
+                    self._focus_guard_timer.start()
+            except Exception:
+                pass
+        else:
+            try:
+                if self._focus_guard_timer.isActive():
+                    self._focus_guard_timer.stop()
+            except Exception:
+                pass
         if self._show_completion_page:
             self.body_stack.setCurrentIndex(1)
             # Hide the per-page hero + subtitle + badge so the only
@@ -2165,7 +2323,24 @@ class TutorialWindow(QDialog):
         self.guide_button.show()
         self.example_button.show()
         self.progress_badge.setText(f"Step {self._step_index + 1} of {len(self._practice_steps)}")
-        self.step_title.setText(step.title)
+        # Once the step is finished, flip the big top title to a
+        # completion message so the user gets a clear "done" signal
+        # at the same spot they read the step name from earlier.
+        # Per-step completion copy below; fallback is generic.
+        _completion_title_map = {
+            "mouse_mode":    "Mouse controls completed!",
+            "voice_command": "Voice command completed!",
+            "volume":        "Volume controls completed!",
+            "play_pause":    "Play / pause completed!",
+            "swipes":        "Swipes completed!",
+            "gesture_wheel": "Gesture wheel completed!",
+        }
+        if self._step_completed:
+            self.step_title.setText(
+                _completion_title_map.get(step.key, f"{step.title} completed!")
+            )
+        else:
+            self.step_title.setText(step.title)
 
         # Step copy branches on Spotify presence: with Spotify the
         # voice step says "play X on Spotify" and play/pause +
@@ -2562,6 +2737,25 @@ class TutorialWindow(QDialog):
         self._trigger_encouragement(time.monotonic())
         text = note or "Completed! Swipe right to move on!"
         self._set_step_progress(text)
+        # Flip the big top title to the per-step completion copy so
+        # the user gets a clear "done" signal at the same place they
+        # read the step name from. Mirrors the same map used when the
+        # step page is (re-)rendered with self._step_completed=True.
+        try:
+            step = self._practice_steps[self._step_index]
+            _completion_title_map = {
+                "mouse_mode":    "Mouse controls completed!",
+                "voice_command": "Voice command completed!",
+                "volume":        "Volume controls completed!",
+                "play_pause":    "Play / pause completed!",
+                "swipes":        "Swipes completed!",
+                "gesture_wheel": "Gesture wheel completed!",
+            }
+            self.step_title.setText(
+                _completion_title_map.get(step.key, f"{step.title} completed!")
+            )
+        except Exception:
+            pass
 
     def _update_completion_feedback(self, now: float) -> None:
         visible = self._step_completed and not self._show_completion_page
@@ -3159,10 +3353,30 @@ class TutorialWindow(QDialog):
             if spotify_present:
                 self._complete_step(f"Spotify is playing! Part {self._step_index + 1}/5 completed!")
             else:
+                # Tutorial-only: flip the engine into YouTube forced
+                # mode now that the user has YouTube actually playing.
+                # The next practice step (gesture wheel) and the
+                # voice/swipe controls then behave the way the user
+                # would normally only get after holding the 'four'
+                # pose, which is one less thing for them to discover
+                # mid-tutorial. The engine clears this in
+                # set_tutorial_context(False) on tutorial close.
+                worker = self._worker
+                if worker is not None:
+                    try:
+                        worker.force_youtube_mode_for_tutorial()
+                    except Exception:
+                        pass
                 self._complete_step(f"YouTube opened in Chrome! Part {self._step_index + 1}/5 completed!")
+            # Spotify / Chrome just stole focus by launching or
+            # waking up. Reclaim focus for the tutorial so the
+            # user can see the completion + continue gesturing
+            # without clicking back manually.
+            self._reclaim_tutorial_focus(delay_ms=300)
             return
         if final_pass:
             self._complete_step(f"Voice command detected. Part {self._step_index + 1}/5 completed!")
+            self._reclaim_tutorial_focus(delay_ms=300)
             return
         # First pass didn't see media yet — give it another 2 s
         # and try the final-pass check.
@@ -3213,6 +3427,138 @@ class TutorialWindow(QDialog):
         if self._practice_steps[self._step_index].key != "voice_command":
             return
         self._complete_step(f"Spotify is playing! Part {self._step_index + 1}/5 completed!")
+        # Spotify just stole focus by launching / waking up. Reclaim
+        # focus to the tutorial window so the user can see the step
+        # completion + continue gesturing without having to click
+        # back. A 250 ms delay gives Spotify time to finish its own
+        # focus grab before we override it (otherwise the race goes
+        # the other way and Spotify wins on slower machines).
+        self._reclaim_tutorial_focus(delay_ms=250)
+
+    def _focus_guard_tick(self) -> None:
+        """Per-tick (500 ms) check: if the foreground window isn't
+        the tutorial dialog, force it back. Runs only while the
+        voice_command step is active and the step hasn't completed
+        — Spotify / Chrome are the only windows that aggressively
+        steal focus from inside this step's flow.
+
+        Performance: GetForegroundWindow is a single CRITICAL_SECTION
+        + atomic-read in user32 — order of microseconds. We compare
+        an int against our own winId(), then bail. Only the
+        actual-mismatch path calls SetForegroundWindow, so when the
+        tutorial IS focused (the steady state) the tick is
+        essentially free."""
+        try:
+            if self._step_completed:
+                return
+            if self._show_completion_page:
+                return
+            step_key = self._practice_steps[self._step_index].key
+            if step_key != "voice_command":
+                # Defensive: timer should have been stopped on step
+                # change; if it wasn't, no-op rather than thrash.
+                return
+            if not self.isVisible():
+                return
+            import ctypes
+            user32 = ctypes.windll.user32
+            foreground_hwnd = int(user32.GetForegroundWindow())
+            if foreground_hwnd == 0:
+                return
+            try:
+                our_hwnd = int(self.winId())
+            except Exception:
+                return
+            if foreground_hwnd == our_hwnd:
+                return
+            # Also tolerate other top-level Touchless windows holding
+            # focus (e.g. the parent MainWindow). The user only cares
+            # that some Touchless window is foreground while they're
+            # on this step — not specifically the tutorial. Walking
+            # the parent chain matches Qt's "we own this thread"
+            # check without the cost.
+            try:
+                from PySide6.QtWidgets import QApplication
+                app = QApplication.instance()
+                if app is not None:
+                    for widget in app.topLevelWidgets():
+                        try:
+                            if int(widget.winId()) == foreground_hwnd:
+                                # Foreground IS some Touchless
+                                # window — fine, don't override.
+                                return
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            # Reclaim. Use SetForegroundWindow directly because Qt's
+            # activateWindow can no-op when another app held focus
+            # within the last second on Windows.
+            user32.SetForegroundWindow(our_hwnd)
+            try:
+                self.raise_()
+                self.activateWindow()
+            except Exception:
+                pass
+        except Exception:
+            # Never let the guard tick raise — it must stay cheap
+            # and silent for the polling cadence to be acceptable.
+            pass
+
+    def _reclaim_tutorial_focus(self, *, delay_ms: int = 250) -> None:
+        """Force the tutorial window back to the foreground after a
+        focus-stealing operation (Spotify launch / playback toggle).
+        Called from the periodic Spotify poll and the voice-command
+        completion paths during the voice_command tutorial step.
+
+        Uses Win32 SetForegroundWindow directly because Qt's
+        activateWindow() is often a silent no-op when another app
+        just stole focus — Windows' anti-focus-stealing protections
+        require the foreground change to be authorised by the
+        kernel, which happens here because we ARE the previous
+        foreground (Touchless → Spotify → Touchless within seconds)."""
+        def _do_reclaim() -> None:
+            try:
+                if self.isMinimized():
+                    self.showNormal()
+                else:
+                    self.show()
+                self.raise_()
+                self.activateWindow()
+                # Belt-and-suspenders Win32 SetForegroundWindow.
+                # Qt's activateWindow can no-op on Windows when
+                # another app held focus recently — the explicit
+                # SetForegroundWindow call wins because Windows
+                # remembers we were the foreground a moment ago.
+                try:
+                    import ctypes
+                    hwnd = int(self.winId())
+                    if hwnd:
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            QTimer.singleShot(max(0, int(delay_ms)), _do_reclaim)
+        except Exception:
+            _do_reclaim()
+
+    def _set_engine_tutorial_mute_block(self, blocked: bool) -> None:
+        """Tell the gesture engine to drop the shaka-mute trigger
+        while the tutorial volume step is in its 'practise up/down
+        first' phase. Engine-side gate prevents the OS audio from
+        actually muting if the user does the shaka pose early, so
+        the experience matches the tutorial's progress display."""
+        worker = self._resolve_parent_worker()
+        if worker is None:
+            return
+        setter = getattr(worker, "set_tutorial_block_mute", None)
+        if callable(setter):
+            try:
+                setter(bool(blocked))
+            except Exception:
+                pass
 
     def _is_spotify_playing_safe(self) -> bool:
         """Wrap SpotifyController.get_playback_state in a try/except
@@ -3532,9 +3878,10 @@ class TutorialWindow(QDialog):
 
         if step.key == "volume":
             # Volume practice: detect mode entry + at least one up
-            # move + one down move + a mute toggle. The engine emits
-            # volume_active, volume_level_scalar, and volume_muted
-            # in the debug payload; we just watch for transitions.
+            # swing AND down swing AND two mute toggles. The engine
+            # emits volume_active, volume_level_scalar, and
+            # volume_muted in the debug payload; we just watch for
+            # transitions.
             volume_active = bool(payload.get("volume_active"))
             level_raw = payload.get("volume_level_scalar")
             try:
@@ -3546,7 +3893,15 @@ class TutorialWindow(QDialog):
             if tracker is None:
                 tracker = {
                     "engaged": False,
-                    "last_level": level,
+                    # Volume swing detection now tracks EXTREMES from
+                    # the anchor level captured on first engagement,
+                    # not per-frame delta. So a user who goes down and
+                    # then back up gets credit for both directions even
+                    # though their net change is zero. 5 % swing
+                    # threshold in either direction.
+                    "anchor_level": None,
+                    "max_seen": None,
+                    "min_seen": None,
                     "up_done": False,
                     "down_done": False,
                     "last_muted": muted,
@@ -3556,26 +3911,65 @@ class TutorialWindow(QDialog):
                     "mute_count": 0,
                 }
                 self._volume_step_state = tracker
+                # Tell the engine to BLOCK system mute toggles until
+                # up + down are both complete, so the user can't
+                # accidentally hit shaka first and have the OS audio
+                # mute before they've practised volume up / down.
+                self._set_engine_tutorial_mute_block(True)
             mute_target = 2
+            SWING_THRESHOLD = 0.05  # 5 % of full volume range
             if volume_active and not tracker["engaged"]:
                 tracker["engaged"] = True
-                tracker["last_level"] = level
-            if volume_active and level is not None and tracker["last_level"] is not None:
-                delta = level - float(tracker["last_level"])
-                if delta >= 0.04 and not tracker["up_done"]:
+                if level is not None:
+                    tracker["anchor_level"] = level
+                    tracker["max_seen"] = level
+                    tracker["min_seen"] = level
+            if volume_active and level is not None and tracker["anchor_level"] is not None:
+                # Track running max / min so a single take that goes
+                # down THEN up scores both directions.
+                if tracker["max_seen"] is None or level > tracker["max_seen"]:
+                    tracker["max_seen"] = level
+                if tracker["min_seen"] is None or level < tracker["min_seen"]:
+                    tracker["min_seen"] = level
+                swing_up = float(tracker["max_seen"]) - float(tracker["anchor_level"])
+                swing_down = float(tracker["anchor_level"]) - float(tracker["min_seen"])
+                if swing_up >= SWING_THRESHOLD and not tracker["up_done"]:
                     tracker["up_done"] = True
                     self._trigger_encouragement(now)
-                if delta <= -0.04 and not tracker["down_done"]:
+                if swing_down >= SWING_THRESHOLD and not tracker["down_done"]:
                     tracker["down_done"] = True
                     self._trigger_encouragement(now)
-                tracker["last_level"] = level
-            if muted != tracker["last_muted"]:
+            # Mute toggle counting. ONLY counts when both directions
+            # are complete, so a user holding the shaka before they've
+            # practised volume up/down doesn't get to skip the swing
+            # half of the step. Engine-side block (set above) prevents
+            # the OS audio from actually muting too.
+            volume_done = bool(tracker["up_done"] and tracker["down_done"])
+            if volume_done and muted != tracker["last_muted"]:
                 tracker["mute_count"] = min(mute_target, tracker.get("mute_count", 0) + 1)
-                tracker["last_muted"] = muted
                 self._trigger_encouragement(now)
+            # last_muted always tracks the current state so we don't
+            # double-count a pre-swing toggle once the gate opens.
+            tracker["last_muted"] = muted
+            # Once swings are done, lift the engine-side mute block.
+            if volume_done:
+                self._set_engine_tutorial_mute_block(False)
             mute_count = int(tracker.get("mute_count", 0))
             mute_done = mute_count >= mute_target
-            visual_ready = volume_active
+            # Skeleton turns green when the user is doing either the
+            # volume pose (raise/lower) OR the mute shaka — earlier
+            # only volume_active triggered green, so during the shaka
+            # half of the step the skeleton flashed red even though
+            # the user was doing the correct gesture. Stable label
+            # 'mute' is what the static recognizer fires for a held
+            # shaka with palm-to-camera; checking raw_label too gives
+            # us a frame or two of green during transitions before
+            # stability latches.
+            mute_pose_held = (
+                stable_label == "mute"
+                or (raw_label == "mute" and confidence >= 0.50)
+            )
+            visual_ready = volume_active or mute_pose_held
             if not tracker["engaged"]:
                 self._set_step_progress("Hold the volume pose to begin.")
             elif not (tracker["up_done"] and tracker["down_done"]):

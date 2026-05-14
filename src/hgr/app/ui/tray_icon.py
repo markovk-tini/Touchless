@@ -69,13 +69,11 @@ def _render_bordered_icon(base_icon: QIcon, border_color: QColor) -> QIcon:
         painter = QPainter(out)
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
-            # Ring thickness ~3.5 % of width, min 2 px. A notch
-            # thinner than the previous 4 % / min-3 -- the colour
-            # is now solid enough (full alpha, vivid saturation)
-            # that 2 px reads fine on dark taskbars, and the
-            # narrower ring lets the hand silhouette dominate
-            # more cleanly.
-            ring = max(2, int(round(size * 0.035)))
+            # Ring thickness ~2.5 % of width, min 2 px. Slimmer
+            # than the previous 3.5 % so the Touchless hand
+            # silhouette dominates almost the full icon area and
+            # the ring reads as a slim coloured frame.
+            ring = max(2, int(round(size * 0.025)))
             radius = max(2, int(round(size * 0.18)))
             # Filled coloured rounded-rect background.
             painter.setBrush(border_color)

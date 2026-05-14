@@ -894,6 +894,12 @@ class GestureWorker(QObject):
         self._dictation_release_candidate_since = 0.0
         self._tutorial_mode_enabled = False
         self._tutorial_step_key: str | None = None
+        # Tutorial-volume-step gate: when True, drop the shaka-mute
+        # trigger so the OS audio doesn't actually mute until the
+        # tutorial advances past its 'practise up/down first' phase.
+        # Tutorial flips this on entering the volume step and off
+        # once swing-up + swing-down are both complete.
+        self._tutorial_block_mute: bool = False
         self._drawing_mode_enabled = False
         self._drawing_toggle_candidate_since = 0.0
         self._drawing_toggle_cooldown_until = 0.0
@@ -1039,6 +1045,20 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] runner init failed: {exc}")
             self._custom_gesture_runner = None
+
+        # Dynamic custom-gesture runtime. Parallel to the static
+        # runner above — same registry, same `fire_once` cooldown
+        # plumbing, but uses motion-based DTW matching instead of
+        # pose-similarity. Loads on construction; auto-reloads on
+        # registry-file mtime changes via maybe_reload_if_changed
+        # alongside the static runner each tick.
+        try:
+            from ...custom_gestures.dynamic_runtime import DynamicGestureRuntime
+            self._dynamic_gesture_runtime = DynamicGestureRuntime()
+            self._dynamic_gesture_runtime.reload()
+        except Exception as exc:
+            print(f"[custom-gestures] dynamic runtime init failed: {exc}")
+            self._dynamic_gesture_runtime = None
 
         # Per-tick timing markers shared between _tick and
         # _on_engine_result â€” needed because the engine call now
@@ -3215,6 +3235,9 @@ class GestureWorker(QObject):
             self._tutorial_step_key = normalized_step or None
         else:
             self._tutorial_step_key = None
+            # Leaving tutorial entirely lifts any leftover mute block
+            # so post-tutorial dictation / normal use can mute again.
+            self._tutorial_block_mute = False
         if not self._tutorial_mode_enabled or self._tutorial_step_key != "gesture_wheel":
             self._reset_chrome_wheel()
             self._reset_spotify_wheel()
@@ -3828,6 +3851,14 @@ class GestureWorker(QObject):
             return
         self._shutdown_runtime(emit_signal=True)
 
+    def set_tutorial_block_mute(self, blocked: bool) -> None:
+        """Toggle whether the engine should drop the shaka-mute
+        trigger. Used by the tutorial's volume step to keep the OS
+        audio from actually muting before the user has practised
+        up + down direction; tutorial flips the flag back off once
+        both swings are complete."""
+        self._tutorial_block_mute = bool(blocked)
+
     def set_pipeline_frozen(self, frozen: bool) -> None:
         """Freeze / unfreeze the gesture pipeline. While frozen,
         _tick still emits raw_frame_ready (so the custom-gesture
@@ -4430,6 +4461,16 @@ class GestureWorker(QObject):
                     custom_match = self._custom_gesture_runner.current_match
                 except Exception:
                     custom_match = None
+            # Dynamic-gesture overlay: show the gesture name briefly
+            # after it fires. Static-runner takes priority — it has a
+            # held state, so its label reflects an in-progress gesture.
+            if custom_match is None:
+                dyn = getattr(self, "_dynamic_gesture_runtime", None)
+                if dyn is not None:
+                    try:
+                        custom_match = dyn.current_match(time.monotonic())
+                    except Exception:
+                        custom_match = None
 
             def _apply_custom_label(default_label: str, default_active: bool, hand_handedness: Optional[str]):
                 """Override the banner with the custom gesture's name
@@ -4583,6 +4624,41 @@ class GestureWorker(QObject):
                 # A bad sample / classifier hiccup must not break the
                 # main pipeline â€” log once and continue.
                 print(f"[custom-gestures] process error: {exc}")
+
+        # Dynamic custom-gesture runtime — parallel to the static
+        # runner. Uses the same registry + same fire_once cooldown
+        # but matches motion (DTW) instead of pose. Falls through
+        # silently when no dynamic gestures are registered.
+        dynamic_runtime = getattr(self, "_dynamic_gesture_runtime", None)
+        if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
+            try:
+                runner_now = time.monotonic()
+                dynamic_runtime.maybe_reload_if_changed(runner_now)
+                hand_lost = not (
+                    result.found
+                    and result.tracked_hand is not None
+                    and result.hand_reading is not None
+                )
+                if hand_lost:
+                    dynamic_runtime.hand_lost()
+                else:
+                    fired_dyn = dynamic_runtime.process_frame(
+                        result.hand_reading.landmarks,
+                        palm_scale=float(result.hand_reading.palm.scale),
+                        handedness=str(result.tracked_hand.handedness or ""),
+                        timestamp=runner_now,
+                    )
+                    if fired_dyn:
+                        try:
+                            self.command_detected.emit(f"custom: {fired_dyn}")
+                        except Exception:
+                            pass
+                        self._record_action(
+                            f"custom_dynamic:{fired_dyn}",
+                            f"custom dynamic gesture: {fired_dyn}",
+                        )
+            except Exception as exc:
+                print(f"[custom-gestures] dynamic runtime error: {exc}")
 
         hand_handedness = result.tracked_hand.handedness if result.found and result.tracked_hand is not None else None
         # MediaPipe occasionally labels a single visible right hand
@@ -4908,6 +4984,18 @@ class GestureWorker(QObject):
 
         controller_error_message: str | None = None
         controller_error_status: str | None = None
+        # Tutorial gate: drop the shaka-mute trigger while the
+        # tutorial volume step is still in its 'practise up/down
+        # first' phase. The tutorial flips _tutorial_block_mute
+        # off once swing-up + swing-down are both complete.
+        if update.trigger_mute_toggle and getattr(self, "_tutorial_block_mute", False):
+            update = update._replace(trigger_mute_toggle=False) if hasattr(update, "_replace") else update
+            # If update is a dataclass / plain object that doesn't
+            # support _replace, mutate the bool field if it's writable.
+            try:
+                update.trigger_mute_toggle = False
+            except Exception:
+                pass
         if update.trigger_mute_toggle:
             toggled = self.volume_controller.toggle_mute()
             if toggled is not None:
