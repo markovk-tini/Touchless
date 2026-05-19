@@ -4,148 +4,81 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Touchless Privacy Policy</title>
+  <meta name="description" content="What Touchless collects, what it doesn't, and where your camera + microphone data lives." />
+  <meta name="theme-color" content="#0c2331" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Touchless Privacy Policy" />
+  <meta property="og:description" content="What Touchless collects, what it doesn't, and where your camera + microphone data lives." />
+  <meta property="og:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <meta property="og:url" content="https://touchless-control.pages.dev/privacy.html" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Touchless Privacy Policy" />
+  <meta name="twitter:description" content="What Touchless collects and what it doesn't." />
+  <meta name="twitter:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="stylesheet" href="site.css" />
   <style>
-    :root {
-      --bg1: #07131d;
-      --bg2: #0c2331;
-      --panel: rgba(10, 28, 39, 0.82);
-      --panel-border: rgba(90, 217, 255, 0.22);
-      --primary: #17bfe6;
-      --primary-2: #58e3ff;
-      --text: #f2fbff;
-      --muted: #a9c6d2;
-      --shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
-      --radius: 24px;
-    }
+    /* Page-specific only — shared chrome lives in site.css. */
+    .shell { width: min(980px, 100%); }
 
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      min-height: 100vh;
-      background:
-        radial-gradient(circle at top left, rgba(23, 191, 230, 0.18), transparent 28%),
-        radial-gradient(circle at bottom right, rgba(88, 227, 255, 0.14), transparent 30%),
-        linear-gradient(135deg, var(--bg1), var(--bg2));
-      padding: 24px;
-    }
-
-    .shell {
-      width: min(980px, 100%);
-      margin: 0 auto;
-      display: grid;
-      gap: 24px;
-    }
-
-    .hero,
-    .content {
+    .hero, .content {
       background: var(--panel);
       border: 1px solid var(--panel-border);
       border-radius: var(--radius);
       box-shadow: var(--shadow);
       backdrop-filter: blur(10px);
     }
-
-    .hero {
-      padding: 28px;
-      display: grid;
-      gap: 12px;
-    }
-
-    .content {
-      padding: 28px;
-      display: grid;
-      gap: 28px;
-    }
+    .hero { padding: 28px; display: grid; gap: 12px; }
+    .content { padding: 28px; display: grid; gap: 28px; }
 
     .eyebrow {
-      display: inline-flex;
-      width: fit-content;
-      padding: 8px 12px;
-      border-radius: 999px;
-      font-size: 13px;
-      font-weight: 800;
-      letter-spacing: 0.03em;
-      text-transform: uppercase;
-      color: var(--primary-2);
+      display: inline-flex; width: fit-content;
+      padding: 8px 12px; border-radius: 999px;
+      font-size: 13px; font-weight: 800; letter-spacing: 0.03em;
+      text-transform: uppercase; color: var(--primary-2);
       background: rgba(23, 191, 230, 0.14);
       border: 1px solid rgba(88, 227, 255, 0.20);
     }
-
-    h1 {
-      margin: 0;
-      font-size: clamp(30px, 4vw, 44px);
-      line-height: 1;
-      letter-spacing: -0.03em;
-    }
-
-    h2 {
-      margin: 0 0 10px;
-      font-size: 22px;
-      letter-spacing: -0.02em;
-    }
-
-    p,
-    li {
-      color: var(--muted);
-      line-height: 1.7;
-    }
-
-    p {
-      margin: 0;
-    }
-
-    ul {
-      margin: 12px 0 0;
-      padding-left: 22px;
-    }
-
-    section {
-      display: grid;
-      gap: 8px;
-    }
-
-    a {
-      color: var(--primary-2);
-      text-decoration: none;
-      font-weight: 700;
-    }
-
-    a:hover {
-      text-decoration: underline;
-    }
-
-    .back-link {
-      width: fit-content;
-    }
-
-    code {
-      background: rgba(255, 255, 255, 0.08);
-      padding: 2px 6px;
-      border-radius: 7px;
-      color: var(--text);
-    }
+    h1 { margin: 0; font-size: clamp(30px, 4vw, 44px); line-height: 1; letter-spacing: -0.03em; }
+    h2 { margin: 0 0 10px; font-size: 22px; letter-spacing: -0.02em; }
+    p, li { color: var(--muted); line-height: 1.7; }
+    p { margin: 0; }
+    ul { margin: 12px 0 0; padding-left: 22px; }
+    section { display: grid; gap: 8px; }
+    a { color: var(--primary-2); text-decoration: none; font-weight: 700; }
+    a:hover { text-decoration: underline; }
+    code { background: rgba(255, 255, 255, 0.08); padding: 2px 6px; border-radius: 7px; color: var(--text); }
 
     @media (max-width: 640px) {
-      body { padding: 16px; }
-      .hero, .content { border-radius: 20px; }
-      .hero, .content { padding: 22px 20px; }
+      .hero, .content { border-radius: 18px; padding: 22px 20px; }
     }
   </style>
 </head>
 <body>
   <main class="shell">
-    <section class="hero">
+    <nav class="topnav" aria-label="Primary">
+      <a class="brand-link" href="index.html">
+        <span class="logo-mini" aria-hidden="true"></span>
+        <span>Touchless</span>
+      </a>
+      <div class="nav-links">
+        <a href="index.html" class="nav-link">Home</a>
+        <a href="downloads.html" class="nav-link">Downloads</a>
+        <a href="integrations.html" class="nav-link">Integrations</a>
+        <a href="about.html" class="nav-link">About</a>
+        <a href="privacy.html" class="nav-link active">Privacy</a>
+        <a href="terms.html" class="nav-link">Terms</a>
+      </div>
+    </nav>
+
+    <section class="hero reveal">
       <span class="eyebrow">Privacy Policy</span>
       <h1>Touchless Privacy Policy</h1>
       <p>Last updated: May 5, 2026</p>
       <p>This policy explains what information Touchless can access, collect, or transmit, how it is used, where it is stored, how users can control it, and the limited third parties involved in downloads and update checks.</p>
-      <a class="back-link" href="index.html">Back to Download Page</a>
     </section>
 
-    <section class="content">
+    <section class="content reveal">
       <section>
         <h2>1. Who this policy applies to</h2>
         <p>This policy applies to the Touchless desktop application, its tutorial and control features, and the public Touchless download website.</p>
@@ -250,7 +183,17 @@
         <p>If you have privacy or support questions about Touchless, contact <a href="mailto:konstantinvmarkov@gmail.com">konstantinvmarkov@gmail.com</a>.</p>
       </section>
     </section>
+
+    <footer class="site-footer">
+      <span>&copy; Konstantin Markov</span>
+      <span class="dot" aria-hidden="true">·</span>
+      <span>v1.1.0</span>
+      <a href="privacy.html">Privacy Policy</a>
+      <a href="terms.html">Terms</a>
+      <a href="mailto:konstantinvmarkov@gmail.com">Support</a>
+    </footer>
   </main>
+  <script defer src="site.js"></script>
 </body>
 </html>
 

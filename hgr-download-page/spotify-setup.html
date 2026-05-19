@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Touchless — Connect Spotify</title>
+  <meta name="description" content="One-minute setup to control your Spotify account by hand gesture and voice through Touchless." />
+  <meta name="theme-color" content="#0c2331" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Touchless — Connect Spotify" />
+  <meta property="og:description" content="Connect Touchless to your personal Spotify account. One-time, ~1 minute." />
+  <meta property="og:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <meta property="og:url" content="https://touchless-control.pages.dev/spotify-setup.html" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Touchless — Connect Spotify" />
+  <meta name="twitter:description" content="Connect Touchless to your personal Spotify account." />
+  <meta name="twitter:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="stylesheet" href="site.css" />
+  <style>
+    .shell { width: min(1040px, 100%); }
+
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .hero {
+      padding: 32px 32px 28px;
+      display: grid; gap: 14px;
+      position: relative; overflow: hidden;
+    }
+    .hero::after {
+      content: ""; position: absolute; inset: 0;
+      background: radial-gradient(circle at top right, rgba(29,233,182,0.10), transparent 50%);
+      pointer-events: none;
+    }
+    .hero > * { position: relative; z-index: 1; }
+
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px;
+      width: fit-content;
+      padding: 7px 14px; border-radius: 999px;
+      font-size: 12px; font-weight: 800; letter-spacing: 0.05em;
+      text-transform: uppercase; color: var(--primary-2);
+      background: rgba(23, 191, 230, 0.14);
+      border: 1px solid rgba(88, 227, 255, 0.20);
+    }
+    .eyebrow .dot-now { width: 6px; height: 6px; border-radius: 50%; background: var(--primary-2); box-shadow: 0 0 8px var(--primary-2); }
+
+    h1 { margin: 0; font-size: clamp(32px, 4.4vw, 50px); line-height: 1.05; letter-spacing: -0.025em; }
+    h2 { margin: 0 0 12px; font-size: 22px; letter-spacing: -0.01em; }
+    p, li { color: var(--muted); line-height: 1.65; }
+    p { margin: 0; }
+
+    .pill-row { display: flex; gap: 10px; flex-wrap: wrap; padding-top: 8px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 6px 12px; border-radius: 999px;
+      font-size: 12px; font-weight: 700;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.10);
+      color: var(--text);
+    }
+    .pill .check { color: var(--primary-2); font-weight: 900; }
+
+    /* Three-app row — Spotify (current page, highlighted), Apple Music
+     * (red glow on hover, links to apple-music.html), Discord (purple
+     * glow on hover, links to discord.html). */
+    .apps-row {
+      display: grid; gap: 12px; margin-top: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+    .app-card {
+      padding: 16px 18px; border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.10);
+      background: rgba(255,255,255,0.03);
+      display: grid; gap: 4px;
+      text-decoration: none; color: inherit;
+      transition: transform 0.2s cubic-bezier(0.2,0.8,0.2,1), border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+    .app-card .name { color: var(--text); font-weight: 700; font-size: 14px; }
+    .app-card .status { color: var(--muted); font-size: 12px; }
+
+    /* Spotify card — current page, highlighted + steady glow */
+    .app-card.active {
+      border-color: rgba(29,233,182,0.50);
+      background: rgba(29,233,182,0.06);
+      box-shadow: 0 0 22px rgba(29,233,182,0.25);
+    }
+    .app-card.active .status { color: var(--primary-2); font-weight: 700; }
+
+    /* Apple Music — red Apple Music palette, pulses on hover */
+    @keyframes glow-applemusic {
+      0%, 100% { box-shadow: 0 0 14px rgba(250, 45, 72, 0.30); }
+      50%      { box-shadow: 0 0 30px rgba(250, 45, 72, 0.60); }
+    }
+    .app-card.apple-card {
+      border-color: rgba(250, 45, 72, 0.35);
+    }
+    .app-card.apple-card .status { color: #ffb6c2; font-weight: 700; }
+    .app-card.apple-card:hover {
+      border-color: rgba(250, 45, 72, 0.75);
+      transform: translateY(-2px);
+      animation: glow-applemusic 2.2s ease-in-out infinite;
+    }
+
+    /* Discord — Blurple palette, pulses on hover */
+    @keyframes glow-discord {
+      0%, 100% { box-shadow: 0 0 14px rgba(88, 101, 242, 0.30); }
+      50%      { box-shadow: 0 0 30px rgba(88, 101, 242, 0.60); }
+    }
+    .app-card.discord-card {
+      border-color: rgba(88, 101, 242, 0.35);
+    }
+    .app-card.discord-card .status { color: #b6bfff; font-weight: 700; }
+    .app-card.discord-card:hover {
+      border-color: rgba(88, 101, 242, 0.75);
+      transform: translateY(-2px);
+      animation: glow-discord 2.2s ease-in-out infinite;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .app-card:hover { animation: none; }
+    }
+
+    /* Steps */
+    .steps {
+      padding: 32px;
+      display: grid; gap: 24px;
+    }
+    .step {
+      display: grid; grid-template-columns: 44px 1fr; gap: 16px;
+      align-items: flex-start;
+    }
+    .step-num {
+      display: grid; place-items: center;
+      width: 36px; height: 36px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--primary), var(--primary-2));
+      color: #001b24;
+      font-size: 16px; font-weight: 900;
+    }
+    .step-body { display: grid; gap: 8px; }
+    .step-title { color: var(--text); font-size: 18px; font-weight: 800; letter-spacing: -0.005em; }
+    .step-body p { color: var(--muted); font-size: 14px; }
+
+    .value-block {
+      margin-top: 6px;
+      background: rgba(0, 0, 0, 0.30);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 10px;
+      padding: 12px 14px;
+      display: grid; gap: 4px;
+      font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+      font-size: 13px;
+      color: var(--text);
+      overflow-x: auto;
+    }
+    .value-block .row { display: grid; grid-template-columns: 120px 1fr; gap: 12px; align-items: baseline; }
+    .value-block .row .k { color: rgba(180,215,255,0.85); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 700; }
+    .value-block .row .v { color: var(--text); }
+    .value-block.uri { font-size: 12px; }
+
+    .callout {
+      background: rgba(29,233,182,0.07);
+      border-left: 3px solid var(--primary-2);
+      padding: 14px 18px;
+      border-radius: 0 10px 10px 0;
+      margin-top: 6px;
+    }
+    .callout strong { color: var(--text); }
+    .callout p { color: var(--muted); }
+
+    .cta-row {
+      display: flex; flex-wrap: wrap; gap: 12px; padding-top: 6px;
+    }
+
+    code, .inline-code {
+      background: rgba(255, 255, 255, 0.08);
+      padding: 2px 8px; border-radius: 7px;
+      color: var(--text);
+      font-family: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+      font-size: 13px;
+    }
+
+    /* FAQ */
+    .faq {
+      display: grid; gap: 14px;
+    }
+    .faq-item {
+      padding: 16px 20px;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.02);
+    }
+    .faq-item .q { color: var(--text); font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+    .faq-item .a { color: var(--muted); font-size: 13px; line-height: 1.6; }
+
+    @media (max-width: 640px) {
+      .hero, .panel, .steps { border-radius: 18px; padding: 24px 20px; }
+      .step { grid-template-columns: 32px 1fr; gap: 12px; }
+      .step-num { width: 28px; height: 28px; font-size: 13px; }
+      .value-block .row { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="topnav" aria-label="Primary">
+      <a class="brand-link" href="index.html">
+        <span class="logo-mini" aria-hidden="true"></span>
+        <span>Touchless</span>
+      </a>
+      <div class="nav-links">
+        <a href="index.html" class="nav-link">Home</a>
+        <a href="downloads.html" class="nav-link">Downloads</a>
+        <a href="integrations.html" class="nav-link">Integrations</a>
+        <a href="about.html" class="nav-link">About</a>
+        <a href="privacy.html" class="nav-link">Privacy</a>
+        <a href="terms.html" class="nav-link">Terms</a>
+      </div>
+    </nav>
+
+    <!-- HERO -->
+    <section class="hero reveal">
+      <span class="eyebrow"><span class="dot-now"></span>Connect Touchless to your apps</span>
+      <h1>Spotify, by hand and by voice.</h1>
+      <p>Control your own Spotify playback through Touchless gestures and voice commands. One-minute setup, then it just works. Your Spotify password stays on Spotify's site — Touchless only ever sees a public ID.</p>
+
+      <div class="pill-row">
+        <span class="pill"><span class="check">✓</span> Runs locally</span>
+        <span class="pill"><span class="check">✓</span> Open source</span>
+        <span class="pill"><span class="check">✓</span> No subscription</span>
+        <span class="pill"><span class="check">✓</span> PKCE OAuth, no shared secrets</span>
+      </div>
+
+      <div class="apps-row">
+        <div class="app-card active" aria-current="page">
+          <span class="name">Spotify</span>
+          <span class="status">● Available now</span>
+        </div>
+        <a class="app-card apple-card" href="apple-music.html">
+          <span class="name">Apple Music</span>
+          <span class="status">Coming soon</span>
+        </a>
+        <a class="app-card discord-card" href="discord.html">
+          <span class="name">Discord</span>
+          <span class="status">Coming soon</span>
+        </a>
+      </div>
+    </section>
+
+    <!-- THE FASTEST PATH -->
+    <section class="panel steps reveal">
+      <h2>The fastest path — use the in-app wizard</h2>
+      <p>In Touchless: <strong>Settings → General → Spotify → Set up your own Spotify app</strong>. Three short screens, each value has a Copy button, you'll be done in about a minute. The instructions below mirror the wizard if you'd rather follow them on the web.</p>
+      <div class="callout">
+        <p><strong>Your Spotify password never leaves Spotify.</strong> Touchless only receives a public Client ID — a public identifier Spotify gives you when you create an app. It's not a secret and doesn't grant access to your account.</p>
+      </div>
+    </section>
+
+    <!-- STEPS -->
+    <section class="panel steps reveal">
+      <h2>Step-by-step</h2>
+
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <div class="step-title">Open the Spotify Developer Dashboard</div>
+          <p>Sign in with the same Spotify account you use to listen to music. Free for everyone — no payment, no waitlist, no review.</p>
+          <div class="cta-row">
+            <a class="btn" href="https://developer.spotify.com/dashboard/create" target="_blank" rel="noopener">Open Create-App page →</a>
+          </div>
+          <div class="callout" style="margin-top: 14px;">
+            <p><strong>Not signed in yet?</strong> The link above takes you to Spotify for Developers. If you see the marketing page (purple background with floating shapes) instead of a Create-App form: click the <strong>≡</strong> menu in the top-right corner → <strong>Log in</strong> → <strong>Dashboard</strong> → <strong>Create app</strong>.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <div class="step-title">Fill in the basics</div>
+          <p>Type any name you like for your app — these are just suggestions:</p>
+          <div class="value-block">
+            <div class="row"><span class="k">App name</span><span class="v">Touchless Personal</span></div>
+            <div class="row"><span class="k">Description</span><span class="v">Personal Spotify control via Touchless</span></div>
+            <div class="row"><span class="k">Website</span><span class="v">https://touchless-control.pages.dev/</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <div class="step-title">Add the callback URLs</div>
+          <p>Spotify sends your browser to one of these local addresses after you sign in. Touchless tries ports 5000 → 5004 in order so a busy 5000 (Discord, OBS, dev servers) doesn't block you — registering all five is recommended. At minimum, register 5000. Click Add in the Dashboard after each line:</p>
+          <div class="value-block uri">
+            <div>http://127.0.0.1:5000/callback</div>
+            <div>http://127.0.0.1:5001/callback</div>
+            <div>http://127.0.0.1:5002/callback</div>
+            <div>http://127.0.0.1:5003/callback</div>
+            <div>http://127.0.0.1:5004/callback</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-num">4</div>
+        <div class="step-body">
+          <div class="step-title">Select Web API</div>
+          <p>Under "Which API/SDKs are you planning to use?", check the box next to <strong>Web API</strong>. Don't tick any of the others — Touchless only uses the Web API to send playback commands (play, pause, skip, volume) to your Spotify account.</p>
+          <p><strong>App type:</strong> <span class="inline-code">Desktop App</span>.  <strong>Commercial application:</strong> <span class="inline-code">No</span>.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-num">5</div>
+        <div class="step-body">
+          <div class="step-title">Copy your Client ID</div>
+          <p>Click Save. Spotify opens your new app's page with a <strong>Client ID</strong> at the top — a 32-character hex string like <code>7763a7c443604776b0060da01428686f</code>. Click the copy icon next to it.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-num">6</div>
+        <div class="step-body">
+          <div class="step-title">Paste into Touchless</div>
+          <p>Back in Touchless: <strong>Settings → General → Spotify → Set up your own Spotify app</strong>. Walk to the last page, paste your Client ID, click Finish. Then click <strong>Connect Spotify</strong> — your browser opens to Spotify's authorize page, you click Agree, and you're done. Voice commands like "play Sade on Spotify" and gestures like right-hand fist now control your Spotify account.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- TROUBLESHOOTING + FAQ -->
+    <section class="panel steps reveal">
+      <h2>Troubleshooting</h2>
+      <div class="faq">
+        <div class="faq-item">
+          <div class="q">INVALID_CLIENT: Invalid redirect URI</div>
+          <div class="a">You missed one of the five callback URLs in step 3. Re-open your app in the Spotify Dashboard, edit, add the missing ones, save.</div>
+        </div>
+        <div class="faq-item">
+          <div class="q">user_not_listed</div>
+          <div class="a">You're still using Touchless's bundled Client ID. Either you skipped this wizard, or your saved Client ID was empty / wrong. Re-run the Set up wizard.</div>
+        </div>
+        <div class="faq-item">
+          <div class="q">"spotify auth port busy"</div>
+          <div class="a">Every callback port 5000–5004 is in use by another app. Close Discord, OBS, or any local dev server, then click Connect Spotify again.</div>
+        </div>
+        <div class="faq-item">
+          <div class="q">Authorization opens then nothing happens</div>
+          <div class="a">The local callback server timed out after 3 minutes. Either Spotify's authorize page didn't load, or you closed the browser tab. Click Connect Spotify again.</div>
+        </div>
+        <div class="faq-item">
+          <div class="q">Still stuck</div>
+          <div class="a">Email <a href="mailto:konstantinvmarkov@gmail.com">konstantinvmarkov@gmail.com</a> with the <span class="inline-code">[spotify-auth]</span> lines from the terminal (if running from source) or from your Touchless log folder (packaged build).</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FAQ -->
+    <section class="panel steps reveal">
+      <h2>FAQ</h2>
+      <div class="faq">
+        <div class="faq-item">
+          <div class="q">Is this safe?</div>
+          <div class="a">Yes. Your Spotify password is entered only on Spotify's official site. Touchless uses PKCE OAuth — no client secret is shared. The Client ID is public per Spotify's docs. Tokens are stored locally on your PC.</div>
+        </div>
+        <div class="faq-item">
+          <div class="q">Does this cost anything?</div>
+          <div class="a">No. Spotify's developer program is free for personal use.</div>
+        </div>
+        <div class="faq-item">
+          <div class="q">Can I revoke access later?</div>
+          <div class="a">Yes. Sign in to <a href="https://www.spotify.com/account/apps/" target="_blank" rel="noopener">spotify.com/account/apps</a> and click Remove next to your app. Or delete the app entirely from the Developer Dashboard.</div>
+        </div>
+        <div class="faq-item">
+          <div class="q">Why do I need to create my own Spotify app?</div>
+          <div class="a">Spotify caps shared developer apps at 5 testers and removed the indie-friendly extension program in 2024. The remaining path requires 250 000 monthly users plus a registered business. Each Touchless user creating their own app keeps Spotify's policies happy and removes the cap entirely — you become the sole user of your own app.</div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="site-footer">
+      <span>&copy; Konstantin Markov</span>
+      <span class="dot" aria-hidden="true">·</span>
+      <span>v1.1.0</span>
+      <a href="privacy.html">Privacy Policy</a>
+      <a href="terms.html">Terms</a>
+      <a href="mailto:konstantinvmarkov@gmail.com">Support</a>
+    </footer>
+  </main>
+  <script defer src="site.js"></script>
+</body>
+</html>
+
+<!-- Author: Konstantin Markov -->

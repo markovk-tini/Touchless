@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Touchless — Apple Music integration</title>
+  <meta name="description" content="Apple Music gesture and voice control through Touchless — coming soon, after macOS support lands." />
+  <meta name="theme-color" content="#0c2331" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Touchless — Apple Music integration" />
+  <meta property="og:description" content="Apple Music gesture and voice control through Touchless. Coming soon." />
+  <meta property="og:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <meta property="og:url" content="https://touchless-control.pages.dev/apple-music.html" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Touchless — Apple Music integration" />
+  <meta name="twitter:description" content="Apple Music gesture and voice control through Touchless. Coming soon." />
+  <meta name="twitter:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="stylesheet" href="site.css" />
+  <style>
+    /* Apple Music accent palette:
+     *   #FA2D48 (red)     — primary
+     *   #FB3F69 (pink)    — accent / hover
+     *   #FF6A88           — lighter highlight
+     * Shared chrome (nav, footer, body bg, .reveal) comes from
+     * site.css; this stylesheet only paints hero + theme accents.
+     */
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .hero {
+      padding: 40px 32px 36px;
+      display: grid; gap: 16px;
+      position: relative; overflow: hidden;
+    }
+    .hero::before {
+      content: ""; position: absolute; inset: 0;
+      background:
+        radial-gradient(circle at top left, rgba(250, 45, 72, 0.22), transparent 45%),
+        radial-gradient(circle at bottom right, rgba(255, 106, 136, 0.18), transparent 50%);
+      pointer-events: none;
+    }
+    .hero > * { position: relative; z-index: 1; }
+
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px;
+      width: fit-content;
+      padding: 7px 14px; border-radius: 999px;
+      font-size: 12px; font-weight: 800; letter-spacing: 0.05em;
+      text-transform: uppercase; color: #ffb6c2;
+      background: rgba(250, 45, 72, 0.16);
+      border: 1px solid rgba(250, 45, 72, 0.40);
+    }
+    .eyebrow .dot { width: 7px; height: 7px; border-radius: 50%; background: #FB3F69; box-shadow: 0 0 10px #FB3F69; }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(34px, 5vw, 56px);
+      line-height: 1.05; letter-spacing: -0.025em;
+    }
+    .accent { color: #ffb6c2; }
+
+    p { margin: 0; color: var(--muted); line-height: 1.65; max-width: 720px; }
+
+    .brand-row { display: flex; align-items: center; gap: 18px; }
+    .brand-logo {
+      width: 72px; height: 72px; border-radius: 20px;
+      background: linear-gradient(145deg, #FA2D48, #FB3F69);
+      display: grid; place-items: center;
+      flex: 0 0 auto;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 12px 30px rgba(250, 45, 72, 0.40);
+    }
+    .brand-logo svg { width: 40px; height: 40px; display: block; color: #fff; }
+
+    .pill-row { display: flex; gap: 10px; flex-wrap: wrap; padding-top: 6px; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 7px 13px; border-radius: 999px;
+      font-size: 12px; font-weight: 700;
+      background: rgba(250, 45, 72, 0.10);
+      border: 1px solid rgba(250, 45, 72, 0.30);
+      color: #ffc4ce;
+    }
+
+    .panel.std { padding: 32px; display: grid; gap: 14px; }
+    h2 { margin: 0; font-size: 22px; letter-spacing: -0.01em; }
+
+    /* Three-app row at the bottom — Spotify (live link),
+     * Apple Music (current page, highlighted), Discord (coming link). */
+    .apps-row {
+      display: grid; gap: 12px; margin-top: 6px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    }
+    .app-card {
+      padding: 16px 18px; border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.10);
+      background: rgba(255,255,255,0.03);
+      display: grid; gap: 4px;
+      text-decoration: none; color: inherit;
+      transition: transform 0.2s cubic-bezier(0.2,0.8,0.2,1), border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+    .app-card .name { color: var(--text); font-weight: 700; font-size: 14px; }
+    .app-card .status { color: var(--muted); font-size: 12px; }
+
+    /* Spotify card glow */
+    @keyframes glow-spotify {
+      0%, 100% { box-shadow: 0 0 14px rgba(29,233,182,0.30); }
+      50%      { box-shadow: 0 0 30px rgba(29,233,182,0.60); }
+    }
+    .app-card.spotify { border-color: rgba(29,233,182,0.40); background: rgba(29,233,182,0.05); }
+    .app-card.spotify .status { color: #5af0c1; font-weight: 700; }
+    .app-card.spotify:hover {
+      border-color: rgba(29,233,182,0.70);
+      transform: translateY(-2px);
+      animation: glow-spotify 2.2s ease-in-out infinite;
+    }
+
+    /* Apple Music card — current page, slightly louder + always glowing */
+    .app-card.apple {
+      border-color: rgba(250, 45, 72, 0.55);
+      background: rgba(250, 45, 72, 0.07);
+    }
+    .app-card.apple .status { color: #ffb6c2; font-weight: 700; }
+    .app-card.apple.current {
+      box-shadow: 0 0 22px rgba(250, 45, 72, 0.35);
+    }
+
+    /* Discord glow */
+    @keyframes glow-discord {
+      0%, 100% { box-shadow: 0 0 14px rgba(88,101,242,0.30); }
+      50%      { box-shadow: 0 0 30px rgba(88,101,242,0.60); }
+    }
+    .app-card.discord { border-color: rgba(88, 101, 242, 0.35); }
+    .app-card.discord:hover {
+      border-color: rgba(88, 101, 242, 0.75);
+      transform: translateY(-2px);
+      animation: glow-discord 2.2s ease-in-out infinite;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .app-card:hover { animation: none; }
+    }
+
+    @media (max-width: 640px) {
+      .hero, .panel { border-radius: 18px; padding: 26px 20px; }
+      .brand-row { gap: 14px; }
+      .brand-logo { width: 56px; height: 56px; border-radius: 16px; }
+      .brand-logo svg { width: 30px; height: 30px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="topnav" aria-label="Primary">
+      <a class="brand-link" href="index.html">
+        <span class="logo-mini" aria-hidden="true"></span>
+        <span>Touchless</span>
+      </a>
+      <div class="nav-links">
+        <a href="index.html" class="nav-link">Home</a>
+        <a href="downloads.html" class="nav-link">Downloads</a>
+        <a href="integrations.html" class="nav-link active">Integrations</a>
+        <a href="about.html" class="nav-link">About</a>
+        <a href="privacy.html" class="nav-link">Privacy</a>
+        <a href="terms.html" class="nav-link">Terms</a>
+      </div>
+    </nav>
+
+    <!-- HERO -->
+    <section class="hero reveal">
+      <span class="eyebrow"><span class="dot"></span>Coming soon</span>
+
+      <div class="brand-row">
+        <div class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 17V7l9 -2v10" />
+            <circle cx="7" cy="17" r="2" />
+            <circle cx="16" cy="15" r="2" />
+          </svg>
+        </div>
+        <div>
+          <h1>Apple Music, <span class="accent">by hand</span> and <span class="accent">by voice.</span></h1>
+        </div>
+      </div>
+
+      <p>Play, pause, skip, and change volume on your Apple Music library — by gesture or by voice. Arrives alongside the macOS build of Touchless.</p>
+
+      <div class="pill-row">
+        <span class="pill">Coming soon</span>
+      </div>
+
+      <!-- Three-app row -->
+      <div class="apps-row">
+        <a class="app-card spotify" href="spotify-setup.html">
+          <span class="name">Spotify</span>
+          <span class="status">● Available now</span>
+        </a>
+        <div class="app-card apple current" aria-current="page">
+          <span class="name">Apple Music</span>
+          <span class="status">Coming soon</span>
+        </div>
+        <a class="app-card discord" href="discord.html">
+          <span class="name">Discord</span>
+          <span class="status">Coming soon</span>
+        </a>
+      </div>
+    </section>
+
+    <!-- PLACEHOLDER -->
+    <section class="panel std reveal">
+      <h2>Stay tuned</h2>
+      <p>I'm working on it. When it's ready, this page will turn into a setup guide — same one-minute-and-done feel as Spotify. Until then, keep an eye on the <a href="downloads.html">Downloads</a> page for new releases.</p>
+    </section>
+
+    <footer class="site-footer">
+      <span>&copy; Konstantin Markov</span>
+      <span class="dot" aria-hidden="true">·</span>
+      <span>v1.1.0</span>
+      <a href="privacy.html">Privacy Policy</a>
+      <a href="terms.html">Terms</a>
+      <a href="mailto:konstantinvmarkov@gmail.com">Support</a>
+    </footer>
+  </main>
+  <script defer src="site.js"></script>
+</body>
+</html>
+
+<!-- Author: Konstantin Markov -->

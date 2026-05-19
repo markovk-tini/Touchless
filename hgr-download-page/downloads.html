@@ -4,67 +4,23 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Download Touchless</title>
+  <meta name="description" content="Download Touchless for Windows. Signed installer with the gesture engine, voice models, and tutorial bundled." />
+  <meta name="theme-color" content="#0c2331" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Download Touchless" />
+  <meta property="og:description" content="Signed Windows installer with everything you need to start using gesture and voice control." />
+  <meta property="og:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <meta property="og:url" content="https://touchless-control.pages.dev/downloads.html" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Download Touchless" />
+  <meta name="twitter:description" content="Signed Windows installer." />
+  <meta name="twitter:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="stylesheet" href="site.css" />
   <style>
-    :root {
-      --bg1: #07131d;
-      --bg2: #0c2331;
-      --panel: rgba(10, 28, 39, 0.82);
-      --panel-border: rgba(90, 217, 255, 0.22);
-      --primary: #17bfe6;
-      --primary-2: #58e3ff;
-      --text: #f2fbff;
-      --muted: #a9c6d2;
-      --danger: #ff6b6b;
-      --shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
-      --radius: 24px;
-    }
-
-    * { box-sizing: border-box; }
-
-    body {
-      margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      min-height: 100vh;
-      background:
-        radial-gradient(circle at top left, rgba(23, 191, 230, 0.18), transparent 28%),
-        radial-gradient(circle at bottom right, rgba(88, 227, 255, 0.14), transparent 30%),
-        linear-gradient(135deg, var(--bg1), var(--bg2));
-      padding: 24px;
-    }
-
-    .shell { width: min(1040px, 100%); margin: 0 auto; display: grid; gap: 24px; }
-
-    /* Top navigation */
-    .topnav {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 12px 16px;
-      background: var(--panel); border: 1px solid var(--panel-border);
-      border-radius: 18px; box-shadow: var(--shadow); backdrop-filter: blur(10px);
-    }
-    .brand-link {
-      display: inline-flex; align-items: center; gap: 10px;
-      color: var(--text); text-decoration: none; font-weight: 800;
-      letter-spacing: -0.01em; font-size: 16px;
-    }
-    .logo-mini {
-      width: 32px; height: 32px; border-radius: 9px;
-      background: linear-gradient(145deg, var(--primary), var(--primary-2));
-      position: relative; flex: 0 0 auto;
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.22), 0 6px 14px rgba(23,191,230,0.30);
-    }
-    .logo-mini::before {
-      content: "TL"; position: absolute; inset: 0;
-      display: grid; place-items: center; color: #032431;
-      font-weight: 900; letter-spacing: 0.08em; font-size: 11px;
-    }
-    .nav-links { display: flex; gap: 4px; flex-wrap: wrap; }
-    .nav-link {
-      color: var(--muted); text-decoration: none; font-weight: 700;
-      padding: 8px 14px; border-radius: 999px; font-size: 14px;
-    }
-    .nav-link:hover { color: var(--text); background: rgba(255,255,255,0.06); }
-    .nav-link.active { color: var(--primary-2); background: rgba(23,191,230,0.14); border: 1px solid rgba(88,227,255,0.2); }
+    /* Page-specific only — shared chrome (colours, body bg, topnav,
+       buttons, footer, .reveal, mobile breakpoints) lives in site.css. */
+    :root { --danger: #ff6b6b; }
 
     .hero, .cards, .notes {
       background: var(--panel); border: 1px solid var(--panel-border);
@@ -74,15 +30,9 @@
     .brand { display: inline-flex; align-items: center; gap: 14px; }
     .logo {
       width: 62px; height: 62px; border-radius: 18px;
-      background: linear-gradient(145deg, var(--primary), var(--primary-2));
+      background: center / cover no-repeat url(favicon.png), linear-gradient(145deg, var(--primary), var(--primary-2));
       box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 8px 22px rgba(23,191,230,0.35);
       position: relative; flex: 0 0 auto;
-    }
-    .logo::before {
-      content: "TL"; position: absolute; inset: 0;
-      display: grid; place-items: center; color: #032431;
-      font-weight: 900; letter-spacing: 0.08em; font-size: 17px;
-      line-height: 1; transform: translateY(-1px);
     }
     h1 { margin: 0; font-size: clamp(30px, 4vw, 46px); line-height: 1; letter-spacing: -0.03em; }
     h2 { margin: 0; font-size: 24px; letter-spacing: -0.02em; }
@@ -103,6 +53,13 @@
       border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 22px;
       padding: 22px; background: rgba(255, 255, 255, 0.02);
       display: grid; gap: 16px; align-content: start;
+      transition: transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1),
+                  border-color 0.25s ease, box-shadow 0.3s ease;
+    }
+    .card:hover {
+      transform: translateY(-3px);
+      border-color: rgba(88,227,255,0.40);
+      box-shadow: 0 18px 40px rgba(0,0,0,0.35), 0 0 0 1px rgba(88,227,255,0.12);
     }
     .tag {
       display: inline-flex; width: fit-content;
@@ -121,16 +78,9 @@
       border: 1px solid rgba(88, 227, 255, 0.20);
     }
     .actions { display: flex; gap: 12px; flex-wrap: wrap; }
-    .btn {
-      appearance: none; border: none; cursor: pointer; text-decoration: none;
-      display: inline-flex; justify-content: center; align-items: center;
-      min-width: 150px; padding: 13px 16px; border-radius: 14px;
-      font-weight: 800; color: #032431;
-      background: linear-gradient(145deg, var(--primary), var(--primary-2));
-      transition: transform 0.12s ease, filter 0.12s ease;
-    }
-    .btn:hover { transform: translateY(-1px); filter: brightness(1.03); }
-    .btn.secondary { background: rgba(255, 255, 255, 0.08); color: var(--text); }
+    /* Override: the download cards' primary buttons are slightly
+       narrower than the home page's. */
+    .actions .btn { min-width: 150px; padding: 13px 16px; }
     .notes { padding: 22px 24px; display: grid; gap: 12px; }
     ul { margin: 0; padding-left: 20px; color: var(--muted); line-height: 1.55; }
     .helper { font-size: 14px; }
@@ -143,13 +93,6 @@
       background: rgba(255, 255, 255, 0.08);
       padding: 2px 6px; border-radius: 7px; color: var(--text);
     }
-
-    footer.site-footer {
-      color: var(--muted); font-size: 13px; padding: 4px 6px;
-      display: flex; gap: 16px; flex-wrap: wrap;
-    }
-    footer.site-footer a { color: var(--primary-2); text-decoration: none; font-weight: 700; }
-    footer.site-footer a:hover { text-decoration: underline; }
 
     /* System-check results styling */
     .sys-check-row {
@@ -217,15 +160,11 @@
     }
 
     @media (max-width: 640px) {
-      body { padding: 16px; }
-      .topnav, .hero, .cards, .notes { border-radius: 18px; }
+      .hero, .cards, .notes { border-radius: 18px; }
       .hero { padding: 22px 20px 18px; }
       .cards { padding: 18px; }
       .card { padding: 18px; }
       .actions { flex-direction: column; }
-      .btn { width: 100%; }
-      .nav-link { padding: 6px 10px; font-size: 13px; }
-      .brand-link { font-size: 14px; }
     }
   </style>
 </head>
@@ -239,42 +178,26 @@
       <div class="nav-links">
         <a href="index.html" class="nav-link">Home</a>
         <a href="downloads.html" class="nav-link active">Downloads</a>
+        <a href="integrations.html" class="nav-link">Integrations</a>
         <a href="about.html" class="nav-link">About</a>
         <a href="privacy.html" class="nav-link">Privacy</a>
+        <a href="terms.html" class="nav-link">Terms</a>
       </div>
     </nav>
 
-    <section class="hero">
+    <section class="hero reveal">
       <div class="brand">
         <div class="logo" aria-hidden="true"></div>
         <div>
           <h1>Download Touchless</h1>
         </div>
       </div>
-      <span class="version">Current Version: v1.1.0b7</span>
+      <span class="version">Current Version: v1.1.0</span>
       <p>Control your PC with hand gestures and your voice — no touch required. Live camera tracking, voice commands, and dictation all run locally on your machine.</p>
       <div id="recommended" class="recommended">Checking your device…</div>
     </section>
 
-    <section class="notes">
-      <h3>System requirements</h3>
-      <div class="sys-check-row">
-        <button id="sysCheckBtn" type="button" class="sys-check-btn">Check My System</button>
-        <span id="sysCheckSummary" class="sys-check-summary"></span>
-      </div>
-      <div id="sysCheckResults" class="sys-check-results hidden" aria-live="polite"></div>
-      <ul>
-        <li><strong>Operating system:</strong> Windows 10 or Windows 11 (64-bit).</li>
-        <li><strong>Webcam:</strong> any USB or built-in camera at 720p/30fps or higher. Faster cameras reduce motion blur on gestures.</li>
-        <li><strong>Microphone:</strong> required for voice commands and dictation. A headset or external mic works best; laptop/webcam mics are fine.</li>
-        <li><strong>GPU (recommended):</strong> NVIDIA (CUDA 12.x) or any Vulkan-capable AMD/Intel GPU for fast voice transcription and grammar correction. CPU-only mode works but is slower.</li>
-        <li><strong>RAM:</strong> 8 GB minimum, 16 GB recommended (voice and grammar models load together).</li>
-        <li><strong>Disk space:</strong> about 6 GB free after install (includes whisper models and optional Qwen 3B grammar model).</li>
-        <li><strong>First run:</strong> Windows may prompt to allow camera and microphone access — accept both.</li>
-      </ul>
-    </section>
-
-    <section class="cards">
+    <section class="cards reveal">
       <article class="card">
         <span class="tag">Windows</span>
         <h2>Windows Installer</h2>
@@ -283,7 +206,7 @@
           <a
             id="windowsDownload"
             class="btn"
-            href="https://pub-3116ebd541fa4ca18a84371667d029fe.r2.dev/windows/v1.1.0b7/Touchless_Installer.exe"
+            href="https://pub-3116ebd541fa4ca18a84371667d029fe.r2.dev/windows/v1.1.0/Touchless_Installer.exe"
           >
             Download for Windows
           </a>
@@ -312,7 +235,54 @@
       </article>
     </section>
 
-    <section class="notes">
+    <section class="notes reveal">
+      <h3>What's new in v1.1.0</h3>
+      <p><strong>New</strong></p>
+      <ul>
+        <li>System tray icon with live status — green ring when running, orange when paused, grey when off. Right-click for Pause / Settings / Quit.</li>
+        <li>Windows Jump List — right-click Touchless in the taskbar to Pause / open Settings / Quit without bringing the window forward.</li>
+        <li>Autostart with Windows — new toggle in General settings.</li>
+        <li>Smarter Settings search — General and About tabs are now indexed.</li>
+        <li>Dynamic gestures (early preview) — record motion-based custom gestures with the new recorder + clip picker. Accuracy is still being tuned.</li>
+        <li>Polished Custom-gesture creator — title bar matches the main window indigo; new Static/Dynamic split control.</li>
+      </ul>
+      <p><strong>Fixes &amp; polish</strong></p>
+      <ul>
+        <li>Camera no longer glitchy on first launch — fixed mostly-black / corrupt-pixel first frames in the tutorial, app start, and the custom-gesture recorder.</li>
+        <li>~50% lower dictation latency without losing accuracy.</li>
+        <li>Cleaner dictation — beam search + VAD filtering + hallucination thresholds cut spurious words.</li>
+        <li>Smarter grammar correction — triggers when you stop typing, aborts on resume, does a final pass at the end.</li>
+        <li>Smooth live view during fullscreen games — new lite paint mode + process-priority boost stop the camera from stuttering.</li>
+        <li>Spotify reauth toast — gentle prompt when your token expires instead of silent failure.</li>
+        <li>Tutorial Spotify step now auto-completes when music actually plays.</li>
+        <li>Consistent spacing on settings panel scroll bars; single green scroll bar on Control Guide.</li>
+        <li>Connect Phone is reachable when no webcam or mic is detected (dropdowns stay enabled).</li>
+      </ul>
+      <p><strong>Known issues</strong></p>
+      <ul>
+        <li>Dynamic gesture accuracy is mediocre — over-firing and missed-fires both happen. Re-record after each update; saved templates aren't forward-compatible across tuning changes yet.</li>
+      </ul>
+    </section>
+
+    <section class="notes reveal">
+      <h3>System requirements</h3>
+      <div class="sys-check-row">
+        <button id="sysCheckBtn" type="button" class="sys-check-btn">Check My System</button>
+        <span id="sysCheckSummary" class="sys-check-summary"></span>
+      </div>
+      <div id="sysCheckResults" class="sys-check-results hidden" aria-live="polite"></div>
+      <ul>
+        <li><strong>Operating system:</strong> Windows 10 or Windows 11 (64-bit).</li>
+        <li><strong>Webcam:</strong> any USB or built-in camera at 720p/30fps or higher. Faster cameras reduce motion blur on gestures.</li>
+        <li><strong>Microphone:</strong> required for voice commands and dictation. A headset or external mic works best; laptop/webcam mics are fine.</li>
+        <li><strong>GPU (recommended):</strong> NVIDIA (CUDA 12.x) or any Vulkan-capable AMD/Intel GPU for fast voice transcription and grammar correction. CPU-only mode works but is slower.</li>
+        <li><strong>RAM:</strong> 8 GB minimum, 16 GB recommended (voice and grammar models load together).</li>
+        <li><strong>Disk space:</strong> about 6 GB free after install (includes whisper models and optional Qwen 3B grammar model).</li>
+        <li><strong>First run:</strong> Windows may prompt to allow camera and microphone access — accept both.</li>
+      </ul>
+    </section>
+
+    <section class="notes reveal">
       <h3>How to install</h3>
       <ul>
         <li>Click <strong>Download for Windows</strong> to download the installer.</li>
@@ -322,11 +292,12 @@
       </ul>
     </section>
 
-    <section class="notes">
+    <section class="notes reveal">
       <h3>Policy and support</h3>
       <p>Need privacy or support details for the Microsoft Store or for your team?</p>
       <div class="meta-links">
         <a href="privacy.html">Privacy Policy</a>
+        <a href="terms.html">Terms of Service</a>
         <a href="about.html">About Touchless</a>
         <a href="mailto:konstantinvmarkov@gmail.com">Support Email</a>
       </div>
@@ -334,7 +305,10 @@
 
     <footer class="site-footer">
       <span>&copy; Konstantin Markov</span>
+      <span class="dot" aria-hidden="true">·</span>
+      <span>v1.1.0</span>
       <a href="privacy.html">Privacy Policy</a>
+      <a href="terms.html">Terms</a>
       <a href="mailto:konstantinvmarkov@gmail.com">Support</a>
     </footer>
   </main>
@@ -849,6 +823,7 @@
       });
     });
   </script>
+  <script defer src="site.js"></script>
 </body>
 </html>
 

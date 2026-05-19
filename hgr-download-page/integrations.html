@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Touchless — Integrations</title>
+  <meta name="description" content="The apps Touchless can control with hand gestures and voice — what works today and what's on the roadmap." />
+  <meta name="theme-color" content="#0c2331" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Touchless — Integrations" />
+  <meta property="og:description" content="The apps Touchless can control with hand gestures and voice." />
+  <meta property="og:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <meta property="og:url" content="https://touchless-control.pages.dev/integrations.html" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Touchless — Integrations" />
+  <meta name="twitter:description" content="The apps Touchless can control with hand gestures and voice." />
+  <meta name="twitter:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="stylesheet" href="site.css" />
+  <style>
+    /* Page-specific styling. Shared chrome (colours, topnav, footer,
+       buttons, reveal animation) lives in site.css. */
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .hero {
+      padding: 36px 32px 28px;
+      display: grid; gap: 14px;
+      position: relative; overflow: hidden;
+    }
+    .hero::after {
+      content: ""; position: absolute; inset: 0;
+      background: radial-gradient(circle at top right, rgba(88,227,255,0.10), transparent 50%);
+      pointer-events: none;
+    }
+    .hero > * { position: relative; z-index: 1; }
+
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px;
+      width: fit-content;
+      padding: 7px 14px; border-radius: 999px;
+      font-size: 12px; font-weight: 800; letter-spacing: 0.05em;
+      text-transform: uppercase; color: var(--primary-2);
+      background: rgba(23, 191, 230, 0.14);
+      border: 1px solid rgba(88, 227, 255, 0.20);
+    }
+    .eyebrow .dot-now { width: 6px; height: 6px; border-radius: 50%; background: var(--primary-2); box-shadow: 0 0 8px var(--primary-2); }
+
+    h1 { margin: 0; font-size: clamp(32px, 4.4vw, 50px); line-height: 1.05; letter-spacing: -0.025em; }
+    h2 { margin: 0 0 14px; font-size: 22px; letter-spacing: -0.01em; }
+    p, li { color: var(--muted); line-height: 1.65; }
+    p { margin: 0; }
+
+    .section-intro { color: var(--muted); max-width: 760px; }
+
+    /* Integration card grid */
+    .int-grid {
+      display: grid; gap: 18px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      margin-top: 18px;
+    }
+    .int-card {
+      padding: 22px 22px 20px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,0.10);
+      background: rgba(255,255,255,0.03);
+      display: grid; gap: 12px;
+      transition: transform 0.25s cubic-bezier(0.2, 0.8, 0.2, 1),
+                  border-color 0.25s ease,
+                  box-shadow 0.3s ease;
+    }
+    .int-card:hover {
+      transform: translateY(-3px);
+      border-color: rgba(88, 227, 255, 0.35);
+      box-shadow: 0 18px 40px rgba(0,0,0,0.35);
+    }
+    .int-card.available {
+      border-color: rgba(29,233,182,0.40);
+      background: rgba(29,233,182,0.05);
+    }
+    /* Anchor-as-card: kill default link underline + inherit colour so
+     * the card looks identical to the article version. Used for
+     * Discord + Apple Music (whole card = link to setup page). */
+    a.int-card-link {
+      text-decoration: none;
+      color: inherit;
+      cursor: pointer;
+    }
+    a.int-card-link:hover { color: inherit; }
+
+    /* Themed hover glow — slow pulsing box-shadow in the brand colour.
+     * Discord = Blurple (#5865F2), Apple Music = red (#FA2D48). Plays
+     * only while the cursor is over the card, so the rest of the
+     * page stays calm. */
+    @keyframes glow-applemusic {
+      0%, 100% { box-shadow: 0 18px 40px rgba(0,0,0,0.35), 0 0 14px rgba(250, 45, 72, 0.30); }
+      50%      { box-shadow: 0 18px 40px rgba(0,0,0,0.35), 0 0 36px rgba(250, 45, 72, 0.65); }
+    }
+    .int-card.discord-card { border-color: rgba(88,101,242,0.32); }
+    /* Discord is shelved behind a future feature update and not
+     * clickable — no hover glow so it doesn't read as interactive. */
+    .int-card.apple-card { border-color: rgba(250, 45, 72, 0.32); }
+    .int-card.apple-card:hover {
+      border-color: rgba(250, 45, 72, 0.75);
+      animation: glow-applemusic 2.2s ease-in-out infinite;
+    }
+    @keyframes glow-youtube {
+      0%, 100% { box-shadow: 0 18px 40px rgba(0,0,0,0.35), 0 0 14px rgba(255, 0, 51, 0.30); }
+      50%      { box-shadow: 0 18px 40px rgba(0,0,0,0.35), 0 0 36px rgba(255, 0, 51, 0.65); }
+    }
+    .int-card.youtube-card { border-color: rgba(255, 0, 51, 0.32); }
+    .int-card.youtube-card:hover {
+      border-color: rgba(255, 0, 51, 0.75);
+      animation: glow-youtube 2.2s ease-in-out infinite;
+    }
+    @keyframes glow-spotify {
+      0%, 100% { box-shadow: 0 18px 40px rgba(0,0,0,0.35), 0 0 14px rgba(29, 185, 84, 0.30); }
+      50%      { box-shadow: 0 18px 40px rgba(0,0,0,0.35), 0 0 36px rgba(29, 185, 84, 0.65); }
+    }
+    .int-card.spotify-card { border-color: rgba(29, 185, 84, 0.32); }
+    .int-card.spotify-card:hover {
+      border-color: rgba(29, 185, 84, 0.75);
+      animation: glow-spotify 2.2s ease-in-out infinite;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .int-card.apple-card:hover,
+      .int-card.youtube-card:hover,
+      .int-card.spotify-card:hover { animation: none; }
+    }
+    .int-card.available:hover {
+      border-color: rgba(29,233,182,0.70);
+    }
+    .int-card .logo-row {
+      display: flex; align-items: center; gap: 12px;
+    }
+    .int-card .glyph {
+      width: 44px; height: 44px; border-radius: 12px;
+      display: grid; place-items: center;
+      flex: 0 0 auto;
+      background: rgba(0, 0, 0, 0.25);
+      border: 1px solid rgba(255,255,255,0.12);
+    }
+    .int-card .glyph svg { width: 26px; height: 26px; display: block; }
+    .int-card .name {
+      color: var(--text); font-weight: 800; font-size: 18px;
+      letter-spacing: -0.01em;
+    }
+    .int-card .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 999px;
+      font-size: 11px; font-weight: 800;
+      letter-spacing: 0.04em; text-transform: uppercase;
+      width: fit-content;
+    }
+    .badge.live {
+      background: rgba(29,233,182,0.14);
+      color: #5af0c1;
+      border: 1px solid rgba(29,233,182,0.35);
+    }
+    .badge.planned {
+      background: rgba(244, 201, 123, 0.10);
+      color: #f4c97b;
+      border: 1px solid rgba(244, 201, 123, 0.30);
+    }
+    .badge.unlikely {
+      background: rgba(255, 120, 140, 0.08);
+      color: #ff97a8;
+      border: 1px solid rgba(255, 120, 140, 0.28);
+    }
+    .int-card p { font-size: 14px; color: var(--muted); }
+    .int-card .footer-row {
+      margin-top: auto;
+      display: flex; gap: 10px; flex-wrap: wrap;
+      padding-top: 6px;
+    }
+    .int-card .verdict {
+      font-size: 12px; color: var(--muted);
+      padding: 8px 12px;
+      border-radius: 10px;
+      background: rgba(0, 0, 0, 0.20);
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    .int-card .verdict strong { color: var(--text); }
+
+    /* Inline CTA buttons re-using site .btn */
+    .int-card .btn { min-width: 0; padding: 9px 14px; font-size: 13px; }
+
+    /* Feasibility deep-dive table-ish layout */
+    .deep {
+      display: grid; gap: 16px;
+    }
+    .deep-row {
+      display: grid; grid-template-columns: 140px 1fr;
+      gap: 14px;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.20);
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    .deep-row .k {
+      color: var(--text);
+      font-weight: 700; font-size: 13px;
+      letter-spacing: 0.02em;
+    }
+    .deep-row .v { color: var(--muted); font-size: 13px; line-height: 1.6; }
+
+    .panel.std { padding: 32px; display: grid; gap: 14px; }
+
+    @media (max-width: 640px) {
+      .hero, .panel { border-radius: 18px; padding: 24px 20px; }
+      .deep-row { grid-template-columns: 1fr; gap: 4px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="topnav" aria-label="Primary">
+      <a class="brand-link" href="index.html">
+        <span class="logo-mini" aria-hidden="true"></span>
+        <span>Touchless</span>
+      </a>
+      <div class="nav-links">
+        <a href="index.html" class="nav-link">Home</a>
+        <a href="downloads.html" class="nav-link">Downloads</a>
+        <a href="integrations.html" class="nav-link active">Integrations</a>
+        <a href="about.html" class="nav-link">About</a>
+        <a href="privacy.html" class="nav-link">Privacy</a>
+        <a href="terms.html" class="nav-link">Terms</a>
+      </div>
+    </nav>
+
+    <!-- HERO -->
+    <section class="hero reveal">
+      <span class="eyebrow"><span class="dot-now"></span>Apps Touchless plays nicely with</span>
+      <h1>Integrations</h1>
+      <p class="section-intro">Touchless can drive a handful of other apps directly — by gesture or by voice. Here's the list.</p>
+    </section>
+
+    <!-- AVAILABLE NOW -->
+    <section class="panel std reveal">
+      <h2>Available now</h2>
+
+      <div class="int-grid">
+
+        <!-- Spotify (clickable → spotify-setup.html) -->
+        <a class="int-card int-card-link spotify-card available" href="spotify-setup.html">
+          <div class="logo-row">
+            <div class="glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#1DB954" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9" />
+                <path d="M7.5 9.5c3 -1.2 6 -1 9 0.6" />
+                <path d="M7.7 13.1c2.4 -0.9 4.9 -0.7 7.4 0.6" />
+                <path d="M7.9 16.6c2 -0.7 4.1 -0.5 6.1 0.6" />
+              </svg>
+            </div>
+            <div>
+              <div class="name">Spotify</div>
+              <span class="badge live">● Live</span>
+            </div>
+          </div>
+          <p>Play, pause, skip, change volume, and switch playlists — by gesture or voice.</p>
+        </a>
+
+        <!-- YouTube (browser, not YouTube Music) -->
+        <a class="int-card int-card-link youtube-card available" href="youtube.html">
+          <div class="logo-row">
+            <div class="glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#ff4040" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="3" y="6" width="18" height="12" rx="3" />
+                <path d="M11 9l4 3 -4 3z" fill="#ff4040" stroke="none" />
+              </svg>
+            </div>
+            <div>
+              <div class="name">YouTube</div>
+              <span class="badge live">● Live</span>
+            </div>
+          </div>
+          <p>Play, pause, seek, fullscreen, and theater-mode toggle in any YouTube tab.</p>
+        </a>
+
+      </div>
+    </section>
+
+    <!-- COMING SOON -->
+    <section class="panel std reveal">
+      <h2>Coming soon…</h2>
+
+      <div class="int-grid">
+
+        <!-- Discord — tabled to a future feature update; not clickable. -->
+        <article class="int-card discord-card">
+          <div class="logo-row">
+            <div class="glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#5865F2" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M8 8a14 14 0 0 1 8 0" />
+                <path d="M5 17a18 18 0 0 0 14 0" />
+                <path d="M5 7l-1 9c0 1 3 3 4 3l1 -2" />
+                <path d="M19 7l1 9c0 1 -3 3 -4 3l-1 -2" />
+                <circle cx="10" cy="13" r="1" fill="#5865F2" stroke="none" />
+                <circle cx="14" cy="13" r="1" fill="#5865F2" stroke="none" />
+              </svg>
+            </div>
+            <div>
+              <div class="name">Discord</div>
+              <span class="badge planned">Coming soon</span>
+            </div>
+          </div>
+          <p>Mute, deafen, and switch voice channels by gesture or voice. Coming in a future Touchless update.</p>
+        </article>
+
+        <!-- Apple Music (clickable → apple-music.html) -->
+        <a class="int-card int-card-link apple-card" href="apple-music.html">
+          <div class="logo-row">
+            <div class="glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="#FA2D48" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M9 17V7l9 -2v10" />
+                <circle cx="7" cy="17" r="2" />
+                <circle cx="16" cy="15" r="2" />
+              </svg>
+            </div>
+            <div>
+              <div class="name">Apple Music</div>
+              <span class="badge planned">Coming soon</span>
+            </div>
+          </div>
+          <p>Play, pause, skip, and change volume on your Apple Music library.</p>
+        </a>
+
+      </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="panel std reveal">
+      <h2>Want a new integration?</h2>
+      <p class="section-intro">If there's an app you'd really like Touchless to control — and it has an official, free API — open an issue or email <a href="mailto:konstantinvmarkov@gmail.com">konstantinvmarkov@gmail.com</a>. A name, a link to the app's developer docs, and one sentence about what you'd want to control is enough.</p>
+    </section>
+
+    <footer class="site-footer">
+      <span>&copy; Konstantin Markov</span>
+      <span class="dot" aria-hidden="true">·</span>
+      <span>v1.1.0</span>
+      <a href="privacy.html">Privacy Policy</a>
+      <a href="terms.html">Terms</a>
+      <a href="mailto:konstantinvmarkov@gmail.com">Support</a>
+    </footer>
+  </main>
+  <script defer src="site.js"></script>
+</body>
+</html>
+
+<!-- Author: Konstantin Markov -->

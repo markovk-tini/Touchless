@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>About Touchless</title>
+  <meta name="description" content="What Touchless is, who built it, and how it works under the hood." />
+  <meta name="theme-color" content="#0c2331" />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="About Touchless" />
+  <meta property="og:description" content="What Touchless is, who built it, and how it works under the hood." />
+  <meta property="og:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <meta property="og:url" content="https://touchless-control.pages.dev/about.html" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="About Touchless" />
+  <meta name="twitter:description" content="What Touchless is, who built it, and how it works under the hood." />
+  <meta name="twitter:image" content="https://touchless-control.pages.dev/og-image.png?v=2" />
+  <link rel="icon" type="image/png" href="favicon.png" />
+  <link rel="stylesheet" href="site.css" />
+  <style>
+    /* Page-specific only — shared chrome lives in site.css. */
+    .shell { width: min(980px, 100%); }
+
+    .hero, .content {
+      background: var(--panel); border: 1px solid var(--panel-border);
+      border-radius: var(--radius); box-shadow: var(--shadow); backdrop-filter: blur(10px);
+    }
+    .hero { padding: 28px; display: grid; gap: 12px; }
+    .content { padding: 28px; display: grid; gap: 28px; }
+
+    .eyebrow {
+      display: inline-flex; width: fit-content;
+      padding: 8px 12px; border-radius: 999px;
+      font-size: 13px; font-weight: 800; letter-spacing: 0.03em;
+      text-transform: uppercase; color: var(--primary-2);
+      background: rgba(23, 191, 230, 0.14);
+      border: 1px solid rgba(88, 227, 255, 0.20);
+    }
+    h1 { margin: 0; font-size: clamp(30px, 4vw, 44px); line-height: 1; letter-spacing: -0.03em; }
+    h2 { margin: 0 0 10px; font-size: 22px; letter-spacing: -0.02em; }
+    p, li { color: var(--muted); line-height: 1.7; }
+    p { margin: 0; }
+    ul { margin: 12px 0 0; padding-left: 22px; }
+    section.block { display: grid; gap: 8px; }
+    a { color: var(--primary-2); text-decoration: none; font-weight: 700; }
+    a:hover { text-decoration: underline; }
+    code { background: rgba(255, 255, 255, 0.08); padding: 2px 6px; border-radius: 7px; color: var(--text); }
+    .cta-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+
+    @media (max-width: 640px) {
+      .hero, .content { border-radius: 18px; padding: 22px 20px; }
+      .cta-row { flex-direction: column; align-items: stretch; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <nav class="topnav" aria-label="Primary">
+      <a class="brand-link" href="index.html">
+        <span class="logo-mini" aria-hidden="true"></span>
+        <span>Touchless</span>
+      </a>
+      <div class="nav-links">
+        <a href="index.html" class="nav-link">Home</a>
+        <a href="downloads.html" class="nav-link">Downloads</a>
+        <a href="integrations.html" class="nav-link">Integrations</a>
+        <a href="about.html" class="nav-link active">About</a>
+        <a href="privacy.html" class="nav-link">Privacy</a>
+        <a href="terms.html" class="nav-link">Terms</a>
+      </div>
+    </nav>
+
+    <section class="hero reveal">
+      <span class="eyebrow">About</span>
+      <h1>What is Touchless?</h1>
+      <p>Touchless is a desktop application for Windows that lets you control your PC with hand gestures and voice — no peripherals, no touch screen, no cloud account. Everything that matters runs locally on your machine.</p>
+    </section>
+
+    <section class="content reveal">
+      <section class="block">
+        <h2>The idea</h2>
+        <p>Touchless started as one idea: control a PC without touching it, from anywhere in the room. No special hardware, no wearables, no cloud account — just the webcam and microphone every modern laptop already has built in, and that pair up as affordable add-ons for any desktop. Those two off-the-shelf devices do the work that mice, keyboards, and remotes do today.</p>
+        <p>Most assistive and accessibility tools either require expensive hardware or send your camera and microphone to the cloud. Touchless takes a different bet: a webcam, a microphone, and enough local compute is all it takes to run the recognition pipeline — and almost every modern laptop already has the first two built in, while any desktop can add them cheaply. The job of the app is to wire all that together into reliable, real-world controls — opening apps, controlling Spotify and YouTube, taking screenshots, dictating into any text field — without leaving your device.</p>
+      </section>
+
+      <section class="block">
+        <h2>Built from scratch</h2>
+        <p>Everything you see in Touchless was built ground-up — and then some. As far as I know, it's the first app that lets you control a general-purpose PC fully touch-free, without specialized hardware or a cloud service in the loop.</p>
+      </section>
+
+      <section class="block">
+        <h2>What it can do today</h2>
+        <ul>
+          <li><strong>Hand-gesture control</strong> — static poses (open palm, fist, two, three, four, peace, OK, thumbs up/down) plus motion gestures (left/right swipes, pinch, volume slider, wheel orbit).</li>
+          <li><strong>Mouse mode</strong> — move the cursor with your right hand, pinch to click, two-finger anchor to scroll. Toggle with a left-hand pose.</li>
+          <li><strong>Voice commands and dictation (beta)</strong> — say things like "play [song] on spotify" or "open chrome." Dictation inserts text into any focused window via clipboard paste; grammar correction runs locally with a small Qwen model. Dictation is currently in beta — accuracy and latency are still being tuned.</li>
+          <li><strong>Drawing and capture</strong> — draw on top of the screen, take screenshots, record short clips, and save anywhere.</li>
+          <li><strong>Spotify, YouTube, and Chrome control</strong> — gesture-driven wheels, swipe-to-skip, voice-to-play, and play/pause.</li>
+          <li><strong>Configurable</strong> — remap any pose to any action; create your own custom gestures; pick which monitor mouse mode targets; bring your own camera/microphone or pair a phone over your local network.</li>
+        </ul>
+      </section>
+
+      <section class="block">
+        <h2>How it works under the hood</h2>
+        <p>Touchless is built in Python with a PySide6 UI. The vision pipeline uses MediaPipe for hand landmarks and a custom classifier for pose recognition. Voice transcription uses whisper.cpp with a CUDA → Vulkan → CPU fallback chain so the fastest backend always wins on whatever hardware you run. Grammar correction is optional and runs on a small local Qwen 2.5 model. None of these models call out to the network for inference.</p>
+      </section>
+
+      <section class="block">
+        <h2>Local by default</h2>
+        <p>Camera frames, microphone audio, and the gestures Touchless recognizes stay on your device. There is no account, no profile, and no cloud sync. The app does make limited network requests for things like checking for updates and serving the optional QR pairing page to your phone — those are detailed in the <a href="privacy.html">Privacy Policy</a>.</p>
+        <p>Anonymous, opt-in usage telemetry (which features are used, not what you do with them) helps the project improve. You can review what's collected on the Privacy Policy page.</p>
+      </section>
+
+      <section class="block">
+        <h2>Who built this</h2>
+        <p>Touchless is built and maintained by Konstantin Markov as an independent project. It started as an experiment in seeing how much could be done with just a laptop's webcam and a local voice stack, and has grown into a real production app with a code-signed installer, an automatic updater, and a five-step in-app tutorial.</p>
+      </section>
+
+      <section class="block">
+        <h2>Where it's going</h2>
+        <p>Current focus areas: macOS support, polish on the voice pipeline, more "second hand" interactions (drawing and wheel gestures continue to use the secondary hand for richer controls), and more first-class app integrations beyond Spotify, YouTube, and Chrome.</p>
+      </section>
+
+      <section class="block">
+        <h2>Get in touch</h2>
+        <p>Questions, bug reports, or feedback: <a href="mailto:konstantinvmarkov@gmail.com">konstantinvmarkov@gmail.com</a>. Privacy-specific questions: see the <a href="privacy.html">Privacy Policy</a>.</p>
+        <div class="cta-row">
+          <a class="btn" href="downloads.html">Download Touchless</a>
+          <a class="btn secondary" href="index.html">Back to Home</a>
+        </div>
+      </section>
+    </section>
+
+    <footer class="site-footer">
+      <span>&copy; Konstantin Markov</span>
+      <span class="dot" aria-hidden="true">·</span>
+      <span>v1.1.0</span>
+      <a href="privacy.html">Privacy Policy</a>
+      <a href="terms.html">Terms</a>
+      <a href="mailto:konstantinvmarkov@gmail.com">Support</a>
+    </footer>
+  </main>
+
+  <script>
+    // Page-view telemetry — same Worker as the rest of the app.
+    const TELEMETRY_ENDPOINT = "https://touchless-telemetry.konstantinvmarkov.workers.dev/batch/";
+    const TELEMETRY_API_KEY = "bec4297146174344837d8f483b5618ea";
+
+    function getVisitId() {
+      try {
+        let id = sessionStorage.getItem("touchless_visit_id");
+        if (!id) {
+          id = (crypto.randomUUID ? crypto.randomUUID() : (Date.now() + "-" + Math.random()))
+            .replace(/-/g, "");
+          sessionStorage.setItem("touchless_visit_id", id);
+        }
+        return id;
+      } catch (_) { return "visit-" + Date.now() + "-" + Math.floor(Math.random() * 1e6); }
+    }
+    try {
+      fetch(TELEMETRY_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_key: TELEMETRY_API_KEY,
+          batch: [{
+            event: "page_view",
+            distinct_id: getVisitId(),
+            timestamp: new Date().toISOString(),
+            properties: { page: "about" },
+          }],
+        }),
+        keepalive: true,
+      }).catch(() => {});
+    } catch (_) {}
+  </script>
+  <script defer src="site.js"></script>
+</body>
+</html>
+
+<!-- Author: Konstantin Markov -->
