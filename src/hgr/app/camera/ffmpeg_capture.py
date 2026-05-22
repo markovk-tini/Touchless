@@ -293,6 +293,14 @@ class FfmpegMjpegCapture:
         self._fresh_frame_event = threading.Event()
         self._opened = False
         self._read_error = False
+        # Fixed-prefix warmup discard. EOS Webcam Utility and some
+        # other DSHOW filters emit a few placeholder frames immediately
+        # after open (cached single-color frame, or auto-exposure
+        # still settling) before real content starts. Drop the first
+        # few decoded frames internally so consumers never see them
+        # — matches the same approach used in ThreadedCvCapture for
+        # cv2-based opens.
+        self._warmup_remaining = 6
         # Capture ffmpeg's stderr to a memory buffer + a stderr
         # mirror so we can surface the actual failure reason on
         # startup. The previous configuration discarded stderr to
@@ -586,6 +594,15 @@ class FfmpegMjpegCapture:
                     (self._height, self._width, 3)
                 ).copy()
             except Exception:
+                continue
+            # Discard the first few decoded frames (placeholder / pre-
+            # exposure-lock output some DSHOW filters emit). Still
+            # set _first_frame_event so the startup waiter in _start
+            # knows the pipe is alive — we just don't publish the
+            # frame to consumers yet.
+            if self._warmup_remaining > 0:
+                self._warmup_remaining -= 1
+                self._first_frame_event.set()
                 continue
             decoded_at = time.monotonic()
             with self._frame_lock:

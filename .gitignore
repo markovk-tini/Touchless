@@ -11,6 +11,16 @@ __pycache__/
 venv/
 env/
 
+# Node deps (cloudflare-telemetry worker tooling — re-installable via npm)
+node_modules/
+
+# Local secrets — Spotify / Discord client secrets, OAuth tokens, etc.
+# The matching constants are also overridable via OS env vars, so the
+# file is just a convenience for dev. Never commit it.
+.env
+.env.local
+auth_token.json
+
 # Build / packaging artifacts
 build/
 dist/

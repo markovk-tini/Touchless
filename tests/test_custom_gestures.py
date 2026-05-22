@@ -39,6 +39,7 @@ from hgr.custom_gestures.description import (  # noqa: E402
 )
 from hgr.custom_gestures.recorder import (  # noqa: E402
     GestureRecorder,
+    _sample_from_landmarks,
     augment_sample,
     augment_samples,
     landmarks_to_sample,
@@ -101,7 +102,7 @@ def test_landmarks_to_sample_has_correct_length():
     lm = _synthetic_landmarks(seed=4)
     sample = landmarks_to_sample(lm)
     # 63 landmarks + 3 spacing + 5 extension + 10 joint + 5 curl + 1 spread
-    assert len(sample.features) == 87
+    assert len(sample.features) == 106
 
 
 def test_spacing_extension_and_joint_features_trail_landmarks():
@@ -176,7 +177,7 @@ def test_legacy_63dim_sample_loads_with_migration(tmp_path):
     loaded = reg.get("legacy_g")
     assert loaded is not None
     assert len(loaded.samples) == 1
-    assert len(loaded.samples[0].features) == 87
+    assert len(loaded.samples[0].features) == 106
 
 
 def test_legacy_66dim_sample_loads_with_migration(tmp_path):
@@ -212,7 +213,7 @@ def test_legacy_66dim_sample_loads_with_migration(tmp_path):
     reg.load()
     loaded = reg.get("legacy_g66")
     assert loaded is not None
-    assert len(loaded.samples[0].features) == 87
+    assert len(loaded.samples[0].features) == 106
 
 
 def test_legacy_71dim_sample_loads_with_migration(tmp_path):
@@ -248,7 +249,7 @@ def test_legacy_71dim_sample_loads_with_migration(tmp_path):
     reg.load()
     loaded = reg.get("legacy_g71")
     assert loaded is not None
-    assert len(loaded.samples[0].features) == 87
+    assert len(loaded.samples[0].features) == 106
 
 
 # ------------------------- GestureRecorder -------------------------
@@ -284,7 +285,7 @@ def test_registry_roundtrip(tmp_path: Path):
     path = tmp_path / "gestures.json"
     reg = GestureRegistry(path=path)
     reg.load()
-    sample = GestureSample(features=[0.0] * 87)
+    sample = GestureSample(features=[0.0] * 106)
     reg.add(
         name="test_thumb",
         samples=[sample],
@@ -308,7 +309,7 @@ def test_registry_roundtrip(tmp_path: Path):
 def test_registry_rejects_duplicate_without_overwrite(tmp_path: Path):
     reg = GestureRegistry(path=tmp_path / "gestures.json")
     reg.load()
-    sample = GestureSample(features=[0.0] * 87)
+    sample = GestureSample(features=[0.0] * 106)
     reg.add("dup", [sample], Action(kind="noop"))
     with pytest.raises(ValueError):
         reg.add("dup", [sample], Action(kind="noop"))
@@ -319,7 +320,7 @@ def test_registry_rejects_duplicate_without_overwrite(tmp_path: Path):
 def test_registry_remove(tmp_path: Path):
     reg = GestureRegistry(path=tmp_path / "gestures.json")
     reg.load()
-    reg.add("g1", [GestureSample(features=[0.0] * 87)], Action(kind="noop"))
+    reg.add("g1", [GestureSample(features=[0.0] * 106)], Action(kind="noop"))
     assert reg.remove("g1") is True
     assert reg.remove("g1") is False
     assert reg.list() == []
@@ -463,9 +464,9 @@ def test_augment_sample_expands_variants():
     # + 2 per-finger jitter
     # = 22 total
     assert len(variants) == 22
-    # All variants must be valid 87-dim feature vectors.
+    # All variants must be valid 106-dim feature vectors.
     for v in variants:
-        assert len(v.features) == 87
+        assert len(v.features) == 106
     # Variants must differ from original (except the original itself).
     original = variants[0].features
     differing = [v for v in variants[1:] if v.features != original]
@@ -504,13 +505,13 @@ def test_augment_makes_rotated_pose_matchable(tmp_path):
         dtype=np.float32,
     )
     tilted_lm = upright_lm @ R.T
-    # Rebuild the 87-dim feature vector: rotated landmarks + all derived
-    # structural features. Rotation preserves Euclidean distances and
-    # the categorical labels derived from them, so the trailing 24
-    # features carry over unchanged.
-    tilted_feats = np.concatenate(
-        [tilted_lm.reshape(63), upright_feats_full[63:87]]
-    )
+    # Rebuild the full feature vector from the rotated landmarks. The
+    # v5 direction + palm-normal regions are rotation-sensitive, so we
+    # can't just splice them from the upright sample — recompute via
+    # the recorder's same-pose helper (which expects already-normalized
+    # landmarks).
+    tilted_sample = _sample_from_landmarks(tilted_lm.astype(np.float32))
+    tilted_feats = np.asarray(tilted_sample.features, dtype=np.float32)
 
     # Plain: stored only the upright sample.
     reg_plain = GestureRegistry(path=tmp_path / "plain.json")
@@ -572,7 +573,7 @@ def test_legacy_81dim_sample_loads_with_migration(tmp_path):
     reg.load()
     loaded = reg.get("legacy_g81")
     assert loaded is not None
-    assert len(loaded.samples[0].features) == 87
+    assert len(loaded.samples[0].features) == 106
 
 
 def test_pose_signature_returns_ranges(tmp_path):

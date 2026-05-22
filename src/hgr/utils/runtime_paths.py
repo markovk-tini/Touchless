@@ -26,4 +26,30 @@ def app_base_path() -> Path:
 def resource_path(*parts: str) -> Path:
     return app_base_path().joinpath(*parts)
 
+
+def build_channel() -> str:
+    """Return the distribution channel this build was produced for.
+
+    'store'   — Microsoft Store build. Updates are delivered by the
+                Store, so the in-app GitHub auto-updater must NOT run
+                (Store policy expects apps to update through the Store,
+                and a self-updater would fight it).
+    'website' — direct-download build from the Touchless website /
+                GitHub release. The in-app GitHub auto-updater is the
+                only update path.
+
+    Read from a `build_channel.txt` marker the build pipeline writes
+    into the bundle (see hgr_app.spec + build_windows.bat). Defaults
+    to 'website' when the marker is absent — source runs and every
+    pre-existing build keep their historical auto-update behavior."""
+    try:
+        marker = resource_path("build_channel.txt")
+        if marker.exists():
+            value = marker.read_text(encoding="utf-8").strip().lower()
+            if value == "store":
+                return "store"
+    except Exception:
+        pass
+    return "website"
+
 # Author: Konstantin Markov

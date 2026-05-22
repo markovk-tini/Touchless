@@ -21,7 +21,7 @@
 ;   /DMONOLITHIC=1                     (optional — switches to embedded zip)
 
 #define MyAppName "Touchless"
-#define MyAppVersion "1.1.0b7"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Konstantin Markov"
 #define MyAppExeName "Touchless.exe"
 #define DistDir "..\..\dist\Touchless"
@@ -40,6 +40,13 @@
   #endif
   #ifndef PAYLOAD_SHA256
     #error "STUB build requires /DPAYLOAD_SHA256=lowercase-hex"
+  #endif
+  ; File count of the dist tree (the build script counts and passes
+  ; this in). Used to drive the extraction-progress bar — if the
+  ; build script forgets, fall back to a sensible default so the bar
+  ; still moves vaguely correctly instead of staying at 0%.
+  #ifndef PAYLOAD_FILE_COUNT
+    #define PAYLOAD_FILE_COUNT "2000"
   #endif
 #endif
 
@@ -86,17 +93,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
-; Defender exclusion task. Default ON because the most common reason
-; GPU Mode silently falls back to CPU on a fresh install is Microsoft
-; Defender's ML heuristic flagging bundled DirectML.dll (Microsoft-
-; signed, but inside a recently-downloaded third-party folder). The
-; exclusion lets DirectML.dll load via LoadLibrary, which lets ONNX
-; Runtime bring up its DirectX 12 execution provider. Reversible
-; (uninstall removes it; user can also remove via Defender Settings
-; -> Exclusions). Triggers one UAC prompt during install — the only
-; UAC prompt in the whole flow, since the rest of the install is
-; per-user under %LOCALAPPDATA%.
-Name: "defender_exclusion"; Description: "Allow Touchless to use your GPU (adds the install folder to Microsoft Defender exclusions — one UAC prompt)"; GroupDescription: "GPU acceleration:"
+; NOTE: the prior "defender_exclusion" task (which added the install
+; folder to Microsoft Defender exclusions) was REMOVED in b8. Even
+; with Flags: unchecked it was producing UAC prompts during install
+; because users were ticking the checkbox without realizing the
+; "Verb: runas" Add-MpPreference call would trigger elevation. The
+; whole install is now 100 % per-user under %LOCALAPPDATA% and
+; UAC-free. Users whose GPU mode falls back to CPU because Defender
+; quarantined DirectML.dll can add the exclusion manually via
+; Windows Security -> Virus & threat protection -> Exclusions.
 
 [Files]
 #ifdef MONOLITHIC
@@ -116,53 +121,12 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingD
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon; IconFilename: "{app}\{#MyAppExeName}"
 
 [Run]
-; Microsoft Defender exclusion for the install folder. Wrapped in a
-; PowerShell try/catch that always exits 0 so a failure (Group Policy
-; blocking Add-MpPreference, third-party AV taking over Defender's
-; role, user denying the UAC prompt) doesn't abort the install or
-; surface a confusing error dialog. Verb: runas triggers UAC for this
-; single command — the rest of the install is per-user. Add-MpPreference
-; is idempotent for ExclusionPath, so re-running on top of an existing
-; install is a no-op.
-;
-; skipifsilent is critical: the auto-updater runs the installer with
-; /SILENT, which would otherwise fire this entry (the task is ON by
-; default) and pop a context-free UAC prompt while the user is in the
-; middle of something else — a real regression. Manual installs aren't
-; affected; the user is in the wizard already and expects the prompt.
-; Net effect: first-time manual installers get the exclusion (the
-; population that needs it most); existing users who auto-update later
-; already had it added at their original install time, so nothing's
-; lost on the auto-update path.
-Filename: "powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command ""try {{ Add-MpPreference -ExclusionPath '{app}' -ErrorAction Stop }} catch {{ exit 0 }}"""; Verb: runas; Flags: shellexec waituntilterminated skipifsilent; Tasks: defender_exclusion; StatusMsg: "Adding Touchless to Microsoft Defender exclusions..."
+; b8: Microsoft Defender exclusion was removed (it was the only
+; UAC trigger in the install). See the comment under [Tasks].
+Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
-; Touchless.exe has requireAdministrator in its manifest (uac_admin=True
-; in hgr_app.spec). Inno's default [Run] launcher uses CreateProcess
-; which can't elevate, producing error 740 "requires elevation" on the
-; post-install Launch checkbox. The 1.1.0b2 attempt at fixing this used
-; "shellexec runasoriginaluser" hoping ShellExecuteEx would auto-elevate
-; via the manifest — but in practice Inno still went through CreateProcess
-; for this particular entry (a real install repro from a beta tester
-; reproduced the same error 740 with that flag set).
-;
-; Forcing it: Verb: runas explicitly asks the shell for the "Run as
-; administrator" verb, which always triggers UAC regardless of how the
-; manifest is interpreted. Same pattern we use on the Defender exclusion
-; PowerShell call above. shellexec stays so ShellExecuteEx is the API
-; (Verb is ignored under CreateProcess). runasoriginaluser dropped — it
-; only matters when the installer itself is elevated, which ours never is
-; (PrivilegesRequired=lowest), so it was a no-op decoration.
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Verb: runas; Flags: nowait postinstall skipifsilent shellexec
-
-[UninstallRun]
-; Mirror of the install-time Defender exclusion: remove the entry
-; on uninstall so we don't leave a stale exclusion pointing at a
-; folder that no longer exists. Same try/catch pattern; if it
-; fails (UAC denied, GP-managed Defender, etc.) the uninstall
-; still completes cleanly. Remove-MpPreference is a no-op when
-; the exclusion isn't set, so older installs that pre-date this
-; change uninstall harmlessly.
-Filename: "powershell.exe"; Parameters: "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command ""try {{ Remove-MpPreference -ExclusionPath '{app}' -ErrorAction Stop }} catch {{ exit 0 }}"""; Verb: runas; Flags: shellexec waituntilterminated; RunOnceId: "RemoveDefenderExclusion"
+; [UninstallRun] removed in b8 along with the install-time Defender
+; exclusion. With nothing to undo, the uninstall is also UAC-free.
 
 #ifdef STUB
 [Code]
@@ -226,35 +190,110 @@ begin
     Result := True;
 end;
 
+// Recursively count files in Dir so the extraction-progress poll
+// has a numerator. Cheap on Windows even for 2-3k files (FindFirst/
+// FindNext is OS-level enumeration), and the poll only runs every
+// 500 ms during extract — well under any real cost concern.
+function CountFilesRecursive(const Dir: String): Integer;
+var
+  FindRec: TFindRec;
+begin
+  Result := 0;
+  if FindFirst(Dir + '\*', FindRec) then begin
+    try
+      repeat
+        if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) = 0 then
+          Result := Result + 1
+        else if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+          Result := Result + CountFilesRecursive(Dir + '\' + FindRec.Name);
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
-  ZipPath: String;
-  ExtractDir: String;
-  PsCmd: String;
+  FileCount: Integer;
+  TotalFiles: Integer;
+  ZipPath, ExtractDir, DoneFlag, PsCmd, StatusText: String;
+  ResultStr: AnsiString;
 begin
   if CurStep = ssInstall then begin
     ZipPath := ExpandConstant('{tmp}\{#PAYLOAD_FILE}');
     ExtractDir := ExpandConstant('{app}');
+    DoneFlag := ExpandConstant('{tmp}\extract_done.flag');
+    TotalFiles := {#PAYLOAD_FILE_COUNT};
+    if TotalFiles < 1 then TotalFiles := 1;
+
     if not ForceDirectories(ExtractDir) then
       RaiseException('Could not create install directory: ' + ExtractDir);
-    // PowerShell's Expand-Archive -- bundled with Windows 10+,
-    // handles arbitrary nested zip layouts, no extra binary to
-    // ship. -Force overwrites any partial extraction left by a
-    // previous failed attempt. Single-quoted PowerShell strings
-    // avoid having to backslash-escape the Windows paths.
+
+    // Wipe any stale sentinel from a previous failed install so the
+    // poll loop below doesn't immediately think extraction finished.
+    if FileExists(DoneFlag) then DeleteFile(DoneFlag);
+
+    // Reconfigure Inno's progress bar to track real extraction state.
+    // ProgressGauge.Style stays the default (smooth, determinate);
+    // we drive Position from a recursive file count of {app} on a
+    // 500 ms poll. Without this the bar sits frozen at 0% because
+    // STUB mode has an empty [Files] section — Inno has nothing of
+    // its own to count.
+    WizardForm.ProgressGauge.Min := 0;
+    WizardForm.ProgressGauge.Max := TotalFiles;
+    WizardForm.ProgressGauge.Position := 0;
+    WizardForm.StatusLabel.Caption := 'Extracting payload (0 / ' + IntToStr(TotalFiles) + ' files)...';
+    WizardForm.FilenameLabel.Caption := '';
+
+    // Run Expand-Archive asynchronously, and have PowerShell write a
+    // sentinel file when it's done (so the Inno side can poll for
+    // completion — Exec(ewNoWait) doesn't return a process handle
+    // we could WaitForSingleObject on). On success the sentinel
+    // contains the literal "OK"; on failure it contains the
+    // exception message so we can surface it to the user.
     PsCmd :=
       '-NoProfile -NonInteractive -ExecutionPolicy Bypass ' +
-      '-Command "Expand-Archive -LiteralPath ''' + ZipPath + ''' ' +
-      '-DestinationPath ''' + ExtractDir + ''' -Force"';
-    if not Exec('powershell.exe', PsCmd, '', SW_HIDE,
-                ewWaitUntilTerminated, ResultCode) then
+      '-Command "try { Expand-Archive -LiteralPath ''' + ZipPath + ''' ' +
+      '-DestinationPath ''' + ExtractDir + ''' -Force; ' +
+      '''OK'' | Out-File -LiteralPath ''' + DoneFlag + ''' -Encoding ascii } ' +
+      'catch { $_.Exception.Message | Out-File -LiteralPath ''' + DoneFlag + ''' -Encoding ascii }"';
+
+    if not Exec('powershell.exe', PsCmd, '', SW_HIDE, ewNoWait, ResultCode) then
       RaiseException('Could not launch PowerShell to extract payload.');
-    if ResultCode <> 0 then
-      RaiseException('Payload extraction failed (PowerShell exit code ' +
-                     IntToStr(ResultCode) + '). Try running the installer ' +
-                     'again, or use the offline edition from the Touchless ' +
-                     'website if the issue persists.');
+
+    // Poll until the sentinel appears. Cap the displayed count at
+    // TotalFiles so a slightly-off PAYLOAD_FILE_COUNT define doesn't
+    // overshoot the bar (or stall it at 99% if undershoot).
+    while not FileExists(DoneFlag) do begin
+      FileCount := CountFilesRecursive(ExtractDir);
+      if FileCount > TotalFiles then FileCount := TotalFiles;
+      WizardForm.ProgressGauge.Position := FileCount;
+      StatusText := 'Extracting payload (' + IntToStr(FileCount) + ' / ' +
+                    IntToStr(TotalFiles) + ' files)...';
+      WizardForm.StatusLabel.Caption := StatusText;
+      WizardForm.Update;
+      Sleep(500);
+    end;
+    // One final update so the bar hits 100% even if the last poll
+    // didn't catch the last few files.
+    WizardForm.ProgressGauge.Position := TotalFiles;
+    WizardForm.Update;
+
+    // Read PowerShell outcome from the sentinel and surface failures.
+    LoadStringFromFile(DoneFlag, ResultStr);
+    DeleteFile(DoneFlag);
+    if Trim(String(ResultStr)) <> 'OK' then
+      // CRLF spelled out with Chr() instead of #13#10 because the
+      // Inno preprocessor treats any line whose first non-whitespace
+      // character is '#' as a directive, and breaking the string
+      // before #13#10 made it fail with 'Unknown preprocessor
+      // directive' at compile time.
+      RaiseException('Payload extraction failed: ' + Trim(String(ResultStr))
+                     + Chr(13) + Chr(10)
+                     + 'Try running the installer again, or use the '
+                     + 'offline edition from the Touchless website if the issue persists.');
   end;
 end;
 #endif

@@ -152,6 +152,19 @@ class AppConfig:
     mouse_control_box_center_y: float = 0.55
     mouse_control_box_area: float = 0.14
     mouse_control_box_aspect_power: float = 0.25
+    # Left-handed mode: swap the Left/Right hand roles across the whole
+    # app (gestures, air mouse, drawing, wheels, YouTube 'four', etc.).
+    # Applied as a single label swap at detection entry in the engine.
+    left_handed_mode: bool = False
+    # Drawing control box: like the mouse control box, a small square
+    # region of the camera frame that maps to the whole drawing canvas,
+    # so the finger only moves within a forearm-sized patch instead of
+    # sweeping the full frame. Square in normalized coords keeps motion
+    # undistorted on a 16:9 frame/canvas. Right-shifted to match where
+    # the drawing hand naturally rests in the mirrored view.
+    drawing_control_box_center_x: float = 0.82
+    drawing_control_box_center_y: float = 0.55
+    drawing_control_box_size: float = 0.45
     # Which monitor mouse-mode controls. None = all monitors (the
     # full virtual desktop, the historical default). 0..N-1 = a
     # specific monitor's index in QGuiApplication.screens(). The
@@ -161,6 +174,60 @@ class AppConfig:
     # mouse-box on the camera frame still spans the same area but
     # the cursor output gets clamped to the chosen monitor's region.
     mouse_active_monitor_index: Optional[int] = None
+    # Default monitor for the "clip that" voice command and any other
+    # capture action that doesn't explicitly ask which monitor to use.
+    # None = primary monitor (Windows considers the screen index 0 to
+    # be primary in most setups). A specific index 0/1/2/… targets
+    # that screen by Qt's QGuiApplication.screens() order. The user
+    # picks this from Settings → General → Clip & Record so they
+    # don't have to answer the monitor prompt every time on a
+    # multi-monitor rig.
+    clip_default_monitor_index: Optional[int] = None
+    # User's own Spotify Developer client_id. Optional — when empty,
+    # Touchless uses its embedded default client_id which is capped
+    # at 5 testers by Spotify's developer policy (Spotify killed the
+    # indie-friendly Extended Quota Mode; the new Partner program
+    # requires 250k+ MAU). When the user supplies their own
+    # client_id via the Spotify setup wizard, Touchless uses that
+    # instead — each user gets their own Spotify Dev app on their
+    # own account, which removes the 5-user cap entirely because the
+    # cap is per-app. PKCE means no client_secret is needed; the
+    # client_id alone is enough to drive OAuth. Empty string and
+    # None both mean "use the embedded default".
+    spotify_client_id: str = ""
+    # Latched True when the user clicks the X on the 'Spotify Premium
+    # required' warning in Settings → General. Stops it from
+    # reappearing on subsequent launches — the user has acknowledged
+    # the requirement and doesn't need the reminder anymore.
+    spotify_premium_warning_dismissed: bool = False
+    # When True, the home-screen camera-health pill is extended with
+    # live diagnostic info — current FPS, top stable gesture +
+    # confidence, mic input level. Off by default so the pill stays
+    # quiet for typical users; testers and debug sessions can flip
+    # it on from Settings → General → Diagnostics.
+    diagnostic_overlay_enabled: bool = False
+    # When True, the tracking pill is extended (per-frame) with the
+    # TOP-3 raw recognizer scores instead of just the latched stable
+    # label. Useful when debugging "I made a fist but it didn't fire"
+    # — shows the runner-up labels so the user can see whether they
+    # were close to the right pose or hitting a different one
+    # entirely. Requires `diagnostic_overlay_enabled` to be on (the
+    # pill is the host surface for both).
+    show_recognizer_top_scores: bool = False
+    # Discord OAuth credentials supplied by the user via the in-app
+    # Discord setup wizard. Same per-user-app pattern as Spotify above,
+    # but with a different motivation: Discord's `rpc` OAuth scope is
+    # restricted to the OWNER of the registered Touchless dev-portal
+    # app while public-distribution approval is pending (and may never
+    # arrive — Discord has wound rpc down). Every user creating their
+    # own free Discord Developer app means they become the owner of
+    # their own app, and the rpc scope works on day one without any
+    # Discord-side review. Unlike Spotify, Discord's rpc flow is NOT
+    # PKCE — the token-exchange step needs the client_secret, so both
+    # fields are required (empty `client_secret` falls back to env /
+    # .env / the embedded default for dev builds).
+    discord_client_id: str = ""
+    discord_client_secret: str = ""
     # Anonymous install UUID for usage telemetry. Now derived
     # deterministically from SHA-256(salt + Windows MachineGuid +
     # username) so a single user gets ONE install_id forever — survives
@@ -249,6 +316,18 @@ class AppConfig:
     # this version", but v1.0.8 still gets a prompt the moment it
     # ships. Empty string = no version dismissed yet.
     last_dismissed_update_version: str = ""
+    # Set True once the user has installed the optional higher-accuracy
+    # dictation model (ggml-medium.en.bin) via the "Voice Recognition
+    # Upgrade" download. Store builds ship only small.en to stay under
+    # the Store package-size limit; this flag + the on-disk model
+    # presence drive whether the upgrade button is shown. Latches the
+    # walkthrough one-time prompt too so it isn't re-offered after the
+    # model is in place.
+    voice_model_upgrade_installed: bool = False
+    # Set True once the walkthrough has offered the Voice Recognition
+    # Upgrade prompt, so it's shown at most once (the General-tab button
+    # remains the always-available entry point).
+    voice_model_upgrade_prompt_shown: bool = False
     # Lite Mode: switches MediaPipe Hands to model_complexity=0
     # (the lite landmark model) and downsamples inference input to
     # ~480px wide. ~2.5x faster than the default full model on
@@ -273,6 +352,26 @@ class AppConfig:
     # to disable itself with a tooltip when no GPU path is reachable
     # so the user isn't toggling a no-op.
     gpu_mode: bool = False
+    # YouTube auto-pause: when True, the engine pauses the currently
+    # playing YouTube tab once no hand has been visible for
+    # `youtube_pause_when_user_leaves_seconds` seconds. Resumes
+    # automatically when a hand reappears (one-shot resume per
+    # absence cycle so the user isn't fighting the engine if they
+    # paused manually before walking away).
+    youtube_pause_when_user_leaves: bool = False
+    youtube_pause_when_user_leaves_seconds: int = 6
+    # YouTube auto-skip-ads: when True, a background timer polls the
+    # currently-focused YouTube tab for the Skip Ad button and clicks
+    # it as soon as the template match crosses the confidence
+    # threshold. Click briefly focuses the YouTube tab then restores
+    # the user's prior foreground window so the skip is invisible
+    # if the user is doing something else.
+    youtube_auto_skip_ads: bool = False
+    # Caption translate target — ISO-style display name as YouTube's
+    # menu shows it (e.g. "Spanish", "Japanese", "French"). Empty
+    # means "don't auto-translate". Triggered by the voice command
+    # "translate captions to X" or the Settings → YouTube picker.
+    youtube_caption_target_language: str = ""
     # Maps action_id -> pose_id for the Settings → Gesture Binds tab.
     # Empty dict means "use default bindings" (see _DEFAULT_GESTURE_BINDS in
     # main_window.py). Only stores user-changed entries to keep the file

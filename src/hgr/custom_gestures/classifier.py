@@ -9,10 +9,12 @@ from .recorder import normalize_landmarks
 from .registry import CustomGesture, GestureRegistry
 
 
-# Score curve: tuned for the 87-dim feature vector. Higher
+# Score curve: tuned for the v5 106-dim feature vector. Higher
 # _SCORE_ZERO_DISTANCE keeps typical same-pose distances mapping to
-# scores that comfortably clear the default 0.88 threshold.
-_SCORE_ZERO_DISTANCE = 7.0
+# scores that comfortably clear the default 0.88 threshold. Bumped
+# from 7.0 (v4) to 8.5 to absorb the extra distance contributed by
+# the new direction + thumb-index-spread + palm-normal regions.
+_SCORE_ZERO_DISTANCE = 8.5
 
 _LANDMARK_FEATURE_LEN = 63
 _SPACING_FEATURE_LEN = 3
@@ -20,9 +22,15 @@ _EXTENSION_FEATURE_LEN = 5
 _JOINT_ANGLE_FEATURE_LEN = 10
 _CURL_CLASS_FEATURE_LEN = 5
 _SPREAD_CLASS_FEATURE_LEN = 1
+# v5 additions:
+_DIRECTION_FEATURE_LEN = 15
+_THUMB_INDEX_SPREAD_FEATURE_LEN = 1
+_PALM_NORMAL_FEATURE_LEN = 3
 
 # Spacing + extension features have small magnitudes (~0.1-4 range), so
 # they need amplification to compete with the 63-dim landmark portion.
+# Thumb-index spread is also a normalized distance and uses the same
+# weight.
 _DISTANCE_FEATURE_WEIGHT = 4.0
 
 # Joint angles are in radians (0..π), inherently larger magnitude. Kept
@@ -38,6 +46,19 @@ _JOINT_ANGLE_WEIGHT = 1.0
 # differences contribute meaningfully without punishing rare
 # boundary-jitter cases.
 _CLASS_FEATURE_WEIGHT = 2.0
+
+# Per-finger direction unit-vectors (15 dims, 5 fingers × 3). Each
+# 3-dim sub-vector has magnitude 1 by construction, so per-finger
+# distance maxes at 2.0 between opposite directions. We boost above
+# unit weight so direction differences (e.g. thumbs-up vs thumbs-side)
+# pull scores apart meaningfully, but keep below the distance weight
+# so a small finger curl doesn't get swamped by direction wiggle.
+_DIRECTION_FEATURE_WEIGHT = 1.5
+
+# Palm-normal unit vector (3 dims). Same unit-magnitude character as
+# the direction features; weighted similarly so palm-toward-camera
+# vs palm-away poses are pulled apart but don't dominate the score.
+_PALM_NORMAL_FEATURE_WEIGHT = 1.5
 
 # Region offsets used during reload/match.
 _DISTANCE_REGION_LEN = _SPACING_FEATURE_LEN + _EXTENSION_FEATURE_LEN
@@ -59,6 +80,51 @@ def _distance_to_score(distance: float) -> float:
     if distance <= 0.0:
         return 1.0
     return max(0.0, 1.0 - distance / _SCORE_ZERO_DISTANCE)
+
+
+def _apply_region_weights(arr: np.ndarray) -> None:
+    """Scale each feature region in place so the unweighted Euclidean
+    distance at match time matches our intended weighting. Accepts
+    either a 1-D query vector or a 2-D matrix (rows = samples).
+
+    Region order (cumulative):
+      [0:63]   landmarks                              (weight 1.0)
+      [63:71]  spacing + extension (distance region)  → DISTANCE
+      [71:81]  joint angles                           → JOINT
+      [81:87]  curl + spread (class region)           → CLASS
+      [87:102] per-finger direction unit vectors      → DIRECTION
+      [102:103] thumb-index spread distance           → DISTANCE
+      [103:106] palm-normal unit vector               → PALM
+    """
+    if arr.ndim == 1:
+        cols_view = arr
+        n_cols = arr.shape[0]
+    else:
+        cols_view = arr
+        n_cols = arr.shape[1]
+
+    def _scale(start: int, end: int, weight: float) -> None:
+        if end > n_cols:
+            return
+        if arr.ndim == 1:
+            cols_view[start:end] *= weight
+        else:
+            cols_view[:, start:end] *= weight
+
+    dist_start = _LANDMARK_FEATURE_LEN
+    dist_end = dist_start + _DISTANCE_REGION_LEN
+    joint_end = dist_end + _JOINT_ANGLE_FEATURE_LEN
+    class_end = joint_end + _CLASS_REGION_LEN
+    direction_end = class_end + _DIRECTION_FEATURE_LEN
+    tspread_end = direction_end + _THUMB_INDEX_SPREAD_FEATURE_LEN
+    palm_end = tspread_end + _PALM_NORMAL_FEATURE_LEN
+
+    _scale(dist_start, dist_end, _DISTANCE_FEATURE_WEIGHT)
+    _scale(dist_end, joint_end, _JOINT_ANGLE_WEIGHT)
+    _scale(joint_end, class_end, _CLASS_FEATURE_WEIGHT)
+    _scale(class_end, direction_end, _DIRECTION_FEATURE_WEIGHT)
+    _scale(direction_end, tspread_end, _DISTANCE_FEATURE_WEIGHT)
+    _scale(tspread_end, palm_end, _PALM_NORMAL_FEATURE_WEIGHT)
 
 
 @dataclass(frozen=True)
@@ -153,20 +219,8 @@ class GestureClassifier:
         matrix = np.asarray(rows, dtype=np.float32)
         # Apply per-region weights in-place so classify() is a plain
         # unweighted Euclidean — simpler and faster than weighting on every
-        # call. Three weighted regions:
-        #   distance features (spacing + extension) → _DISTANCE_FEATURE_WEIGHT
-        #   joint angles                            → _JOINT_ANGLE_WEIGHT
-        #   class features (curl + spread)          → _CLASS_FEATURE_WEIGHT
-        dist_start = _LANDMARK_FEATURE_LEN
-        dist_end = dist_start + _DISTANCE_REGION_LEN
-        joint_end = dist_end + _JOINT_ANGLE_FEATURE_LEN
-        class_end = joint_end + _CLASS_REGION_LEN
-        if matrix.shape[1] >= dist_end:
-            matrix[:, dist_start:dist_end] *= _DISTANCE_FEATURE_WEIGHT
-        if matrix.shape[1] >= joint_end:
-            matrix[:, dist_end:joint_end] *= _JOINT_ANGLE_WEIGHT
-        if matrix.shape[1] >= class_end:
-            matrix[:, joint_end:class_end] *= _CLASS_FEATURE_WEIGHT
+        # call. See _apply_region_weights for the full region layout.
+        _apply_region_weights(matrix)
         self._matrix = matrix
 
     def _match_from_features(
@@ -182,16 +236,7 @@ class GestureClassifier:
         # Apply the same per-region weights to the query so matrix rows
         # and query live in the same weighted space.
         q = np.array(features, dtype=np.float32, copy=True)
-        dist_start = _LANDMARK_FEATURE_LEN
-        dist_end = dist_start + _DISTANCE_REGION_LEN
-        joint_end = dist_end + _JOINT_ANGLE_FEATURE_LEN
-        class_end = joint_end + _CLASS_REGION_LEN
-        if q.shape[0] >= dist_end:
-            q[dist_start:dist_end] *= _DISTANCE_FEATURE_WEIGHT
-        if q.shape[0] >= joint_end:
-            q[dist_end:joint_end] *= _JOINT_ANGLE_WEIGHT
-        if q.shape[0] >= class_end:
-            q[joint_end:class_end] *= _CLASS_FEATURE_WEIGHT
+        _apply_region_weights(q)
         diffs = self._matrix - q
         distances = np.linalg.norm(diffs, axis=1)
         best_idx = int(np.argmin(distances))
@@ -271,7 +316,7 @@ class GestureClassifier:
         sticky_name: Optional[str] = None,
     ) -> Optional[MatchResult]:
         """Alternate entry point when the caller already has a normalized
-        87-dim feature vector (e.g., reusing an existing pipeline's output)."""
+        feature vector (e.g., reusing an existing pipeline's output)."""
         return self._match_from_features(
             np.asarray(feature_vector, dtype=np.float32),
             sticky_name=sticky_name,
@@ -291,16 +336,7 @@ class GestureClassifier:
         except Exception:
             return None, 0.0
         q = np.array(features, dtype=np.float32, copy=True)
-        dist_start = _LANDMARK_FEATURE_LEN
-        dist_end = dist_start + _DISTANCE_REGION_LEN
-        joint_end = dist_end + _JOINT_ANGLE_FEATURE_LEN
-        class_end = joint_end + _CLASS_REGION_LEN
-        if q.shape[0] >= dist_end:
-            q[dist_start:dist_end] *= _DISTANCE_FEATURE_WEIGHT
-        if q.shape[0] >= joint_end:
-            q[dist_end:joint_end] *= _JOINT_ANGLE_WEIGHT
-        if q.shape[0] >= class_end:
-            q[joint_end:class_end] *= _CLASS_FEATURE_WEIGHT
+        _apply_region_weights(q)
         diffs = self._matrix - q
         distances = np.linalg.norm(diffs, axis=1)
         best_idx = int(np.argmin(distances))

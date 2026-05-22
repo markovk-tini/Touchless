@@ -32,3 +32,12 @@ onnxruntime-directml
 # (src/hgr/live_api). The rest of the app launches fine without it;
 # clicking "Test Live API" in the UI shows a friendly install hint.
 websocket-client
+
+# Phone camera over WebRTC (Settings -> Camera -> "Connect Phone", the
+# pairing-code flow via touchless-control.com/connect). The WebRTC stream
+# is decoded by a hidden Chromium page (PySide6 QtWebEngine — already a
+# PySide6 component, no extra wheel), which feeds JPEG frames to a tiny
+# local aiohttp server. aiohttp is also used by the QR server; pinned
+# here explicitly. (No aiortc — QtWebEngine does the WebRTC + hardware
+# decode, which is far smoother than software decoding in Python.)
+aiohttp

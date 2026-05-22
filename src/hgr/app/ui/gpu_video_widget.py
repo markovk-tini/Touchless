@@ -284,15 +284,18 @@ class GpuVideoWidget(QWidget):
         target = self._aspect_target()
         if self._image is not None and not self._image.isNull():
             painter.drawImage(target, self._image)
-            # Skip the overlay drawing in lite paint mode -- the
-            # skeleton, bbox, banner and mouse-overlay strokes are
-            # the expensive part of each paint, and during a
-            # fullscreen game we want each paint cheap so DWM can
-            # actually composite us alongside the game. Detection
-            # is unaffected; only the visible-on-screen overlay
-            # disappears.
-            if not self._lite_paint_mode:
-                self._draw_landmarks(painter, target)
+            # In lite paint mode (a fullscreen game is foreground)
+            # we keep the cheap parts of the overlay — the hand
+            # skeleton + joint dots, which are 2 batched draw calls
+            # total — and skip only the expensive parts (mouse-mode
+            # control box pixmap blit, per-hand bbox/banner text).
+            # The skeleton is what the user actually needs to see
+            # while gaming to know whether their hand is being
+            # tracked; the bbox/banners are diagnostic noise that's
+            # OK to drop. _draw_landmarks now honours
+            # _lite_paint_mode internally and gates its own heavy
+            # sections.
+            self._draw_landmarks(painter, target)
         elif self._idle_text:
             painter.setPen(QPen(self._idle_color, 1))
             painter.setFont(self._idle_font)
@@ -347,7 +350,9 @@ class GpuVideoWidget(QWidget):
         # behind the hand. Faint red fill + bold red border + a
         # small "Mouse control area" label so the user
         # immediately knows where to keep their hand.
-        if self._mouse_overlay is not None:
+        # Heavy: monitor-layout pixmap blit. Skipped in lite paint
+        # mode (fullscreen game) so each paint stays cheap.
+        if self._mouse_overlay is not None and not self._lite_paint_mode:
             bx1, by1, bx2, by2 = self._mouse_overlay["bounds"]
             rx1 = bx1 * tw + tx
             ry1 = by1 * th + ty
@@ -545,10 +550,22 @@ class GpuVideoWidget(QWidget):
         # Per-hand bbox + banner. Drawn first so the skeleton +
         # joints paint over them (avoids the bbox edge cutting
         # through a fingertip).
-        painter.save()
-        painter.setFont(self._banner_font)
-        metrics = QFontMetrics(self._banner_font)
-        banner_h = metrics.height()
+        # Heavy: per-hand text rendering (handedness + gesture
+        # label). Skipped in lite paint mode — the skeleton alone
+        # is enough to confirm tracking while gaming.
+        if not self._lite_paint_mode:
+            painter.save()
+            painter.setFont(self._banner_font)
+            metrics = QFontMetrics(self._banner_font)
+            banner_h = metrics.height()
+            self._draw_hand_banners(painter, tx, ty, tw, th, metrics, banner_h)
+            painter.restore()
+
+        # Skeleton + joints — cheap (2 batched paint ops total), drawn
+        # in BOTH normal and lite paint modes.
+        self._draw_hand_skeleton(painter, tx, ty, tw, th)
+
+    def _draw_hand_banners(self, painter, tx, ty, tw, th, metrics, banner_h) -> None:
         for hand in self._hands_info:
             bbox = hand.get("bbox")
             if bbox is None:
@@ -595,8 +612,8 @@ class GpuVideoWidget(QWidget):
             painter.setPen(QPen(self._banner_text_color, 1))
             text_pt = QPointF(bg_rect.x() + 5.0, bg_rect.y() + banner_h - 3.0)
             painter.drawText(text_pt, banner)
-        painter.restore()
 
+    def _draw_hand_skeleton(self, painter, tx, ty, tw, th) -> None:
         # Batch every connection across every hand into one drawLines
         # call and every joint into one drawPoints call. Replaces what
         # used to be ~84 individual painter.draw* calls per paint

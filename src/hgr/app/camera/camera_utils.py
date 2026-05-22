@@ -350,14 +350,25 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
                 display_name=f"Camera {index} ({backend_name(backend)})",
             )
             # Wrap the synchronous cv2.VideoCapture in a reader-thread
-            # shim so cap.read() returns immediately with the latest
-            # buffered frame instead of blocking ~33 ms (a 30 fps
-            # frame interval) on the main thread. Without this, the
-            # gesture loop's main-thread cap.read call itself was the
-            # dominant cycle cost on the OpenCV fallback path,
-            # capping FPS at the camera's frame rate AND starving
-            # other Qt events of the main thread for the duration of
-            # each blocking read.
+            # shim. The wrapper does two things:
+            #
+            # 1) cap.read() returns immediately with the latest buffered
+            #    frame instead of blocking ~33 ms (a 30 fps frame
+            #    interval) on the main thread. Without this the gesture
+            #    loop's main-thread cap.read call was the dominant
+            #    cycle cost on the OpenCV fallback path and starved
+            #    Qt's paint events.
+            #
+            # 2) Drops the first few decoded frames internally so
+            #    consumers never see the partial / mostly-black frames
+            #    many cameras emit immediately after open (the symptom
+            #    was "tutorial shows black with pixel artifacts" on
+            #    first launch). The old synchronous warmup_capture(cap)
+            #    here did the same job but blocked the UI thread for
+            #    up to ~2 s during open AND mis-classified frames in
+            #    dim rooms vs. corrupted-noise frames — fixed-prefix
+            #    discard in the reader thread is simpler and works on
+            #    every camera regardless of lighting.
             return info, ThreadedCvCapture(cap)
 
     # EOS subprocess-isolated fallback. cv2.VideoCapture failed for
@@ -423,6 +434,11 @@ def try_open_camera_url(url: str, read_attempts: int = 12) -> Optional[cv2.Video
         for _ in range(read_attempts):
             ok, _ = cap.read()
             if ok:
+                # Initial garbage-frame discard happens inside
+                # ThreadedCvCapture when the caller wraps this cap
+                # (open_phone_camera_url does). No synchronous drain
+                # here so the Test-Phone-URL settings button stays
+                # responsive while the open path succeeds.
                 return cap
             time.sleep(0.08)
         cap.release()
@@ -464,6 +480,10 @@ def open_preferred_or_first_available(preferred_index: Optional[int], max_index:
     cap = try_open_camera(selected.index, selected.backend, read_attempts=100)
     if cap is None:
         return None, None
-    return selected, cap
+    # Wrap in the threaded reader so behavior matches the preferred-
+    # index path (open_camera_by_index also wraps): non-blocking
+    # cap.read() AND internal first-frames-discard for the open-time
+    # garbage every camera emits.
+    return selected, ThreadedCvCapture(cap)
 
 # Author: Konstantin Markov

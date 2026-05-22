@@ -464,6 +464,13 @@ class ScreenDrawOverlay(QWidget):
         self.update()
 
     def _snap_stroke_to_shape(self, points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+        # Strategy: score each shape independently against a resampled
+        # + smoothed copy of the stroke, then snap to the best fit
+        # only if its residual is acceptable. If everything fits
+        # poorly we keep the original freehand stroke — that's the
+        # main accuracy win over the previous version, which always
+        # snapped closed strokes to a bbox rectangle regardless of
+        # whether the stroke actually looked like one.
         pts = [(float(x), float(y)) for x, y in points]
         n = len(pts)
         if n < 3:
@@ -477,89 +484,328 @@ class ScreenDrawOverlay(QWidget):
         span = max(width, height, 1.0)
         if span < 14.0:
             return pts
-        cx = (min_x + max_x) / 2.0
-        cy = (min_y + max_y) / 2.0
+
+        # Resample to uniform arc-length spacing so dense slow segments
+        # don't bias residuals, then smooth out fingertip jitter.
+        sampled = self._resample_uniform(pts, count=128)
+        if len(sampled) < 8:
+            sampled = pts
+        smooth = self._smooth_points(sampled, window=3)
+
+        aspect = min(width, height) / max(width, height, 1.0)
         start_end_dist = math.hypot(pts[0][0] - pts[-1][0], pts[0][1] - pts[-1][1])
-        closed = start_end_dist < span * 0.32
+        # Relaxed closure threshold: real users almost never close
+        # perfectly. Match anything within ~40% of span.
+        closed = start_end_dist < span * 0.40
+
+        # --- Line score: mean perpendicular distance to chord(P0, Pn). ---
+        line_residual = self._line_residual_norm(smooth, pts[0], pts[-1]) / span
 
         if not closed:
-            return [pts[0], pts[-1]]
+            if line_residual < 0.045:
+                return [pts[0], pts[-1]]
+            return pts
 
-        simplified = self._simplify_polyline(pts, span * 0.08)
-        if len(simplified) > 1:
-            if math.hypot(simplified[0][0] - simplified[-1][0], simplified[0][1] - simplified[-1][1]) < span * 0.06:
-                simplified = simplified[:-1]
-        corner_count = max(len(simplified), 1)
-
-        radii = [math.hypot(p[0] - cx, p[1] - cy) for p in pts]
-        avg_r = sum(radii) / len(radii) if radii else 0.0
-        aspect = min(width, height) / max(width, height, 1.0)
-
-        # Compare how well the stroke fits a rectangle (points hug the four
-        # bbox edges) vs a circle (points stay at avg_r from center). Whichever
-        # residual is smaller wins. A wobbly square with rounded corners still
-        # hugs the edges much closer than it hugs a circle, so this is far more
-        # forgiving than radius-deviation + corner-count heuristics.
-        rect_residual = 0.0
-        for px, py in pts:
-            rect_residual += min(abs(px - min_x), abs(px - max_x), abs(py - min_y), abs(py - max_y))
-        rect_residual = rect_residual / len(pts) / span
-
+        # --- Centroid + radii (used by circle + ellipse). ---
+        n_s = len(smooth)
+        ctr_x = sum(p[0] for p in smooth) / n_s
+        ctr_y = sum(p[1] for p in smooth) / n_s
+        radii = [math.hypot(p[0] - ctr_x, p[1] - ctr_y) for p in smooth]
+        avg_r = sum(radii) / n_s
         if avg_r > 0:
-            circle_residual = sum(abs(math.hypot(p[0] - cx, p[1] - cy) - avg_r) for p in pts) / len(pts) / avg_r
+            circle_residual = sum(abs(r - avg_r) for r in radii) / n_s / avg_r
         else:
             circle_residual = 1.0
 
-        # Bias toward rectangle: circle must beat rect by a clear margin.
-        is_circle = (
-            circle_residual < rect_residual * 0.75
-            and aspect > 0.72
-            and corner_count >= 6
-        )
-        is_triangle = (
-            not is_circle
-            and corner_count == 3
-            and rect_residual > 0.08
-            and len(simplified) >= 3
-        )
+        # --- Step 1: try polygon detection first. ---
+        # Corner-based polygons take priority over residual ranking
+        # because a clean triangle's "rect residual" is moderate
+        # (two edges align with the bbox), but its corner residual
+        # against the actual 3 vertices is tiny. We try k=4 and k=3
+        # and pick the better fit among polygons whose corners are
+        # genuine sharp turns.
+        POLY_RESIDUAL_GATE = 0.05  # mean point-to-edge distance / span
+        MIN_CORNER_TURN = 0.55     # ~31° interior turn — eliminates circles
+        poly_choice: tuple[str, list[tuple[float, float]], float] | None = None
+        for k in (4, 3):
+            picked = self._dominant_corners(smooth, k=k, span=span)
+            if picked is None or len(picked) != k:
+                continue
+            min_turn = self._min_turn_score(smooth, picked, span)
+            if min_turn < MIN_CORNER_TURN:
+                continue
+            verts = self._order_polygon_ccw([smooth[i] for i in picked], ctr_x, ctr_y)
+            residual = self._polygon_edge_residual(smooth, verts) / span
+            if residual > POLY_RESIDUAL_GATE:
+                continue
+            kind = "quad" if k == 4 else "triangle"
+            if poly_choice is None or residual < poly_choice[2]:
+                poly_choice = (kind, verts, residual)
 
-        if is_circle:
-            steps = 72
+        # --- Step 2: circle / ellipse via radial std-dev. ---
+        var_r = sum((r - avg_r) * (r - avg_r) for r in radii) / n_s
+        std_r = math.sqrt(var_r)
+        # Std-dev normalized by SPAN, not avg_r, so this is directly
+        # comparable to rect residuals. A clean circle has std ~ noise
+        # level; a square has std ~ (corner radius - edge radius)/3 ~
+        # several percent of span.
+        circle_radial_std = std_r / span if span > 0 else 1.0
+
+        # Ellipse via PCA-rotated bbox (only used when aspect < ~0.88).
+        pca_angle = self._principal_axis_angle(smooth, ctr_x, ctr_y)
+        cos_a = math.cos(-pca_angle)
+        sin_a = math.sin(-pca_angle)
+        rot_pts = [
+            ((p[0] - ctr_x) * cos_a - (p[1] - ctr_y) * sin_a,
+             (p[0] - ctr_x) * sin_a + (p[1] - ctr_y) * cos_a)
+            for p in smooth
+        ]
+        r_min_x = min(p[0] for p in rot_pts)
+        r_max_x = max(p[0] for p in rot_pts)
+        r_min_y = min(p[1] for p in rot_pts)
+        r_max_y = max(p[1] for p in rot_pts)
+        rx_half = (r_max_x - r_min_x) / 2.0
+        ry_half = (r_max_y - r_min_y) / 2.0
+        ec_x = (r_min_x + r_max_x) / 2.0
+        ec_y = (r_min_y + r_max_y) / 2.0
+        if rx_half > 1.0 and ry_half > 1.0:
+            ellipse_sum = 0.0
+            for px, py in rot_pts:
+                lx = (px - ec_x) / rx_half
+                ly = (py - ec_y) / ry_half
+                r_local = math.hypot(lx, ly)
+                # Approximate: scale point to ellipse boundary, take
+                # remaining radial difference in world units.
+                ellipse_sum += abs(r_local - 1.0) * min(rx_half, ry_half)
+            ellipse_residual = ellipse_sum / n_s / span
+        else:
+            ellipse_residual = 1.0
+
+        CURVE_RESIDUAL_GATE = 0.03
+
+        # --- Step 3: decide. ---
+        # Polygon wins outright when present (we already filtered by
+        # the polygon residual gate). When both quad and triangle
+        # qualify we kept the lower-residual one.
+        if poly_choice is not None:
+            kind, verts, _ = poly_choice
+            return verts + [verts[0]]
+
+        if aspect > 0.88 and circle_radial_std < CURVE_RESIDUAL_GATE:
+            steps = 96
             result: list[tuple[float, float]] = []
             for i in range(steps + 1):
-                angle = 2.0 * math.pi * i / steps
-                result.append((cx + avg_r * math.cos(angle), cy + avg_r * math.sin(angle)))
+                t = 2.0 * math.pi * i / steps
+                result.append((ctr_x + avg_r * math.cos(t), ctr_y + avg_r * math.sin(t)))
             return result
-        if is_triangle:
-            tri = [simplified[0], simplified[1], simplified[2]]
-            return [tri[0], tri[1], tri[2], tri[0]]
-        return [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y), (min_x, min_y)]
 
-    def _simplify_polyline(self, pts: list[tuple[float, float]], epsilon: float) -> list[tuple[float, float]]:
-        if len(pts) < 3:
+        if aspect < 0.88 and ellipse_residual < CURVE_RESIDUAL_GATE:
+            steps = 96
+            cos_p = math.cos(pca_angle)
+            sin_p = math.sin(pca_angle)
+            result = []
+            for i in range(steps + 1):
+                t = 2.0 * math.pi * i / steps
+                lx = ec_x + rx_half * math.cos(t)
+                ly = ec_y + ry_half * math.sin(t)
+                wx = ctr_x + lx * cos_p - ly * sin_p
+                wy = ctr_y + lx * sin_p + ly * cos_p
+                result.append((wx, wy))
+            return result
+
+        # No confident snap → keep freehand. (The old version always
+        # snapped to a bbox rect here, which was the main source of
+        # "why did my squiggle turn into a rectangle?" complaints.)
+        return pts
+
+    def _resample_uniform(self, pts: list[tuple[float, float]], count: int) -> list[tuple[float, float]]:
+        if len(pts) < 2 or count < 2:
             return list(pts)
-        stack: list[tuple[int, int]] = [(0, len(pts) - 1)]
-        keep = [False] * len(pts)
-        keep[0] = True
-        keep[-1] = True
-        while stack:
-            start, end = stack.pop()
-            if end <= start + 1:
+        seg_lens = []
+        total = 0.0
+        for i in range(1, len(pts)):
+            d = math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+            seg_lens.append(d)
+            total += d
+        if total <= 0.0:
+            return list(pts)
+        step = total / (count - 1)
+        out: list[tuple[float, float]] = [pts[0]]
+        traveled = 0.0
+        target = step
+        i = 1
+        # Walk segments, emitting points at every `step` of accumulated
+        # arc length. Linear interp inside each segment.
+        while i < len(pts) and len(out) < count - 1:
+            seg = seg_lens[i - 1]
+            if seg <= 0.0:
+                i += 1
                 continue
-            ax, ay = pts[start]
-            bx, by = pts[end]
-            dmax = 0.0
-            idx = start
-            for i in range(start + 1, end):
-                d2 = self._point_to_segment_distance_sq(pts[i][0], pts[i][1], ax, ay, bx, by)
-                if d2 > dmax:
-                    dmax = d2
-                    idx = i
-            if dmax > epsilon * epsilon:
-                keep[idx] = True
-                stack.append((start, idx))
-                stack.append((idx, end))
-        return [pts[i] for i, k in enumerate(keep) if k]
+            while target <= traveled + seg and len(out) < count - 1:
+                t = (target - traveled) / seg
+                ax, ay = pts[i - 1]
+                bx, by = pts[i]
+                out.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+                target += step
+            traveled += seg
+            i += 1
+        out.append(pts[-1])
+        return out
+
+    def _smooth_points(self, pts: list[tuple[float, float]], window: int) -> list[tuple[float, float]]:
+        if window <= 1 or len(pts) < 3:
+            return list(pts)
+        half = window // 2
+        n = len(pts)
+        out: list[tuple[float, float]] = []
+        for i in range(n):
+            lo = max(0, i - half)
+            hi = min(n, i + half + 1)
+            sx = 0.0
+            sy = 0.0
+            for j in range(lo, hi):
+                sx += pts[j][0]
+                sy += pts[j][1]
+            denom = float(hi - lo)
+            out.append((sx / denom, sy / denom))
+        return out
+
+    def _line_residual_norm(
+        self,
+        pts: list[tuple[float, float]],
+        a: tuple[float, float],
+        b: tuple[float, float],
+    ) -> float:
+        ax, ay = a
+        bx, by = b
+        dx = bx - ax
+        dy = by - ay
+        L = math.hypot(dx, dy)
+        if L <= 0.0:
+            return 0.0
+        total = 0.0
+        for px, py in pts:
+            # Perpendicular distance from P to line AB.
+            total += abs((dy * px) - (dx * py) + (bx * ay) - (by * ax)) / L
+        return total / len(pts)
+
+    def _principal_axis_angle(
+        self,
+        pts: list[tuple[float, float]],
+        cx: float,
+        cy: float,
+    ) -> float:
+        # 2x2 covariance matrix and closed-form dominant eigenvector.
+        sxx = 0.0
+        syy = 0.0
+        sxy = 0.0
+        for x, y in pts:
+            dx = x - cx
+            dy = y - cy
+            sxx += dx * dx
+            syy += dy * dy
+            sxy += dx * dy
+        return 0.5 * math.atan2(2.0 * sxy, sxx - syy)
+
+    def _dominant_corners(
+        self,
+        pts: list[tuple[float, float]],
+        k: int,
+        span: float,
+    ) -> list[int] | None:
+        # Score every point by the supplement of its turning angle in
+        # a sliding window. Treats the stroke as cyclic (corners near
+        # the start/end of a closed shape would otherwise be missed
+        # entirely). NMS suppresses two scores collapsing onto the
+        # same physical corner, with cyclic distance so the wrap-around
+        # is handled correctly there too.
+        n = len(pts)
+        if n < k + 4:
+            return None
+        w = max(3, n // 16)
+        scores = self._turn_scores(pts, w)
+        min_sep = max(w, n // 8)
+        ordered = sorted(range(n), key=lambda i: scores[i], reverse=True)
+        picked: list[int] = []
+        for idx in ordered:
+            if scores[idx] <= 0.0:
+                break
+            ok = True
+            for p in picked:
+                d = abs(idx - p)
+                d = min(d, n - d)  # cyclic
+                if d < min_sep:
+                    ok = False
+                    break
+            if ok:
+                picked.append(idx)
+            if len(picked) >= k:
+                break
+        if len(picked) < k:
+            return None
+        return sorted(picked)
+
+    def _turn_scores(self, pts: list[tuple[float, float]], w: int) -> list[float]:
+        # Exterior turn angle at each point, measured between
+        # v1 = (P[i] - P[i-w]) and v2 = (P[i+w] - P[i]). A straight
+        # stroke segment has v1 ∥ v2 → angle 0 (score 0). A sharp
+        # 90° corner has perpendicular v1, v2 → score π/2. A full
+        # about-face has v1 anti-parallel to v2 → score π.
+        n = len(pts)
+        scores = [0.0] * n
+        for i in range(n):
+            ax, ay = pts[(i - w) % n]
+            bx, by = pts[i]
+            cx, cy = pts[(i + w) % n]
+            v1x, v1y = bx - ax, by - ay
+            v2x, v2y = cx - bx, cy - by
+            n1 = math.hypot(v1x, v1y)
+            n2 = math.hypot(v2x, v2y)
+            if n1 <= 0.0 or n2 <= 0.0:
+                continue
+            dot = (v1x * v2x + v1y * v2y) / (n1 * n2)
+            dot = max(-1.0, min(1.0, dot))
+            scores[i] = math.acos(dot)
+        return scores
+
+    def _min_turn_score(
+        self,
+        pts: list[tuple[float, float]],
+        idxs: list[int],
+        span: float,
+    ) -> float:
+        n = len(pts)
+        w = max(3, n // 16)
+        scores = self._turn_scores(pts, w)
+        return min(scores[i] for i in idxs)
+
+    def _polygon_edge_residual(
+        self,
+        pts: list[tuple[float, float]],
+        polygon: list[tuple[float, float]],
+    ) -> float:
+        total = 0.0
+        m = len(polygon)
+        if m < 2:
+            return 1e9
+        for px, py in pts:
+            best = float("inf")
+            for j in range(m):
+                ax, ay = polygon[j]
+                bx, by = polygon[(j + 1) % m]
+                d = self._point_to_segment_distance_sq(px, py, ax, ay, bx, by)
+                if d < best:
+                    best = d
+            total += math.sqrt(best)
+        return total / len(pts)
+
+    def _order_polygon_ccw(
+        self,
+        verts: list[tuple[float, float]],
+        cx: float,
+        cy: float,
+    ) -> list[tuple[float, float]]:
+        return sorted(verts, key=lambda v: math.atan2(v[1] - cy, v[0] - cx))
 
     def map_normalized_to_screen(self, x: float, y: float) -> QPointF:
         geo = self.geometry()
@@ -1147,6 +1393,12 @@ class SavedLocationOverlay(QWidget):
     _PILL_HEIGHT = 56
     _PILL_PADDING_X = 28
     _SCREEN_BOTTOM_GAP = 64
+    # Vertical offset so this pill stacks ABOVE the standard
+    # processing / voice-status pill row instead of overlapping with
+    # them. The other two pills sit at y = bottom - height - 64.
+    # 110 px = the 88-px ProcessingOverlay + 22-px gap (matches the
+    # 56-px voice overlay's similar clearance).
+    _STACK_ABOVE_OFFSET = 110
     _MIN_WIDTH = 280
     _MAX_WIDTH_FRAC = 0.80  # of screen width
 
@@ -1162,11 +1414,18 @@ class SavedLocationOverlay(QWidget):
         self.setAttribute(Qt.WA_NoSystemBackground)
         self.setAttribute(Qt.WA_StyledBackground, False)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        # Mouse-RECEIVING (was Mouse-Transparent): clicking the pill
+        # opens the saved file (or its folder if the file is gone).
+        # The cursor flips to PointingHandCursor on enter so the
+        # affordance is discoverable.
+        self.setCursor(Qt.PointingHandCursor)
         self.setAutoFillBackground(False)
         self.setStyleSheet("background: transparent; border: none;")
         self._text = ""
         self._displayed_text = ""
+        # Path the click handler will open. None disables the click
+        # behaviour (falls back to a regular informational pill).
+        self._click_target: Path | None = None
         # Hold-then-fade timers. Hold duration = total_ms - fade_ms.
         self._hold_timer = QTimer(self)
         self._hold_timer.setSingleShot(True)
@@ -1179,8 +1438,18 @@ class SavedLocationOverlay(QWidget):
         self._fade_remaining_ms = 0
         self.resize(self._MIN_WIDTH, self._PILL_HEIGHT)
 
-    def show_saved(self, text: str, *, total_ms: int = 3000, fade_ms: int = 600) -> None:
+    def show_saved(self, text: str, *, total_ms: int = 3000, fade_ms: int = 600, click_target: Path | None = None) -> None:
+        """Show the saved-location pill above the standard pill row.
+
+        If `click_target` is supplied (recommended for every save
+        outcome), the user can click the pill to open the file in
+        its native handler. When the file no longer exists at click
+        time (deleted between save and click), we fall back to
+        opening the containing folder via Explorer. None target =
+        informational pill only, click does nothing.
+        """
         self._text = str(text or "")
+        self._click_target = Path(click_target) if click_target else None
         # Stop any prior cycle so a new save replaces the old pill
         # cleanly.
         self._hold_timer.stop()
@@ -1200,6 +1469,33 @@ class SavedLocationOverlay(QWidget):
         self._fade_total_ms = max(50, int(fade_ms))
         hold_ms = max(0, int(total_ms) - self._fade_total_ms)
         self._hold_timer.start(hold_ms)
+
+    def mousePressEvent(self, event):  # noqa: N802
+        """Left-click → open the saved file (or its folder if the
+        file's been moved / deleted in the interim)."""
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        target = self._click_target
+        if target is None:
+            event.accept()
+            return
+        try:
+            import os
+            if target.exists():
+                os.startfile(str(target))
+            elif target.parent.exists():
+                # File gone — open the folder so the user can see
+                # where it WAS / find a renamed version.
+                os.startfile(str(target.parent))
+        except Exception:
+            pass
+        # Hide immediately on click so the pill doesn't linger
+        # while the OS opens the file.
+        self._hold_timer.stop()
+        self._fade_timer.stop()
+        self.hide()
+        event.accept()
 
     def _begin_fade(self) -> None:
         self._fade_remaining_ms = self._fade_total_ms
@@ -1243,7 +1539,12 @@ class SavedLocationOverlay(QWidget):
             return
         geo = screen.availableGeometry()
         x = geo.center().x() - self.width() // 2
-        y = geo.bottom() - self.height() - self._SCREEN_BOTTOM_GAP
+        # Stack ABOVE the standard processing / voice-status pill row.
+        # Without the offset, this overlay landed at the same y as
+        # ProcessingOverlay's "Processing clip" and VoiceStatusOverlay's
+        # "Executing command", producing a visible overlap on every
+        # save flow that involved either of those pills.
+        y = geo.bottom() - self.height() - self._SCREEN_BOTTOM_GAP - self._STACK_ABOVE_OFFSET
         self.move(x, y)
 
     def paintEvent(self, event) -> None:  # noqa: N802

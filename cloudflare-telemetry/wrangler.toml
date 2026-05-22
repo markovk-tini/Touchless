@@ -1,0 +1,15 @@
+# Cloudflare Worker config for the Touchless telemetry endpoint.
+# Fill in the placeholders marked CHANGEME after running the
+# step-by-step setup in README.md.
+
+name = "touchless-telemetry"
+main = "src/index.ts"
+compatibility_date = "2025-05-01"
+
+# D1 database binding. Create the database with:
+#   wrangler d1 create touchless-events
+# Wrangler will print a database_id — paste it below.
+[[d1_databases]]
+binding = "DB"                    # accessible as `env.DB` in the Worker
+database_name = "touchless-events"
+database_id = "8e3e9263-829b-4fcd-87e9-a81b9da45747"

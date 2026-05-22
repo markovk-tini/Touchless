@@ -34,6 +34,8 @@ from .volume_gesture import VolumeGestureTracker
 class DebugWindow(QMainWindow):
     def __init__(self, config: AppConfig):
         super().__init__()
+        from ..app.ui.window_chrome import apply_touchless_chrome
+        apply_touchless_chrome(self)
         self.config = config
         self.backend: GestureBackend | None = None
         self.cap = None

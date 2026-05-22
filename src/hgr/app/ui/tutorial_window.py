@@ -220,7 +220,13 @@ class MousePracticeWidget(QWidget):
         self._cursor_position: tuple[float, float] | None = None
         self._mode_enabled = False
         self._status_text = "Hold left-hand three to turn mouse mode on."
-        self.setMinimumHeight(240)
+        # Bumped from 240 → 360 per UX request: bigger click arena
+        # makes the four numbered targets easier to see + clearer
+        # space between them. The arena is also vertically centred
+        # inside this height (see paintEvent) so the dots sit in the
+        # middle of the right panel rather than crowding the top
+        # edge.
+        self.setMinimumHeight(360)
 
     def apply_theme(self, accent: str, text: str) -> None:
         self._accent = QColor(accent)
@@ -297,7 +303,26 @@ class MousePracticeWidget(QWidget):
         painter.setPen(QPen(QColor(self._accent.red(), self._accent.green(), self._accent.blue(), 55), 1.2))
         painter.drawRoundedRect(card, 18, 18)
 
-        arena = QRectF(card.left() + 12, card.top() + 12, card.width() - 24, card.height() - 64)
+        # Centre the practice arena vertically inside the card. The
+        # arena is sized to ~75 % of the card's available height
+        # (height minus the 64 px status band reserved at the
+        # bottom) so the remaining 25 % is split evenly as top +
+        # bottom padding, putting the four target dots visually in
+        # the middle of the right panel instead of pinned to the
+        # top edge.
+        status_band_h = 64
+        available_h = max(160, card.height() - status_band_h)
+        arena_h = max(180, int(available_h * 0.78))
+        # Clamp to card width minus side padding so the arena stays
+        # close to square / portrait on narrow panels.
+        arena_w = card.width() - 24
+        arena_top = card.top() + (available_h - arena_h) // 2
+        arena = QRectF(
+            card.left() + 12,
+            arena_top,
+            arena_w,
+            arena_h,
+        )
         painter.setBrush(QColor(255, 255, 255, 7))
         painter.setPen(QPen(QColor(255, 255, 255, 28), 1.0))
         painter.drawRoundedRect(arena, 16, 16)
@@ -369,6 +394,251 @@ class MousePracticeWidget(QWidget):
                 Qt.AlignCenter,
                 "Completed!",
             )
+
+
+class MouseScrollPracticeWidget(QScrollArea):
+    """Scroll-phase practice arena. Active after the click practice is
+    finished — the user has to scroll all the way to the TOP bar AND
+    all the way to the BOTTOM bar to complete the step.
+
+    Why a QScrollArea: Touchless's mouse mode emits real OS-level
+    scroll wheel events when the user makes the scroll gesture, so
+    a standard QScrollArea responds without us simulating anything.
+    We listen to the vertical scrollbar's `valueChanged` signal,
+    flip `_top_reached` / `_bottom_reached` when the scrollbar hits
+    each extremity, and complete when both are seen.
+
+    Top / bottom bars: small dyed banners glued to the start/end of
+    the scrollable content. They're purely visual markers — the
+    completion check is on the scrollbar's value, not collision
+    with the bars (saves us a hit-test path).
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._accent = QColor("#1DE9B6")
+        self._text = QColor("#F4FAFF")
+        self._top_reached = False
+        self._bottom_reached = False
+        self._status_text = "Use mouse mode to scroll up to the top bar."
+        # Strip the QScrollArea's default chrome so it visually blends
+        # with the tutorial card surface.
+        self.setObjectName("mouseScrollPractice")
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setWidgetResizable(True)
+        # Fill the entire right panel vertically while scroll phase
+        # is active — Expanding size policy in both directions, plus
+        # a generous minimum height so it doesn't shrink below a
+        # usable scrollable region on smaller window sizes.
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumHeight(360)
+        # Custom-styled vertical scrollbar so the green track matches
+        # the rest of the tutorial chrome (the stock Win11 scrollbar
+        # clashes with the accent palette).
+        self.setStyleSheet(
+            "QScrollArea#mouseScrollPractice { background: transparent; }"
+            "QScrollArea#mouseScrollPractice > QWidget > QWidget { background: transparent; }"
+            "QScrollBar:vertical { background: rgba(255,255,255,0.06); "
+            "  width: 10px; border-radius: 5px; margin: 2px 0; }"
+            "QScrollBar::handle:vertical { background: #1DE9B6; "
+            "  min-height: 28px; border-radius: 5px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
+        )
+
+        content = QWidget()
+        content.setObjectName("mouseScrollContent")
+        content.setStyleSheet(
+            "#mouseScrollContent { background: transparent; }"
+        )
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(14)
+
+        # Top bar — the "you've reached the top" marker.
+        self._top_bar = QLabel("▲  Top of the page")
+        self._top_bar.setAlignment(Qt.AlignCenter)
+        self._top_bar.setMinimumHeight(48)
+        self._top_bar.setStyleSheet(self._bar_style(active=False))
+        layout.addWidget(self._top_bar)
+
+        # Upper-instruction text. The animated tutorial_scrolling.mp4
+        # demo used to live to the right of this text — it's now in
+        # the top-right of the LIVE CAMERA VIEW instead (the same
+        # spot the left_three / mouse_clicks demos use), so users
+        # see the pose without having to look away from the camera.
+        upper_text = QLabel(
+            "Scroll by holding two fingers up and drifting your hand "
+            "<b>up</b> (to scroll up) or <b>down</b> (to scroll down).<br><br>"
+            "Reach the top bar and the bottom bar to complete this step."
+        )
+        upper_text.setWordWrap(True)
+        upper_text.setTextFormat(Qt.RichText)
+        upper_text.setStyleSheet("color: #E8F6FF; font-size: 13px;")
+        layout.addWidget(upper_text)
+
+        # Tall middle spacer — pushes the bottom bar past the
+        # viewport so the user has to actually scroll.
+        spacer = QWidget()
+        spacer.setMinimumHeight(640)
+        spacer.setStyleSheet(
+            "background: rgba(255,255,255,0.04);"
+            " border: 1px dashed rgba(255,255,255,0.18);"
+            " border-radius: 12px;"
+        )
+        spacer_layout = QVBoxLayout(spacer)
+        spacer_layout.setContentsMargins(20, 20, 20, 20)
+        spacer_label = QLabel(
+            "Keep scrolling.\n\nWhen you reach the bar at the bottom, "
+            "the bar turns green and you can head back to the top."
+        )
+        spacer_label.setAlignment(Qt.AlignCenter)
+        spacer_label.setWordWrap(True)
+        spacer_label.setStyleSheet("color: #A6C7D7; font-size: 12px;")
+        spacer_layout.addStretch(1)
+        spacer_layout.addWidget(spacer_label)
+        spacer_layout.addStretch(1)
+        layout.addWidget(spacer)
+
+        # Footer text "below" the practice area.
+        lower_text = QLabel(
+            "Almost there — touch the bottom bar, then scroll back up "
+            "to finish this part."
+        )
+        lower_text.setWordWrap(True)
+        lower_text.setStyleSheet("color: #E8F6FF; font-size: 13px;")
+        layout.addWidget(lower_text)
+
+        # Bottom bar.
+        self._bottom_bar = QLabel("▼  Bottom of the page")
+        self._bottom_bar.setAlignment(Qt.AlignCenter)
+        self._bottom_bar.setMinimumHeight(48)
+        self._bottom_bar.setStyleSheet(self._bar_style(active=False))
+        layout.addWidget(self._bottom_bar)
+
+        # Status line that mirrors which extremity the user still
+        # needs to reach. Lives inside the scroll content so it
+        # follows the user as they navigate.
+        self._status_label = QLabel(self._status_text)
+        self._status_label.setAlignment(Qt.AlignCenter)
+        self._status_label.setWordWrap(True)
+        self._status_label.setStyleSheet(
+            "color: #1DE9B6; font-size: 13px; font-weight: 700;"
+        )
+        layout.addWidget(self._status_label)
+
+        self.setWidget(content)
+        # Listen for scrollbar moves so we can mark top / bottom
+        # reached. A tolerance of 2 px on each extremity covers the
+        # 1-px rounding the Qt scrollbar sometimes produces at the
+        # very ends of the range.
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+
+    @staticmethod
+    def _bar_style(active: bool) -> str:
+        if active:
+            return (
+                "background: rgba(29, 233, 182, 0.20);"
+                " color: #1DE9B6;"
+                " border: 1.5px solid #1DE9B6;"
+                " border-radius: 10px;"
+                " font-size: 15px; font-weight: 800;"
+                " padding: 12px;"
+            )
+        return (
+            "background: rgba(255, 82, 82, 0.16);"
+            " color: #FF8A8A;"
+            " border: 1.5px solid rgba(255, 82, 82, 0.55);"
+            " border-radius: 10px;"
+            " font-size: 15px; font-weight: 800;"
+            " padding: 12px;"
+        )
+
+    def apply_theme(self, accent: str, text: str) -> None:
+        self._accent = QColor(accent)
+        self._text = QColor(text)
+        self._refresh_bars()
+
+    def reset(self) -> None:
+        self._top_reached = False
+        self._bottom_reached = False
+        self._status_text = "Use mouse mode to scroll up to the top bar."
+        self._refresh_bars()
+        self._status_label.setText(self._status_text)
+        # Reset scroll position to a neutral midway start so neither
+        # extremity is auto-claimed when the widget shows.
+        try:
+            sb = self.verticalScrollBar()
+            sb.setValue((sb.minimum() + sb.maximum()) // 2)
+        except Exception:
+            pass
+
+    @property
+    def completed(self) -> bool:
+        return self._top_reached and self._bottom_reached
+
+    @property
+    def top_reached(self) -> bool:
+        return self._top_reached
+
+    @property
+    def bottom_reached(self) -> bool:
+        return self._bottom_reached
+
+    def register_scroll_steps(self, steps: int) -> None:
+        """Programmatically scroll the practice area by the number of
+        scroll-wheel steps emitted by the tutorial's mouse-gesture
+        tracker. Positive = up, negative = down. The widget would
+        otherwise only respond to real OS-level wheel events landing
+        on its viewport — but in tutorial mode the engine doesn't
+        actually fire OS wheel events (those would scroll whatever
+        the desktop cursor sits over, not the tutorial), so we
+        translate steps → scrollbar deltas ourselves.
+
+        Step → pixel mapping: one logical step = the QScrollArea's
+        own SingleStep, which gives a per-frame scroll amount close
+        to what a physical wheel notch would produce on a standard
+        Qt scrollable widget.
+        """
+        if steps == 0:
+            return
+        try:
+            sb = self.verticalScrollBar()
+            step_pixels = max(20, int(sb.singleStep() or 20))
+            # Negative `steps` means scroll DOWN (raise scrollbar
+            # value); positive `steps` means scroll UP (lower
+            # scrollbar value). Matches QAbstractSlider behaviour.
+            sb.setValue(sb.value() - int(steps) * step_pixels)
+        except Exception:
+            pass
+
+    def _on_scroll(self, value: int) -> None:
+        sb = self.verticalScrollBar()
+        if value <= sb.minimum() + 2:
+            if not self._top_reached:
+                self._top_reached = True
+                self._refresh_bars()
+        if value >= sb.maximum() - 2:
+            if not self._bottom_reached:
+                self._bottom_reached = True
+                self._refresh_bars()
+        # Status copy updates based on which extremes have been hit.
+        if self.completed:
+            new_status = "Scrolling done! Turn mouse mode off to finish."
+        elif self._top_reached and not self._bottom_reached:
+            new_status = "Top reached. Now scroll down to the bottom bar."
+        elif self._bottom_reached and not self._top_reached:
+            new_status = "Bottom reached. Now scroll up to the top bar."
+        else:
+            new_status = "Use mouse mode to scroll up to the top bar."
+        if new_status != self._status_text:
+            self._status_text = new_status
+            self._status_label.setText(new_status)
+
+    def _refresh_bars(self) -> None:
+        self._top_bar.setStyleSheet(self._bar_style(active=self._top_reached))
+        self._bottom_bar.setStyleSheet(self._bar_style(active=self._bottom_reached))
 
 
 class _VoiceMicArrow(QWidget):
@@ -849,6 +1119,24 @@ class TutorialWindow(QDialog):
         # or the OS media keys (which YouTube + every other media
         # app respect via Windows Media integration).
         self._has_spotify = self._detect_spotify_installed()
+        # Spotify-first-active prompt forwarding. The main app's
+        # per-frame Spotify-detection path doesn't fire while the
+        # tutorial is in front (parent engine is frozen and the
+        # tutorial owns the live debug-frame stream). If the user
+        # already has Spotify running but never authorised Touchless,
+        # we'd silently skip the prompt for the entire tutorial — so
+        # ask the parent MainWindow to run its one-shot startup check
+        # immediately on tutorial open. The check is idempotent
+        # (gated on config.spotify_first_active_prompt_shown), so
+        # it's a no-op for already-prompted users.
+        try:
+            parent = self.parent()
+            check = getattr(parent, "_check_spotify_at_startup", None)
+            if callable(check):
+                from PySide6.QtCore import QTimer as _QT
+                _QT.singleShot(800, check)
+        except Exception:
+            pass
         # Five-step practice flow. Swipes come first so users learn
         # left/right-swipe early — the same gesture the tutorial uses
         # to advance / go back between pages — then the audio-driven
@@ -934,12 +1222,12 @@ class TutorialWindow(QDialog):
     def _build_ui(self) -> None:
         self.setWindowTitle("Touchless Tutorial")
         self.setModal(False)
-        # Match the main-window starting size (1020x740) so the
-        # tutorial doesn't pop up visibly bigger than the app it
-        # launched from. Min size is conservative so the camera
-        # preview + step navigator both stay visible.
-        self.resize(1020, 720)
-        self.setMinimumSize(880, 640)
+        # Slightly taller than the main app (1020×820) per UX request
+        # so the live camera view gets meaningfully larger without
+        # widening the dialog. Min height bumped in parallel so
+        # constrained displays still get the bigger camera region.
+        self.resize(1020, 820)
+        self.setMinimumSize(880, 740)
 
         # In-window "Starting..." pill. Floating QLabel anchored at
         # bottom-center of the tutorial dialog (NOT a desktop-level
@@ -993,15 +1281,105 @@ class TutorialWindow(QDialog):
         body_layout.setSpacing(18)
         self.body_stack.addWidget(body)
 
+        # ---- LEFT CARD ----------------------------------------------
+        # User-requested single-panel layout for all steps. Visual
+        # order: Part X/5 title → short description (+ Show more
+        # link) → Show Example button → live camera view → footer
+        # words (camera_header above, tutorial_camera_footer below)
+        # → remaining diagnostic / completion labels. The mouse step
+        # additionally shows a right card with the practice arena;
+        # all other steps show only this left card so the page looks
+        # and feels like one panel.
         video_card = QFrame()
         video_card.setObjectName("tutorialCard")
         video_layout = QVBoxLayout(video_card)
         video_layout.setContentsMargins(16, 16, 16, 16)
         video_layout.setSpacing(10)
 
-        self.camera_label = QLabel("Camera: waiting")
+        # --- Top row: title on the left, all step-action buttons on
+        # the right. Mouse / Spotify / example buttons share the same
+        # right cluster — only one or two are visible per step but
+        # the layout keeps them top-right consistently.
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(10)
+
+        self.step_title = QLabel("")
+        self.step_title.setObjectName("tutorialStepTitle")
+        # Bigger title font — overrides global QSS for #tutorialStepTitle.
+        self.step_title.setStyleSheet(
+            "QLabel#tutorialStepTitle {"
+            "  color: #1DE9B6;"
+            "  font-size: 26px;"
+            "  font-weight: 800;"
+            "  letter-spacing: -0.01em;"
+            "}"
+        )
+        self.step_title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        # Don't let the title stretch — fix its size policy to its
+        # text width so the description sits right next to it
+        # without a giant gap.
+        self.step_title.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Preferred)
+        title_row.addWidget(self.step_title, 0, Qt.AlignLeft | Qt.AlignVCenter)
+        title_row.addStretch(1)
+
+        # step_desc (white inline description) removed per UX request.
+        # The widget is still constructed and hidden so legacy
+        # code paths that call self.step_desc.setText(...) keep
+        # working without modification — they just write into a
+        # dead widget. Avoids a wider sweep through _apply_step_content
+        # and related callers.
+        self.step_desc = QLabel("")
+        self.step_desc.setObjectName("tutorialStepDesc")
+        self.step_desc.hide()
+
+        # Right-side button cluster. Spotify-setup first so it sits
+        # leftmost in the cluster, mouse-instructions in the middle,
+        # Show Example as the rightmost (most-used) action.
+        self.spotify_setup_button = QPushButton("Set up Spotify")
+        self.spotify_setup_button.setVisible(False)
+        self.spotify_setup_button.clicked.connect(self._open_spotify_setup_from_tutorial)
+        title_row.addWidget(self.spotify_setup_button, 0, Qt.AlignRight)
+
+        # Mouse instructions button removed per UX request — Show
+        # Example covers the same destination (the example popup
+        # already carries the full mouse-step instructions text). We
+        # still construct the widget hidden so any back-compat call
+        # to setVisible(...) doesn't hit an AttributeError.
+        self.mouse_instructions_button = QPushButton("Mouse instructions")
+        self.mouse_instructions_button.setVisible(False)
+        self.mouse_instructions_button.clicked.connect(self._open_step_example)
+        # NOT added to title_row — kept as an orphan widget so it
+        # never displays. setVisible(True) elsewhere is a no-op since
+        # it has no parent layout.
+        # Back-compat shim — older code still references the attribute.
+        self.expand_instructions_button = self.mouse_instructions_button
+
+        self.example_button = QPushButton("Show Example")
+        self.example_button.clicked.connect(self._open_step_example)
+        title_row.addWidget(self.example_button, 0, Qt.AlignRight)
+
+        video_layout.addLayout(title_row)
+
+        # Mouse-step long-form instructions (back-compat — still used
+        # by _open_step_example to compose the popup's "Detailed
+        # instructions" section). Kept invisible inline since the
+        # text is now surfaced only through the popup.
+        self.instruction_box = QLabel("")
+        self.instruction_box.setObjectName("tutorialInstructionBox")
+        self.instruction_box.setWordWrap(True)
+        self.instruction_box.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.instruction_box.setVisible(False)
+
+        # --- Camera + footer (was video_card content) -----------------
+        # "Camera: waiting" meta label removed per UX request — the
+        # camera_label widget is still constructed and hidden to keep
+        # the rest of the engine's update path working (it sets
+        # camera_label.setText(...) on every frame to report device
+        # state).
+        self.camera_label = QLabel("")
         self.camera_label.setObjectName("tutorialMeta")
-        video_layout.addWidget(self.camera_label)
+        self.camera_label.hide()
 
         # Big bold accent-coloured header above the camera view. Used
         # by the swipes step to call out the current sub-task ("Let's
@@ -1011,6 +1389,14 @@ class TutorialWindow(QDialog):
         self.tutorial_camera_header.setObjectName("tutorialCameraHeader")
         self.tutorial_camera_header.setAlignment(Qt.AlignCenter)
         self.tutorial_camera_header.setWordWrap(True)
+        # Rich-text + clickable so the "Show more…" link appended by
+        # `_set_camera_header_text` can route to the example popup.
+        # Routes to the same _on_step_desc_link handler the step_desc
+        # link used before — opens the step's example dialog.
+        self.tutorial_camera_header.setTextFormat(Qt.RichText)
+        self.tutorial_camera_header.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.tutorial_camera_header.setOpenExternalLinks(False)
+        self.tutorial_camera_header.linkActivated.connect(self._on_step_desc_link)
         self.tutorial_camera_header.hide()
         video_layout.addWidget(self.tutorial_camera_header)
 
@@ -1018,11 +1404,41 @@ class TutorialWindow(QDialog):
         self.video_label.setObjectName("tutorialVideo")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setWordWrap(True)
-        self.video_label.setMinimumSize(480, 360)
-        # Cap height so the header above + counter below stay on
-        # screen without overlap as the window grows.
-        self.video_label.setMaximumHeight(540)
+        # Floor + ceiling both bumped per UX request — bigger camera
+        # view fills the new vertical space the resized window
+        # provides. 440 min floor (was 360) so even minimum-window
+        # users see a meaningfully bigger image; 640 ceiling (was 540)
+        # so larger windows can grow further without the camera
+        # stalling at a small ratio.
+        self.video_label.setMinimumSize(480, 440)
+        self.video_label.setMaximumHeight(640)
         video_layout.addWidget(self.video_label, 1)
+
+        # Floating "✓ + Completed!" overlay child of video_label.
+        # Stays visible at a fixed semi-transparent level whenever
+        # the current step is in completed state — no fade animation
+        # (the previous fade-in/fade-out kept restarting on every
+        # _update_completion_feedback tick which manifested as a
+        # flashing glyph). Alpha is baked into the stylesheet color
+        # via rgba(...) so we don't need QGraphicsOpacityEffect.
+        # Positioned + sized by an eventFilter on video_label so it
+        # tracks the camera widget's geometry as the window resizes.
+        self._fade_check_label = QLabel("✓", self.video_label)
+        self._fade_check_label.setObjectName("tutorialFadeCheck")
+        self._fade_check_label.setAlignment(Qt.AlignCenter)
+        self._fade_check_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._fade_check_label.hide()
+        # Sub-label below the check. Larger than a bare caption so
+        # the "Completed!" reads at a glance, but smaller than the
+        # main glyph.
+        self._fade_check_caption = QLabel("Completed!", self.video_label)
+        self._fade_check_caption.setObjectName("tutorialFadeCheckCaption")
+        self._fade_check_caption.setAlignment(Qt.AlignCenter)
+        self._fade_check_caption.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._fade_check_caption.hide()
+        # Tracks resize events on video_label so the overlay stays
+        # centred / sized as the window grows.
+        self.video_label.installEventFilter(self)
 
         self.gesture_chip = QLabel("Gesture: neutral")
         self.gesture_chip.setObjectName("tutorialChip")
@@ -1054,67 +1470,39 @@ class TutorialWindow(QDialog):
         # lookups.
         self._sprites: dict = {}
 
-        info_card = QFrame()
-        info_card.setObjectName("tutorialCard")
-        info_layout = QVBoxLayout(info_card)
+        # ---- RIGHT CARD ---------------------------------------------
+        # Only visible on the mouse step (where the user practises
+        # clicking targets) AND when the completion-overlay fires for
+        # any step (so the "Completed ✓" check has somewhere to sit).
+        # Every other step hides this card entirely, giving the
+        # tutorial the user-requested single-panel feel.
+        self.info_card = QFrame()
+        self.info_card.setObjectName("tutorialCard")
+        info_layout = QVBoxLayout(self.info_card)
         info_layout.setContentsMargins(18, 18, 18, 18)
         info_layout.setSpacing(12)
-        body_layout.addWidget(info_card, 5)
-
-        self.step_title = QLabel("")
-        self.step_title.setObjectName("tutorialStepTitle")
-        self.step_desc = QLabel("")
-        self.step_desc.setObjectName("tutorialStepDesc")
-        self.step_desc.setWordWrap(True)
-        info_layout.addWidget(self.step_title)
-        info_layout.addWidget(self.step_desc)
-
-        self.instruction_box = QLabel("")
-        self.instruction_box.setObjectName("tutorialInstructionBox")
-        self.instruction_box.setWordWrap(True)
-        self.instruction_box.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        # Wrap the instruction box in a scroll area so when the
-        # window is short and the step has a long list of steps, the
-        # text scrolls inside its card instead of pushing other UI
-        # off-screen. ScrollBarAsNeeded means the scrollbar is
-        # invisible whenever the content fits.
-        self.instruction_scroll = QScrollArea()
-        self.instruction_scroll.setObjectName("tutorialInstructionScroll")
-        self.instruction_scroll.setWidgetResizable(True)
-        self.instruction_scroll.setFrameShape(QFrame.NoFrame)
-        self.instruction_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.instruction_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.instruction_scroll.setStyleSheet(
-            "QScrollArea#tutorialInstructionScroll, "
-            "QScrollArea#tutorialInstructionScroll > QWidget, "
-            "QScrollArea#tutorialInstructionScroll QWidget#qt_scrollarea_viewport "
-            "{ background: transparent; border: none; }"
-        )
-        self.instruction_scroll.viewport().setStyleSheet("background: transparent;")
-        self.instruction_scroll.setWidget(self.instruction_box)
-        info_layout.addWidget(self.instruction_scroll, 1)
-
-        example_row = QHBoxLayout()
-        example_row.setContentsMargins(0, 0, 0, 0)
-        example_row.setSpacing(8)
-        self.example_button = QPushButton("Show Example")
-        self.example_button.clicked.connect(self._open_step_example)
-        example_row.addWidget(self.example_button, 0, Qt.AlignLeft)
-        # "Show full instructions" — pops the same text the instruction
-        # scrollbox holds into a large, tall modal dialog so users who
-        # find the inline scrollbox cramped on long-step pages (e.g.
-        # mouse_mode with 6+ numbered steps) can read everything at
-        # once. Triggers the same content; just gives it more height.
-        self.expand_instructions_button = QPushButton("Show full instructions")
-        self.expand_instructions_button.clicked.connect(self._open_full_instructions_dialog)
-        example_row.addWidget(self.expand_instructions_button, 0, Qt.AlignLeft)
-        example_row.addStretch(1)
-        info_layout.addLayout(example_row)
+        body_layout.addWidget(self.info_card, 5)
+        # Hide by default — _apply_step_content + completion-fire
+        # paths toggle visibility back on when needed.
+        self.info_card.setVisible(False)
 
         self.practice_stack = QStackedWidget()
+        # Practice stack fills the right-side info_card vertically.
+        # Without Expanding policy the QStackedWidget defaults to
+        # Preferred sizing, which means it shrinks to the sizeHint of
+        # whichever child is active and floats up to the top of the
+        # info_card — leaving empty room at the bottom and making
+        # the mouse-scroll arena look pinned to the top-right.
+        self.practice_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.swipe_widget = SwipeInstructionWidget()
         self.wheel_widget = WheelInstructionWidget()
         self.mouse_widget = MousePracticeWidget()
+        # Scroll-phase counterpart to mouse_widget. Becomes the
+        # active page in practice_stack after the user clicks all 4
+        # click-phase targets. User must scroll to the top bar AND
+        # the bottom bar to complete; tracked via the QScrollArea's
+        # valueChanged signal in the widget itself.
+        self.mouse_scroll_widget = MouseScrollPracticeWidget()
         # Big check overlay used by every step EXCEPT mouse_mode
         # (mouse paints its own ✓ inside the practice arena). Lives
         # inside practice_stack so it occupies the stretch=1 region
@@ -1123,25 +1511,53 @@ class TutorialWindow(QDialog):
         # shown (or empty space) when the user completes the step.
         self.completion_overlay = QFrame()
         self.completion_overlay.setObjectName("tutorialCompletionOverlay")
+        # Avoid layout-driven cropping: the overlay sets the check label
+        # to fill the frame minus a reserved band for "Completed!", and
+        # we rescale the glyph in resizeEvent so it never gets clipped.
+        # Margins are tight (top=0, bottom=0) so the check has the full
+        # frame height to work with; left/right keep a small inset so it
+        # doesn't kiss the card border.
         completion_layout = QVBoxLayout(self.completion_overlay)
-        completion_layout.setContentsMargins(20, 12, 20, 12)
-        completion_layout.setSpacing(4)
-        completion_layout.addStretch(1)
+        completion_layout.setContentsMargins(8, 0, 8, 0)
+        completion_layout.setSpacing(0)
         self.completion_overlay_check = QLabel("✓")
         self.completion_overlay_check.setObjectName("tutorialCompletionOverlayCheck")
         self.completion_overlay_check.setAlignment(Qt.AlignCenter)
         self.completion_overlay_check.setStyleSheet(
-            "color: rgb(29, 233, 182); font-size: 200px; font-weight: 900;"
+            "color: rgb(29, 233, 182); font-weight: 900;"
         )
-        completion_layout.addWidget(self.completion_overlay_check)
+        self.completion_overlay_check.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Minimum height of 0 lets the check shrink without forcing the
+        # overlay to grow when the practice_stack region is short.
+        self.completion_overlay_check.setMinimumHeight(0)
+        completion_layout.addWidget(self.completion_overlay_check, 1)
         self.completion_overlay_text = QLabel("Completed!")
         self.completion_overlay_text.setObjectName("tutorialCompletionOverlayText")
         self.completion_overlay_text.setAlignment(Qt.AlignCenter)
         self.completion_overlay_text.setStyleSheet(
             "color: rgb(29, 233, 182); font-size: 28px; font-weight: 800;"
         )
-        completion_layout.addWidget(self.completion_overlay_text)
-        completion_layout.addStretch(1)
+        self.completion_overlay_text.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        completion_layout.addWidget(self.completion_overlay_text, 0, Qt.AlignBottom | Qt.AlignHCenter)
+
+        # Auto-fit the check glyph to whatever vertical space the
+        # overlay has, minus the reserved bottom band for "Completed!".
+        # Without this the 200 px check gets clipped on short dialogs
+        # (especially since steps with long inline instructions now
+        # squeeze the practice_stack region). Letting the check overlap
+        # surrounding UI is acceptable — but it must never overlap the
+        # "Completed!" word below it, which is why we subtract its
+        # sizeHint from the available height before rescaling.
+        def _rescale_completion_check(event, _frame=self.completion_overlay,
+                                       _check=self.completion_overlay_check,
+                                       _text=self.completion_overlay_text):
+            QFrame.resizeEvent(_frame, event)
+            reserved = _text.sizeHint().height() + 4  # 4 px breathing gap
+            target = max(40, _frame.height() - reserved - 4)
+            f = _check.font()
+            f.setPixelSize(int(target))
+            _check.setFont(f)
+        self.completion_overlay.resizeEvent = _rescale_completion_check
         self.generic_practice = QLabel("")
         self.generic_practice.setObjectName("tutorialPracticeLabel")
         self.generic_practice.setWordWrap(True)
@@ -1150,8 +1566,18 @@ class TutorialWindow(QDialog):
         self.practice_stack.addWidget(self.generic_practice)
         self.practice_stack.addWidget(self.wheel_widget)
         self.practice_stack.addWidget(self.mouse_widget)
+        self.practice_stack.addWidget(self.mouse_scroll_widget)
         self.practice_stack.addWidget(self.completion_overlay)
-        info_layout.addWidget(self.practice_stack, 1)
+        # High stretch factor (99 vs. the trailing addStretch(1)
+        # below) so the practice_stack absorbs essentially all of the
+        # info_card's vertical room. Before this the QVBoxLayout's
+        # trailing stretch claimed an equal share, pinning the
+        # practice arena to the top half of the right panel and
+        # leaving a dead band underneath. The other widgets (progress
+        # label / completion labels / etc.) are hidden on every step
+        # so giving practice_stack near-100% of the stretch budget
+        # is safe.
+        info_layout.addWidget(self.practice_stack, 99)
 
         self.progress_label = QLabel("")
         self.progress_label.setObjectName("tutorialProgress")
@@ -1357,8 +1783,16 @@ class TutorialWindow(QDialog):
         done = self.mouse_widget.completed_targets if completed_targets is None else int(completed_targets)
         if self._step_completed:
             return "Swipe right to continue!"
+        # Three post-click stages mapped onto distinct headers:
+        #   "scroll"  — clicks done, waiting on scroll completion
+        #   "disable" — scroll done, waiting on left-hand-three to
+        #               toggle mouse mode off
+        # "scroll" must check before the broader `done >= 4` clause
+        # so the scroll-pose hint isn't masked by the disable hint.
+        if self._mouse_stage == "scroll":
+            return "Use your middle and index fingers together to scroll!"
         if done >= 4 or self._mouse_stage == "disable":
-            return "Turn off mouse mode by doing left hand three!"
+            return "Use left hand three to turn off mouse mode!"
         if done >= 3:
             return "Now click on target 4"
         if done >= 2:
@@ -1390,6 +1824,11 @@ class TutorialWindow(QDialog):
             "play_pause": (
                 "This is the Control Guide example for the play or pause pose used in this part.",
                 ("Right Hand Fist",),
+            ),
+            "volume": (
+                "These are the Control Guide examples for the volume pose (raise / lower) and the "
+                "shaka mute pose used in this part.",
+                ("Volume Control", "Mute"),
             ),
             "gesture_wheel": (
                 "This is the Control Guide example for the gesture wheel pose used in this part.",
@@ -1439,6 +1878,22 @@ class TutorialWindow(QDialog):
                 card.deleteLater()
 
         return intro_text, selected_cards
+
+    def _open_spotify_setup_from_tutorial(self) -> None:
+        """Open the Spotify setup wizard from the tutorial's
+        voice_command step. This is a shortcut into the same flow the
+        Set up your own Spotify app button in Settings → General runs,
+        so users discovering "play X on Spotify" needs authorisation
+        can fix it without leaving the tutorial."""
+        try:
+            from .spotify_setup_wizard import SpotifySetupWizard
+        except Exception:
+            return
+        try:
+            dialog = SpotifySetupWizard(self.config, parent=self)
+            dialog.exec()
+        except Exception:
+            pass
 
     def _open_full_instructions_dialog(self) -> None:
         """Pop the current step's full instruction text into a tall
@@ -1502,6 +1957,14 @@ class TutorialWindow(QDialog):
         layout.addLayout(button_row)
         dialog.exec()
 
+    def _on_step_desc_link(self, link: str) -> None:
+        """Route 'Show more…' clicks in step_desc to the existing
+        step-example dialog. Same dialog the example button + mouse
+        instructions button open — keeps one source of truth for the
+        full instruction text per step."""
+        if str(link or "").strip() == "show_more":
+            self._open_step_example()
+
     def _open_step_example(self) -> None:
         if self._show_completion_page:
             return
@@ -1523,6 +1986,14 @@ class TutorialWindow(QDialog):
         dialog.setProperty("tutorialStepKey", step.key)
         dialog.setWindowTitle(f"{step.title} Example")
         dialog.resize(960, 740)
+        # Match the main app's Win11 DWM caption colour so the popup
+        # doesn't fall back to the system-default light grey title bar
+        # against our dark Touchless theme.
+        try:
+            from .window_chrome import apply_touchless_chrome
+            apply_touchless_chrome(dialog)
+        except Exception:
+            pass
         self._apply_example_dialog_theme(dialog)
 
         outer = QVBoxLayout(dialog)
@@ -1546,6 +2017,30 @@ class TutorialWindow(QDialog):
         intro_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         card_layout.addWidget(intro_label)
 
+        # Detailed step instructions — same text the inline instruction
+        # box on the main tutorial page shows. Folded into the Example
+        # dialog so users get the full how-to + examples in one window
+        # instead of clicking through two separate buttons.
+        try:
+            detailed_text = self.instruction_box.text() or ""
+        except Exception:
+            detailed_text = ""
+        if detailed_text.strip():
+            details_header = QLabel("Detailed instructions")
+            details_header.setStyleSheet(
+                f"color: {self.config.accent_color or '#1DE9B6'}; "
+                "font-size: 14px; font-weight: 700; padding-top: 4px;"
+            )
+            card_layout.addWidget(details_header)
+            details_label = QLabel(detailed_text)
+            details_label.setWordWrap(True)
+            details_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            details_label.setStyleSheet(
+                "color: rgba(232,246,255,0.92); font-size: 13px; "
+                "line-height: 155%;"
+            )
+            card_layout.addWidget(details_label)
+
         scroll = QScrollArea()
         scroll.setObjectName("tutorialExampleScroll")
         scroll.setWidgetResizable(True)
@@ -1557,6 +2052,20 @@ class TutorialWindow(QDialog):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(12)
         for guide_card in cards:
+            # Per the tutorial-popup UX request, scale every media
+            # widget (gesture image / clip / sketch) by 1.3× so the
+            # examples are easier to see at a glance. set_scale_factor
+            # operates on the original-resolution source pixmap so the
+            # result stays crisp rather than blurry.
+            try:
+                from .main_window import GestureMediaWidget as _GMW
+                for media in guide_card.findChildren(_GMW):
+                    try:
+                        media.set_scale_factor(1.3)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             content_layout.addWidget(guide_card)
         content_layout.addStretch(1)
         scroll.setWidget(content)
@@ -1668,15 +2177,17 @@ class TutorialWindow(QDialog):
         # item primer; users who want the deep list expand it.
         primary_tips = [
             (
+                "Connect Spotify",
+                "Settings → General → Spotify → Set up your own Spotify app "
+                "(one-time, ~1 minute), then click Connect Spotify. After that, "
+                "voice and gesture controls for Spotify just work — re-click "
+                "Connect anytime you need to re-authorise.",
+            ),
+            (
                 "Pause gestures without quitting",
                 "Open the Live View widget (the small camera thumbnail) and "
                 "toggle gestures off. The app keeps running and you can flip "
                 "them back on the same way.",
-            ),
-            (
-                "Connect Spotify",
-                "Settings → General → Connect Spotify. After authorising once, "
-                "voice and gesture controls for Spotify just work.",
             ),
             (
                 "Adjust mouse sensitivity",
@@ -2130,9 +2641,9 @@ class TutorialWindow(QDialog):
         except Exception:
             pass
         self._connect_worker(owned_worker)
-        self.camera_label.setText("Camera: starting tutorial runtime...")
+        self.camera_label.setText("Camera: Starting tutorial runtime...")
         self.video_label.setText("Starting tutorial camera and runtime...")
-        self.gesture_chip.setText("Gesture: starting")
+        self.gesture_chip.setText("Gesture: Starting")
         owned_worker.start()
 
     def _stop_session(self) -> None:
@@ -2188,14 +2699,19 @@ class TutorialWindow(QDialog):
         if "spotify" in text:
             self._last_spotify_tutorial_action = text
         if self._practice_steps[self._step_index].key == "voice_command":
-            # Voice step succeeds when the command targets the
-            # detected media app: Spotify when installed (status
-            # mentions spotify / play), otherwise the previous
-            # YouTube-on-Chrome combo.
-            spotify_present = bool(getattr(self, "_has_spotify", False))
-            if spotify_present and ("spotify" in text or "play" in text):
-                self._last_voice_success_text = text
-            elif not spotify_present and "youtube" in text and "chrome" in text:
+            # The voice step's goal is simply "speak a command and have
+            # it work." command_detected fires with the executed action's
+            # status text, so ANY of these success markers means the
+            # user's spoken command did something — complete the step.
+            # Previously this was gated on _has_spotify and the Spotify
+            # completion branch never checked _last_voice_success_text,
+            # so a working "play X on Spotify" could leave the step stuck
+            # on "waiting for left hand one." No app-presence gate now.
+            success_markers = (
+                "spotify", "play", "youtube", "chrome",
+                "execut", "launch", "pause",
+            )
+            if any(marker in text for marker in success_markers):
                 self._last_voice_success_text = text
 
     def _tutorial_nav_from_payload(self, payload: dict, now: float) -> None:
@@ -2233,6 +2749,15 @@ class TutorialWindow(QDialog):
         self._step_completed = True if self._show_completion_page else (self._step_index in self._completed_steps)
         self._hold_started.clear()
         self._hold_last_fired.clear()
+        # Hide the steady ✓ + "Completed!" overlay whenever we move
+        # to a new step. _update_completion_feedback re-shows it the
+        # moment _step_completed flips True again. Skipped on the
+        # completion page where the overlay is irrelevant.
+        if not self._step_completed:
+            try:
+                self._fade_check_set_visible(False)
+            except Exception:
+                pass
         self._visual_hold_started.clear()
         self._visual_edge_active.clear()
         self._last_dynamic_label = "neutral"
@@ -2307,6 +2832,14 @@ class TutorialWindow(QDialog):
             self.progress_badge.hide()
             self.guide_button.hide()
             self.example_button.hide()
+            try:
+                self.spotify_setup_button.hide()
+            except Exception:
+                pass
+            try:
+                self.mouse_instructions_button.hide()
+            except Exception:
+                pass
             self.prev_button.setEnabled(True)
             self.prev_button.setText("Previous")
             self.next_button.setEnabled(True)
@@ -2322,6 +2855,31 @@ class TutorialWindow(QDialog):
         self.progress_badge.show()
         self.guide_button.show()
         self.example_button.show()
+        # Right card (info_card / practice_stack) is only shown on
+        # the mouse step (where the click-practice arena lives) and
+        # whenever the completion overlay is the active page in the
+        # stack. Every other step hides it so the tutorial reads as
+        # a single panel per the layout refactor.
+        try:
+            current_practice = self.practice_stack.currentWidget()
+        except Exception:
+            current_practice = None
+        show_right = (
+            step.key == "mouse_mode"
+            or current_practice is self.completion_overlay
+        )
+        try:
+            self.info_card.setVisible(show_right)
+        except Exception:
+            pass
+        # Spotify shortcut: only visible on the voice command step,
+        # where it's most useful (the step where users first try
+        # "play X on Spotify" and discover the connection needs
+        # authorisation).
+        try:
+            self.spotify_setup_button.setVisible(step.key == "voice_command")
+        except Exception:
+            pass
         self.progress_badge.setText(f"Step {self._step_index + 1} of {len(self._practice_steps)}")
         # Once the step is finished, flip the big top title to a
         # completion message so the user gets a clear "done" signal
@@ -2411,8 +2969,25 @@ class TutorialWindow(QDialog):
                 "To complete: 3 right swipes, then 3 left swipes. Bbox turns green on each one."
             ),
         }
-        self.step_desc.setText(what_is_map.get(step.key, step.description))
+        # Always set the instruction_box text first — _open_step_example
+        # reads it back to compose the "Detailed instructions" section in
+        # the popup, and the Show-more link on non-mouse steps relies on
+        # the same popup as the source of truth.
         self.instruction_box.setText(instruction_map.get(step.key, step.description))
+        short_desc = what_is_map.get(step.key, step.description)
+        # White-text description sits inline next to the green title.
+        # The "Show more…" link USED to be appended here; per the
+        # latest UX request it now lives at the end of the green
+        # camera-header text instead, surfaced via _set_camera_header_text.
+        self.step_desc.setText(short_desc)
+        self.instruction_box.setVisible(False)
+        # NEVER setVisible(True) on mouse_instructions_button — it was
+        # removed from the title row at construction time, which makes
+        # it an orphan widget with no parent layout. Qt promotes
+        # orphan-but-visible widgets to top-level windows, which was
+        # popping the button up as a free-floating dialog whenever
+        # the user navigated to the mouse step. Force it hidden here.
+        self.mouse_instructions_button.setVisible(False)
         self.note_label.clear()
         self.voice_preview_label.clear()
 
@@ -2618,9 +3193,125 @@ class TutorialWindow(QDialog):
             self.tutorial_camera_footer.clear()
             self.tutorial_camera_footer.hide()
 
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API name)
+        # Keep the floating ✓ overlay centred and sized to the
+        # current video_label geometry. Re-position on every resize
+        # because the QLabel parent-child relationship doesn't
+        # auto-stretch the child.
+        try:
+            if obj is self.video_label and event.type() == event.Type.Resize:
+                self._position_fade_check()
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def _position_fade_check(self) -> None:
+        """Re-position + re-style the ✓ glyph and the 'Completed!'
+        caption to track the live video_label dimensions. Called on
+        every resize via eventFilter and on every show via
+        _fade_check_set_visible. Alpha is baked into the rgba(...)
+        colour (no QGraphicsOpacityEffect) so the overlay holds at a
+        constant transparency instead of fading in/out."""
+        try:
+            w = self.video_label.width()
+            h = self.video_label.height()
+        except Exception:
+            return
+        if w <= 0 or h <= 0:
+            return
+        # Check glyph fills ~58% of the smaller dimension. Slightly
+        # smaller than before so there's room for the caption below
+        # without crowding the camera frame.
+        size = max(110, int(min(w, h) * 0.58))
+        font_px = max(110, int(size * 0.85))
+        caption_h = max(28, int(size * 0.18))
+        caption_font_px = max(22, int(caption_h * 0.82))
+        try:
+            # Centre the (glyph + caption) pair vertically — total
+            # height = size + small gap + caption_h. Bias the cluster
+            # slightly upward (top_offset) so it doesn't sit on the
+            # camera's bottom edge.
+            gap = max(6, int(size * 0.04))
+            cluster_h = size + gap + caption_h
+            top = max(0, (h - cluster_h) // 2)
+            self._fade_check_label.setGeometry((w - size) // 2, top, size, size)
+            self._fade_check_caption.setGeometry(
+                (w - int(size * 1.4)) // 2,
+                top + size + gap,
+                int(size * 1.4),
+                caption_h,
+            )
+            # Both glyphs use the same rgba colour so they fade
+            # together visually at a constant level (alpha 220/255 ≈
+            # 86% — slightly less transparent than the prior fade
+            # peak of 0.92 → 92%? actually the user asked for
+            # "slightly less transparent" = "more opaque", so we
+            # bump opacity. 220/255 reads as a confident overlay
+            # without fully blocking the camera).
+            self._fade_check_label.setStyleSheet(
+                "QLabel#tutorialFadeCheck {"
+                "  color: rgba(29, 233, 182, 220);"
+                f"  font-size: {font_px}px;"
+                "  font-weight: 900;"
+                "  background: transparent;"
+                "}"
+            )
+            self._fade_check_caption.setStyleSheet(
+                "QLabel#tutorialFadeCheckCaption {"
+                "  color: rgba(29, 233, 182, 220);"
+                f"  font-size: {caption_font_px}px;"
+                "  font-weight: 800;"
+                "  letter-spacing: 0.02em;"
+                "  background: transparent;"
+                "}"
+            )
+        except Exception:
+            pass
+
+    def _fade_check_set_visible(self, visible: bool) -> None:
+        """Show or hide the steady ✓ + 'Completed!' overlay. Idempotent
+        — repeated calls don't trigger any animation or restart."""
+        try:
+            if visible:
+                self._position_fade_check()
+                self._fade_check_label.raise_()
+                self._fade_check_caption.raise_()
+                self._fade_check_label.show()
+                self._fade_check_caption.show()
+            else:
+                self._fade_check_label.hide()
+                self._fade_check_caption.hide()
+        except Exception:
+            pass
+
     def _set_camera_header_text(self, text: str) -> None:
         if text:
-            self.tutorial_camera_header.setText(text)
+            # Per UX request, append the "Show more…" link to the
+            # green camera-header text so it sits immediately after
+            # the in-the-moment instruction (e.g. "Use example clip
+            # for help. Show more…"). The header is rich-text +
+            # link-interactive (configured at construction time).
+            # Tutorial-completion-page texts ("All done, great work!"
+            # etc.) skip the suffix — they're celebratory and not
+            # backed by an example.
+            try:
+                step = self._practice_steps[self._step_index]
+                allow_link = (
+                    not self._show_completion_page
+                    and not self._step_completed
+                )
+            except Exception:
+                allow_link = False
+            if allow_link:
+                annotated = (
+                    f"{text} "
+                    "<a href='show_more' "
+                    "style='color: #58E3FF; text-decoration: underline; "
+                    "font-weight: 600;'>Show more…</a>"
+                )
+            else:
+                annotated = text
+            self.tutorial_camera_header.setText(annotated)
             self.tutorial_camera_header.show()
         else:
             self.tutorial_camera_header.clear()
@@ -2700,7 +3391,10 @@ class TutorialWindow(QDialog):
                 footer_html = "Swipe right to move on!"
                 count, label = 3, "left swipes"
         elif not in_left_phase:
-            header = "Let's start with swiping right! Use skeleton hands for help."
+            # Use "example clip" for dynamic gestures (swipes), "example
+            # image" for static. Swipes is dynamic so the link directs
+            # the user to the looping clip in the Show Example popup.
+            header = "Let's start with swiping right! Use the example clip for help."
             count, label = right_count, "right swipes"
         elif left_count == 0 and in_transition:
             header = "Completed right swipes!"
@@ -2719,7 +3413,11 @@ class TutorialWindow(QDialog):
                 f'<span style="color:{color};">{count}/3</span> '
                 f'{label}'
             )
-        self.tutorial_camera_header.setText(header)
+        # Route through _set_camera_header_text so the "Show more…"
+        # link gets appended automatically (the swipe step used to
+        # call setText directly and skip that path, which left the
+        # link missing on every swipe-mode refresh).
+        self._set_camera_header_text(header)
         self.tutorial_camera_footer.setText(footer_html)
         self.tutorial_camera_header.show()
         self.tutorial_camera_footer.show()
@@ -2785,9 +3483,12 @@ class TutorialWindow(QDialog):
         # it. Make sure the stack is visible — for swipes step
         # _apply_step_content explicitly hides it; we override that
         # here so the overlay can show.
+        # Per UX: show the steady-state ✓ + "Completed!" overlay
+        # over the live camera view. Constant transparency, no
+        # animation — replaces the prior fade-in/fade-out which kept
+        # restarting every tick and visually flashed.
         try:
-            self.practice_stack.setCurrentWidget(self.completion_overlay)
-            self.practice_stack.show()
+            self._fade_check_set_visible(True)
         except Exception:
             pass
 
@@ -3182,18 +3883,28 @@ class TutorialWindow(QDialog):
                 targets_done = bool(self.mouse_widget.completed)
             except Exception:
                 targets_done = False
+            try:
+                scroll_done = bool(self.mouse_scroll_widget.completed)
+            except Exception:
+                scroll_done = False
+            # Three-way branching across the mouse-mode sub-stages:
+            #   click phase (targets pending, mouse mode on)
+            #       → mouse_clicks demo (pinch-click motion)
+            #   scroll phase (targets done, scroll incomplete)
+            #       → tutorial_scrolling demo (two-finger scroll pose)
+            #   pre-activation OR final disable phase
+            #       → left_three pose (toggle mouse mode on / off)
+            in_scroll_phase = targets_done and not scroll_done
             if mode_on and not targets_done:
-                # Active practice phase: play the pinch-click demo so
-                # the user can mirror the mechanic. Full-size inset
-                # because they're actively learning the motion.
                 self._draw_static_demo(frame, None, "mouse_clicks",
+                                        fallback_scale=1.00, now=now)
+            elif mode_on and in_scroll_phase:
+                self._draw_static_demo(frame, None, "tutorial_scrolling",
                                         fallback_scale=1.00, now=now)
             else:
                 # Either pre-activation (mode_off) or post-completion
-                # (targets cleared, time to toggle off). Both states
-                # want the SAME hint — the Left Three pose. Smaller
-                # inset because it's a static reminder, not a motion
-                # to mirror.
+                # (targets + scroll both cleared, time to toggle off).
+                # Both want the same Left Three reminder.
                 self._draw_static_demo(frame, None, "left_three",
                                         fallback_scale=0.62, now=now)
             if mouse_state is not None and mouse_state.get("camera_control_bounds") is not None:
@@ -3267,17 +3978,26 @@ class TutorialWindow(QDialog):
                 normalized = heard_text.lower()
                 if self._practice_steps[self._step_index].key == "voice_command":
                     spotify_present = bool(getattr(self, "_has_spotify", False))
-                    if spotify_present and (
-                        "spotify" in normalized
-                        or "play" in normalized
-                    ):
+                    media_keyword = (
+                        (spotify_present and ("spotify" in normalized or "play" in normalized))
+                        or (not spotify_present and ("youtube" in normalized or "you tube" in normalized))
+                    )
+                    if media_keyword:
                         # Wait briefly so Spotify has time to start
                         # the track before we poll its playback state.
                         QTimer.singleShot(3000, self._check_voice_media_playing)
-                    elif not spotify_present and (
-                        "youtube" in normalized or "you tube" in normalized
-                    ):
-                        QTimer.singleShot(3000, self._check_voice_media_playing)
+                    elif success:
+                        # The voice command was recognized AND executed,
+                        # but the heard text didn't include a Spotify /
+                        # YouTube keyword — e.g. user said "open
+                        # Notepad". Treat that as a successful voice-
+                        # command step too: the user has demonstrated
+                        # the voice listener works.
+                        if not self._step_completed:
+                            self._complete_step(
+                                f"Voice command executed. Part {self._step_index + 1}/5 completed!"
+                            )
+                            self._reclaim_tutorial_focus(delay_ms=300)
 
     def _check_voice_media_playing(self) -> None:
         """First-pass media-played check. Runs the Spotify Web API
@@ -3970,6 +4690,18 @@ class TutorialWindow(QDialog):
                 or (raw_label == "mute" and confidence >= 0.50)
             )
             visual_ready = volume_active or mute_pose_held
+            # Header switches once both raise + lower are done: the
+            # instruction at the top of the camera view changes from
+            # 'hold the volume pose' to the shaka instruction so the
+            # user knows the step has moved on to the mute half. We
+            # also shorten the footer in the mute phase to just the
+            # counter (the shaka instruction is now in the header).
+            if tracker["up_done"] and tracker["down_done"]:
+                self._set_camera_header_text(
+                    "Do a shaka with palm towards the monitor to mute."
+                )
+            else:
+                self._set_camera_header_text("Hold the volume pose to adjust.")
             if not tracker["engaged"]:
                 self._set_step_progress("Hold the volume pose to begin.")
             elif not (tracker["up_done"] and tracker["down_done"]):
@@ -3981,14 +4713,12 @@ class TutorialWindow(QDialog):
                 self._set_step_progress("".join(progress_bits))
             elif not mute_done:
                 # Colored counter like the fist step: red 0/2 →
-                # orange 1/2 → green 2/2. The mute event itself is
-                # toggle-only (a held shaka pose flips the system
-                # mute once and then has to be released-and-redone
-                # to count again), so progress can't be cheated by
-                # holding the pose.
+                # orange 1/2 → green 2/2. The shaka instruction lives
+                # in the camera header now (set above) — keep the
+                # footer to just the counter so the two pieces of
+                # information don't duplicate each other.
                 color = self._progress_color(mute_count, mute_target)
                 self._set_step_progress(
-                    f"Now do a shaka with palm towards the monitor to mute. "
                     f"Mute toggles <span style='color:{color};'>{mute_count}/{mute_target}</span>"
                 )
             else:
@@ -4079,10 +4809,58 @@ class TutorialWindow(QDialog):
                 self._set_step_progress("Mouse mode on. Clear all tutorial targets.")
                 visual_ready = False
                 if self.mouse_widget.completed:
+                    # Transition into the scroll phase. Swap the
+                    # right-panel widget to the scroll practice arena
+                    # and reset its state in case the user navigated
+                    # away and came back.
+                    self._mouse_stage = "scroll"
+                    try:
+                        self.mouse_scroll_widget.reset()
+                        self.practice_stack.setCurrentWidget(self.mouse_scroll_widget)
+                    except Exception:
+                        pass
+            elif self._mouse_stage == "scroll":
+                # Progressive footer copy per UX spec:
+                #   neither end reached → "Get to the top of the page on the right."
+                #   top reached, bottom not → "Now get to the bottom!"
+                #   both reached → handled by the disable-phase
+                #     branch below (we'll have already transitioned)
+                if self.mouse_scroll_widget.top_reached and not self.mouse_scroll_widget.bottom_reached:
+                    self._set_step_progress("Now get to the bottom!")
+                elif self.mouse_scroll_widget.bottom_reached and not self.mouse_scroll_widget.top_reached:
+                    self._set_step_progress("Now scroll up to the top!")
+                else:
+                    self._set_step_progress(
+                        "Get to the top of the page on the right."
+                    )
+                visual_ready = False
+                # Translate scroll-pose steps emitted by the engine
+                # into the practice arena's scrollbar movement.
+                # mouse_scroll_steps is positive for scroll-up,
+                # negative for scroll-down (matches the engine's
+                # mouse_controller.scroll(steps) signature).
+                steps = int(payload.get("mouse_scroll_steps", 0) or 0)
+                if steps != 0:
+                    try:
+                        self.mouse_scroll_widget.register_scroll_steps(steps)
+                    except Exception:
+                        pass
+                if self.mouse_scroll_widget.completed:
                     self._mouse_stage = "disable"
+                    # Swap back to the mouse_widget so the disable-
+                    # phase paints the standard "✓ targets cleared"
+                    # overlay over the original click arena.
+                    try:
+                        self.practice_stack.setCurrentWidget(self.mouse_widget)
+                    except Exception:
+                        pass
             else:
+                # Scroll phase is done by the time we hit disable;
+                # tell the user the practice piece is complete and
+                # the only thing left is to toggle mouse mode off.
                 self._set_step_progress(
-                    "Detected left-hand three!" if left_three_active else "Targets cleared. Turn mouse mode off to finish."
+                    "Detected left-hand three!" if left_three_active
+                    else "You've completed the mouse tutorial! Turn mouse mode off to finish."
                 )
                 self._flash_on_edge("mouse_disable", left_three_active, now)
                 visual_ready = now < self._visual_green_until.get("mouse_disable", 0.0)
@@ -4094,7 +4872,7 @@ class TutorialWindow(QDialog):
                     cooldown=self._mouse_tracker.toggle_cooldown_seconds,
                 ):
                     visual_ready = True
-                if not mouse_mode_enabled and self.mouse_widget.completed:
+                if not mouse_mode_enabled and self.mouse_widget.completed and self.mouse_scroll_widget.completed:
                     self._complete_step("Completed! Swipe right to move on!")
             if mouse_mode_enabled and cursor_position is not None:
                 self._mouse_cursor_seen = True
@@ -4132,26 +4910,25 @@ class TutorialWindow(QDialog):
                 except Exception:
                     pass
                 visual_ready = True
+            # Primary completion signal: _on_worker_command_detected set
+            # _last_voice_success_text when a recognized voice command
+            # executed. This is the reliable path (command_detected
+            # always fires on a successful action) and is app-agnostic,
+            # so it works whether the user said "play X on Spotify" or
+            # opened YouTube on Chrome.
+            if self._last_voice_success_text:
+                self._complete_step("Completed! Swipe right to move on!")
+                return visual_ready or voice_listening
             spotify_present = bool(getattr(self, "_has_spotify", False))
             if spotify_present:
-                # Periodic OFF-thread Spotify-playback poll. Throttled
-                # to once every ~3 s; the result slot only completes
-                # the step on playing=True. Covers the case the user
-                # mentioned: "i played a song on spotify and its not
-                # allowing to go next" -- whether they got there via
-                # a voice command, the Spotify hotkey, or clicking
-                # play in the desktop app. We deliberately don't call
-                # _is_spotify_playing_safe() inline (blocking HTTP).
+                # Secondary signals when command_detected didn't carry a
+                # marker: confirm via the playback poll, or the per-frame
+                # heard/control text fallback.
                 self._maybe_periodic_spotify_poll(now)
-                # Cheap text-fallback for offline / 401 cases where
-                # the playback API can't confirm but the voice path
-                # clearly succeeded.
                 if "spotify" in voice_heard and ("execut" in voice_control or "play" in voice_control):
                     self._complete_step("Completed! Swipe right to move on!")
             else:
-                if "youtube" in self._last_voice_success_text and "chrome" in self._last_voice_success_text:
-                    self._complete_step("Completed! Swipe right to move on!")
-                elif "youtube" in voice_heard and "chrome" in voice_heard and ("execut" in voice_control or "chrome open" in voice_control):
+                if "youtube" in voice_heard and "chrome" in voice_heard and ("execut" in voice_control or "chrome open" in voice_control):
                     self._complete_step("Completed! Swipe right to move on!")
             return visual_ready or voice_listening
 
@@ -4309,12 +5086,51 @@ class TutorialWindow(QDialog):
                 self._set_step_progress("Mouse mode on. Clear all tutorial targets.")
                 visual_ready = update.mode_enabled
                 if self.mouse_widget.completed:
+                    # Move into scroll phase — see the parallel
+                    # branch in the engine-driven handler for the
+                    # same flow.
+                    self._mouse_stage = "scroll"
+                    try:
+                        self.mouse_scroll_widget.reset()
+                        self.practice_stack.setCurrentWidget(self.mouse_scroll_widget)
+                    except Exception:
+                        pass
+            elif self._mouse_stage == "scroll":
+                # Mirror the engine-driven branch's progressive
+                # footer: which extremity has the user reached?
+                if self.mouse_scroll_widget.top_reached and not self.mouse_scroll_widget.bottom_reached:
+                    self._set_step_progress("Now get to the bottom!")
+                elif self.mouse_scroll_widget.bottom_reached and not self.mouse_scroll_widget.top_reached:
+                    self._set_step_progress("Now scroll up to the top!")
+                else:
+                    self._set_step_progress(
+                        "Get to the top of the page on the right."
+                    )
+                visual_ready = update.mode_enabled
+                # Pipe scroll_steps from the local mouse_tracker
+                # update straight into the practice arena. Same
+                # contract as the engine-driven path above; positive
+                # = up, negative = down.
+                steps = int(getattr(update, "scroll_steps", 0) or 0)
+                if steps != 0:
+                    try:
+                        self.mouse_scroll_widget.register_scroll_steps(steps)
+                    except Exception:
+                        pass
+                if self.mouse_scroll_widget.completed:
                     self._mouse_stage = "disable"
+                    try:
+                        self.practice_stack.setCurrentWidget(self.mouse_widget)
+                    except Exception:
+                        pass
             else:
                 mouse_disable_active = bool(result.found and result.tracked_hand is not None and str(result.tracked_hand.handedness or "").lower() == "left" and result.prediction.stable_label == "three")
-                self._set_step_progress("Detected left-hand three!" if mouse_disable_active else "Targets cleared. Turn mouse mode off to finish.")
+                self._set_step_progress(
+                    "Detected left-hand three!" if mouse_disable_active
+                    else "You've completed the mouse tutorial! Turn mouse mode off to finish."
+                )
                 visual_ready = self._visual_ready("mouse_disable", mouse_disable_active, now, self._mouse_tracker.toggle_hold_seconds)
-                if not update.mode_enabled and self.mouse_widget.completed:
+                if not update.mode_enabled and self.mouse_widget.completed and self.mouse_scroll_widget.completed:
                     self._complete_step(f"Mouse mode practice completed. Part {self._step_index + 1}/6 completed!")
             if update.mode_enabled and update.cursor_position is not None:
                 self._mouse_cursor_seen = True
@@ -4356,7 +5172,10 @@ class TutorialWindow(QDialog):
 
     def _tutorial_wheel_selection_key(self, dx: float, dy: float, items: tuple[tuple[str, str, float], ...]) -> str | None:
         radius = math.hypot(dx, dy)
-        if radius < 0.28 or radius > 1.25:
+        # No upper bound: once the cursor is past the central
+        # deadzone the angle alone picks the slice, even if the
+        # user's hand has drifted well past the visible wheel ring.
+        if radius < 0.28:
             return None
         angle = (math.degrees(math.atan2(-dy, dx)) + 360.0) % 360.0
         slice_span = 360.0 / max(1, len(items))

@@ -1416,9 +1416,11 @@ class GestureTestWindow(QMainWindow):
 
     def _wheel_selection_key(self, dx: float, dy: float, items: tuple[tuple[str, str, float], ...]) -> str | None:
         radius = math.hypot(dx, dy)
+        # No upper bound: once the cursor is outside the central
+        # deadzone the angle alone picks the slice, even if the
+        # user's hand has drifted well past the visible wheel ring.
         min_select_radius = 0.30
-        max_select_radius = 1.25
-        if radius < min_select_radius or radius > max_select_radius:
+        if radius < min_select_radius:
             return None
 
         angle = (math.degrees(math.atan2(-dy, dx)) + 360.0) % 360.0
@@ -1555,9 +1557,11 @@ class GestureTestWindow(QMainWindow):
 
     def _spotify_wheel_selection_key(self, dx: float, dy: float) -> str | None:
         radius = math.hypot(dx, dy)
+        # No upper bound: once the cursor is past the central
+        # deadzone the angle alone picks the slice, even if the
+        # user's hand has drifted well past the visible wheel ring.
         min_select_radius = 0.46
-        max_select_radius = 1.15
-        if radius < min_select_radius or radius > max_select_radius:
+        if radius < min_select_radius:
             return None
 
         angle = (math.degrees(math.atan2(-dy, dx)) + 360.0) % 360.0

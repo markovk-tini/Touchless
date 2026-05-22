@@ -555,10 +555,17 @@ class CustomGestureRunner:
             # the bridge has to live here. The handler talks to the
             # GUI thread via a queued Qt signal.
             if match.gesture.action.kind == "show_overlay_drawing":
-                filename = str((match.gesture.action.payload or {}).get("filename", ""))
+                payload = match.gesture.action.payload or {}
+                filename = str(payload.get("filename", ""))
+                # `path` is set by the wizard at gesture-creation time
+                # after the user resolved any duplicate-name ambiguity.
+                # Empty string here = legacy gesture made before the
+                # creation-time validation existed; main_window falls
+                # back to filesystem search.
+                resolved_path = str(payload.get("path", ""))
                 if self._image_overlay_handler is not None:
                     try:
-                        self._image_overlay_handler(filename)
+                        self._image_overlay_handler(filename, resolved_path)
                     except Exception as exc:
                         print(
                             f"[custom-gestures] image_overlay_handler error "

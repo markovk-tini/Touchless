@@ -16,16 +16,27 @@ _DWMWA_CAPTION_COLOR = 35
 _DWMWA_TEXT_COLOR = 36
 
 # COLORREF = 0x00BBGGRR.
-# Touchless primary blue #0B3D91 → 0x00913D0B
+# Touchless deep indigo #1F2D6B → 0x006B2D1F  (matches MainWindow titlebar)
 # Touchless light text #E5F6FF → 0x00FFF6E5
-_CAPTION_COLOR = 0x00913D0B
+_CAPTION_COLOR = 0x006B2D1F
 _TEXT_COLOR = 0x00FFF6E5
 
 
 def apply_touchless_titlebar(widget) -> None:
-    """Paint the OS title bar with Touchless's primary blue. Safe to call
-    from any showEvent — wraps every operation in try/except so a stale
-    HWND or older Windows version just produces a no-op."""
+    """Paint the OS title bar with Touchless's primary blue + set the
+    Touchless hand icon as the window icon (which Windows displays at
+    the top-left of the native title bar). Safe to call from any
+    showEvent — wraps every operation in try/except so a stale HWND or
+    older Windows version just produces a no-op."""
+    # Icon (works on any platform, any title-bar style).
+    try:
+        from PySide6.QtWidgets import QApplication
+        app_icon = QApplication.windowIcon()
+        if not app_icon.isNull():
+            widget.setWindowIcon(app_icon)
+    except Exception:
+        pass
+
     if sys.platform != "win32":
         return
     try:

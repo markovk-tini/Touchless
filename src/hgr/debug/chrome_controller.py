@@ -260,6 +260,58 @@ class ChromeController:
         self._message = "chrome search failed"
         return False
 
+    def search_youtube(self, query: str, *, kind: str = "auto") -> bool:
+        """Open YouTube search results for `query` in Chrome. Used by
+        the voice command "play X on YouTube".
+
+        `kind` selects the YouTube search filter:
+          - "video"    -> sp=EgIQAQ%253D%253D (videos only — best for
+                          single-song queries; first card is reliably
+                          a playable video).
+          - "playlist" -> sp=EgIQAw%253D%253D (playlists only — best
+                          for "play the X playlist" / "play X mix" /
+                          "play X songs" intents; first card is a
+                          playlist that auto-starts its first video
+                          when clicked).
+          - "auto"     -> heuristic on the query text: contains
+                          'playlist'/'mix'/'album'/'songs'/'compilation'
+                          -> playlist, otherwise video.
+
+        Auto-click of the first card is handled by the YouTube
+        controller's `play_first_search_result` after the page loads;
+        it works the same regardless of result kind."""
+        if not self._available:
+            self._message = "chrome unavailable on this platform"
+            return False
+        normalized = " ".join((query or "").split()).strip()
+        if not normalized:
+            self._message = "youtube search query missing"
+            return False
+        resolved_kind = str(kind or "auto").lower()
+        if resolved_kind == "auto":
+            lower = normalized.lower()
+            playlist_markers = (
+                "playlist", " mix", " album", " songs",
+                "compilation", "soundtrack", "best of",
+            )
+            resolved_kind = "playlist" if any(
+                m in (" " + lower) for m in playlist_markers
+            ) else "video"
+        if resolved_kind == "playlist":
+            sp_param = "EgIQAw%253D%253D"
+        else:
+            sp_param = "EgIQAQ%253D%253D"
+        url = (
+            "https://www.youtube.com/results"
+            f"?search_query={quote_plus(normalized)}"
+            f"&sp={sp_param}"
+        )
+        if self._launch_target(url):
+            self._message = f"youtube search ({resolved_kind}): {normalized}"
+            return True
+        self._message = "youtube search failed"
+        return False
+
     def open_url(self, url: str, *, display_name: str | None = None) -> bool:
         if not self._available:
             self._message = "chrome unavailable on this platform"

@@ -92,6 +92,8 @@ class RecordingWindow(QDialog):
         config=None,
     ) -> None:
         super().__init__(parent)
+        from .window_chrome import apply_touchless_chrome
+        apply_touchless_chrome(self)
         self.setWindowTitle(f"Recording: {name}")
         self.setModal(True)
         self.setMinimumSize(820, 560)
@@ -173,7 +175,11 @@ class RecordingWindow(QDialog):
         if self._init_error:
             err = self._init_error
             self._init_error = None
-            QMessageBox.critical(self, "Camera unavailable", err)
+            from .window_chrome import touchless_message_box
+            touchless_message_box(
+                self, "Camera unavailable", err,
+                icon=QMessageBox.Critical, buttons=QMessageBox.Ok,
+            )
 
     # --- UI -------------------------------------------------------------
 
@@ -903,10 +909,14 @@ class RecordingWindow(QDialog):
         self._reposition_complete_overlay()
 
     def _on_save(self) -> None:
+        from .window_chrome import touchless_message_box
         try:
             originals = self._recorder.finalize()
         except ValueError:
-            QMessageBox.warning(self, "No samples", "No samples were captured.")
+            touchless_message_box(
+                self, "No samples", "No samples were captured.",
+                icon=QMessageBox.Warning, buttons=QMessageBox.Ok,
+            )
             return
 
         # Majority hand from per-sample MediaPipe labels. With ~100
@@ -923,13 +933,14 @@ class RecordingWindow(QDialog):
         # only sensible response is "pick a different pose".
         builtin = find_matching_builtin(originals, handedness=recorded_hand)
         if builtin is not None:
-            QMessageBox.warning(
+            touchless_message_box(
                 self,
                 "Pose already in use",
                 f"This gesture pose already exists as <b>{builtin.name}</b> "
                 f"({builtin.description}).<br><br>"
                 f"Please try using a different pose.",
-                QMessageBox.Ok,
+                icon=QMessageBox.Warning,
+                buttons=QMessageBox.Ok,
             )
             return
 
@@ -976,6 +987,7 @@ class RecordingWindow(QDialog):
                 # only positive choice. Override deletes the existing
                 # gesture so live use only fires the new one.
                 from PySide6.QtWidgets import QMessageBox as _QMB
+                from .window_chrome import apply_touchless_chrome
                 box = _QMB(self)
                 box.setIcon(_QMB.Warning)
                 box.setWindowTitle("Pose already in use")
@@ -989,6 +1001,7 @@ class RecordingWindow(QDialog):
                 )
                 cancel_btn = box.addButton(_QMB.Cancel)
                 box.setDefaultButton(cancel_btn)
+                apply_touchless_chrome(box)
                 box.exec()
                 if box.clickedButton() is not override_btn:
                     return
@@ -1042,7 +1055,10 @@ class RecordingWindow(QDialog):
                 image_filename=chosen_image_filename,
             )
         except ValueError as exc:
-            QMessageBox.critical(self, "Save failed", str(exc))
+            touchless_message_box(
+                self, "Save failed", str(exc),
+                icon=QMessageBox.Critical, buttons=QMessageBox.Ok,
+            )
             return
         registry.save()
         self._show_saved_summary(format_gesture_summary(registry.get(self._name)))
@@ -1214,6 +1230,8 @@ class GesturePosePickerDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
+        from .window_chrome import apply_touchless_chrome
+        apply_touchless_chrome(self)
         self._thumbnails = list(thumbnails)
         self._selected_index: Optional[int] = None
         self._accent = accent_color or "#1DE9B6"

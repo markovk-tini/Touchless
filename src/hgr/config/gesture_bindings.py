@@ -67,6 +67,18 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
         "Face your right palm toward the monitor and close all five fingers into a tight, compact fist. Hold for ~0.5s.",
     ),
     (
+        "right_three",
+        "Right Hand Three (together)",
+        "Three.png",
+        "Face your right palm toward the monitor. Extend the index, middle, and ring fingers and hold them TOGETHER (touching, not spread); fold the thumb and pinky. Hold for ~0.5s.",
+    ),
+    (
+        "right_four",
+        "Right Hand Four",
+        "Four.png",
+        "Face your right palm toward the monitor. Extend the index, middle, ring, and pinky fingers; fold the thumb across the palm. Hold for ~0.75s.",
+    ),
+    (
         "mute",
         "Mute",
         "Mute.png",
@@ -83,6 +95,12 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
         "Screen Wheel",
         "ScreenWheel.png",
         "Face your right palm toward the monitor. Extend the index finger and pinky while folding the thumb, middle, and ring (a 'rock on' shape). Hold for ~1s.",
+    ),
+    (
+        "close_window",
+        "Close Window",
+        "close.png",
+        "Face your right palm toward the monitor. Extend the thumb out sideways (horizontal, not pointing up) and fold the index, middle, ring, and pinky into the palm. Hold for ~1s to close the focused window.",
     ),
     (
         "right_pinch",
@@ -108,9 +126,14 @@ _GESTURE_BIND_ACTIONS: list[tuple[str, str, str]] = [
     ("voice_cancel", "Cancel voice command or dictation", "left_fist"),
     ("open_spotify", "Open or focus Spotify", "right_two"),
     ("play_pause", "Play or pause media", "right_fist"),
+    ("chrome_mode_toggle", "Toggle Chrome mode on/off", "right_three_together"),
+    ("youtube_mode_toggle", "Toggle YouTube mode on/off", "right_four_together"),
+    ("open_chrome", "Open or focus Chrome", "right_three"),
+    ("open_touchless", "Open or focus Touchless", "right_four"),
     ("system_mute_toggle", "Mute or unmute system audio", "mute"),
     ("open_gesture_wheel", "Open Spotify/Chrome wheel", "wheel_pose"),
     ("open_screen_wheel", "Open screen capture wheel", "screen_wheel"),
+    ("close_active_window", "Close the focused window", "close_window"),
 ]
 
 
@@ -135,10 +158,23 @@ STATIC_POSE_LABEL_MAP: dict[str, tuple[str, str]] = {
     "left_fist":  ("Left",  "fist"),
     "right_two":  ("Right", "two"),
     "right_fist": ("Right", "fist"),
+    "right_three": ("Right", "three"),
+    "right_three_together": ("Right", "three_together"),
+    "right_four":  ("Right", "four"),
+    "right_four_together": ("Right", "four_together"),
     "mute":       ("Right", "mute"),
     "wheel_pose": ("Right", "wheel_pose"),
     "right_pinch": ("Right", "pinch"),
     "left_pinch":  ("Left",  "pinch"),
+    # Right-hand-only pose entries with no action binding. They exist
+    # so the banner filter recognises these labels as right-hand
+    # gestures and suppresses them on the left hand. thumb_up /
+    # thumb_down are the YT like / dislike gestures — handled inside
+    # the YouTube router, not via the global action registry, so they
+    # have no _GESTURE_BIND_ACTIONS entry but DO have visible meaning
+    # on the right hand.
+    "right_thumb_up":      ("Right", "thumb_up"),
+    "right_thumb_down":    ("Right", "thumb_down"),
 }
 
 STATIC_LABEL_TO_POSE: dict[tuple[str, str], str] = {

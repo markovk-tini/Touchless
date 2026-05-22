@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable
 
 import numpy as np
@@ -25,6 +25,29 @@ class _StableLabelState:
     stable: str = "neutral"
 
 
+def _swap_handedness_label(label: str) -> str:
+    if label == "Right":
+        return "Left"
+    if label == "Left":
+        return "Right"
+    return label
+
+
+def _swap_tracked_hand_handedness(hand: TrackedHand | None) -> TrackedHand | None:
+    """Return `hand` with its Left/Right label flipped (for left-handed mode).
+
+    Done at the single point where detection enters the engine so every
+    downstream `handedness == "Right"` check across the app sees swapped
+    roles without per-site edits. Non-Left/Right labels pass through.
+    """
+    if hand is None:
+        return None
+    swapped = _swap_handedness_label(hand.handedness)
+    if swapped == hand.handedness:
+        return hand
+    return replace(hand, handedness=swapped)
+
+
 class GestureRecognitionEngine:
     def __init__(
         self,
@@ -44,6 +67,11 @@ class GestureRecognitionEngine:
         self._frame_index = 0
         self._last_static_scores: Dict[str, float] = {}
         self._last_dynamic_scores: Dict[str, float] = {}
+        # When True, the physical Left/Right hand labels are swapped at
+        # detection entry so all gesture/mouse/drawing/wheel roles move
+        # to the opposite hand (left-handed mode). Set live by the app
+        # from AppConfig.left_handed_mode each tick.
+        self.swap_handedness = False
 
     def close(self) -> None:
         self.detector.close()
@@ -761,7 +789,15 @@ class GestureRecognitionEngine:
         detection = self.detector.process(frame_bgr)
         frame_index = self._frame_index
         self._frame_index += 1
-        if detection.tracked_hand is None:
+        # Single-point handedness swap for left-handed mode: flip the
+        # Left/Right labels here, before any analysis, so the rest of
+        # the pipeline (and every downstream role check) is consistent.
+        primary_hand = detection.tracked_hand
+        secondary_hand = detection.secondary_hand
+        if self.swap_handedness:
+            primary_hand = _swap_tracked_hand_handedness(primary_hand)
+            secondary_hand = _swap_tracked_hand_handedness(secondary_hand)
+        if primary_hand is None:
             self.reset()
             return GestureFrameResult(
                 found=False,
@@ -771,13 +807,13 @@ class GestureRecognitionEngine:
                 prediction=self._neutral_prediction(),
                 annotated_frame=detection.frame_bgr,
             )
-        primary_result = self._analyze_tracked_hand(detection.tracked_hand, detection.frame_bgr, timestamp, frame_index)
-        if detection.secondary_hand is None:
+        primary_result = self._analyze_tracked_hand(primary_hand, detection.frame_bgr, timestamp, frame_index)
+        if secondary_hand is None:
             self._secondary_stable_state = _StableLabelState()
             self._secondary_dynamic_recognizer.reset()
             return primary_result
         secondary_result = self._analyze_tracked_hand(
-            detection.secondary_hand,
+            secondary_hand,
             detection.frame_bgr,
             timestamp,
             frame_index,
@@ -792,7 +828,7 @@ class GestureRecognitionEngine:
             hand_reading=primary_result.hand_reading,
             prediction=primary_result.prediction,
             annotated_frame=primary_result.annotated_frame,
-            secondary_tracked_hand=detection.secondary_hand,
+            secondary_tracked_hand=secondary_hand,
             secondary_hand_reading=secondary_result.hand_reading,
             secondary_prediction=secondary_result.prediction,
         )

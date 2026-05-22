@@ -118,12 +118,15 @@ class MouseGestureTracker:
         self.pose_grace_seconds = float(pose_grace_seconds)
         self.no_hand_grace_seconds = float(no_hand_grace_seconds)
         self._desktop_aspect_ratio = 16.0 / 9.0
-        # When the cursor is constrained to a single monitor (the
-        # default case), skip the aspect-compression treatment so
-        # the camera-frame box hugs the monitor's actual aspect.
-        # set_desktop_bounds() flips this to False when the bounds
-        # span a multi-monitor virtual desktop (>= ~21:9).
-        self._use_raw_aspect = True
+        # Always use aspect-compression now. Previously this was True
+        # for single-monitor setups so the camera box visually matched
+        # the monitor's 16:9 — but that produced a wide, stretched box
+        # that didn't match the natural ergonomic shape of a hand-reach
+        # area. The compressed formula (aspect ** control_box_aspect_power
+        # with a small power) gives a more upright/square box that feels
+        # better to control while still leaning slightly wider for
+        # wider desktops.
+        self._use_raw_aspect = False
         self.reset()
 
     @property
@@ -167,14 +170,11 @@ class MouseGestureTracker:
         width = max(1.0, float(width))
         height = max(1.0, float(height))
         self._desktop_aspect_ratio = max(0.80, min(4.50, width / height))
-        # Single-monitor (typical 4:3 .. 21:9 range) → tightly match
-        # the monitor's aspect so the camera-frame box doesn't have
-        # large empty horizontal padding around the rendered green
-        # monitor rectangle. Multi-monitor (32:9 dual or wider) →
-        # keep the compressed aspect_power treatment so an extreme
-        # virtual desktop doesn't produce a comically flat box that
-        # hand-tracking can't comfortably cover.
-        self._use_raw_aspect = self._desktop_aspect_ratio <= 2.40
+        # Always use aspect_power compression — produces an upright,
+        # ergonomic hand-reach box for single-monitor and a still-
+        # widened but not comically flat box for multi-monitor. The
+        # box aspect tracks desktop aspect but more gently than raw.
+        self._use_raw_aspect = False
 
     def reset(self) -> None:
         self._mode_enabled = False
@@ -647,7 +647,20 @@ class MouseGestureTracker:
         # → square in normalized coords → 16:9 visually, matching the
         # monitor's aspect exactly.
         box_aspect = target_visual_aspect / FRAME_ASPECT
-        target_area = max(0.08, min(0.44, self.control_box_area))
+        # Auto-scale the effective area by desktop aspect. Single-
+        # monitor 16:9 setups use control_box_area as-is (default 0.12,
+        # tuned so the red box matches the displayed green Monitor 1
+        # outline). Multi-monitor (wider) desktops scale up so the
+        # user gets a proportionally wider control area without needing
+        # to manually tune the sensitivity slider when they add a
+        # monitor. The clamp prevents super-wide setups from blowing
+        # past the camera frame.
+        _SINGLE_MONITOR_VISUAL_ASPECT = 16.0 / 9.0
+        aspect_scale = max(
+            1.0,
+            min(2.6, target_visual_aspect / _SINGLE_MONITOR_VISUAL_ASPECT),
+        )
+        target_area = max(0.06, min(0.50, self.control_box_area * aspect_scale))
         width = math.sqrt(target_area * box_aspect)
         height = math.sqrt(target_area / box_aspect)
         width = min(max(width, min(self.control_box_min_width, available_width)), min(self.control_box_max_width, available_width))
@@ -719,16 +732,16 @@ class MouseGestureTracker:
             return self._cursor_position
 
         # Velocity-adaptive alpha tuned for cursor precision and
-        # smoothness. User reported the previous curve still felt
-        # "snappy / jittery" — bumping alpha down across the band
-        # gives more visible damping on every move WITHOUT making
-        # fast sweeps feel laggy (the upper end stays close to
-        # near-passthrough). Curve points:
+        # smoothness. User reported normal-speed hover/aim still
+        # felt slightly jittery — slow band tightened from 0.40 to
+        # 0.34 for more damping during fine targeting. Fast band
+        # stays at 0.86 so big sweeps still arrive promptly without
+        # adding any new perceived lag. Curve points:
         #
         #   motion just above deadzone (~0.012, slow precision):
-        #     alpha = 0.40  -> heavy smoothing for hover/aim
+        #     alpha = 0.34  -> heavier smoothing for hover/aim
         #   motion ~0.05 (deliberate move):
-        #     alpha ~ 0.66  -> smooth but responsive
+        #     alpha ~ 0.60  -> smooth but responsive
         #   motion >= 0.10 (fast sweep):
         #     alpha = 0.86  -> near-passthrough so big sweeps
         #                      arrive in the same frame batch
@@ -736,10 +749,10 @@ class MouseGestureTracker:
             alpha = 0.86
         else:
             t = motion / 0.10  # 0..1 across the slow-to-fast band
-            alpha = 0.40 + (0.86 - 0.40) * t
+            alpha = 0.34 + (0.86 - 0.34) * t
 
         # Click-latch damping: shrink alpha hard for the FIRST
-        # ~120 ms after a pinch starts so the click lands on
+        # ~200 ms after a pinch starts so the click lands on
         # whatever the user was aiming at when they began the
         # pinch — protects against the natural index-curl-toward-
         # thumb motion of pinching dragging the cursor off-target.
@@ -749,6 +762,15 @@ class MouseGestureTracker:
         # entire pinch hold, which the user reported as "very
         # leggy when clicking" — every drag felt stuck because
         # alpha was 0.35x normal the whole way through.
+        #
+        # User reported clicks were still drifting off small
+        # buttons. The previous values (0.12 s @ 0.18x) didn't
+        # damp hard enough or long enough — a slow pinch finishes
+        # AFTER the latch window, so the cursor was free to drift
+        # again right as the actual button-down fired. Bumped to
+        # 0.20 s @ 0.08x: cursor essentially freezes for the full
+        # duration of a normal click gesture (typical pinch
+        # completes in 80-180 ms).
         #
         # We pick the most recent press timestamp across both
         # finger states (left/right pinch) so right-click pinches
@@ -760,10 +782,10 @@ class MouseGestureTracker:
                     latest_press = state.press_started_at
         if latest_press is not None:
             press_age = max(0.0, time.monotonic() - latest_press)
-            if press_age < 0.12:
-                # Click moment — heavy latch, cursor barely moves
-                # so the click lands cleanly.
-                alpha *= 0.18
+            if press_age < 0.20:
+                # Click moment — cursor essentially frozen so the
+                # click lands exactly where the user was aiming.
+                alpha *= 0.08
             # else: pinch is held but past the click-settle window;
             # use the natural alpha so click-and-drag tracks the
             # hand normally.

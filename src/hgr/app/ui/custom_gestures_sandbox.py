@@ -38,6 +38,8 @@ from hgr.custom_gestures.description import (
     short_curl_label,
     short_spread_label,
 )
+from hgr.custom_gestures.dynamic_recording import palm_scale_from_landmarks
+from hgr.custom_gestures.dynamic_runtime import DynamicGestureRuntime
 from hgr.custom_gestures.recorder import (
     landmarks_from_mediapipe,
     normalize_landmarks,
@@ -65,6 +67,8 @@ class SandboxWindow(QDialog):
         config=None,
     ) -> None:
         super().__init__(parent)
+        from .window_chrome import apply_touchless_chrome
+        apply_touchless_chrome(self)
         self.setWindowTitle("Custom Gestures Sandbox")
         self.setModal(False)
         self.setMinimumSize(820, 560)
@@ -93,6 +97,12 @@ class SandboxWindow(QDialog):
         # sandbox is a faithful preview of live behaviour.
         self._classifier = GestureClassifier(self._registry, threshold=0.78)
         self._classifier.reload()
+        # Dynamic-gesture runtime — same registry, separate classifier.
+        # Sandbox calls process_frame with dispatch=False unless the
+        # "Fire actions" checkbox is on, so detection feedback shows
+        # up even in read-only mode.
+        self._dynamic_runtime = DynamicGestureRuntime()
+        self._dynamic_runtime.reload()
 
         # Hold-to-activate state.
         self._hold_name: Optional[str] = None
@@ -515,6 +525,35 @@ class SandboxWindow(QDialog):
                     ):
                         self._hold_name = None
                         self._fired_for_hold = False
+
+                # Dynamic gesture matching runs in parallel to the
+                # static classifier above. Detection (segment close +
+                # DTW match below threshold) is independent of the
+                # sandbox "Fire actions" checkbox — but we only call
+                # the gesture's action when the checkbox is on, via
+                # the runtime's dispatch=True path. Otherwise the
+                # runtime returns the matched name without firing.
+                try:
+                    fire_now = bool(self._fire_checkbox.isChecked())
+                    fired_dyn = self._dynamic_runtime.process_frame(
+                        lm,
+                        palm_scale=palm_scale_from_landmarks(lm),
+                        handedness=live_hand,
+                        timestamp=now,
+                        dispatch=fire_now,
+                    )
+                except Exception as exc:
+                    fired_dyn = None
+                    print(f"[sandbox] dynamic runtime error: {exc}")
+                if fired_dyn:
+                    self._last_match_label = (
+                        f"dynamic: {fired_dyn}"
+                        + ("  fired" if fire_now else "  (detected, fire-off)")
+                    )
+                    self._last_fire_name = fired_dyn
+                    self._last_fire_at = now
+                    if fire_now:
+                        self._cooldown_until = now + _DEFAULT_COOLDOWN
             else:
                 self._latest_sig = {}
                 self._latest_feats = None
@@ -525,6 +564,10 @@ class SandboxWindow(QDialog):
                 ):
                     self._hold_name = None
                     self._fired_for_hold = False
+                try:
+                    self._dynamic_runtime.hand_lost()
+                except Exception:
+                    pass
 
             self._draw_overlay(display_bgr, match, now)
             self._render(display_bgr)

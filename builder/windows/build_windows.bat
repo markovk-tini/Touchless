@@ -99,11 +99,32 @@ set "PAYLOAD_FILE=Touchless_Payload_v%APP_VERSION%.zip"
 set "PAYLOAD_URL_BASE=https://pub-3116ebd541fa4ca18a84371667d029fe.r2.dev/windows/v%APP_VERSION%"
 set "PAYLOAD_URL=%PAYLOAD_URL_BASE%/%PAYLOAD_FILE%"
 
+REM STORE=1 forces a Microsoft Store-compliant build. Store policy
+REM 10.2.9.3 forbids "downloader" installers (the default stub
+REM downloads the payload from R2 at install time), so a Store
+REM submission MUST be the MONOLITHIC standalone/offline installer.
+REM Policy 10.2.9.2 additionally requires silent install — the
+REM Partner Center silent args are printed at the end of this build.
+REM Setting STORE=1 implies MONOLITHIC=1.
+if "%STORE%"=="1" set "MONOLITHIC=1"
+
 if "%MONOLITHIC%"=="1" (
   set "BUILD_MODE=monolithic"
 ) else (
   set "BUILD_MODE=stub"
 )
+
+REM Build-channel marker baked into the bundle (read at runtime by
+REM hgr.utils.runtime_paths.build_channel). STORE builds set 'store'
+REM so the in-app GitHub auto-updater stays OFF and the Microsoft
+REM Store owns updates; every other build is 'website' so the GitHub
+REM auto-updater is the update path.
+if "%STORE%"=="1" (
+  set "TOUCHLESS_BUILD_CHANNEL=store"
+) else (
+  set "TOUCHLESS_BUILD_CHANNEL=website"
+)
+echo [info] Build channel:  %TOUCHLESS_BUILD_CHANNEL%
 
 echo [info] Build mode:    %BUILD_MODE%
 echo [info] App version:   %APP_VERSION%
@@ -153,9 +174,28 @@ if not exist "%ROOT%\release" mkdir "%ROOT%\release"
 echo [4/6] Building payload zip ^(release\%PAYLOAD_FILE%^)...
 REM Use PowerShell Compress-Archive -- built into Windows, deterministic
 REM enough for our purposes, no extra build dependency.
+REM
+REM Retry loop: PyInstaller writes `_internal/base_library.zip` right
+REM before this step runs, and on machines with aggressive antivirus
+REM (Defender + 3rd-party AV) the file handle isn't released by the
+REM scanner for a second or two. Compress-Archive then errors with
+REM "process cannot access the file because it is being used by
+REM another process" and the whole build dies. Three attempts with a
+REM 5-second sleep between them clears every real-world AV race
+REM we've hit; if it's still locked after 15 s, something else is
+REM wrong and the build fails for real.
+set "PAYLOAD_RETRIES=0"
+:payload_zip_retry
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%ROOT%\dist\Touchless\*' -DestinationPath '%ROOT%\release\%PAYLOAD_FILE%' -CompressionLevel Optimal -Force"
 if errorlevel 1 (
-  echo [ERROR] Payload zip build failed.
+  set /a PAYLOAD_RETRIES+=1
+  if !PAYLOAD_RETRIES! lss 3 (
+    echo [WARN] Payload zip attempt !PAYLOAD_RETRIES! failed - antivirus lock on dist/_internal/* likely. Retrying in 5 s...
+    powershell -NoProfile -Command "Start-Sleep -Seconds 5"
+    del "%ROOT%\release\%PAYLOAD_FILE%" 2>nul
+    goto payload_zip_retry
+  )
+  echo [ERROR] Payload zip build failed after 3 attempts.
   popd
   exit /b 1
 )
@@ -177,6 +217,14 @@ for %%S in ("%ROOT%\release\%PAYLOAD_FILE%") do set "PAYLOAD_SIZE=%%~zS"
 echo [info] Payload size:   %PAYLOAD_SIZE% bytes
 echo [info] Payload SHA256: %PAYLOAD_SHA256%
 
+REM Count files in the dist tree so the stub installer can drive a
+REM REAL extraction-progress bar instead of the frozen "Installing..."
+REM page users currently sit on for several minutes while PowerShell
+REM Expand-Archive runs silently. Passed to ISCC as PAYLOAD_FILE_COUNT.
+for /f "delims=" %%C in ('powershell -NoProfile -Command "(Get-ChildItem -LiteralPath '%ROOT%\dist\Touchless' -Recurse -File).Count"') do set "PAYLOAD_FILE_COUNT=%%C"
+if not defined PAYLOAD_FILE_COUNT set "PAYLOAD_FILE_COUNT=2000"
+echo [info] Payload files:  %PAYLOAD_FILE_COUNT%
+
 if not exist "%ISCC%" (
   echo [ERROR] Inno Setup compiler not found at:
   echo         !ISCC!
@@ -191,6 +239,7 @@ if "%BUILD_MODE%"=="stub" (
     "/DPAYLOAD_URL=%PAYLOAD_URL%" ^
     "/DPAYLOAD_FILE=%PAYLOAD_FILE%" ^
     "/DPAYLOAD_SHA256=%PAYLOAD_SHA256%" ^
+    "/DPAYLOAD_FILE_COUNT=%PAYLOAD_FILE_COUNT%" ^
     "%ISS%"
 ) else (
   "%ISCC%" /Q "/DMONOLITHIC=1" "%ISS%"
@@ -245,6 +294,36 @@ if "%BUILD_MODE%"=="stub" (
   echo the installer.
 )
 echo.
+
+if "%STORE%"=="1" (
+  REM Copy the monolithic installer to a Store-distinct name so it
+  REM can never be confused with the stub when submitting to Partner
+  REM Center. Both are produced as Touchless_Installer.exe by ISCC.
+  copy /y "%ROOT%\release\Touchless_Installer.exe" "%ROOT%\release\Touchless_Store_Installer.exe" >nul
+  echo ===============================================================
+  echo MICROSOFT STORE SUBMISSION
+  echo ===============================================================
+  echo This is a MONOLITHIC standalone/offline installer — it carries
+  echo the full app and downloads nothing at install time, satisfying
+  echo Store policy 10.2.9.3 ^(no downloader installers^).
+  echo.
+  echo Submit this file to Partner Center:
+  echo   %ROOT%\release\Touchless_Store_Installer.exe
+  echo.
+  echo Set these in the Partner Center package "Installer parameters"
+  echo so the app installs silently ^(Store policy 10.2.9.2^):
+  echo   Silent install:    /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL
+  echo   Silent uninstall:  /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+  echo.
+  echo Notes:
+  echo   - Do NOT submit the stub installer ^(that was the 10.2.9.3
+  echo     rejection^). Always use STORE=1 for Store builds.
+  echo   - The install is per-user under %%LOCALAPPDATA%%\Programs and
+  echo     needs no elevation, so silent install completes without a
+  echo     UAC prompt. The Defender-exclusion and Launch steps are
+  echo     skipped under /VERYSILENT ^(skipifsilent^).
+  echo.
+)
 
 popd
 exit /b 0

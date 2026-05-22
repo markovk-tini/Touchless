@@ -22,6 +22,23 @@ for package_name in ("PySide6", "shiboken6", "mediapipe"):
     binaries += pkg_binaries
     hiddenimports += pkg_hiddenimports
 
+# WebRTC phone camera (Settings -> Camera -> "Connect Phone") decodes the
+# stream in a hidden Chromium page via QtWebEngine. That ships as part of
+# PySide6 (collected above), but QtWebEngine needs its runtime side-cars
+# bundled too: QtWebEngineProcess.exe, the ICU data, locales, and the
+# resource .pak files. PyInstaller's PySide6 hook normally adds these;
+# collect_all('PySide6') above already pulls them. If a future PySide6
+# refactor splits QtWebEngine into PySide6-Addons as a separate import
+# name, collect it explicitly here too (skip silently if absent).
+for package_name in ("PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineCore"):
+    try:
+        pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(package_name)
+        datas += pkg_datas
+        binaries += pkg_binaries
+        hiddenimports += pkg_hiddenimports
+    except Exception:
+        pass
+
 # onnxruntime-directml: ships native DLLs (DirectML.dll, the DML
 # execution provider, the providers_shared shim, plus a few
 # Microsoft.AI.MachineLearning runtime files). PyInstaller's
@@ -67,6 +84,22 @@ for source_path, target_name in (
     if source_path.exists():
         datas.append((str(source_path), target_name))
 
+# Build-channel marker. Written to the bundle root so the runtime
+# helper hgr.utils.runtime_paths.build_channel() can read it. The
+# value comes from the TOUCHLESS_BUILD_CHANNEL env var that
+# build_windows.bat sets ('store' when STORE=1, 'website' otherwise).
+# 'store'   -> in-app GitHub auto-updater stays OFF (the Microsoft
+#              Store delivers updates).
+# 'website' -> GitHub auto-updater is the update path (default).
+import os  # noqa: E402 — late import is fine in a PyInstaller spec
+_channel = os.environ.get("TOUCHLESS_BUILD_CHANNEL", "website").strip().lower()
+if _channel != "store":
+    _channel = "website"
+_channel_marker = ROOT / "build" / "build_channel.txt"
+_channel_marker.parent.mkdir(parents=True, exist_ok=True)
+_channel_marker.write_text(_channel, encoding="utf-8")
+datas.append((str(_channel_marker), "."))
+
 # Bundle ffmpeg.exe alongside Touchless.exe so the camera fallback
 # path can use it. Why we need ffmpeg in the bundle: cv2.VideoCapture
 # under DirectShow constructs a filter graph in-process — and a
@@ -109,6 +142,34 @@ def _collect_whisper_runtime(roots):
     Windows MAX_PATH limit that Inno Setup enforces on every compressed path.
     """
     keep_ext = {".exe", ".dll", ".bin", ".pdb"}
+    # Whisper model filter: ship medium.en (best quality) + small.en
+    # (fallback). The runtime resolver in live_api/local_backend.py
+    # prefers medium when present, falls back to small if medium
+    # ever goes missing — so users get the best dictation accuracy
+    # by default with a safety net.
+    # - medium.en (~1.4 GB) → primary dictation model (better accuracy
+    #   on tricky words, unusual names, noisy environments).
+    # - small.en (~465 MB) → kept as fallback (handles voice commands
+    #   and clean dictation almost as well; never want to be without
+    #   any model if medium fails to load for any reason).
+    # - base/tiny variants stay excluded (small handles every realistic
+    #   short-transcript better than them).
+    # - for-tests-*.bin are repository test fixtures, not runtime files.
+    #
+    # STORE builds ship ONLY small.en. The Microsoft Store caps EXE/MSI
+    # package size, and the ~1.5 GB medium.en model pushes the monolithic
+    # installer past it. The slim Store build (~1.1 GB) is fully
+    # functional on small.en; users who want higher dictation accuracy
+    # pull medium.en at runtime via the in-app "Voice Recognition
+    # Upgrade" download (optional DLC — does NOT block app use, so it's
+    # Store-policy compliant, unlike an install-time downloader).
+    # Channel is read from TOUCHLESS_BUILD_CHANNEL (set by
+    # build_windows.bat: 'store' when STORE=1, else 'website').
+    _channel_for_models = os.environ.get("TOUCHLESS_BUILD_CHANNEL", "website").strip().lower()
+    if _channel_for_models == "store":
+        MODEL_ALLOWLIST = {"ggml-small.en.bin"}
+    else:
+        MODEL_ALLOWLIST = {"ggml-small.en.bin", "ggml-medium.en.bin"}
     collected = []
     seen_models: set[str] = set()
     seen_binaries: set[tuple[str, str]] = set()
@@ -120,6 +181,9 @@ def _collect_whisper_runtime(roots):
         if models_dir.exists():
             for model_file in models_dir.glob("*.bin"):
                 if model_file.name in seen_models:
+                    continue
+                if model_file.name not in MODEL_ALLOWLIST:
+                    # Skip oversized / test-only whisper models.
                     continue
                 seen_models.add(model_file.name)
                 collected.append((str(model_file), "whisper.cpp/models"))
@@ -222,24 +286,6 @@ exe = EXE(
     icon=str(ICON) if ICON.exists() else None,
     disable_windowed_traceback=False,
     upx=False,
-    # Embed a manifest with requireAdministrator so Touchless
-    # launches elevated by default. Why: clip recording uses
-    # Windows screen capture (DXGI / GDI), which can't see frames
-    # from games running at higher integrity levels (most modern
-    # AAA titles + many anti-cheat-protected games). Without
-    # admin, clipping yields the desktop background instead of
-    # the game window. With admin, the captured frames include
-    # the game. The user reported this exact bug. Trade-offs we
-    # accept by elevating:
-    #   - one UAC prompt per launch (the OS handles it; no code
-    #     change needed). Same UX as OBS Studio with admin.
-    #   - drag-drop from non-admin Explorer is blocked by UIPI.
-    #     Touchless doesn't accept drag-drop today, so no
-    #     regression.
-    #   - Auto-updater still works because the running admin
-    #     process can spawn the (per-user) installer with same
-    #     elevation.
-    uac_admin=True,
 )
 
 coll = COLLECT(

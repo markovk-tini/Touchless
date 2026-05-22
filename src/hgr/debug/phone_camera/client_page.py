@@ -33,8 +33,23 @@ CLIENT_HTML = r"""<!DOCTYPE html>
        to cover the viewport. .fs-active is toggled from JS. */
     .preview-wrap.fs-active { position: fixed; inset: 0; z-index: 999;
       border-radius: 0; }
-    video { width: 100%; height: 100%; object-fit: cover;
-      transform: scaleX(-1); /* phone-preview shows the selfie view locally */ }
+    /* The <video> element is the raw camera source. Once streaming
+       starts it's hidden behind #previewCanvas (below); before Start it
+       shows the live camera so the user can frame themselves. */
+    video { width: 100%; height: 100%; object-fit: cover; }
+    /* Device-independent preview. Front-camera mirroring differs per
+       browser (some auto-mirror the <video>, some don't), so a CSS flip
+       on the <video> can't reliably match the app. Instead we render the
+       preview from the SAME canvas whose frames are POSTed to the PC —
+       drawImage(video) always yields the raw, un-mirrored buffer
+       regardless of how the browser displays the <video> — and flip it
+       horizontally to match the engine's selfie flip (cv2.flip). That
+       makes the phone preview show exactly what the app displays, on
+       every device. Hidden until streaming starts (.live). */
+    canvas#previewCanvas { position: absolute; inset: 0; width: 100%;
+      height: 100%; object-fit: cover; transform: scaleX(-1);
+      display: none; }
+    canvas#previewCanvas.live { display: block; }
     .stats { position: absolute; left: 10px; bottom: 10px; font-size: 11px;
       padding: 4px 8px; background: rgba(0,0,0,0.55); border-radius: 6px;
       font-variant-numeric: tabular-nums; }
@@ -123,6 +138,7 @@ CLIENT_HTML = r"""<!DOCTYPE html>
 
   <div class="preview-wrap" id="previewWrap">
     <video id="preview" autoplay playsinline muted></video>
+    <canvas id="previewCanvas"></canvas>
     <div class="stats" id="stats"></div>
     <button class="fs-exit" id="fsExit" type="button">Exit fullscreen</button>
   </div>
@@ -705,8 +721,13 @@ CLIENT_HTML = r"""<!DOCTYPE html>
     startBtn.textContent = "Stop";
     startBtn.disabled = false;
     requestWakeLock();
-    canvas = document.createElement("canvas");
+    // Reuse the on-page #previewCanvas as the send canvas so the visible
+    // preview IS the exact RAW frame being POSTed. The CSS scaleX(-1) on
+    // #previewCanvas flips it to match the engine's selfie flip, so phone
+    // preview == app display regardless of front-camera browser quirks.
+    canvas = document.getElementById("previewCanvas");
     ctx = canvas.getContext("2d", { alpha: false });
+    canvas.classList.add("live");
     sending = true;
     frameCount = 0;
     lastStatsAt = performance.now();
@@ -789,6 +810,12 @@ CLIENT_HTML = r"""<!DOCTYPE html>
 
   function stopLoop() {
     sending = false;
+    // Hide the flipped preview canvas so the live <video> shows again
+    // for re-framing before the next Start.
+    try {
+      const pc = document.getElementById("previewCanvas");
+      if (pc) pc.classList.remove("live");
+    } catch (_) {}
     stopAudioPipeline();
     if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
     if (wakeLock) { try { wakeLock.release(); } catch (_) {} wakeLock = null; }

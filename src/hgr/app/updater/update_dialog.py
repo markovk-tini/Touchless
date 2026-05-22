@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from .release_checker import ReleaseInfo
 from ... import __version__ as RUNNING_VERSION
+from ..ui.window_chrome import apply_touchless_chrome
 
 
 class UpdateDialog(QDialog):
@@ -45,6 +46,7 @@ class UpdateDialog(QDialog):
 
     def __init__(self, info: ReleaseInfo, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        apply_touchless_chrome(self)
         self._info = info
         self._showing_changelog = False
         self.setWindowTitle("Touchless Update Available")

@@ -9,7 +9,15 @@ from .registry import GestureSample
 
 _LANDMARK_COUNT = 21
 _LANDMARK_DIM = _LANDMARK_COUNT * 3  # 63 — x, y, z per landmark
-_FEATURE_DIM = 87  # 63 landmark + 3 spacing + 5 extension + 10 joint + 5 curl-class + 1 spread-class
+# 87 was the v4 size: 63 landmark + 3 spacing + 5 extension + 10 joint
+# + 5 curl-class + 1 spread-class.
+# v5 adds direction + structure features that nail down occlusion-
+# robustness and direction-of-pointing for poses like thumbs-up:
+#   + 15  per-finger MCP→tip unit vectors  (5 fingers × 3 dims)
+#   +  1  thumb-to-index spread distance
+#   +  3  palm normal unit vector  (cross of wrist→idx-MCP, wrist→pinky-MCP)
+# Total v5: 87 + 19 = 106.
+_FEATURE_DIM = 106
 
 # Per-finger wrist-to-tip distance thresholds (normalized landmark units,
 # where wrist-to-L9 = 1.0). Calibrated against real MediaPipe outputs.
@@ -101,20 +109,32 @@ def _bend_angle(v1: np.ndarray, v2: np.ndarray) -> float:
     return float(np.arccos(cos))
 
 
-# Thumb tip-to-index-MCP distance buckets. The thumb is the only
-# finger where wrist-to-tip distance is unreliable across hand
-# orientations: a fist tilted back projects the thumb tip *further*
-# from the wrist (in 2D) even though the thumb itself is still curled.
-# Tip-to-index-MCP is on the hand itself, so it's tilt-invariant —
-# we compute it as a SECONDARY signal and take the more-curled of
-# the two classes so the live recorder doesn't lose track of a curled
-# thumb when the user wrist-tilts. Calibrated against real recordings.
-_THUMB_TO_INDEX_MCP_THRESHOLDS: Tuple[float, float, float, float] = (
-    0.85,  # >= → fully extended (0)
-    0.65,  # >= → slightly curled (1)
-    0.50,  # >= → half curled (2)
-    0.38,  # >= → mostly curled (3)
-    # < 0.38 → closed (4)
+# Thumb curl thresholds on the SUM of inner-joint bend angles
+# (bend at L2 + bend at L3, both in radians). The thumb chain is
+# L1 (CMC) → L2 (MCP) → L3 (IP) → L4 (TIP). Joint angles live
+# entirely on the thumb itself, so they're immune to hand
+# rotation / foreshortening — the two-distance MAX rule the
+# original code used would push intermediate poses straight to
+# closed because `tip_to_index_MCP` collapses fast when the thumb
+# heads toward the palm in 2D. Joint angles give a real graduated
+# signal across all 5 curl classes.
+#
+# Why joint angles work for the thumb but NOT for the other four
+# fingers: the other fingers curl FORWARD (toward the camera),
+# which puts their joints into MediaPipe's noisy z-axis. The
+# thumb curls SIDEWAYS across the palm — its joints stay in the
+# xy plane, which MediaPipe predicts cleanly.
+#
+# Buckets are on the SUM of the two inner-joint bends so partial
+# bends accumulate naturally — a thumb with each joint at ~0.4 rad
+# (slight C-shape) lands at sum ~0.8 → class 1 (slightly curled),
+# without one signal having to single-handedly cross a threshold.
+_THUMB_JOINT_BEND_SUM_THRESHOLDS: Tuple[float, float, float, float] = (
+    0.5,   # < → fully extended (0)
+    1.0,   # < → slightly curled (1)
+    1.5,   # < → half curled (2)
+    2.0,   # < → mostly curled (3)
+    # >= → closed (4)
 )
 
 
@@ -131,12 +151,14 @@ def _curl_class_features(
     small. Wrist-to-tip distance is a single 2D-dominant measurement that
     doesn't require accurate depth inference at every joint.
 
-    Thumb fallback: when the user tilts their wrist back while making a
-    fist, wrist-to-thumb-tip distance grows (the thumb projects further
-    from the wrist in the rotated frame) even though the thumb is still
-    curled. We compute a SECONDARY thumb signal — thumb tip to
-    index-MCP distance, which lives entirely on the hand and so doesn't
-    move under wrist rotation — and take the more-curled of the two.
+    Thumb classification uses a different scheme: the SUM of bend
+    angles at the inner thumb joints (L2 and L3) is the only signal.
+    The thumb curls SIDEWAYS across the palm rather than forward
+    toward the camera, so its joint angles aren't corrupted by
+    MediaPipe's z-axis noise (which is what made joint angles
+    unreliable for the OTHER fingers). Joint-angle sum gives a real
+    graduated 5-class signal instead of the binary 0/closed jump
+    the previous distance-MAX rule produced.
 
     Hard bucketing — values snap to a stable integer that doesn't change
     under small landmark noise.
@@ -157,23 +179,30 @@ def _curl_class_features(
             cls = 4.0
 
         if finger_idx == 0:
-            # Thumb-tip to index-MCP — tilt-invariant secondary signal.
-            tip_to_idx_mcp = float(np.linalg.norm(landmarks[4] - landmarks[5]))
-            t = _THUMB_TO_INDEX_MCP_THRESHOLDS
-            if tip_to_idx_mcp >= t[0]:
-                alt = 0.0
-            elif tip_to_idx_mcp >= t[1]:
-                alt = 1.0
-            elif tip_to_idx_mcp >= t[2]:
-                alt = 2.0
-            elif tip_to_idx_mcp >= t[3]:
-                alt = 3.0
+            # Thumb: replace the distance-based class entirely with
+            # joint-bend geometry. See _THUMB_JOINT_BEND_SUM_THRESHOLDS
+            # for the rationale — short version: joint angles on the
+            # thumb are orientation-invariant AND graduated, so they
+            # naturally span all 5 curl classes. The two distance
+            # signals (wrist→tip, tip→index-MCP) both collapse in 2D
+            # under common hand rotations and would either skip past
+            # the intermediate classes (binary 0/4 jump) or
+            # over-report curl on a geometrically-straight thumb.
+            seg_12 = landmarks[2] - landmarks[1]
+            seg_23 = landmarks[3] - landmarks[2]
+            seg_34 = landmarks[4] - landmarks[3]
+            bend_sum = _bend_angle(seg_12, seg_23) + _bend_angle(seg_23, seg_34)
+            t = _THUMB_JOINT_BEND_SUM_THRESHOLDS
+            if bend_sum < t[0]:
+                cls = 0.0
+            elif bend_sum < t[1]:
+                cls = 1.0
+            elif bend_sum < t[2]:
+                cls = 2.0
+            elif bend_sum < t[3]:
+                cls = 3.0
             else:
-                alt = 4.0
-            # MAX so a curled thumb that the wrist-distance signal
-            # under-curls (because of tilt) gets promoted to the
-            # correct curl class.
-            cls = max(cls, alt)
+                cls = 4.0
 
         out.append(cls)
     return np.asarray(out, dtype=np.float32)
@@ -191,6 +220,75 @@ def _spread_class_features(spacing_features: np.ndarray) -> np.ndarray:
     if total < 1.05:
         return np.asarray([2.0], dtype=np.float32)
     return np.asarray([3.0], dtype=np.float32)
+
+
+def _direction_features_from_landmarks(lm: np.ndarray) -> np.ndarray:
+    """Per-finger MCP→TIP unit-direction vectors. 5 fingers × 3 dims =
+    15 floats.
+
+    For each finger, take the vector from its MCP (proximal knuckle)
+    to its TIP and L2-normalize. This explicitly encodes which way
+    each finger is POINTING, independent of finger length. Critical
+    for poses like thumbs-up (thumb points roughly +Y), thumbs-side
+    (thumb points roughly ±X), peace sign (index + middle both point
+    +Y, others curled). The raw-landmark feature region already
+    contains this info implicitly, but mixed into 63 dims it gets
+    drowned by the curl variance — making it explicit pulls direction
+    into its own discriminative channel.
+
+    Also robust to occlusion: a unit-direction vector averages over
+    two landmarks (MCP + tip), so per-landmark noise from a partially-
+    hidden tip doesn't blow up the magnitude — only the direction
+    matters here, and the MCP anchors it.
+    """
+    pairs = ((2, 4), (5, 8), (9, 12), (13, 16), (17, 20))
+    out: List[float] = []
+    for mcp_idx, tip_idx in pairs:
+        v = lm[tip_idx] - lm[mcp_idx]
+        n = float(np.linalg.norm(v))
+        if n < 1e-6:
+            out.extend([0.0, 0.0, 0.0])
+        else:
+            out.extend((float(v[0] / n), float(v[1] / n), float(v[2] / n)))
+    return np.asarray(out, dtype=np.float32)
+
+
+def _thumb_index_spread_from_landmarks(lm: np.ndarray) -> np.ndarray:
+    """Distance L4 (thumb tip) → L8 (index tip), normalized by the
+    standard hand scale (already applied to `lm` by the caller). The
+    existing spacing region covers adjacent tip pairs (8-12, 12-16,
+    16-20) but NOT thumb↔index — so the difference between "C-shape
+    hand" and "fully-open hand" was previously only encoded by the
+    raw-landmark region. Making this explicit gives the classifier
+    a single dimension that goes from ~0.3 (pinched) to ~1.5
+    (fully spread), which is hard to confuse with anything else.
+    """
+    return np.asarray(
+        [float(np.linalg.norm(lm[4] - lm[8]))],
+        dtype=np.float32,
+    )
+
+
+def _palm_normal_from_landmarks(lm: np.ndarray) -> np.ndarray:
+    """3-dim palm normal unit vector. Distinguishes palm-toward-
+    camera from palm-toward-monitor poses — the same hand shape
+    (e.g. open palm, or thumbs-up) reads very differently to the
+    user depending on which way the palm faces, so the classifier
+    needs to see it.
+
+    Computed as the cross product of (wrist → index MCP) × (wrist →
+    pinky MCP), then L2-normalized. The result points OUT of the
+    palm side of the hand — for a right hand held vertically palm-
+    toward-camera, this is roughly the +Z axis (toward the user);
+    for the same hand back-toward-camera, it flips to -Z.
+    """
+    v1 = lm[5] - lm[0]
+    v2 = lm[17] - lm[0]
+    n = np.cross(v1, v2)
+    mag = float(np.linalg.norm(n))
+    if mag < 1e-6:
+        return np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
+    return np.asarray((n / mag).astype(np.float32), dtype=np.float32)
 
 
 def _joint_angle_features_from_landmarks(lm: np.ndarray) -> np.ndarray:
@@ -257,9 +355,13 @@ def normalize_landmarks(landmarks: np.ndarray) -> np.ndarray:
     joint_feats = _joint_angle_features_from_landmarks(arr)
     curl_feats = _curl_class_features(extension_feats, arr)
     spread_feats = _spread_class_features(spacing_feats)
+    direction_feats = _direction_features_from_landmarks(arr)
+    thumb_index_spread = _thumb_index_spread_from_landmarks(arr)
+    palm_normal = _palm_normal_from_landmarks(arr)
     return np.concatenate(
         [landmark_feats, spacing_feats, extension_feats, joint_feats,
-         curl_feats, spread_feats]
+         curl_feats, spread_feats,
+         direction_feats, thumb_index_spread, palm_normal]
     ).astype(np.float32)
 
 
@@ -329,19 +431,23 @@ def _landmarks_from_sample(sample: GestureSample) -> np.ndarray:
 
 
 def _sample_from_landmarks(lm: np.ndarray) -> GestureSample:
-    """Build a fresh 87-dim sample from a (21, 3) landmark array. All
+    """Build a fresh 106-dim sample from a (21, 3) landmark array. All
     derived features (spacing, extension, joint angles, curl classes,
-    spread class) are recomputed so they always reflect the current
-    landmarks."""
+    spread class, per-finger direction, thumb-index spread, palm normal)
+    are recomputed so they always reflect the current landmarks."""
     landmark_feats = lm.reshape(_LANDMARK_DIM)
     spacing_feats = _spacing_features_from_landmarks(lm)
     extension_feats = _extension_features_from_landmarks(lm)
     joint_feats = _joint_angle_features_from_landmarks(lm)
     curl_feats = _curl_class_features(extension_feats, lm)
     spread_feats = _spread_class_features(spacing_feats)
+    direction_feats = _direction_features_from_landmarks(lm)
+    thumb_index_spread = _thumb_index_spread_from_landmarks(lm)
+    palm_normal = _palm_normal_from_landmarks(lm)
     feats = np.concatenate(
         [landmark_feats, spacing_feats, extension_feats, joint_feats,
-         curl_feats, spread_feats]
+         curl_feats, spread_feats,
+         direction_feats, thumb_index_spread, palm_normal]
     ).astype(np.float32)
     return GestureSample(features=feats.tolist())
 

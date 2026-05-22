@@ -35,6 +35,8 @@ from ...debug.low_fps_suggestion_overlay import LowFpsSuggestionOverlay
 from ...debug.screen_volume_overlay import ScreenVolumeOverlay
 from ...debug.spotify_controller import SpotifyController
 from ...debug.spotify_gesture_router import SpotifyGestureRouter
+from ...debug.discord_controller import DiscordController
+from ...debug.discord_gesture_router import DiscordGestureRouter, DiscordGestureSnapshot
 from ...debug.text_input_controller import TextInputController
 from ...debug.voice_command_listener import VoiceCommandListener
 from ...debug.volume_controller import VolumeController
@@ -43,7 +45,7 @@ from ...debug.youtube_controller import YouTubeController
 from ...debug.youtube_gesture_router import YouTubeGestureRouter
 from ...gesture.recognition.engine import GestureRecognitionEngine
 from ...gesture.tracking.detector import HandDetector
-from ...gesture.tracking.smoothing import AdaptiveLandmarkSmoother
+from ...gesture.tracking.smoothing import AdaptiveLandmarkSmoother, OneEuroFilter
 from ...gesture.ui.test_window import SpotifyWheelOverlay
 from ...gesture.ui.voice_status_overlay import VoiceStatusOverlay
 from ...voice.command_processor import VoiceCommandContext, VoiceCommandProcessor
@@ -481,6 +483,11 @@ class GestureWorker(QObject):
     # the popup based on config.mouse_active_monitor_index already
     # being set — engine doesn't make that decision; UI does.
     mouse_mode_activated = Signal()
+    # Fired when the open_touchless gesture binding triggers. Main
+    # window connects a slot that does show + raise_ + activateWindow
+    # so the user can hand-gesture-summon Touchless back to focus
+    # without alt-tabbing.
+    open_touchless_requested = Signal()
     # Decoupled display path. Emitted from `_tick` immediately after
     # the camera read + flip + prepare step, BEFORE the engine
     # dispatch. Receivers connect to this for the live-view paint
@@ -548,10 +555,18 @@ class GestureWorker(QObject):
     _FULLSCREEN_POLL_INTERVAL = 1.0
     # Drawing pen-lift hold duration. When the user opens their
     # thumb, the pen lifts after this many seconds of continuous
-    # open-thumb detection. 0.20 s is short enough to feel
-    # immediate (~6 frames at 30 fps) but long enough that brief
-    # rotation wobble during a stroke can't trigger a false lift.
-    _DRAWING_THUMB_OPEN_HOLD_SECONDS = 0.20
+    # open-thumb detection. 0.10 s (~3 frames at 30 fps) feels
+    # near-instant; the strict 4-condition open-thumb gate below
+    # plus the freeze-pen (which locks the stroke endpoint during
+    # the hold) keep brief rotation wobble from false-firing even
+    # at this shorter hold.
+    _DRAWING_THUMB_OPEN_HOLD_SECONDS = 0.10
+    # One Euro filter params for the drawing fingertip cursor. Applied
+    # to the RAW normalized fingertip (before the control-box remap) so
+    # tuning is independent of box gain. Lower min_cutoff => steadier
+    # when holding still; higher beta => less lag on fast strokes.
+    _DRAWING_OEF_MIN_CUTOFF = 1.2
+    _DRAWING_OEF_BETA = 0.6
     # Suggestion overlay: triggered when measured FPS stays below 15 for
     # longer than 10 seconds. After the user dismisses (X, left-fist, or
     # auto-dismiss), we wait this many seconds before re-offering.
@@ -738,6 +753,30 @@ class GestureWorker(QObject):
         self._volume_nudge_next_at = 0.0
         self._volume_nudge_last_dir = 0
         self._youtube_volume_step_next_at = 0.0
+        # Hold-and-fire state for the right-hand plain-three / plain-four
+        # actions (open_chrome / open_touchless). These bindings have
+        # no router consuming them — fired here directly from
+        # _maybe_fire_open_chrome_touchless on a 0.5 s hold.
+        self._open_action_candidate: Optional[str] = None
+        self._open_action_candidate_since: float = 0.0
+        self._open_action_cooldown_until: float = 0.0
+        # Rate-limited diagnostic: emit the right-hand stable_label
+        # once every ~1 s so the user can read the debug log while
+        # testing without flooding it at frame rate.
+        self._open_action_last_diag_label: str = ""
+        self._open_action_last_diag_at: float = 0.0
+        # YouTube auto-pause-on-absence state. Tracks the wall-clock
+        # time we first noticed no hand in frame (0.0 = currently
+        # visible). When this exceeds the configured threshold, we
+        # fire toggle_playback() once and latch _youtube_paused_for_absence
+        # so we don't keep re-pausing. On hand return, if we latched
+        # earlier, we fire toggle_playback() once to resume.
+        self._youtube_absence_started_at: float = 0.0
+        self._youtube_paused_for_absence: bool = False
+        # YouTube auto-skip-ads background tick. The per-frame engine
+        # callback would poll at frame rate (~30 Hz) which wastes CPU
+        # on template matching; throttle to once per 1.0 s.
+        self._youtube_auto_skip_last_tick: float = 0.0
         self._chrome_active_cache = False
         self._chrome_active_cache_until = 0.0
         self._spotify_active_cache = False
@@ -794,7 +833,7 @@ class GestureWorker(QObject):
             scroll_steps=0,
         )
         self._mouse_mode_enabled = False
-        self._mouse_control_text = "mouse mode off" if self.mouse_controller.available else self.mouse_controller.message
+        self._mouse_control_text = "Mouse mode off" if self.mouse_controller.available else self.mouse_controller.message
         self._mouse_status_text = "off" if self.mouse_controller.available else "unavailable"
 
         _pump_events()
@@ -809,9 +848,25 @@ class GestureWorker(QObject):
         self._spotify_control_text = self.spotify_controller.message
 
         _pump_events()
+        # Discord controller — owns the local RPC pipe to the Discord
+        # desktop client (mute / deafen / read voice state). Used by
+        # both the Settings → Connect button auth flow and the
+        # discord_router below for gesture-driven control.
+        self.discord_controller = DiscordController()
+        self.discord_router = DiscordGestureRouter(
+            static_hold_seconds=0.5,
+            static_cooldown_seconds=1.5,
+            toggle_hold_seconds=0.7,
+            toggle_cooldown_seconds=1.5,
+        )
+        self._discord_control_text = self.discord_controller.message
+        self._discord_mode_prev_active = False
+        self._last_discord_action_counter = 0
+
+        _pump_events()
         self.youtube_controller = YouTubeController(volume_controller=self.volume_controller)
         self.youtube_router = YouTubeGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.0)
-        self._youtube_control_text = "youtube idle"
+        self._youtube_control_text = "YouTube idle"
         self._youtube_mode_info = "off"
         self._youtube_mode_prev_active = False
         self._chrome_mode_prev_active = False
@@ -837,6 +892,15 @@ class GestureWorker(QObject):
         self.voice_processor = VoiceCommandProcessor(
             chrome_controller=self.chrome_controller,
             spotify_controller=self.spotify_controller,
+            discord_controller=self.discord_controller,
+            # Step-emit callback. Every meaningful step inside the
+            # processor's multi-step commands (find channel → focus
+            # window → paste → press enter) gets forwarded to the
+            # engine_log signal so the user sees granular progress
+            # in the detailed log surface. Wrapped in try/except via
+            # _emit_voice_log_step to keep logging failures from
+            # breaking the underlying command.
+            log_step=self._emit_voice_log_step,
         )
         _pump_events()
         self.live_dictation_streamer = LiveDictationStreamer(
@@ -879,6 +943,15 @@ class GestureWorker(QObject):
         self._voice_latched_label: str | None = None
         self._voice_one_two_triggered_at: float = 0.0
         self._left_hand_prediction = None
+        # Cached LEFT-hand reading (landmarks + finger states). Set
+        # alongside _left_hand_prediction each frame so other systems
+        # can inspect specific finger geometry without re-running
+        # MediaPipe. Used by Discord's MRP activator pose detector —
+        # the recogniser labels any three-finger pose as "three", so
+        # to distinguish "index+middle+ring" (mouse-mode toggle) from
+        # "middle+ring+pinky" (Discord-mode toggle) we need the
+        # actual per-finger states.
+        self._left_hand_reading = None
         self._left_hand_streak_since = 0.0
         self._voice_queue: queue.Queue[tuple[int, object]] = queue.Queue()
         self._voice_thread: threading.Thread | None = None
@@ -905,7 +978,7 @@ class GestureWorker(QObject):
         self._drawing_toggle_cooldown_until = 0.0
         self._drawing_cursor_norm: tuple[float, float] | None = None
         self._drawing_tool = "hidden"
-        self._drawing_control_text = "drawing mode off"
+        self._drawing_control_text = "Drawing mode off"
         self._drawing_render_target = "screen"
         self._drawing_brush_hex = str(getattr(config, "accent_color", "#1DE9B6") or "#1DE9B6")
         self._drawing_brush_thickness = 8
@@ -941,6 +1014,15 @@ class GestureWorker(QObject):
         # (vs frame-counted) so the hold duration is deterministic
         # across variable fps.
         self._drawing_thumb_open_since: float = 0.0
+        # True for every frame the thumb-open lift signal is firing
+        # right now (sustained or just-started). Set by the tool-
+        # decision pass and consumed by the stroke renderer to skip
+        # point appending while the user is lifting — without this,
+        # the natural rightward hand motion during the 0.20 s lift
+        # hold would drift the stroke endpoint. Brief one-frame
+        # thumb_open misreads still recover (next frame this flips
+        # back to False and the grace window keeps drawing).
+        self._drawing_freeze_pen: bool = False
         # Anti-misfire: a new stroke only starts after 2 consecutive
         # draw-pose frames. Single-frame jitter (e.g. dropping the
         # hand from an open position briefly reads as draw pose for
@@ -984,6 +1066,11 @@ class GestureWorker(QObject):
         self._utility_capture_cursor_norm: tuple[float, float] | None = None
         self._utility_capture_left_down = False
         self._utility_capture_right_down = False
+        # Effective (shrunk) mouse-control-box bounds applied while a
+        # hand-selector dialog is active. Used by the live-view
+        # widget to render the red box during chooser sessions even
+        # when full mouse mode is off.
+        self._utility_capture_box_bounds: tuple[float, float, float, float] | None = None
         self._window_expand_candidate_since = 0.0
         self._window_contract_candidate_since = 0.0
         self._window_close_candidate_since = 0.0
@@ -1148,11 +1235,28 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] reload failed: {exc}")
 
+    def _emit_voice_log_step(self, message: str) -> None:
+        """Forward a step message from VoiceCommandProcessor to the
+        user-facing detailed log. Wrapped in try/except because the
+        emit can theoretically fire from a worker thread; we don't
+        want a Qt-side error to bubble up and crash the running
+        voice command."""
+        try:
+            self.engine_log.emit(str(message))
+        except Exception:
+            pass
+
     def _record_action(self, label: str, display_text: str) -> None:
         if not label or label == "-":
             return
-        if label.endswith("_failed") or label.endswith("_idle") or label.endswith("_requires_open") or label.endswith("_closed"):
-            return
+        # Used to skip every *_failed / *_idle / *_requires_open /
+        # *_closed event silently. That meant the user couldn't see
+        # WHY a command didn't fire — the action history showed only
+        # the successes. Now we record them so the action log has the
+        # full picture, including the failure variants. The undo
+        # logic still ignores non-undoable labels via the
+        # _UNDO_LABEL_PAIRS lookup below, so the user can't accidentally
+        # "undo" a failure entry.
         undoable = label in _UNDO_LABEL_PAIRS
         event = ActionEvent(
             timestamp=time.time(),
@@ -1471,7 +1575,7 @@ class GestureWorker(QObject):
             self.mouse_tracker.reset()
             self._last_mouse_update = self._blank_mouse_update()
             self._mouse_mode_enabled = False
-            self._mouse_control_text = "gestures disabled"
+            self._mouse_control_text = "Gestures disabled"
             self._mouse_status_text = "off"
             self._reset_chrome_wheel(clear_cooldown=False)
             self._reset_spotify_wheel(clear_cooldown=False)
@@ -1484,8 +1588,8 @@ class GestureWorker(QObject):
             self._camera_draw_last_point = None
             self._window_pair_smoothed_distance = None
             self._window_pair_overlay = None
-            self._chrome_control_text = "gestures disabled"
-            self._spotify_control_text = "gestures disabled"
+            self._chrome_control_text = "Gestures disabled"
+            self._spotify_control_text = "Gestures disabled"
             self._volume_mode_active = False
             self._volume_status_text = "paused"
             self._volume_overlay_visible = False
@@ -1494,7 +1598,7 @@ class GestureWorker(QObject):
             self._chrome_control_text = self.chrome_controller.message
             self._spotify_control_text = self.spotify_controller.message
             if self.mouse_controller.available:
-                self._mouse_control_text = "mouse mode off"
+                self._mouse_control_text = "Mouse mode off"
                 self._mouse_status_text = "off"
 
     def _reset_drawing_runtime(self, *, keep_mode: bool = False) -> None:
@@ -1523,7 +1627,7 @@ class GestureWorker(QObject):
         if self._drawing_shape_mode:
             self._drawing_shape_mode = False
             self._queue_drawing_request("shape_off")
-        self._drawing_control_text = "drawing mode on" if self._drawing_mode_enabled else "drawing mode off"
+        self._drawing_control_text = "Drawing mode on" if self._drawing_mode_enabled else "Drawing mode off"
 
     def _toggle_drawing_mode(self, now: float) -> None:
         self._drawing_mode_enabled = not self._drawing_mode_enabled
@@ -1553,14 +1657,14 @@ class GestureWorker(QObject):
         self._last_mouse_update = self._blank_mouse_update()
         self._mouse_mode_enabled = False
         self._mouse_status_text = "off" if self.mouse_controller.available else "unavailable"
-        self._mouse_control_text = "mouse mode off" if self.mouse_controller.available else self.mouse_controller.message
+        self._mouse_control_text = "Mouse mode off" if self.mouse_controller.available else self.mouse_controller.message
         self._volume_mode_active = False
         self._volume_status_text = "paused"
         self._volume_overlay_visible = False
         self._update_volume_overlay()
         self.voice_status_overlay.hide_overlay()
         state = "enabled" if self._drawing_mode_enabled else "disabled"
-        self._drawing_control_text = f"drawing mode {state}"
+        self._drawing_control_text = f"Drawing mode {state}"
         try:
             self.voice_status_overlay.show_info_hint(
                 "Draw mode: ON" if self._drawing_mode_enabled else "Draw mode: OFF",
@@ -1576,7 +1680,7 @@ class GestureWorker(QObject):
         # up in the action history (was previously emit-only).
         self._record_action(
             "drawing_mode_on" if self._drawing_mode_enabled else "drawing_mode_off",
-            "drawing mode on" if self._drawing_mode_enabled else "drawing mode off",
+            "Drawing mode on" if self._drawing_mode_enabled else "Drawing mode off",
         )
 
     def _handle_drawing_toggle(self, prediction, hand_handedness: str | None, now: float) -> bool:
@@ -1790,6 +1894,28 @@ class GestureWorker(QObject):
         confidence = float(getattr(prediction, "confidence", 0.0) or 0.0)
         return stable_label == "wheel_pose" or (raw_label == "wheel_pose" and confidence >= 0.52)
 
+    def _map_drawing_control_box(self, x: float, y: float) -> tuple[float, float]:
+        """Map a normalized fingertip coord through the drawing control box.
+
+        A small square region of the frame (size x size, centered on the
+        configured point) fills the whole [0,1] canvas, so the finger only
+        moves within a forearm-sized patch. Square in normalized coords
+        keeps motion undistorted on a 16:9 frame/canvas.
+        """
+        size = float(getattr(self.config, "drawing_control_box_size", 0.45))
+        size = max(0.15, min(1.0, size))
+        cx = float(getattr(self.config, "drawing_control_box_center_x", 0.82))
+        cy = float(getattr(self.config, "drawing_control_box_center_y", 0.55))
+        half = size * 0.5
+        min_x = min(max(cx - half, 0.0), 1.0 - size)
+        min_y = min(max(cy - half, 0.0), 1.0 - size)
+        mapped_x = (x - min_x) / size
+        mapped_y = (y - min_y) / size
+        return (
+            max(0.0, min(1.0, mapped_x)),
+            max(0.0, min(1.0, mapped_y)),
+        )
+
     def _update_drawing_controls(self, prediction, hand_reading, hand_handedness: str | None, now: float) -> None:
         if not self._drawing_mode_enabled:
             self._drawing_cursor_norm = None
@@ -1798,48 +1924,46 @@ class GestureWorker(QObject):
         if hand_handedness != "Right" or hand_reading is None:
             self._drawing_cursor_norm = None
             self._drawing_tool = "hidden"
-            self._drawing_control_text = f"drawing mode enabled ({self._drawing_render_target})"
+            self._drawing_control_text = f"Drawing mode enabled ({self._drawing_render_target})"
             self._camera_draw_last_point = None
             return
         try:
-            cursor_x = max(0.0, min(1.0, float(hand_reading.landmarks[8][0])))
-            cursor_y = max(0.0, min(1.0, float(hand_reading.landmarks[8][1])))
+            raw_x = max(0.0, min(1.0, float(hand_reading.landmarks[8][0])))
+            raw_y = max(0.0, min(1.0, float(hand_reading.landmarks[8][1])))
         except Exception:
             self._drawing_cursor_norm = None
             self._drawing_tool = "hidden"
             self._camera_draw_last_point = None
             return
-        # Velocity-adaptive cursor smoothing. The global landmark
-        # smoother is tuned for gesture recognition (noise budget
-        # spread across all 21 landmarks) and leaves enough jitter
-        # on landmark 8 to make the cursor feel fidgety when the
-        # user holds their finger still while drawing. Apply a
-        # second per-cursor EMA with a velocity-adaptive alpha:
-        #   - slow motion (< 0.005 normalized, ~3 px on 640-wide)
-        #     â†’ alpha 0.30 (heavy smoothing, suppresses jitter)
-        #   - fast motion (> 0.030 normalized, ~19 px / fast stroke)
-        #     â†’ alpha 0.85 (near-passthrough, preserves response)
-        #   - between â†’ linear ramp
-        # First frame after the cursor was None (drawing mode just
-        # entered or hand just re-acquired) snaps to the current
-        # value with no smoothing so the cursor doesn't visibly
-        # crawl in from the previous position.
-        prior = self._drawing_cursor_norm
-        if prior is None:
-            self._drawing_cursor_norm = (cursor_x, cursor_y)
-        else:
-            px, py = prior
-            dx = cursor_x - px
-            dy = cursor_y - py
-            motion = (dx * dx + dy * dy) ** 0.5
-            if motion < 0.005:
-                alpha = 0.30
-            elif motion > 0.030:
-                alpha = 0.85
-            else:
-                t = (motion - 0.005) / (0.030 - 0.005)
-                alpha = 0.30 + (0.85 - 0.30) * t
-            self._drawing_cursor_norm = (px + alpha * dx, py + alpha * dy)
+        # Drawing cursor pipeline (two stages, both fixing prior
+        # complaints that the pen felt jittery and forced full-frame
+        # arm sweeps):
+        #   1. One Euro filter on the RAW fingertip — adaptive
+        #      jitter/lag tradeoff: steady when held still, low lag on
+        #      fast strokes. Replaces the old fixed velocity-adaptive
+        #      EMA, which still passed ~30% of jitter at rest.
+        #   2. Control-box remap — a small square patch of the frame
+        #      fills the whole canvas (like air-mouse), so the finger
+        #      moves within a forearm-sized area instead of sweeping
+        #      the full frame.
+        # Filtering happens BEFORE the remap so filter tuning is
+        # independent of the box gain.
+        if getattr(self, "_drawing_oef_x", None) is None:
+            self._drawing_oef_x = OneEuroFilter(
+                min_cutoff=self._DRAWING_OEF_MIN_CUTOFF, beta=self._DRAWING_OEF_BETA
+            )
+            self._drawing_oef_y = OneEuroFilter(
+                min_cutoff=self._DRAWING_OEF_MIN_CUTOFF, beta=self._DRAWING_OEF_BETA
+            )
+        # Re-seed the filters whenever the cursor was just lost (drawing
+        # mode entered or hand re-acquired) so it doesn't crawl in from
+        # a stale position.
+        if self._drawing_cursor_norm is None:
+            self._drawing_oef_x.reset()
+            self._drawing_oef_y.reset()
+        smooth_x = self._drawing_oef_x.update(raw_x, now)
+        smooth_y = self._drawing_oef_y.update(raw_y, now)
+        self._drawing_cursor_norm = self._map_drawing_control_box(smooth_x, smooth_y)
         if self._drawing_lift_pose_active(hand_reading):
             self._drawing_tool = "hover"
             self._drawing_control_text = f"drawing hover ({self._drawing_render_target})"
@@ -1885,6 +2009,11 @@ class GestureWorker(QObject):
             # has clearly indicated they're not gripping a pen.
             draw_active = False
             erase_active = False
+        # Tell the stroke renderer to freeze the pen tip wherever it
+        # was on the LAST drawing-pose frame, so the natural hand
+        # motion that accompanies opening the thumb doesn't drift the
+        # stroke endpoint to the right before the 0.20 s commit fires.
+        self._drawing_freeze_pen = bool(thumb_open_now)
 
         # Track sustained draw-pose intent. Single-frame draw_active
         # blips (e.g. dropping an open hand briefly reads as draw
@@ -2024,7 +2153,7 @@ class GestureWorker(QObject):
         if key == "shape":
             self._drawing_shape_mode = not self._drawing_shape_mode
             self._queue_drawing_request("shape_on" if self._drawing_shape_mode else "shape_off")
-            self._drawing_control_text = "shape mode on" if self._drawing_shape_mode else "shape mode off"
+            self._drawing_control_text = "Shape mode on" if self._drawing_shape_mode else "Shape mode off"
             hint_text = "Shape mode: ON" if self._drawing_shape_mode else "Shape mode: OFF"
             try:
                 self.voice_status_overlay.show_info_hint(hint_text, duration=3.0)
@@ -2334,6 +2463,7 @@ class GestureWorker(QObject):
             self._utility_capture_cursor_norm = None
             self._utility_capture_left_down = False
             self._utility_capture_right_down = False
+            self._utility_capture_box_bounds = None
 
     def _utility_capture_click_down(self, finger) -> bool:
         if finger is None:
@@ -2342,24 +2472,62 @@ class GestureWorker(QObject):
         curl = float(getattr(finger, 'curl', 0.0) or 0.0)
         return finger.state in {'closed', 'mostly_curled'} or openness <= 0.42 or curl >= 0.52
 
+    # Sensitivity boost applied while a hand-selector dialog (pen
+    # options, eraser options, monitor selection, etc.) is open.
+    # The palm is mapped through the same ergonomic mouse-control
+    # box as regular mouse mode, but the effective box is shrunk
+    # around its center by this factor so the user can reach the
+    # full dialog with less hand travel. 1.0 = same as mouse mode;
+    # <1.0 = more sensitive (smaller hand reach covers same screen
+    # area).
+    _UTILITY_CAPTURE_SENSITIVITY = 0.62
+
     def _update_utility_capture_selection(self, hand_reading, hand_handedness: str | None) -> None:
         if hand_handedness != 'Right' or hand_reading is None:
             self._utility_capture_cursor_norm = None
             self._utility_capture_left_down = False
             self._utility_capture_right_down = False
             self._utility_capture_clicks_armed = False
+            self._utility_capture_box_bounds = None
             return
         try:
             palm_center = getattr(hand_reading.palm, 'center', None)
             if palm_center is None or len(palm_center) < 2:
                 raise ValueError('missing palm center')
-            cursor_x = max(0.0, min(1.0, float(palm_center[0])))
-            cursor_y = max(0.0, min(1.0, float(palm_center[1])))
+            palm_x = float(palm_center[0])
+            palm_y = float(palm_center[1])
+            # Route the palm through the regular mouse-control box
+            # (so the dialog cursor uses the same ergonomic hand-reach
+            # region the user already learned for mouse mode), then
+            # shrink that box around its center by the sensitivity
+            # multiplier. Smaller effective box = same hand motion
+            # reaches further on screen = "more sensitive".
+            try:
+                min_x, min_y, max_x, max_y = self.mouse_tracker._camera_bounds()
+            except Exception:
+                min_x, min_y, max_x, max_y = (0.0, 0.0, 1.0, 1.0)
+            cx = (min_x + max_x) * 0.5
+            cy = (min_y + max_y) * 0.5
+            half_w = max(1e-3, (max_x - min_x) * 0.5 * self._UTILITY_CAPTURE_SENSITIVITY)
+            half_h = max(1e-3, (max_y - min_y) * 0.5 * self._UTILITY_CAPTURE_SENSITIVITY)
+            eff_min_x = max(0.0, cx - half_w)
+            eff_max_x = min(1.0, cx + half_w)
+            eff_min_y = max(0.0, cy - half_h)
+            eff_max_y = min(1.0, cy + half_h)
+            cursor_x = max(0.0, min(1.0, (palm_x - eff_min_x) / max(1e-6, eff_max_x - eff_min_x)))
+            cursor_y = max(0.0, min(1.0, (palm_y - eff_min_y) / max(1e-6, eff_max_y - eff_min_y)))
+            # Stash the shrunk bounds so the live-view widget can
+            # render the same red box during chooser dialogs as it
+            # does in mouse mode — the user asked for it to "still
+            # use the red mouse control area" while these dialogs
+            # are open.
+            self._utility_capture_box_bounds = (eff_min_x, eff_min_y, eff_max_x, eff_max_y)
         except Exception:
             self._utility_capture_cursor_norm = None
             self._utility_capture_left_down = False
             self._utility_capture_right_down = False
             self._utility_capture_clicks_armed = False
+            self._utility_capture_box_bounds = None
             return
         fingers = hand_reading.fingers
         self._utility_capture_cursor_norm = (cursor_x, cursor_y)
@@ -2835,6 +3003,17 @@ class GestureWorker(QObject):
         thickness = int(max(2, self._drawing_brush_thickness))
         if self._drawing_tool == "draw":
             self._camera_draw_erasing = False
+            if self._drawing_freeze_pen:
+                # User has opened the thumb to lift — we're inside the
+                # 0.20 s commit hold but still in the grace window so
+                # _drawing_tool is "draw". Skip appending any new point
+                # this frame so the stroke endpoint doesn't drift along
+                # with the natural rightward hand motion that comes
+                # with opening the thumb. The previous sample stays
+                # as the final point; if the user closes the thumb
+                # again before the hold elapses, drawing resumes from
+                # there without a stray segment.
+                return
             if self._camera_draw_last_point is None:
                 # First sample of stroke â€” record only, no draw yet.
                 # The Bezier-through-midpoints scheme below needs at
@@ -3128,6 +3307,29 @@ class GestureWorker(QObject):
             return "", False
         return chosen, True
 
+    def _derive_display_label(self, prediction, hand_reading) -> tuple[str, bool]:
+        # Like _gesture_banner_label but promotes the recognizer's
+        # base label to its derived variant (three_together,
+        # four_together, thumb_up, thumb_down) when the finger
+        # pattern matches — so the bbox banner reflects the same
+        # label the action-routing layer uses, instead of stalling
+        # on "three" / "four" / "fist" while the engine is firing
+        # YouTube actions off the derived form. Active flag stays
+        # True for any non-neutral chosen label, which keeps the
+        # bbox green via the existing color branch.
+        if prediction is None:
+            return "", False
+        if hand_reading is not None:
+            try:
+                derived = self._derive_app_static_label(prediction, hand_reading)
+            except Exception:
+                derived = ""
+            if derived and derived != "neutral":
+                stable = str(getattr(prediction, "stable_label", "neutral") or "neutral")
+                if derived != stable:
+                    return derived, True
+        return self._gesture_banner_label(prediction)
+
     @staticmethod
     def _filter_banner_label_by_handedness(
         label: str,
@@ -3150,10 +3352,13 @@ class GestureWorker(QObject):
         own_pose = pose_id_for_static_label(handedness, label)
         if own_pose is not None:
             return label, active
-        other = "Right" if handedness == "Left" else "Left"
-        if pose_id_for_static_label(other, label) is not None:
-            return "", False
-        return label, active
+        # Suppress labels not bound on this hand. Covers the
+        # other-hand-only case (e.g. mute on left hand — only bound
+        # right) and the bound-nowhere case (e.g. thumb_up / thumb_down
+        # on a hand with no binding entry). Without this the banner
+        # showed labels the user couldn't use on the active hand,
+        # which was visually noisy and misleading.
+        return "", False
 
     @staticmethod
     def _build_hand_overlay_info(
@@ -3769,7 +3974,7 @@ class GestureWorker(QObject):
         self.mouse_tracker.reset()
         self._last_mouse_update = self._blank_mouse_update()
         self._mouse_mode_enabled = False
-        self._mouse_control_text = "mouse mode off" if self.mouse_controller.available else self.mouse_controller.message
+        self._mouse_control_text = "Mouse mode off" if self.mouse_controller.available else self.mouse_controller.message
         self._mouse_status_text = "off" if self.mouse_controller.available else "unavailable"
         self._reset_chrome_wheel(clear_cooldown=True)
         self._reset_spotify_wheel(clear_cooldown=True)
@@ -3783,7 +3988,7 @@ class GestureWorker(QObject):
         self._spotify_info_text = "-"
         self._last_spotify_action = "-"
         self.youtube_router.reset()
-        self._youtube_control_text = "youtube idle"
+        self._youtube_control_text = "YouTube idle"
         self._youtube_mode_info = "off"
         self._last_chrome_action_counter = 0
         self._last_spotify_action_counter = 0
@@ -3831,9 +4036,25 @@ class GestureWorker(QObject):
         self._fullscreen_check_last = 0.0
         self._dynamic_hold_label = "neutral"
         self._dynamic_hold_until = 0.0
+        # Camera-health tracking. _camera_first_frame_received flips
+        # True on the first successful cap.read() of this session and
+        # gates the "Starting camera…" → "Touchless active" status
+        # update. _camera_recovery_* fields drive the dead-cap
+        # auto-reopen path in _tick: if isOpened() goes False after
+        # frames were flowing, the engine tries to reopen the same
+        # camera index (up to MAX) before giving up. Covers transient
+        # USB drops, brief driver hiccups, and the "another app
+        # grabbed the camera for a second" case.
+        self._camera_first_frame_received = False
+        self._camera_start_at = time.monotonic()
+        self._camera_recovery_attempts = 0
+        self._camera_recovery_last_at = 0.0
+        self._camera_recovery_max_attempts = 3
+        self._camera_recovery_cooldown_s = 1.5
+        self._camera_no_first_frame_warned = False
         self.camera_selected.emit(camera_info.display_name)
-        self._emit_status("Touchless active")
-        self.command_detected.emit("Gesture and voice control active")
+        self._emit_status("starting camera…")
+        self.command_detected.emit("Starting camera…")
         self.running_state_changed.emit(True)
         self._timer.start()
 
@@ -3927,7 +4148,7 @@ class GestureWorker(QObject):
         self.mouse_tracker.reset()
         self._last_mouse_update = self._blank_mouse_update()
         self._mouse_mode_enabled = False
-        self._mouse_control_text = "mouse mode off" if self.mouse_controller.available else self.mouse_controller.message
+        self._mouse_control_text = "Mouse mode off" if self.mouse_controller.available else self.mouse_controller.message
         self._mouse_status_text = "off" if self.mouse_controller.available else "unavailable"
         self._reset_chrome_wheel(clear_cooldown=True)
         self._reset_spotify_wheel(clear_cooldown=True)
@@ -4013,6 +4234,80 @@ class GestureWorker(QObject):
         self._apply_low_fps_capture_tuning(result)
         result = self._upgrade_to_ffmpeg_capture_if_lite(result)
         return result
+
+    def _attempt_camera_recovery(self) -> None:
+        """Reopen the camera after the threaded reader flagged the
+        capture dead. Rate-limited so we don't spin (the open call
+        itself can take 500 ms+ on a slow virtual camera) and capped
+        at _camera_recovery_max_attempts so a permanently-gone camera
+        eventually surfaces as a hard error instead of looping.
+
+        Same backend/source as the current cap — uses
+        camera_index_override if it was set, otherwise the same
+        preferred-or-first-available path the original open went
+        through. The threaded reader's warmup discard runs again on
+        the new cap, so the consumer still doesn't see partial frames
+        after a recovery.
+        """
+        now = time.monotonic()
+        if now - self._camera_recovery_last_at < self._camera_recovery_cooldown_s:
+            return
+        self._camera_recovery_last_at = now
+        if self._camera_recovery_attempts >= self._camera_recovery_max_attempts:
+            # Give up — clean shutdown rather than spinning forever.
+            if self._camera_recovery_attempts == self._camera_recovery_max_attempts:
+                # Increment once more so this branch only emits once.
+                self._camera_recovery_attempts += 1
+                try:
+                    self._emit_status("camera disconnected")
+                    self.error_occurred.emit(
+                        "Camera connection lost and could not be restored. "
+                        "Check the USB cable / make sure no other app is using the camera, "
+                        "then press Stop and Start to retry."
+                    )
+                except Exception:
+                    pass
+            return
+        self._camera_recovery_attempts += 1
+        try:
+            self._emit_status(
+                f"reconnecting camera (attempt {self._camera_recovery_attempts}/"
+                f"{self._camera_recovery_max_attempts})…"
+            )
+        except Exception:
+            pass
+        # Tear down the dead cap before opening a new one — some
+        # drivers refuse a second open while a stale handle is still
+        # holding the device.
+        try:
+            if self._cap is not None:
+                self._cap.release()
+        except Exception:
+            pass
+        self._cap = None
+        try:
+            camera_info, cap = self._open_camera()
+        except Exception:
+            camera_info, cap = (None, None)
+        if cap is None or camera_info is None:
+            # Open failed — leave _cap None and try again on the next
+            # tick (after the cooldown). _camera_recovery_attempts
+            # already incremented above so we'll hit the max-attempts
+            # branch eventually if the camera doesn't come back.
+            return
+        self._camera_info = camera_info
+        self._cap = cap
+        # Reset first-frame tracking so the recovered cap goes
+        # through the same "starting → active" status transition the
+        # initial open did. Don't reset attempts — that only resets
+        # after a successful frame arrives (in _tick).
+        self._camera_first_frame_received = False
+        self._camera_start_at = now
+        self._camera_no_first_frame_warned = False
+        try:
+            self.camera_selected.emit(camera_info.display_name)
+        except Exception:
+            pass
 
     def _upgrade_to_ffmpeg_capture_if_lite(self, open_result):
         # When Lite Mode is on for a local USB webcam, swap the
@@ -4247,6 +4542,29 @@ class GestureWorker(QObject):
     def _tick(self) -> None:
         if not self._running or self._cap is None or self.engine is None:
             return
+        # Dead-cap auto-recovery. The threaded reader marks the
+        # capture dead (isOpened() → False) when it hits the
+        # consecutive-failure ceiling — typically a USB hiccup or
+        # another app briefly grabbing the camera. Reopen the same
+        # camera (rate-limited; capped at _camera_recovery_max_attempts)
+        # so a transient drop doesn't permanently freeze the live
+        # view on its last good frame.
+        try:
+            cap_alive = bool(self._cap.isOpened())
+        except Exception:
+            cap_alive = False
+        if not cap_alive:
+            self._attempt_camera_recovery()
+            return
+        # No-first-frame timeout. If the camera opened but never
+        # actually produced a clean frame within ~5 s, surface a
+        # one-time status update so the user gets visible feedback
+        # instead of "Starting camera…" hanging silently.
+        if not self._camera_first_frame_received and not self._camera_no_first_frame_warned:
+            elapsed = time.monotonic() - self._camera_start_at
+            if elapsed >= 5.0:
+                self._camera_no_first_frame_warned = True
+                self._emit_status("camera opened but no frames yet")
         # Per-frame timing diagnostic â€” sampled when Lite Mode is on
         # so we can attribute fps drops to camera vs MediaPipe vs
         # downstream work. Lazy so non-debug callers pay no
@@ -4266,6 +4584,20 @@ class GestureWorker(QObject):
             # enough idle time between ticks to process the
             # queued paint events.
             return
+        # First clean frame of this session — flip the live status
+        # from "Starting camera…" to "Touchless active" so the user
+        # gets clear feedback that the engine actually came up.
+        # `_camera_recovery_attempts` resets here too so a future
+        # mid-session drop gets its own independent retry budget.
+        if not self._camera_first_frame_received:
+            self._camera_first_frame_received = True
+            self._camera_recovery_attempts = 0
+            self._camera_no_first_frame_warned = False
+            try:
+                self._emit_status("Touchless active")
+                self.command_detected.emit("Gesture and voice control active")
+            except Exception:
+                pass
         # Always mirror to selfie view. The earlier
         # `camera_source_is_mirrored` toggle was meant for phone-camera
         # sources whose host app pre-mirrored the feed (e.g., Iriun
@@ -4367,6 +4699,11 @@ class GestureWorker(QObject):
             self._on_engine_result(frame, result)
             return
         self._inference_skipped_last = False
+        # Push left-handed mode to the engine each tick (cheap bool set
+        # on the shared engine object the runner also holds). Read live
+        # from config so the Settings toggle takes effect next frame.
+        if self.engine is not None:
+            self.engine.swap_handedness = bool(getattr(self.config, "left_handed_mode", False))
         # Async engine path: dispatch to runner thread and return
         # immediately. The runner runs engine.process_frame on its
         # own thread; the result fires _on_engine_result via a
@@ -4416,6 +4753,19 @@ class GestureWorker(QObject):
         # reports found=False, so the skip-frame state machine still
         # behaves identically to the pre-async implementation.
         self._last_result_had_hand = bool(result.found)
+        # YouTube auto-pause-on-absence + auto-skip-ads background
+        # ticks. Driven off the per-frame callback because we already
+        # have wall-clock time + hand presence here; no separate
+        # QTimer needed. Both features short-circuit when their
+        # respective settings are off.
+        try:
+            self._youtube_absence_tick(bool(result.found))
+        except Exception:
+            pass
+        try:
+            self._youtube_auto_skip_tick()
+        except Exception:
+            pass
         t_engine = time.perf_counter() if debug_timing else 0.0
         self._drawing_secondary_hand_reading = getattr(result, "secondary_hand_reading", None)
         now = time.time()
@@ -4487,37 +4837,65 @@ class GestureWorker(QObject):
 
             hands_info: list = []
             if result.found and result.tracked_hand is not None:
-                label, active = self._gesture_banner_label(result.prediction)
+                label, active = self._derive_display_label(
+                    result.prediction, getattr(result, "hand_reading", None)
+                )
                 primary_handedness = getattr(result.tracked_hand, "handedness", None)
                 label, active = self._filter_banner_label_by_handedness(
                     label, active, primary_handedness
                 )
                 label, active = _apply_custom_label(label, active, primary_handedness)
+                # Display: underscore -> space so derived labels read
+                # naturally ('three together', 'four together',
+                # 'thumb up', 'thumb down') instead of with underscores.
+                # Done after the filter pipeline so any binding lookup
+                # that needs the underscore form still sees it.
+                display_label = label.replace("_", " ") if label else label
                 hands_info.append(
                     self._build_hand_overlay_info(
                         result.tracked_hand,
-                        label=label,
+                        label=display_label,
                         active=active,
                     )
                 )
             secondary_hand = getattr(result, "secondary_tracked_hand", None)
             if secondary_hand is not None:
                 sec_pred = getattr(result, "secondary_prediction", None)
-                label, active = self._gesture_banner_label(sec_pred)
+                label, active = self._derive_display_label(
+                    sec_pred, getattr(result, "secondary_hand_reading", None)
+                )
                 sec_handedness = getattr(secondary_hand, "handedness", None)
                 label, active = self._filter_banner_label_by_handedness(
                     label, active, sec_handedness
                 )
                 label, active = _apply_custom_label(label, active, sec_handedness)
+                display_label = label.replace("_", " ") if label else label
                 hands_info.append(
                     self._build_hand_overlay_info(
                         secondary_hand,
-                        label=label,
+                        label=display_label,
                         active=active,
                     )
                 )
             mouse_overlay = None
-            if self._mouse_mode_enabled:
+            # Hand-selector dialogs (pen options, eraser options,
+            # monitor selection, etc.) also use the red mouse-control
+            # box for cursor mapping, with a sensitivity boost. Render
+            # the SAME visual red box here so the user can see and
+            # use the ergonomic hand-reach region during the dialog
+            # exactly like they do in mouse mode.
+            if self._utility_capture_selection_active and self._utility_capture_box_bounds is not None:
+                mouse_overlay = {
+                    "bounds": tuple(float(v) for v in self._utility_capture_box_bounds),
+                    "anchor": None,
+                    "cursor": (
+                        tuple(float(v) for v in self._utility_capture_cursor_norm)
+                        if self._utility_capture_cursor_norm is not None
+                        else None
+                    ),
+                    "active_monitor_index": None,
+                }
+            elif self._mouse_mode_enabled:
                 try:
                     debug = self.mouse_tracker.debug_state
                 except Exception:
@@ -4681,14 +5059,19 @@ class GestureWorker(QObject):
             and hand_handedness != sec_handedness
         )
         candidate_left_prediction = None
+        candidate_left_reading = None
         if both_hands_visible:
             if hand_handedness == "Left":
                 candidate_left_prediction = result.prediction
+                candidate_left_reading = result.hand_reading
             else:
                 candidate_left_prediction = getattr(result, "secondary_prediction", None)
+                candidate_left_reading = getattr(result, "secondary_hand_reading", None)
         elif result.found and hand_handedness == "Left":
             candidate_left_prediction = result.prediction
+            candidate_left_reading = result.hand_reading
 
+        left_reading_out = None
         if candidate_left_prediction is not None:
             if self._left_hand_streak_since <= 0.0:
                 self._left_hand_streak_since = monotonic_now
@@ -4697,15 +5080,17 @@ class GestureWorker(QObject):
             # labeling before we act on them.
             if both_hands_visible or (monotonic_now - self._left_hand_streak_since) >= 0.30:
                 left_prediction = candidate_left_prediction
+                left_reading_out = candidate_left_reading
         else:
             self._left_hand_streak_since = 0.0
         self._left_hand_prediction = left_prediction
+        self._left_hand_reading = left_reading_out
         t_gate_a = time.perf_counter() if debug_timing else 0.0
         if self._gestures_enabled:
             if self._drawing_mode_enabled:
                 self._volume_mode_active = False
                 self._volume_status_text = "paused"
-                self._volume_message = "drawing mode active"
+                self._volume_message = "Drawing mode active"
                 self._volume_overlay_visible = False
                 self._update_volume_overlay()
             else:
@@ -4860,7 +5245,7 @@ class GestureWorker(QObject):
         if self.mouse_tracker.mode_enabled:
             self._volume_level = current_level
             self._volume_muted = current_muted
-            self._volume_message = "mouse mode active"
+            self._volume_message = "Mouse mode active"
             self._volume_mode_active = False
             self._volume_status_text = "paused"
             self._volume_overlay_visible = False
@@ -4871,7 +5256,7 @@ class GestureWorker(QObject):
         if self._drawing_mode_enabled:
             self._volume_level = current_level
             self._volume_muted = current_muted
-            self._volume_message = "drawing mode active"
+            self._volume_message = "Drawing mode active"
             self._volume_mode_active = False
             self._volume_status_text = "paused"
             self._volume_overlay_visible = False
@@ -5246,6 +5631,21 @@ class GestureWorker(QObject):
                     fired = True
                 except Exception:
                     fired = False
+            elif action_id == "open_chrome":
+                try:
+                    self.chrome_controller.focus_or_open_window()
+                    fired = True
+                except Exception:
+                    fired = False
+            elif action_id == "open_touchless":
+                # Main window connects to open_touchless_requested and
+                # raises itself. Engine has no direct main-window ref,
+                # so the signal hop is necessary.
+                try:
+                    self.open_touchless_requested.emit()
+                    fired = True
+                except Exception:
+                    fired = False
             elif action_id == "system_mute_toggle":
                 try:
                     toggled = self.volume_controller.toggle_mute()
@@ -5320,6 +5720,93 @@ class GestureWorker(QObject):
             except Exception:
                 pass
         return fired
+
+    def _maybe_fire_open_chrome_touchless(
+        self,
+        prediction,
+        hand_handedness: str | None,
+        now: float,
+    ) -> None:
+        """Right-hand plain-three -> open_chrome,
+        right-hand plain-four -> open_touchless. Fire after a 0.4 s
+        hold with a 2.0 s cooldown so a quick gesture doesn't double-
+        fire when the user is in transit between poses.
+
+        Also inspects the SECONDARY hand: if the user's right hand
+        appears in frame as the secondary while their left is primary
+        (rare but happens when two hands are tracked and the left was
+        detected first), we still fire on the right. Without this,
+        users who keep both hands in view get inconsistent triggering.
+
+        Only fires for the DEFAULT pose binding. If the user has
+        remapped right_three or right_four to a different action, the
+        binding remap step above this call already rewrote the
+        stable_label, so the labels here will be different and this
+        method early-exits. No competing path."""
+        # Resolve which prediction is from the RIGHT hand. _handle_app_controls
+        # is called with the primary prediction + its handedness. If the
+        # primary is the right hand, use it. Otherwise, walk the engine's
+        # cached right-hand state for the secondary's prediction.
+        if hand_handedness == "Right":
+            right_pred = prediction
+        else:
+            # _normalize_result_right_primary already moved the right hand
+            # to primary when it was present, so reaching here means the
+            # right hand isn't tracked this frame. Nothing to fire.
+            if self._open_action_candidate is not None:
+                self._open_action_candidate = None
+                self._open_action_candidate_since = 0.0
+            return
+        stable_label = str(getattr(right_pred, "stable_label", "neutral") or "neutral")
+        # Rate-limited visibility log: every ~1 s, surface what the
+        # right-hand recognizer is producing. Lets the user diagnose
+        # "I'm making the gesture but nothing fires" by reading the
+        # debug log — they can see whether the engine sees 'four',
+        # 'four_together', 'neutral', or something else entirely.
+        if (
+            stable_label != self._open_action_last_diag_label
+            or (now - self._open_action_last_diag_at) > 1.0
+        ):
+            self._open_action_last_diag_label = stable_label
+            self._open_action_last_diag_at = now
+            try:
+                self.engine_log.emit(f"right-hand label: {stable_label}")
+            except Exception:
+                pass
+        # Only plain three / plain four trigger this — the _together
+        # variants are handled by their bound mode toggles.
+        if stable_label not in {"three", "four"}:
+            if self._open_action_candidate is not None:
+                self._open_action_candidate = None
+                self._open_action_candidate_since = 0.0
+            return
+        if self._open_action_candidate != stable_label:
+            self._open_action_candidate = stable_label
+            self._open_action_candidate_since = now
+            try:
+                self.engine_log.emit(
+                    f"open-action: candidate started '{stable_label}' on right hand"
+                )
+            except Exception:
+                pass
+            return
+        if now < self._open_action_cooldown_until:
+            return
+        held = now - self._open_action_candidate_since
+        if held < 0.4:
+            return
+        self._open_action_cooldown_until = now + 2.0
+        action_id = "open_chrome" if stable_label == "three" else "open_touchless"
+        try:
+            self.engine_log.emit(
+                f"open-action: firing {action_id} after {held:.2f}s hold"
+            )
+        except Exception:
+            pass
+        try:
+            self._dispatch_action(action_id, now)
+        except Exception:
+            pass
 
     def _apply_gesture_binding_remap(self, prediction, hand_handedness, now: float):
         """Apply the user's static-pose binding remap to a prediction.
@@ -5875,6 +6362,13 @@ class GestureWorker(QObject):
         # also fires it via _dispatch_action. See the helper docstring.
         prediction = self._apply_gesture_binding_remap(prediction, hand_handedness, now)
 
+        # Default-bound open_chrome (right_three) / open_touchless
+        # (right_four) actions have no router. Fire them here on a
+        # short hold. Runs BEFORE the rest of the handler so a brief
+        # three / four reliably opens its target before any other
+        # router (spotify, chrome) gets a turn.
+        self._maybe_fire_open_chrome_touchless(prediction, hand_handedness, now)
+
         # When a save-location prompt is awaiting input, give the left-hand voice handler
         # a chance to run before any mode-specific branch returns early. This keeps the
         # left-fist cancel gesture available even while drawing / mouse / volume mode is
@@ -6021,12 +6515,107 @@ class GestureWorker(QObject):
         if self._handle_window_control_gestures(hand_reading, hand_handedness, now):
             return
 
-        mouse_consuming = self._handle_mouse_control(
-            prediction=prediction,
-            hand_reading=hand_reading if hand_handedness == "Right" else None,
-            hand_handedness=hand_handedness,
-            now=now,
+        # ---- Discord router (mode toggle + mute/deafen) ------------
+        # Discord mode needs BOTH hands' stable labels every frame:
+        # left hand for the mode-toggle activator, right hand for
+        # mute / deafen actions. The engine processes one hand per
+        # call to _handle_main_controls, so we synthesise both from
+        # the current prediction + the cached _left_hand_prediction.
+        left_pred = prediction if hand_handedness == "Left" else self._left_hand_prediction
+        right_pred_label = (
+            prediction.stable_label if hand_handedness == "Right" else "neutral"
         )
+        # Discord activator is a CUSTOM left-hand pose: middle + ring
+        # + pinky extended, index folded. The base recogniser labels
+        # any three-finger pose as "three" so we'd collide with mouse
+        # mode's left-3 toggle. The MRP geometry check disambiguates:
+        # only the specific finger set fires "three_mrp", which is
+        # the only label the Discord router accepts as its activator.
+        left_reading_for_mrp = (
+            hand_reading if hand_handedness == "Left" else self._left_hand_reading
+        )
+        # Discord integration is shelved behind a future feature update
+        # (the Settings → General → Discord card renders only as a
+        # "Coming soon" placeholder). To keep behaviour consistent we
+        # force `left_mrp_active` off here so the MRP activator never
+        # engages mouse-mode lockout, and we feed downstream code a
+        # neutral snapshot so the router stays idle. The router itself
+        # remains in the codebase for the future feature update — we're
+        # just routing around it for now.
+        left_mrp_active = False
+        left_pred_label = (
+            left_pred.stable_label if left_pred is not None else "neutral"
+        )
+        discord_snapshot = DiscordGestureSnapshot(
+            control_text="",
+            info_text="off",
+            last_action="-",
+            mode_active=False,
+            consume_other_routes=False,
+            suppress_mouse=False,
+            action_counter=self._last_discord_action_counter,
+        )
+        self._discord_control_text = discord_snapshot.control_text
+        # Emit a HUD toast on mode flip (4 s, same style as YouTube
+        # mode notification) and record to the action history.
+        if discord_snapshot.mode_active != self._discord_mode_prev_active:
+            self._discord_mode_prev_active = discord_snapshot.mode_active
+            label_text = (
+                "Discord mode: ON" if discord_snapshot.mode_active else "Discord mode: OFF"
+            )
+            try:
+                self.voice_status_overlay.show_info_hint(label_text, duration=4.0)
+            except Exception:
+                pass
+            try:
+                self.command_detected.emit(label_text)
+            except Exception:
+                pass
+            try:
+                self._record_action(
+                    "discord_mode_on" if discord_snapshot.mode_active else "discord_mode_off",
+                    label_text,
+                )
+            except Exception:
+                pass
+        # Emit a HUD toast each time a Discord mute/deafen action
+        # fires — the user can't always see the Discord client, so
+        # the toast confirms their gesture took effect.
+        if discord_snapshot.action_counter != self._last_discord_action_counter:
+            self._last_discord_action_counter = discord_snapshot.action_counter
+            if discord_snapshot.last_action not in ("-", "discord_mode_on", "discord_mode_off"):
+                try:
+                    self.command_detected.emit(discord_snapshot.control_text)
+                except Exception:
+                    pass
+                try:
+                    self._record_action(
+                        discord_snapshot.last_action, discord_snapshot.control_text
+                    )
+                except Exception:
+                    pass
+        # ------------------------------------------------------------
+
+        # Mouse control is suppressed in two cases:
+        #   1. Discord mode is currently active (user is on a call,
+        #      wants free hand movement for mute/deafen without the
+        #      cursor following along).
+        #   2. The user is currently holding the Discord MRP activator
+        #      pose. The base recogniser sees this as plain "three"
+        #      which would otherwise also satisfy mouse-mode's left-3
+        #      toggle — so we lock mouse-mode out for any frame where
+        #      MRP is detected, regardless of whether Discord mode is
+        #      already on. Without this gate the same gesture would
+        #      simultaneously toggle Discord mode AND toggle mouse mode.
+        if discord_snapshot.suppress_mouse or left_mrp_active:
+            mouse_consuming = False
+        else:
+            mouse_consuming = self._handle_mouse_control(
+                prediction=prediction,
+                hand_reading=hand_reading if hand_handedness == "Right" else None,
+                hand_handedness=hand_handedness,
+                now=now,
+            )
         if mouse_consuming:
             self._update_youtube_wheel(prediction=None, hand_reading=None, now=now, active=False)
             self._update_chrome_wheel(prediction=None, hand_reading=None, now=now, active=False)
@@ -6034,8 +6623,8 @@ class GestureWorker(QObject):
             self._reset_voice_candidate(now)
             self.chrome_router.reset()
             self.spotify_router.reset()
-            self._chrome_control_text = "mouse mode active"
-            self._spotify_control_text = "mouse mode active"
+            self._chrome_control_text = "Mouse mode active"
+            self._spotify_control_text = "Mouse mode active"
             return
 
         if self._left_hand_prediction is not None:
@@ -6198,8 +6787,8 @@ class GestureWorker(QObject):
             self.chrome_router.reset()
             self.spotify_router.reset()
             if mouse_consuming:
-                self._chrome_control_text = "mouse mode active"
-                self._spotify_control_text = "mouse mode active"
+                self._chrome_control_text = "Mouse mode active"
+                self._spotify_control_text = "Mouse mode active"
             return
 
         self._reset_voice_candidate(now)
@@ -6210,8 +6799,8 @@ class GestureWorker(QObject):
             self._update_spotify_wheel(prediction=None, hand_reading=None, now=now, active=False)
             self.chrome_router.reset()
             self.spotify_router.reset()
-            self._chrome_control_text = "mouse mode active"
-            self._spotify_control_text = "mouse mode active"
+            self._chrome_control_text = "Mouse mode active"
+            self._spotify_control_text = "Mouse mode active"
             return
 
         if step_key == "voice_command":
@@ -6380,7 +6969,7 @@ class GestureWorker(QObject):
             # in the dashboard if useful.
             self._record_action(
                 "mouse_mode_on" if update.mode_enabled else "mouse_mode_off",
-                "mouse mode on" if update.mode_enabled else "mouse mode off",
+                "Mouse mode on" if update.mode_enabled else "Mouse mode off",
             )
             # On the off->on transition only, emit the activation
             # signal so the main window can show the "which monitor
@@ -6397,7 +6986,7 @@ class GestureWorker(QObject):
             # only logging media + volume actions).
             self._record_action(
                 "mouse_mode_on" if update.mode_enabled else "mouse_mode_off",
-                "mouse mode on" if update.mode_enabled else "mouse mode off",
+                "Mouse mode on" if update.mode_enabled else "Mouse mode off",
             )
         action_text = update.control_text
         if not tutorial_demo_only and (update.left_press or update.left_release or update.left_click or update.right_click or update.scroll_steps):
@@ -6729,6 +7318,20 @@ class GestureWorker(QObject):
                 f"Reasoning: extended={reading.finger_count_extended} "
                 f"occlusion={reading.occlusion_score:.2f} shape={reading.shape_confidence:.2f}"
             )
+        # Raw per-frame static-pose scores from the recognizer — top-N
+        # by score, capped to 3 for display. The recognizer maintains
+        # `last_static_scores` as a dict of label→confidence updated
+        # each frame; the Settings → General → Diagnostics 'top
+        # scores' toggle renders this in the home tracking pill so the
+        # user can see runner-up poses (the ones that ALMOST won).
+        try:
+            scores_dict = self.engine.last_static_scores if self.engine is not None else {}
+            top_scores = sorted(
+                scores_dict.items(), key=lambda kv: float(kv[1]), reverse=True
+            )[:3]
+        except Exception:
+            top_scores = []
+
         return {
             "result": result,
             "gesture_chip": gesture_chip,
@@ -6739,6 +7342,7 @@ class GestureWorker(QObject):
             "stable_label": payload_stable_label,
             "dynamic_label": payload_dynamic_label,
             "confidence": float(prediction.confidence),
+            "top_static_scores": top_scores,
             "fps": float(self._fps),
             "low_fps_active": bool(self._low_fps_active),
             "low_fps_forced": bool(getattr(self.config, "low_fps_mode", False)),
@@ -6792,6 +7396,13 @@ class GestureWorker(QObject):
             ),
             "mouse_left_click": bool(getattr(self._last_mouse_update, "left_click", False)),
             "mouse_left_press": bool(getattr(self._last_mouse_update, "left_press", False)),
+            # Scroll-step count emitted by the mouse_gesture tracker.
+            # Positive = scroll up, negative = scroll down. The
+            # tutorial's mouse-scroll practice arena reads this to
+            # drive a QScrollArea instead of firing OS wheel events
+            # (so the tutorial's scroll detection works regardless
+            # of where the real cursor sits on the desktop).
+            "mouse_scroll_steps": int(getattr(self._last_mouse_update, "scroll_steps", 0)),
             "gestures_enabled": bool(self._gestures_enabled),
             "drawing_mode_enabled": bool(self._drawing_mode_enabled),
             "drawing_tool": self._drawing_tool,
@@ -6852,12 +7463,33 @@ class GestureWorker(QObject):
         stable_label = prediction.stable_label
         if hand_reading is None:
             return stable_label
-        if stable_label in {"three", "neutral"} and self._is_three_apart(hand_reading):
-            return "three_apart"
-        if stable_label in {"three", "neutral"} and self._is_three_together(hand_reading):
-            return "three_together"
+        # Three-finger poses split into TWO distinct labels: tight
+        # fingers -> "three_together" (chrome_mode_toggle's default
+        # binding), spread fingers -> plain "three" (no global
+        # action by default, consumed by YT router for skip-ad while
+        # YT mode is forced). The static recognizer doesn't have
+        # either in its base label set (only fist/one/two/four/mute/
+        # wheel_pose/pinch), so a three-finger pose lands as
+        # "neutral" -- we promote here.
+        if stable_label in {"three", "neutral"}:
+            if self._is_three_together(hand_reading):
+                return "three_together"
+            if self._is_three_apart(hand_reading):
+                return "three"
         if stable_label in {"four", "neutral"} and self._is_four_together(hand_reading):
             return "four_together"
+        # Thumb-up / thumb-down: only thumb extended, four others
+        # folded. Direction picked from thumb-tip vs wrist in image
+        # y-coordinates (y grows downward). Tested against fist /
+        # neutral base labels because a thumb-only-extended hand
+        # typically gets classified as fist by the static recognizer
+        # (the thumb is short relative to palm scale and the
+        # finger-count heuristic rounds toward fist).
+        if stable_label in {"fist", "neutral"}:
+            if self._is_thumb_up(hand_reading):
+                return "thumb_up"
+            if self._is_thumb_down(hand_reading):
+                return "thumb_down"
         return stable_label
 
     def _is_three_together(self, hand_reading) -> bool:
@@ -6872,6 +7504,33 @@ class GestureWorker(QObject):
             and self._spread_is_together(hand_reading, "middle_ring", max_distance=0.38, min_strength=0.54)
         )
 
+    def _is_left_three_mrp(self, hand_reading) -> bool:
+        """Detects the Discord-mode activator: left hand showing
+        middle + ring + pinky extended, with index folded and thumb
+        folded.
+
+        The base recogniser labels this as "three" (it just counts
+        extended fingers) — which collides with mouse-mode's left-3
+        toggle that expects index + middle + ring. Splitting them
+        out by exact finger set gives us two disjoint left-hand
+        three-finger gestures: standard `three` = mouse, MRP = Discord.
+        """
+        if hand_reading is None:
+            return False
+        fingers = getattr(hand_reading, "fingers", None)
+        if fingers is None:
+            return False
+        try:
+            return (
+                self._is_chrome_open_finger(fingers["middle"])
+                and self._is_chrome_open_finger(fingers["ring"])
+                and self._is_chrome_open_finger(fingers["pinky"])
+                and self._is_folded_finger(fingers["index"])
+                and self._is_folded_finger(fingers["thumb"], allow_partial=True)
+            )
+        except Exception:
+            return False
+
     def _is_three_apart(self, hand_reading) -> bool:
         fingers = hand_reading.fingers
         return (
@@ -6883,6 +7542,40 @@ class GestureWorker(QObject):
             and self._spread_is_apart(hand_reading, "index_middle", min_distance=0.50, min_strength=0.56)
             and self._spread_is_apart(hand_reading, "middle_ring", min_distance=0.48, min_strength=0.54)
         )
+
+    def _is_thumb_only_extended(self, hand_reading) -> bool:
+        fingers = hand_reading.fingers
+        return (
+            self._is_chrome_open_finger(fingers["thumb"])
+            and self._is_folded_finger(fingers["index"])
+            and self._is_folded_finger(fingers["middle"])
+            and self._is_folded_finger(fingers["ring"])
+            and self._is_folded_finger(fingers["pinky"])
+        )
+
+    def _is_thumb_up(self, hand_reading) -> bool:
+        if not self._is_thumb_only_extended(hand_reading):
+            return False
+        try:
+            wrist_y = float(hand_reading.landmarks[0][1])
+            thumb_tip_y = float(hand_reading.landmarks[4][1])
+        except Exception:
+            return False
+        # MediaPipe landmark y grows downward, so thumb-tip ABOVE the
+        # wrist means thumb_tip_y < wrist_y. Threshold (0.06) guards
+        # against a sideways thumb being mis-classified — the tip has
+        # to be a clear chunk above the wrist, not just slightly above.
+        return (wrist_y - thumb_tip_y) > 0.06
+
+    def _is_thumb_down(self, hand_reading) -> bool:
+        if not self._is_thumb_only_extended(hand_reading):
+            return False
+        try:
+            wrist_y = float(hand_reading.landmarks[0][1])
+            thumb_tip_y = float(hand_reading.landmarks[4][1])
+        except Exception:
+            return False
+        return (thumb_tip_y - wrist_y) > 0.06
 
     def _is_four_together(self, hand_reading) -> bool:
         fingers = hand_reading.fingers
@@ -6964,6 +7657,62 @@ class GestureWorker(QObject):
             self._youtube_wheel_cooldown_until = 0.0
         if self.youtube_wheel_overlay.isVisible():
             self.youtube_wheel_overlay.hide_overlay()
+
+    def _youtube_absence_tick(self, hand_visible: bool) -> None:
+        """Auto-pause the playing YouTube tab when no hand is visible
+        for `youtube_pause_when_user_leaves_seconds`. Resume on hand
+        return — but only if we were the one who paused (don't fight
+        a manual pause)."""
+        if not bool(getattr(self.config, "youtube_pause_when_user_leaves", False)):
+            self._youtube_absence_started_at = 0.0
+            self._youtube_paused_for_absence = False
+            return
+        try:
+            tab_present = bool(self.youtube_controller.has_youtube_tab())
+        except Exception:
+            tab_present = False
+        if not tab_present:
+            self._youtube_absence_started_at = 0.0
+            self._youtube_paused_for_absence = False
+            return
+        now = time.time()
+        if hand_visible:
+            if self._youtube_paused_for_absence:
+                try:
+                    self.youtube_controller.toggle_playback()
+                except Exception:
+                    pass
+                self._youtube_paused_for_absence = False
+            self._youtube_absence_started_at = 0.0
+            return
+        if self._youtube_absence_started_at <= 0.0:
+            self._youtube_absence_started_at = now
+            return
+        if self._youtube_paused_for_absence:
+            return
+        threshold = max(2, int(getattr(self.config, "youtube_pause_when_user_leaves_seconds", 6)))
+        if (now - self._youtube_absence_started_at) >= threshold:
+            try:
+                self.youtube_controller.toggle_playback()
+                self._youtube_paused_for_absence = True
+            except Exception:
+                pass
+
+    def _youtube_auto_skip_tick(self) -> None:
+        """Poll the focused YouTube tab for a Skip Ad button at 1 Hz
+        and click it when the template match crosses the configured
+        threshold. Restores prior foreground after the click so the
+        skip is invisible to the user."""
+        if not bool(getattr(self.config, "youtube_auto_skip_ads", False)):
+            return
+        now = time.time()
+        if (now - self._youtube_auto_skip_last_tick) < 1.0:
+            return
+        self._youtube_auto_skip_last_tick = now
+        try:
+            self.youtube_controller.auto_skip_ads_tick()
+        except Exception:
+            pass
 
     def _youtube_wheel_items(self) -> tuple[tuple[str, str, float], ...]:
         labels = (
@@ -7090,7 +7839,7 @@ class GestureWorker(QObject):
             controller.share_video()
             self.mouse_tracker.force_enable_mode(now)
             self._mouse_mode_enabled = True
-            self._mouse_control_text = "mouse mode on"
+            self._mouse_control_text = "Mouse mode on"
             self.voice_status_overlay.show_info_hint("Mouse mode on - click the Share options", duration=3.0)
         elif key == "speed_down":
             controller.speed_down()
@@ -7275,7 +8024,13 @@ class GestureWorker(QObject):
 
     def _wheel_selection_key(self, dx: float, dy: float, items: tuple[tuple[str, str, float], ...]) -> str | None:
         radius = math.hypot(dx, dy)
-        if radius < 0.59 or radius > 1.25:
+        # No upper bound on radius: as long as the cursor is past the
+        # central deadzone, the angle alone determines the selected
+        # slice. Previously a `radius > 1.25` cap dropped selection
+        # the moment the user's hand drifted further from the wheel
+        # center, which felt like "the cursor is clearly inside this
+        # slice but nothing's selected".
+        if radius < 0.59:
             return None
         angle = (math.degrees(math.atan2(-dy, dx)) + 360.0) % 360.0
         slice_span = 360.0 / max(1, len(items))

@@ -11,12 +11,26 @@ pass straight through to whatever app is underneath.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication, QPainter, QPixmap
 from PySide6.QtWidgets import QWidget
+
+
+# Image extensions the show_overlay_drawing action knows how to
+# render. Restricting the filesystem search to these stops the
+# disambiguation prompt from offering, say, a Word document that
+# happens to share a basename.
+_DRAWING_SEARCH_EXTENSIONS = {".png", ".jpg", ".jpeg"}
+
+# Hard ceiling on filesystem-search results. Beyond this either the
+# filename is too generic (user should rename) or something is wrong
+# with their indexed scope. Either way listing 50 paths in a chooser
+# UI is worse than listing 10.
+_DRAWING_SEARCH_MAX_RESULTS = 10
 
 
 class DrawingOverlayWindow(QWidget):
@@ -172,5 +186,150 @@ def resolve_drawing_path(filename: str, drawings_dir: str | Path) -> Optional[Pa
     except OSError:
         return None
     return None
+
+
+def search_drawings_by_filename(
+    filename: str,
+    *,
+    max_results: int = _DRAWING_SEARCH_MAX_RESULTS,
+) -> List[Path]:
+    """Find every file on the system whose basename matches
+    `filename` exactly (case-insensitive), restricted to image
+    extensions. Used by the show_overlay_drawing action's
+    "search anywhere" fallback when the configured
+    `drawings_save_dir` doesn't contain the requested file.
+
+    Resolution strategy:
+      1. Windows Search Index (`SystemIndex`, the same backend File
+         Explorer's search box uses) — fast (~50 ms) and covers every
+         indexed location including OneDrive, Pictures, Documents,
+         Desktop, Downloads, plus any user-added indexed folders.
+      2. Bounded fallback walk of common user dirs — only runs if
+         the index is unavailable (rare; the service is on by
+         default) or the query raises.
+
+    Returns absolute paths, capped at `max_results`. Empty list if
+    nothing matched anywhere reachable.
+    """
+    if not filename:
+        return []
+    target = Path(filename).name
+    if Path(target).suffix.lower() not in _DRAWING_SEARCH_EXTENSIONS:
+        return []
+
+    indexed = _search_via_system_index(target, max_results=max_results)
+    if indexed is not None:
+        return indexed
+    return _fallback_walk_for_filename(target, max_results=max_results)
+
+
+def _search_via_system_index(
+    filename: str,
+    *,
+    max_results: int,
+) -> Optional[List[Path]]:
+    """Query the Windows Search Index for files named `filename`.
+    Returns the (possibly empty) list of absolute paths on success;
+    returns None if the index isn't reachable so the caller falls
+    back to a directory walk."""
+    try:
+        import win32com.client  # type: ignore
+    except Exception:
+        return None
+
+    safe = filename.replace("'", "''")
+    sql = (
+        "SELECT TOP %d System.ItemPathDisplay "
+        "FROM SystemIndex "
+        "WHERE System.FileName = '%s' AND System.Kind = 'picture'"
+    ) % (max_results, safe)
+
+    results: List[Path] = []
+    conn = None
+    rs = None
+    try:
+        conn = win32com.client.Dispatch("ADODB.Connection")
+        conn.Open(
+            "Provider=Search.CollatorDSO;"
+            "Extended Properties='Application=Windows'"
+        )
+        rs = win32com.client.Dispatch("ADODB.Recordset")
+        rs.Open(sql, conn)
+        while not rs.EOF and len(results) < max_results:
+            try:
+                raw = rs.Fields.Item("System.ItemPathDisplay").Value
+                if raw:
+                    p = Path(str(raw))
+                    if p.is_file():
+                        results.append(p)
+            except Exception:
+                pass
+            rs.MoveNext()
+    except Exception:
+        # Index service unavailable / SQL rejected / COM error.
+        return None
+    finally:
+        for handle in (rs, conn):
+            if handle is None:
+                continue
+            try:
+                handle.Close()
+            except Exception:
+                pass
+    return results
+
+
+def _fallback_walk_for_filename(
+    filename: str,
+    *,
+    max_results: int,
+) -> List[Path]:
+    """Bounded directory walk used when SystemIndex isn't available.
+    Walks the most common user-content directories with a depth cap
+    so a stray symlink loop or selectively-synced OneDrive tree
+    can't run forever."""
+    home = Path.home()
+    bases = (
+        home / "Pictures",
+        home / "OneDrive" / "Pictures",
+        home / "OneDrive - Personal" / "Pictures",
+        home / "Documents",
+        home / "Desktop",
+        home / "Downloads",
+    )
+    target_lower = filename.lower()
+    seen_roots: set[str] = set()
+    found: List[Path] = []
+    skip_dirs = {"appdata", "node_modules", "__pycache__", "$recycle.bin"}
+
+    for base in bases:
+        try:
+            if not base.exists():
+                continue
+            root_key = str(base.resolve()).lower()
+            if root_key in seen_roots:
+                continue
+            seen_roots.add(root_key)
+            base_parts = len(base.parts)
+            for root, dirs, files in os.walk(base, followlinks=False):
+                depth = len(Path(root).parts) - base_parts
+                if depth > 4:
+                    dirs[:] = []
+                    continue
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".") and d.lower() not in skip_dirs
+                ]
+                for f in files:
+                    if f.lower() == target_lower:
+                        candidate = Path(root) / f
+                        if (candidate.is_file()
+                                and candidate.suffix.lower() in _DRAWING_SEARCH_EXTENSIONS):
+                            found.append(candidate)
+                            if len(found) >= max_results:
+                                return found
+        except (OSError, PermissionError):
+            continue
+    return found
 
 # Author: Konstantin Markov

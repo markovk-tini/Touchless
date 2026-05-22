@@ -54,6 +54,20 @@ class PhoneCameraCapture:
         # NEXT push, instead of returning the same frame repeatedly.
         self._wait_event.set()
 
+    def push_frame(self, frame: np.ndarray) -> None:
+        """Publish an already-decoded BGR frame as the latest frame.
+
+        The WebRTC receiver hands us decoded ndarrays directly (PyAV
+        gives BGR via VideoFrame.to_ndarray), so there's no JPEG to
+        decode. Mirrors push_jpeg's publish-and-wake otherwise.
+        """
+        if self._closed or frame is None or getattr(frame, "size", 0) == 0:
+            return
+        with self._lock:
+            self._frame = frame
+            self._frame_age_hint = time.monotonic()
+        self._wait_event.set()
+
     def has_fresh_frame(self) -> bool:
         with self._lock:
             return self._frame is not None

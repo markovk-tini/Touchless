@@ -14,6 +14,14 @@ from typing import Any, Dict, List, Optional
 _ENV_REGISTRY_PATH = "HGR_CUSTOM_GESTURES_PATH"
 _DEFAULT_REGISTRY_PATH = Path.home() / ".hgr_app" / "custom_gestures.json"
 
+# Hard cap on the number of user custom gestures. Enforced at the UI
+# layer (the create flow and the bundle-import flow both check it) so
+# the current release ships with a bounded set; a future feature
+# update may raise or remove this. The registry itself does NOT
+# enforce it on add() — keeping the limit in the UI lets imports/tests
+# stay flexible while the user-facing buttons honour the cap.
+MAX_CUSTOM_GESTURES = 5
+
 # Feature vector layout (total 87):
 #   [0:63]   — 21 landmarks * 3 coords, wrist-centered, scaled by |L9|
 #   [63:66]  — 3 adjacent fingertip-pair distances (grouping signal)
@@ -30,13 +38,23 @@ _DEFAULT_REGISTRY_PATH = Path.home() / ".hgr_app" / "custom_gestures.json"
 # small landmark noise the way the continuous features do. They give the
 # classifier a stable shape signature on top of the precise (but jittery)
 # continuous values.
-_FEATURE_VECTOR_LEN = 87
+# v5 feature vector (106 dims). Legacy v1-v4 samples auto-upgrade
+# on load — the always-present first 63 raw landmarks are enough to
+# re-derive every newer feature.
+_FEATURE_VECTOR_LEN = 106
 _LANDMARK_FEATURE_LEN = 63
 _SPACING_FEATURE_LEN = 3
 _EXTENSION_FEATURE_LEN = 5
 _JOINT_ANGLE_FEATURE_LEN = 10
 _CURL_CLASS_FEATURE_LEN = 5
 _SPREAD_CLASS_FEATURE_LEN = 1
+# v5 additions:
+_DIRECTION_FEATURE_LEN = 15        # 5 fingers × 3-dim MCP→tip unit vector
+_THUMB_INDEX_SPREAD_FEATURE_LEN = 1  # |L4 - L8| normalized distance
+_PALM_NORMAL_FEATURE_LEN = 3       # palm-normal unit vector
+# Pre-v5 vector length (used to detect "needs v5 direction features
+# appended" during auto-upgrade).
+_V4_FEATURE_VECTOR_LEN = 87
 
 
 def registry_path() -> Path:
@@ -151,6 +169,53 @@ class GestureSample:
                     classes.append(4.0)
             return classes
 
+        def _derive_direction(lm: List[float]) -> List[float]:
+            """Per-finger MCP→tip unit-direction vectors. 5 fingers × 3
+            dims = 15 floats. Mirrors the recorder's
+            _direction_features_from_landmarks; kept inline so the
+            legacy-upgrade path doesn't have to import from recorder
+            (recorder imports registry, would create a cycle)."""
+            pairs = ((2, 4), (5, 8), (9, 12), (13, 16), (17, 20))
+            out: List[float] = []
+            for mcp_idx, tip_idx in pairs:
+                mx, my, mz = lm[mcp_idx * 3], lm[mcp_idx * 3 + 1], lm[mcp_idx * 3 + 2]
+                tx, ty, tz = lm[tip_idx * 3], lm[tip_idx * 3 + 1], lm[tip_idx * 3 + 2]
+                dx, dy, dz = tx - mx, ty - my, tz - mz
+                n = (dx * dx + dy * dy + dz * dz) ** 0.5
+                if n < 1e-6:
+                    out.extend([0.0, 0.0, 0.0])
+                else:
+                    out.extend((dx / n, dy / n, dz / n))
+            return out
+
+        def _derive_thumb_index_spread(lm: List[float]) -> List[float]:
+            """L4 (thumb tip) → L8 (index tip) distance, already
+            normalized because the stored landmark region is
+            wrist-centered + scaled to wrist→L9 = 1."""
+            return [_dist(lm, 4, 8)]
+
+        def _derive_palm_normal(lm: List[float]) -> List[float]:
+            """Palm normal: (L5-L0) × (L17-L0), L2-normalized."""
+            v1 = (lm[5 * 3] - lm[0], lm[5 * 3 + 1] - lm[1], lm[5 * 3 + 2] - lm[2])
+            v2 = (lm[17 * 3] - lm[0], lm[17 * 3 + 1] - lm[1], lm[17 * 3 + 2] - lm[2])
+            cx = v1[1] * v2[2] - v1[2] * v2[1]
+            cy = v1[2] * v2[0] - v1[0] * v2[2]
+            cz = v1[0] * v2[1] - v1[1] * v2[0]
+            mag = (cx * cx + cy * cy + cz * cz) ** 0.5
+            if mag < 1e-6:
+                return [0.0, 0.0, 0.0]
+            return [cx / mag, cy / mag, cz / mag]
+
+        def _append_v5_features(feats_so_far: List[float]) -> List[float]:
+            """Top off any pre-v5 feature vector with the direction +
+            thumb-index-spread + palm-normal trio. Caller has already
+            ensured everything up to v4 (87 dims) is in place."""
+            lm = list(feats_so_far[:_LANDMARK_FEATURE_LEN])
+            return (list(feats_so_far)
+                    + _derive_direction(lm)
+                    + _derive_thumb_index_spread(lm)
+                    + _derive_palm_normal(lm))
+
         def _derive_spread_class(spacing: List[float]) -> List[float]:
             """Bucket total fingertip spread into 4 categories (tight..wide).
             Calibrated against real MediaPipe outputs."""
@@ -172,6 +237,7 @@ class GestureSample:
             feats = (list(feats) + spacing + extension + joints
                      + _derive_curl_classes(extension)
                      + _derive_spread_class(spacing))
+            feats = _append_v5_features(feats)
         elif len(feats) == _LANDMARK_FEATURE_LEN + _SPACING_FEATURE_LEN:
             # Legacy schema 2: landmarks + spacing (66 floats).
             lm = feats[:_LANDMARK_FEATURE_LEN]
@@ -181,6 +247,7 @@ class GestureSample:
             feats = (list(feats) + extension + joints
                      + _derive_curl_classes(extension)
                      + _derive_spread_class(spacing))
+            feats = _append_v5_features(feats)
         elif len(feats) == _LANDMARK_FEATURE_LEN + _SPACING_FEATURE_LEN + _EXTENSION_FEATURE_LEN:
             # Legacy schema 3: landmarks + spacing + extension (71 floats).
             lm = feats[:_LANDMARK_FEATURE_LEN]
@@ -191,6 +258,7 @@ class GestureSample:
             feats = (list(feats) + joints
                      + _derive_curl_classes(extension)
                      + _derive_spread_class(spacing))
+            feats = _append_v5_features(feats)
         elif len(feats) == (_LANDMARK_FEATURE_LEN + _SPACING_FEATURE_LEN
                             + _EXTENSION_FEATURE_LEN + _JOINT_ANGLE_FEATURE_LEN):
             # Legacy schema 4: landmarks + spacing + extension + joints (81 floats).
@@ -200,6 +268,13 @@ class GestureSample:
             feats = (list(feats)
                      + _derive_curl_classes(extension)
                      + _derive_spread_class(spacing))
+            feats = _append_v5_features(feats)
+        elif len(feats) == _V4_FEATURE_VECTOR_LEN:
+            # Legacy schema 4 finalised (87 floats — landmarks + spacing
+            # + extension + joints + curl + spread, no v5 direction
+            # features yet). Re-derive v5 from the always-present
+            # landmark region.
+            feats = _append_v5_features(feats)
         return cls(features=feats)
 
 
@@ -222,8 +297,34 @@ class CustomGesture:
     # gestures or user skipped the picker).
     image_filename: str = ""
 
+    # ---- dynamic-gesture fields ----
+    # `kind` discriminates the runtime path:
+    #   "static"  -> samples field holds 1-N feature vectors; matched
+    #                by the existing cosine-similarity classifier
+    #                (custom_gestures/classifier.py).
+    #   "dynamic" -> sample_trajectories holds N (=takes) trajectories
+    #                of the SELECTED key-point landmarks over time;
+    #                matched by DynamicGestureClassifier via DTW.
+    # Default is "static" so any gesture deserialized from a v1 file
+    # (which didn't have this field) behaves identically to before.
+    kind: str = "static"
+    # Dynamic-only: which landmark indices the runtime classifier
+    # should extract from each incoming frame before DTW. Picked by
+    # key_point_selector.select_key_points at gesture-save time.
+    key_point_indices: List[int] = field(default_factory=list)
+    # Dynamic-only: N x (resampled_length, num_key_points, 3) arrays
+    # flattened to nested Python lists for JSON storage. We store
+    # ALL takes (not a centroid) so DTW can match against the
+    # variant that best resembles the user's current attempt.
+    sample_trajectories: List[List[List[List[float]]]] = field(default_factory=list)
+    # Dynamic-only: recording duration policy used when the takes
+    # were captured. Useful for the wizard's "edit gesture" flow so
+    # the user re-records with the same mode by default. One of:
+    # "fixed_short" / "fixed_long" / "until_stopped".
+    duration_mode: str = ""
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "name": self.name,
             "description": self.description,
             "created_at": self.created_at,
@@ -232,11 +333,45 @@ class CustomGesture:
             "action": self.action.to_dict(),
             "samples": [s.to_dict() for s in self.samples],
         }
+        # Only emit the dynamic fields when they're actually populated
+        # so the JSON for static gestures stays unchanged byte-for-byte
+        # (clean diffs + interop with anyone editing the file by hand).
+        if self.kind != "static":
+            out["kind"] = self.kind
+        if self.key_point_indices:
+            out["key_point_indices"] = list(self.key_point_indices)
+        if self.sample_trajectories:
+            out["sample_trajectories"] = self.sample_trajectories
+        if self.duration_mode:
+            out["duration_mode"] = self.duration_mode
+        return out
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "CustomGesture":
         raw_hand = data.get("handedness")
         hand = str(raw_hand) if raw_hand in ("Left", "Right") else None
+        kind = str(data.get("kind", "static") or "static").lower()
+        if kind not in ("static", "dynamic"):
+            kind = "static"
+        # Static gestures must still load their per-frame feature
+        # vectors. Dynamic gestures don't HAVE static samples but the
+        # field is required by the dataclass, so default to empty.
+        if kind == "dynamic":
+            samples = []  # static-pose samples are not used in this kind
+        else:
+            samples = [GestureSample.from_dict(s) for s in data.get("samples", [])]
+        # Defensive coercion on the dynamic fields — a hand-edited
+        # JSON might have nonsense in any of them.
+        raw_kp = data.get("key_point_indices") or []
+        try:
+            key_point_indices = [int(i) for i in raw_kp]
+        except Exception:
+            key_point_indices = []
+        raw_traj = data.get("sample_trajectories") or []
+        # We accept it as-is and rely on the runtime template builder
+        # to validate shape (the registry doesn't own numpy import).
+        sample_trajectories = list(raw_traj)
+        duration_mode = str(data.get("duration_mode", "") or "")
         return cls(
             name=str(data["name"]),
             description=str(data.get("description", "")),
@@ -244,7 +379,11 @@ class CustomGesture:
             handedness=hand,
             image_filename=str(data.get("image_filename", "") or ""),
             action=Action.from_dict(data.get("action") or {}),
-            samples=[GestureSample.from_dict(s) for s in data.get("samples", [])],
+            samples=samples,
+            kind=kind,
+            key_point_indices=key_point_indices,
+            sample_trajectories=sample_trajectories,
+            duration_mode=duration_mode,
         )
 
 
@@ -334,6 +473,67 @@ class GestureRegistry:
                 description=description,
                 handedness=handedness,
                 image_filename=str(image_filename or ""),
+            )
+            self._gestures[name] = gesture
+        return gesture
+
+    def add_dynamic(
+        self,
+        name: str,
+        key_point_indices: List[int],
+        sample_trajectories,  # numpy arrays or nested lists
+        action: Action,
+        *,
+        description: str = "",
+        overwrite: bool = False,
+        handedness: Optional[str] = None,
+        image_filename: str = "",
+        duration_mode: str = "",
+    ) -> CustomGesture:
+        """Register a dynamic gesture. `sample_trajectories` is an
+        iterable of arrays/lists with shape (resampled_length,
+        num_key_points, 3). We coerce each to nested lists for JSON
+        serialization so callers can pass numpy arrays directly from
+        the recorder."""
+        if not self._loaded:
+            self.load()
+        name = name.strip()
+        if not name:
+            raise ValueError("gesture name must be non-empty")
+        if not key_point_indices:
+            raise ValueError("dynamic gesture must have at least one key point")
+        if not sample_trajectories:
+            raise ValueError("dynamic gesture must have at least one sample trajectory")
+        if handedness is not None and handedness not in ("Left", "Right"):
+            raise ValueError(
+                f"handedness must be 'Left', 'Right', or None — got {handedness!r}"
+            )
+        # Coerce numpy arrays → nested lists for JSON. tolist() is
+        # the only numpy thing we touch here, gracefully falls back
+        # for already-list inputs.
+        serialized: List[List[List[List[float]]]] = []
+        for traj in sample_trajectories:
+            if hasattr(traj, "tolist"):
+                serialized.append(traj.tolist())
+            else:
+                serialized.append([[[float(v) for v in coord] for coord in frame] for frame in traj])
+        with self._lock:
+            if name in self._gestures and not overwrite:
+                raise ValueError(
+                    f"gesture {name!r} already exists (pass overwrite=True to replace)"
+                )
+            gesture = CustomGesture(
+                name=name,
+                samples=[],
+                action=action,
+                created_at=_utc_now_iso(),
+                description=description,
+                handedness=handedness,
+                image_filename=str(image_filename or ""),
+                kind="dynamic",
+                key_point_indices=[int(i) for i in key_point_indices],
+                sample_trajectories=serialized,
+                duration_mode=str(duration_mode or ""),
             )
             self._gestures[name] = gesture
         return gesture

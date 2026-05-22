@@ -32,7 +32,7 @@ class ThreadedCvCapture:
     """Async wrapper for cv2.VideoCapture. Drops blocking-read latency
     from main thread. Same API surface the engine consumes."""
 
-    def __init__(self, inner: cv2.VideoCapture) -> None:
+    def __init__(self, inner: cv2.VideoCapture, *, warmup_frames: int = 6) -> None:
         self._inner = inner
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
@@ -45,6 +45,18 @@ class ThreadedCvCapture:
         self._read_error = False
         self._closed = False
         self._reader_thread: Optional[threading.Thread] = None
+        # Drop this many OK frames at the start of the reader loop
+        # before publishing any to consumers. Replaces the previous
+        # synchronous `warmup_capture(cap)` that ran on the main
+        # thread before the reader started — that approach blocked
+        # the UI for up to ~2 s during camera open AND used a
+        # brightness heuristic that misclassified corrupted-decode
+        # frames (random noise can read as bright) and dim-room
+        # frames (clean output can read as dark) in opposite ways.
+        # Doing the discard here is non-blocking (the UI is free
+        # while these frames pass through the reader thread) and
+        # works on every camera regardless of lighting.
+        self._warmup_remaining = max(0, int(warmup_frames))
         if self._inner.isOpened():
             self._reader_thread = threading.Thread(
                 target=self._reader_loop,
@@ -55,6 +67,19 @@ class ThreadedCvCapture:
 
     def _reader_loop(self) -> None:
         consecutive_failures = 0
+        # Tolerance window for transient cap.read() failures before we
+        # mark the capture as dead. The previous 30 (~150 ms at the
+        # 5 ms inter-attempt sleep below) was too tight: many USB
+        # webcams go through a SECOND warm-up phase after their first
+        # ok frame (auto-exposure + white balance settling) where
+        # cap.read() returns ok=False for 200-800 ms. Hitting the old
+        # ceiling during that window made isOpened() report False
+        # permanently — which silently broke the engine's `_tick`
+        # (no frames ever emitted, "Press START" placeholder
+        # persists). 300 ≈ 1.5 s, generous enough to cover any
+        # reasonable camera stall and still bound truly dead
+        # captures (unplugged USB, app stole the device) within ~2 s.
+        FAILURE_TOLERANCE = 300
         while not self._stop_event.is_set():
             try:
                 ok, frame = self._inner.read()
@@ -66,7 +91,7 @@ class ThreadedCvCapture:
                 return
             if not ok or frame is None:
                 consecutive_failures += 1
-                if consecutive_failures >= 30:
+                if consecutive_failures >= FAILURE_TOLERANCE:
                     self._read_error = True
                     self._fresh_frame_event.set()
                     return
@@ -75,6 +100,21 @@ class ThreadedCvCapture:
                 time.sleep(0.005)
                 continue
             consecutive_failures = 0
+            # Initial warm-up discard. Many USB / virtual cameras emit
+            # the first few decoded frames in a partial / mostly-black
+            # state (the symptom was "tutorial shows black with pixel
+            # artifacts on first open"). We discard a fixed prefix here
+            # rather than gating on brightness, because brightness-
+            # based gates misclassify in both directions: corrupted
+            # frames with random noise can read as bright (passed
+            # through), and clean frames in a dim room can read as
+            # dark (incorrectly drained). Discarding ~6 frames burns
+            # ~200 ms of natural camera time, which is invisible to
+            # the user (the placeholder text simply transitions to
+            # the live feed slightly later).
+            if self._warmup_remaining > 0:
+                self._warmup_remaining -= 1
+                continue
             decoded_at = time.monotonic()
             with self._frame_lock:
                 self._latest_frame = frame

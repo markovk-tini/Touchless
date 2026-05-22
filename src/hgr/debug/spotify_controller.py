@@ -965,15 +965,44 @@ class SpotifyController:
 
         On success, writes the resulting access + refresh tokens to
         the user's token file (`auth_token.json`) so subsequent
-        launches skip the dance until the refresh token expires."""
+        launches skip the dance until the refresh token expires.
+
+        Port-fallback: tries the requested port first, then
+        5001..5004 if that one is already in use (Discord, OBS, dev
+        servers, IIS, etc. commonly grab 5000). Each fallback port
+        needs to be a registered redirect URI in the Spotify
+        Developer Dashboard.
+
+        Errors are logged to stderr with [spotify-auth] prefix so a
+        user / tester running from a terminal can diagnose. Surfaces
+        Spotify-specific error codes verbatim (user_not_listed,
+        invalid_redirect_uri, etc.)."""
+        import sys as _sys
+        def _log(msg: str) -> None:
+            try:
+                _sys.stderr.write(f"[spotify-auth] {msg}\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
+
         if not self._client_id:
             self._message = "spotify client id not configured"
+            _log("FAIL: client_id missing (env var or embedded default both unset)")
             return False
         import http.server
         import socketserver
         import threading
         import webbrowser
 
+        _log(f"starting PKCE flow with client_id={self._client_id[:8]}…")
+        # Determine redirect URI + port list to try. If the caller
+        # passed an explicit redirect_uri via .env, honour it exactly
+        # (no port fallback — they're telling us they registered that
+        # specific URI). Otherwise try a small range of localhost
+        # ports so a busy 5000 (Discord RPC, OBS dock, dev server)
+        # doesn't completely break OAuth for the user.
+        fallback_ports = [port, 5001, 5002, 5003, 5004]
+        explicit_redirect = bool(self._redirect_uri)
         redirect_uri = self._redirect_uri or f"http://127.0.0.1:{port}/callback"
         state = secrets.token_urlsafe(16)
         # PKCE: generate a high-entropy code_verifier (43-128 chars,
@@ -1023,24 +1052,84 @@ class SpotifyController:
                 self_inner.wfile.write(body.encode("utf-8"))
                 done.set()
 
-        try:
-            host = urllib_parse.urlparse(redirect_uri).hostname or "127.0.0.1"
-            httpd = socketserver.TCPServer((host, port), _Handler)
-        except OSError as exc:
-            self._message = f"spotify auth port busy: {exc}"
+        # Bind the local callback server. With explicit_redirect we
+        # only try the one configured port; otherwise walk the
+        # fallback list. Each attempt logs its outcome so a tester
+        # can see WHICH port worked / which were busy.
+        host = urllib_parse.urlparse(redirect_uri).hostname or "127.0.0.1"
+        httpd = None
+        bound_port = None
+        ports_to_try = [port] if explicit_redirect else fallback_ports
+        for candidate_port in ports_to_try:
+            try:
+                httpd = socketserver.TCPServer((host, candidate_port), _Handler)
+                bound_port = candidate_port
+                _log(f"callback server bound to {host}:{candidate_port}")
+                break
+            except OSError as exc:
+                _log(f"port {candidate_port} busy ({exc}); trying next")
+                continue
+            except Exception as exc:
+                _log(f"port {candidate_port} failed ({exc}); trying next")
+                continue
+        if httpd is None or bound_port is None:
+            tried = ", ".join(str(p) for p in ports_to_try)
+            self._message = (
+                f"spotify auth: no callback port available (tried {tried}). "
+                "Close apps using these ports (Discord, OBS, dev servers) and "
+                "try again."
+            )
+            _log(f"FAIL: every candidate port busy ({tried})")
             return False
+        # Rebuild the auth URL with whichever port actually bound.
+        # The Spotify Dev Dashboard must list ALL fallback URIs as
+        # registered redirect URIs (5000..5004) or Spotify rejects
+        # the authorize call with invalid_redirect_uri.
+        if not explicit_redirect and bound_port != port:
+            redirect_uri = f"http://127.0.0.1:{bound_port}/callback"
+            auth_params["redirect_uri"] = redirect_uri
+            auth_url = f"{SPOTIFY_AUTH_URL}?{urllib_parse.urlencode(auth_params)}"
+            _log(f"using fallback redirect_uri={redirect_uri}")
 
         server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         server_thread.start()
         try:
-            webbrowser.open(auth_url)
+            _log("opening Spotify authorize URL in default browser")
+            opened = webbrowser.open(auth_url)
+            if not opened:
+                _log("WARNING: webbrowser.open returned False — browser may not have launched")
             done.wait(timeout=timeout_seconds)
         finally:
             httpd.shutdown()
             httpd.server_close()
 
         if result.get("error") or not result.get("code"):
-            self._message = f"spotify auth failed: {result.get('error') or 'no code'}"
+            err = result.get("error") or "no code (timed out or browser closed)"
+            # Map common Spotify error codes to actionable guidance.
+            guidance = ""
+            if err == "access_denied":
+                guidance = " — user clicked Cancel / Don't Allow in the browser."
+            elif err == "invalid_redirect_uri":
+                guidance = (
+                    " — the redirect URI isn't registered in the Spotify "
+                    "Developer Dashboard. Open your app at developer.spotify.com, "
+                    "go to Edit Settings → Redirect URIs, and add "
+                    f"{redirect_uri}."
+                )
+            elif err == "invalid_client":
+                guidance = " — the embedded client_id is wrong or has been deleted in the Spotify Dashboard."
+            elif err == "user_not_listed" or err == "user_not_registered":
+                guidance = (
+                    " — your Spotify app is still in Development Mode and "
+                    "this user isn't on the allow-list. Either add them at "
+                    "developer.spotify.com → app → Users and Access, or "
+                    "submit your app for Extended Quota Mode review to "
+                    "lift the 25-user cap."
+                )
+            elif err == "state mismatch":
+                guidance = " — possible CSRF / browser-cache issue; clear cookies for accounts.spotify.com and try again."
+            self._message = f"spotify auth failed: {err}{guidance}"
+            _log(f"FAIL: {self._message}")
             return False
 
         # PKCE token exchange: send client_id + code_verifier in the
@@ -1063,14 +1152,42 @@ class SpotifyController:
             method="POST",
         )
         try:
+            _log("exchanging authorization code for access token (PKCE)")
             with urllib_request.urlopen(request, timeout=self._request_timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
+            _log("token exchange OK — received access + refresh tokens")
         except urllib_error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")
-            self._message = f"spotify token exchange failed ({exc.code}): {body[:200]}"
+            # Parse Spotify's JSON error so we can surface the
+            # specific code (invalid_grant, unauthorized_client, etc.)
+            # in a user-friendly way.
+            err_code = ""
+            err_desc = ""
+            try:
+                parsed = json.loads(body)
+                err_code = str(parsed.get("error") or "")
+                err_desc = str(parsed.get("error_description") or "")
+            except Exception:
+                pass
+            guidance = ""
+            if err_code == "invalid_grant":
+                guidance = " — authorization code expired or already used. Try connecting again."
+            elif err_code == "invalid_client":
+                guidance = " — client_id rejected by Spotify (deleted from dashboard? Wrong account?)."
+            elif err_code == "unauthorized_client":
+                guidance = (
+                    " — your Spotify Dev app isn't authorised for this grant "
+                    "type. Check the app's settings at developer.spotify.com."
+                )
+            elif exc.code == 429:
+                guidance = " — rate-limited by Spotify. Wait a minute and try again."
+            human = err_desc or body[:200] or str(exc)
+            self._message = f"spotify token exchange failed ({exc.code}): {human}{guidance}"
+            _log(f"FAIL: HTTPError {exc.code}: code={err_code!r} desc={err_desc!r}")
             return False
         except Exception as exc:
             self._message = f"spotify token exchange failed: {exc}"
+            _log(f"FAIL: exception during token exchange: {exc}")
             return False
 
         self._access_token = payload.get("access_token")
@@ -1079,10 +1196,40 @@ class SpotifyController:
             self._refresh_token = refresh
         self._token_issue_time = time.time()
         if self._token_path is None:
-            self._token_path = self._token_paths[0]
+            # Save to the persistent per-user path
+            # (~/Documents/Touchless/auth_token.json) rather than the
+            # install-directory default. The install dir is wiped on
+            # every auto-update, which would force every shipped user
+            # to re-authorise Spotify after every release. The
+            # Documents folder survives updates AND is per Windows
+            # user (different users on the same machine get separate
+            # tokens). _resolve_persistent_token_path picks that path,
+            # creating the directory if needed.
+            self._token_path = self._resolve_persistent_token_path()
         self._save_tokens()
+        _log(f"tokens saved to {self._token_path}")
         self._message = "spotify authorized with full scopes"
+        _log("SUCCESS: spotify authorized with full scopes")
         return bool(self._access_token)
+
+    def _resolve_persistent_token_path(self) -> Path:
+        """Return the per-user, update-survival path Spotify tokens
+        should be written to. Always ~/Documents/Touchless/
+        auth_token.json on Windows; the parent directory is
+        created on demand so the very-first OAuth on a fresh
+        install doesn't fail just because Documents/Touchless/
+        doesn't exist yet."""
+        home = Path.home()
+        target = home / "Documents" / "Touchless" / "auth_token.json"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # If we can't create the per-user folder for any reason
+            # (locked-down corporate environment, etc.) fall back to
+            # the legacy install-dir path. The user might lose tokens
+            # on update but at least the OAuth flow completes.
+            return self._token_paths[0]
+        return target
 
     def _default_token_paths(self) -> tuple[Path, ...]:
         home = Path.home()
@@ -1154,17 +1301,35 @@ class SpotifyController:
     def _load_credentials(self) -> None:
         """Resolve client_id + redirect_uri for the Spotify OAuth
         flow. Resolution order:
-          1. Env vars (TOUCHLESS_SPOTIFY_CLIENT_ID / CLIENT_ID).
-          2. First .env file in `_env_paths` that defines CLIENT_ID.
-          3. Embedded defaults (`_DEFAULT_SPOTIFY_CLIENT_ID`) — this
-             is what shipped builds use. The client_id is public per
-             Spotify's documentation; no secret is required because
-             the auth flow is PKCE.
+          1. Per-user setting (config.spotify_client_id) set via the
+             in-app Spotify setup wizard. This is the ONLY path that
+             scales past Spotify's 5-user cap on shared dev apps —
+             each user runs against their own Spotify Dev app, so
+             the cap is per-Touchless-user instead of per-installation.
+          2. Env vars (TOUCHLESS_SPOTIFY_CLIENT_ID / CLIENT_ID).
+          3. First .env file in `_env_paths` that defines CLIENT_ID.
+          4. Embedded defaults (`_DEFAULT_SPOTIFY_CLIENT_ID`) — this
+             is what shipped builds use for the first 5 testers per
+             release. After 5 unique Spotify users have authorised,
+             Spotify rejects further connections with `user_not_listed`
+             unless the user supplies their own client_id (path 1).
 
         client_secret is loaded for backwards compatibility (legacy
         non-PKCE refresh tokens from older Touchless installs can
         still be refreshed using the secret path) but is NOT
         required for new auth flows."""
+        # Path 1: per-user client_id from in-app setup wizard.
+        try:
+            from ..config.app_config import load_config as _load_config
+            user_cfg = _load_config()
+            user_client_id = str(getattr(user_cfg, "spotify_client_id", "") or "").strip()
+        except Exception:
+            user_client_id = ""
+        if user_client_id:
+            self._client_id = user_client_id
+            self._client_secret = None
+            self._redirect_uri = _DEFAULT_SPOTIFY_REDIRECT_URI
+            return
         env_client_id = (
             os.getenv("TOUCHLESS_SPOTIFY_CLIENT_ID")
             or os.getenv("CLIENT_ID")
@@ -1210,7 +1375,42 @@ class SpotifyController:
             self._refresh_token = refresh_token
             issue_time = data.get("issue_time")
             self._token_issue_time = float(issue_time) if isinstance(issue_time, (int, float)) else None
+            # Fresh tokens loaded — clear the 'needs reauth' latch in
+            # case it was set by a prior dead refresh token. Otherwise
+            # the toast keeps nagging the user to reconnect even though
+            # their tokens are now valid.
+            self._needs_reauth = False
             return
+
+    def reload_tokens(self) -> bool:
+        """Force-reload tokens from disk into this controller, blowing
+        away whatever was in memory. Called after the OAuth flow when
+        the controller doing the authorization is a DIFFERENT instance
+        than the engine's running controller (race: user clicks
+        Connect while the engine's controller is mid-init, or auth
+        happens via a one-shot SpotifyController spawned before the
+        engine started). Returns True if a token file was found and
+        loaded, False otherwise.
+
+        Also resets the cached device id so the next ensure_ready
+        re-resolves the active device against the freshly authorised
+        account (covers the case where the controller had a device
+        cached against an older / wrong user)."""
+        # Snapshot prior state so we can tell if the reload actually
+        # changed anything (for diagnostic logging).
+        before = (self._access_token, self._refresh_token)
+        self._access_token = None
+        self._refresh_token = None
+        self._token_issue_time = None
+        self._token_path = None
+        self._device_id = None
+        self._device_name = None
+        self._needs_reauth = False
+        self._load_tokens()
+        loaded = bool(self._access_token) or bool(self._refresh_token)
+        if loaded and before != (self._access_token, self._refresh_token):
+            self._message = "spotify tokens reloaded"
+        return loaded
 
     def _save_tokens(self) -> None:
         if self._token_path is None:

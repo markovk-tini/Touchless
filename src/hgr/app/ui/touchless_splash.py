@@ -241,37 +241,73 @@ class TouchlessSplash(QWidget):
 
     @staticmethod
     def run_with(callback_build_window, accent_color: str, app) -> QWidget:
-        """Show splash, play the reveal, pre-render the main window
-        off-screen while the splash is visible, then close the splash and
-        show the main window. Pre-rendering off-screen means the main window
-        never flashes a hollow frame on its first paint."""
+        """Show splash, play the reveal, then build + map the main window
+        fully transparent so its first paint cycle is invisible, close the
+        splash, and reveal the main window at full opacity. Mapping it
+        transparent (rather than the old off-screen WA_DontShowOnScreen
+        toggle) avoids the hollow framed-white flash that toggle leaked on
+        Windows."""
         splash = TouchlessSplash(accent_color)
+        # Kill the startup flash: a Qt.Tool translucent window's FIRST
+        # mapped frame briefly appears at the default top-left corner —
+        # a small blank box — before the move-to-center, the glyph mask,
+        # and the DWM non-client tweaks take effect. That corner flash
+        # was the "little window that pops up right before the logo".
+        #
+        # Two-part guard:
+        #   1. Park the window far off-screen for the initial map so the
+        #      raw first frame is painted where nobody can see it.
+        #      (setWindowOpacity(0) BEFORE show() doesn't help — there's
+        #      no native HWND yet, so the layered-alpha call is a no-op
+        #      and the first frame still shows at full opacity.)
+        #   2. Hold opacity at 0 too, then after the window is mapped +
+        #      masked (showEvent has fired, DWM tweaks applied), move it
+        #      to center and reveal. Moving an already-mapped window
+        #      doesn't flash. The per-letter content starts at 0 opacity,
+        #      so revealing shows nothing until the animation begins.
+        splash.move(-10000, -10000)
+        splash.setWindowOpacity(0.0)
         splash.show()
         splash.raise_()
         for _ in range(4):
             app.processEvents()
+        splash._center_on_screen()
+        splash.setWindowOpacity(1.0)
 
         splash.start_animation()
         while not splash.is_finished():
             app.processEvents()
 
-        # Build the main window but render it off-screen so its first paint
-        # cycle happens without ever appearing to the user. When we then
-        # call show() after closing the splash, the window already has its
-        # content ready and doesn't flash any intermediate frame.
+        # Build the main window, then map it FULLY TRANSPARENT for its
+        # first paint so the user never sees the hollow framed white box
+        # that flashes on a frameless window's first show.
+        #
+        # The previous approach toggled WA_DontShowOnScreen around an
+        # off-screen show()/hide(). On Windows that leaks: the platform
+        # plugin briefly maps a small default-framed window before the
+        # frameless hint + real geometry apply — that was the little
+        # white "Touchless" window popping up at launch.
+        #
+        # Instead: poke winId() to force native-handle creation, set
+        # opacity to 0 on that real HWND (setWindowOpacity is a no-op
+        # before the handle exists), then show(). The window maps
+        # invisibly, paints its real content during the processEvents
+        # below, and only after the splash closes do we reveal it at
+        # full opacity. Position is left untouched, so saved/centered
+        # geometry is preserved.
         window = callback_build_window()
-        window.setAttribute(Qt.WA_DontShowOnScreen, True)
+        window.setWindowOpacity(0.0)
+        window.winId()  # force native window creation so opacity applies
+        window.setWindowOpacity(0.0)
         window.show()
         for _ in range(6):
             app.processEvents()
-        window.hide()
-        window.setAttribute(Qt.WA_DontShowOnScreen, False)
 
         splash.close()
         for _ in range(2):
             app.processEvents()
 
-        window.show()
+        window.setWindowOpacity(1.0)
         window.raise_()
         return window
 

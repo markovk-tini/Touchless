@@ -27,19 +27,44 @@ class VoiceCommandResult:
 
 
 def list_input_microphones() -> list[str]:
-    """Return readable names for available input-capable microphone devices."""
+    """Return readable names for available input-capable microphone devices.
+
+    On Windows, sounddevice/PortAudio enumerates every device under
+    EACH host API (MME / DirectSound / WASAPI / WDM-KS), so a single
+    physical mic shows up 4× — sometimes with slightly different
+    name suffixes that the dedup-by-name step missed. The user
+    reported "I have 3 real mics in Windows settings but the
+    Touchless dropdown shows 8+ entries". Fix: restrict the listing
+    to WASAPI on Windows because that's the host API the Windows
+    Sound control panel uses, so the dropdown matches what the user
+    sees there. Other platforms fall back to the previous all-API
+    listing (where the duplicate-host-API problem doesn't exist).
+    """
     try:
         import sounddevice as sd
     except Exception:
         return []
 
-    names: list[str] = []
-    seen: set[str] = set()
     try:
         devices = sd.query_devices()
     except Exception:
         return []
 
+    # Identify the WASAPI host-api index on Windows. On other
+    # platforms we leave wasapi_index=None and the filter no-ops.
+    wasapi_index: int | None = None
+    try:
+        if platform.system() == "Windows":
+            for idx, host in enumerate(sd.query_hostapis()):
+                host_name = str(host.get("name", "") or "").strip().lower()
+                if host_name == "windows wasapi":
+                    wasapi_index = idx
+                    break
+    except Exception:
+        wasapi_index = None
+
+    names: list[str] = []
+    seen: set[str] = set()
     for device in devices:
         try:
             max_inputs = int(device.get("max_input_channels", 0) or 0)
@@ -47,11 +72,40 @@ def list_input_microphones() -> list[str]:
             max_inputs = 0
         if max_inputs <= 0:
             continue
+        # On Windows, only accept devices exposed through WASAPI.
+        # That's the host API the Windows Sound control panel +
+        # modern apps use; restricting to it eliminates the 3-4×
+        # duplication caused by the legacy MME / DirectSound /
+        # WDM-KS exposures of the same physical hardware.
+        if wasapi_index is not None:
+            try:
+                if int(device.get("hostapi", -1)) != wasapi_index:
+                    continue
+            except Exception:
+                continue
         name = str(device.get("name", "") or "").strip()
         if not name or name in seen:
             continue
         seen.add(name)
         names.append(name)
+    # Defensive fallback: if the WASAPI filter eliminated every
+    # device (e.g. PortAudio compiled without WASAPI support on
+    # this user's setup), fall back to the legacy unfiltered list
+    # so the dropdown isn't empty — better to show duplicates than
+    # to lock the user out of mic selection entirely.
+    if not names and wasapi_index is not None:
+        for device in devices:
+            try:
+                max_inputs = int(device.get("max_input_channels", 0) or 0)
+            except Exception:
+                max_inputs = 0
+            if max_inputs <= 0:
+                continue
+            name = str(device.get("name", "") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
     return names
 
 
@@ -478,6 +532,32 @@ class VoiceCommandListener:
         peak = float(np.max(np.abs(audio))) if audio.size else 0.0
         if peak <= 0.0025:
             return None
+        # Detect input clipping (max RMS seen > 0.9 strongly suggests
+        # the device is clipping mid-capture, which whisper turns
+        # into garbled or empty transcripts — a common failure mode
+        # for headset mics with their own preamp set too high).
+        # Log a one-line warning so the user / dev can see it in the
+        # detailed log without changing app behaviour.
+        if max_rms_seen >= 0.85 or peak >= 0.995:
+            import sys as _sys
+            print(
+                f"[voice] WARNING input likely clipping (max_rms={max_rms_seen:.3f} "
+                f"peak={peak:.3f}). Headset mics with high gain can produce distorted "
+                f"audio that whisper can't transcribe; lower the device's input volume "
+                f"in Windows Sound Settings OR drop Touchless 'Mic input gain' below 1.0.",
+                file=_sys.stderr,
+                flush=True,
+            )
+        # Pre-normalize-peak gain reduction when severe clipping is
+        # detected: scale down by 0.7 BEFORE peak-normalise. This
+        # gives whisper a less-distorted (but quieter) signal which
+        # is usually still transcribable, instead of a peak-loud but
+        # clipped one which usually isn't.
+        if max_rms_seen >= 0.95:
+            audio = audio * 0.7
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            if peak <= 0.0025:
+                return None
         target_peak = 0.95
         if peak > 0.0:
             audio = audio * (target_peak / peak)

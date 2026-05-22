@@ -136,6 +136,10 @@ class CustomGesturesPanel(QWidget):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
+        # Default Preferred sizePolicy so the widget reports its
+        # natural content sizeHint to the outer settingsContentScroll,
+        # which engages when sizeHint > viewport (same as Save
+        # Locations).
         self._config = config
         self._accent_color = accent_color
         self._registry_path_provider = registry_path_provider
@@ -143,38 +147,77 @@ class CustomGesturesPanel(QWidget):
         self._registry = GestureRegistry()
         self._cards: List["GestureCard"] = []
 
-        # Outer layout: just hosts the page-level scroll area.
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        page_scroll = QScrollArea()
-        page_scroll.setWidgetResizable(True)
-        page_scroll.setFrameShape(QFrame.NoFrame)
-        page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        page_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        page_scroll.setStyleSheet(_SCROLLBAR_STYLE.format(accent=self._accent_color))
-        # CSS-only `qt_scrollarea_viewport` targeting wasn't beating the
-        # OS default background on Win 11 — set the viewport's bg
-        # explicitly via API so it actually takes effect.
-        page_scroll.viewport().setStyleSheet("background: transparent;")
-        outer.addWidget(page_scroll)
-
-        inner = QWidget()
-        inner.setStyleSheet("background: transparent;")
-        page_scroll.setWidget(inner)
-        root = QVBoxLayout(inner)
-        # Right padding leaves space for the scrollbar.
-        root.setContentsMargins(0, 0, 8, 0)
+        # Direct layout — NO inner page_scroll. The outer
+        # settingsContentScroll (wraps the whole settings page)
+        # handles overflow. This mirrors the Save Locations panel
+        # architecture which the user confirmed has the layout they
+        # want: one green scrollbar at the page level, content sizes
+        # naturally.
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
         root.addWidget(self._build_how_it_works_card())
         root.addWidget(self._build_actions_card())
         self._cards_card = self._build_cards_card()
+        # Preferred vertical — sizes to its content. No stretch needed
+        # because there's no scroll viewport to fill; the outer scroll
+        # handles the page.
+        self._cards_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         root.addWidget(self._cards_card)
-        root.addStretch(1)
 
         self.refresh_cards()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        # Install an event filter on every descendant so wheel events
+        # are forwarded to the enclosing outer settingsContentScroll —
+        # by default Qt only auto-scrolls when the wheel event reaches
+        # the QScrollArea, but some descendants (especially QFrames
+        # with WA_StyledBackground) end up consuming wheel events
+        # silently. We catch them and re-send to the outer scroll.
+        self._install_wheel_forwarder()
+
+    def _install_wheel_forwarder(self) -> None:
+        try:
+            if getattr(self, "_wheel_forwarder_installed", False):
+                return
+            self.installEventFilter(self)
+            for child in self.findChildren(QWidget):
+                try:
+                    child.installEventFilter(self)
+                except Exception:
+                    pass
+            self._wheel_forwarder_installed = True
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        try:
+            from PySide6.QtCore import QEvent
+            if event.type() == QEvent.Wheel:
+                # Directly manipulate the outer scrollbar — sendEvent
+                # to viewport wasn't propagating through some Qt
+                # internal handling. setValue is the authoritative API.
+                from PySide6.QtWidgets import QScrollArea
+                walker = self.parent()
+                for _ in range(8):
+                    if walker is None:
+                        break
+                    if isinstance(walker, QScrollArea):
+                        sb = walker.verticalScrollBar()
+                        if sb is not None and sb.maximum() > 0:
+                            # angleDelta().y() is 120 per "click" of
+                            # the wheel; * 0.5 gives ~60 px per click,
+                            # roughly matching Qt's default 3-line step.
+                            delta = event.angleDelta().y()
+                            new_val = sb.value() - int(delta * 0.5)
+                            sb.setValue(max(0, min(sb.maximum(), new_val)))
+                            return True
+                    walker = walker.parent()
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
 
     # --- card builders ---------------------------------------------------
 
@@ -311,26 +354,16 @@ class CustomGesturesPanel(QWidget):
         self._empty_label.setWordWrap(True)
         self._cards_layout.addWidget(self._empty_label)
 
-        # Inner scroll area so a long list of gestures stays bounded
-        # rather than pushing every other card off-screen.
-        cards_scroll = QScrollArea()
-        cards_scroll.setWidgetResizable(True)
-        cards_scroll.setFrameShape(QFrame.NoFrame)
-        cards_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        cards_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        cards_scroll.setStyleSheet(_SCROLLBAR_STYLE.format(accent=self._accent_color))
-        cards_scroll.viewport().setStyleSheet("background: transparent;")
-        cards_scroll.setMinimumHeight(220)
-        cards_scroll.setMaximumHeight(420)
-
+        # Cards stack directly in cards_card. The outer page_scroll
+        # in CustomGesturesPanel.__init__ provides the single
+        # scrollbar for the whole page.
         self._cards_container = QWidget()
         self._cards_container.setStyleSheet("background: transparent;")
         self._cards_container_layout = QVBoxLayout(self._cards_container)
-        self._cards_container_layout.setContentsMargins(0, 0, 8, 0)
+        self._cards_container_layout.setContentsMargins(0, 0, 0, 0)
         self._cards_container_layout.setSpacing(8)
         self._cards_container_layout.addStretch(1)
-        cards_scroll.setWidget(self._cards_container)
-        self._cards_layout.addWidget(cards_scroll)
+        self._cards_layout.addWidget(self._cards_container, 1)
         return box
 
     # --- public API ------------------------------------------------------
@@ -389,19 +422,35 @@ class CustomGesturesPanel(QWidget):
             self._cards.append(card)
             self._cards_container_layout.insertWidget(insert_index, card)
             insert_index += 1
+        # Newly created gesture cards aren't covered by the wheel
+        # forwarder yet — reinstall so wheel events anywhere on them
+        # (and their internal QPushButton / QLabel children) get
+        # forwarded to the outer settings scroll.
+        try:
+            for child in self.findChildren(QWidget):
+                child.removeEventFilter(self)
+                child.installEventFilter(self)
+        except Exception:
+            pass
 
     def _on_edit_gesture(self, name: str) -> None:
         self.open_edit_requested.emit(name)
 
     def _on_delete_gesture(self, name: str) -> None:
-        confirm = QMessageBox.question(
+        # TouchlessNotice.show_confirm renders the dialog with the
+        # app's themed title bar + surface color background, matching
+        # the rest of Touchless instead of the OS-native QMessageBox.
+        # Lazy import keeps the panel module independent of main_window
+        # at import time (main_window already imports this panel).
+        from .main_window import TouchlessNotice
+        confirmed = TouchlessNotice.show_confirm(
             self,
             "Delete gesture",
             f"Delete custom gesture '{name}'? This cannot be undone.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            confirm_label="Delete",
+            cancel_label="Cancel",
         )
-        if confirm != QMessageBox.Yes:
+        if not confirmed:
             return
         self._registry.load()
         self._registry.remove(name)
@@ -609,8 +658,11 @@ class GestureCard(QFrame):
         self._expanded_thumb_label.setVisible(self._expanded)
 
     def _refresh_expanded_thumbnail(self) -> None:
-        """Load the user-picked thumbnail into the expanded slot. Falls
-        back to a friendly placeholder when the gesture has no image."""
+        """Load the user-picked thumbnail (or animated motion clip)
+        into the expanded slot. Falls back to a friendly placeholder
+        when the gesture has no image. Animated GIFs (saved by the
+        dynamic-gesture flow) are played via QMovie so the card shows
+        the recorded motion instead of a frozen frame."""
         try:
             from hgr.custom_gestures.registry import GestureRegistry
             registry = GestureRegistry()
@@ -618,8 +670,27 @@ class GestureCard(QFrame):
             path = registry.thumbnail_path(self._gesture)
         except Exception:
             path = None
+        # Stop any previous QMovie so switching gestures doesn't leak
+        # animations.
+        prev_movie = getattr(self, "_expanded_thumb_movie", None)
+        if prev_movie is not None:
+            try:
+                prev_movie.stop()
+            except Exception:
+                pass
+            self._expanded_thumb_movie = None
         if path is not None:
-            pix = QPixmap(str(path))
+            spath = str(path)
+            if spath.lower().endswith(".gif"):
+                from PySide6.QtGui import QMovie
+                from PySide6.QtCore import QSize
+                movie = QMovie(spath)
+                movie.setScaledSize(QSize(224, 164))
+                self._expanded_thumb_label.setMovie(movie)
+                movie.start()
+                self._expanded_thumb_movie = movie
+                return
+            pix = QPixmap(spath)
             if not pix.isNull():
                 # Subtract the label's CSS padding (8px each side) so
                 # the scaled pixmap doesn't render past the rounded

@@ -259,15 +259,8 @@ class Updater(QObject):
         #                touch system DLLs)
         params = "/SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /NORESTART"
         try:
-            # ShellExecuteW with verb 'runas' triggers UAC if the
-            # install dir requires admin (legacy Program Files
-            # installs). New per-user installs under LocalAppData
-            # don't need elevation, but we use 'runas' anyway so
-            # mixed-environment users get prompted only when
-            # actually necessary — Windows skips the UAC prompt
-            # if the target binary's manifest doesn't require it.
             ret = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", installer_path, params, None, 1
+                None, "open", installer_path, params, None, 1
             )
             if ret <= 32:
                 return False

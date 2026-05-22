@@ -28,8 +28,19 @@ class YouTubeGestureRouter:
     """
 
     _CONSUMABLE_DYNAMIC = {"swipe_left", "swipe_right"}
-    _CONSUMABLE_STATIC = {"fist", "three_apart"}
-    _TOGGLE_LABELS = {"four", "four_together"}
+    # thumb_up / thumb_down drive like / dislike while forced YouTube
+    # mode is active. Plain three is reserved for open_chrome and is
+    # NOT consumed here — skip-ad as a gesture is replaced by the
+    # auto-skip-ads background timer in the Settings dialog. mute /
+    # wheel_pose are intentionally NOT consumed either — they keep
+    # their global handlers (system mute, gesture wheel) so volume
+    # control still works while watching YouTube.
+    _CONSUMABLE_STATIC = {"fist", "thumb_up", "thumb_down"}
+    # Only four_together activates YT mode now — plain "four" is
+    # reserved for the open_touchless action (handled in the engine,
+    # not here). Without this restriction, plain four would race the
+    # YT toggle hold-timer against open_touchless's hold-fire.
+    _TOGGLE_LABELS = {"four_together"}
 
     def __init__(
         self,
@@ -158,6 +169,34 @@ class YouTubeGestureRouter:
         self._control_text = "youtube mode on"
         self._set_action("youtube_mode_on")
 
+    def force_on(self, *, now: float, controller: YouTubeController) -> bool:
+        # Tutorial-only entry. Skips the 'four'-hold timer and flips
+        # straight into forced mode after the user successfully opens
+        # YouTube via the voice-command step. Returns True iff the
+        # tab is still present at activation time (no point forcing
+        # a mode the engine will immediately disable on the next
+        # tick when has_youtube_tab() returns False).
+        if self._forced_mode:
+            return True
+        has_tab = False
+        try:
+            has_tab = bool(controller.has_youtube_tab())
+        except Exception:
+            has_tab = False
+        if not has_tab:
+            return False
+        self._forced_mode = True
+        self._control_text = "youtube mode on"
+        self._info_text = "forced"
+        self._set_action("youtube_mode_on")
+        # Suppress the next user-side toggle so a residual 'four'
+        # pose at activation time doesn't immediately flip it back
+        # off via the regular hold timer.
+        self._toggle_latched = True
+        self._toggle_cooldown_until = now + self.toggle_cooldown_seconds
+        self._toggle_candidate_since = None
+        return True
+
     def _update_static(self, stable_label: str, dynamic_label: str, controller: YouTubeController, now: float) -> None:
         actionable = self._CONSUMABLE_STATIC
         if dynamic_label == "repeat_circle" and stable_label == "one":
@@ -192,10 +231,14 @@ class YouTubeGestureRouter:
             ok = controller.toggle_playback()
             self._control_text = controller.message
             self._set_action("youtube_toggle" if ok else "youtube_toggle_failed")
-        elif stable_label == "three_apart":
-            ok = controller.skip_ad()
+        elif stable_label == "thumb_up":
+            ok = controller.like_video()
             self._control_text = controller.message
-            self._set_action("youtube_skip_ad" if ok else "youtube_skip_ad_failed")
+            self._set_action("youtube_like" if ok else "youtube_like_failed")
+        elif stable_label == "thumb_down":
+            ok = controller.dislike_video()
+            self._control_text = controller.message
+            self._set_action("youtube_dislike" if ok else "youtube_dislike_failed")
 
     def _update_dynamic(self, dynamic_label: str, stable_label: str, controller: YouTubeController, now: float) -> None:
         actionable = self._CONSUMABLE_DYNAMIC

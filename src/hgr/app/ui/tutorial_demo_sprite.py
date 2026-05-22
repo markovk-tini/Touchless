@@ -43,6 +43,16 @@ _STEP_TO_ASSET = {
     # swaps to the live click demo once mouse mode turns on.
     "mouse_clicks": "Mouse Clicks.mp4",
     "mouse_demo":   "Mouse Demo.mp4",
+    # Mouse-mode SCROLL phase (added after click practice succeeds):
+    # the user has to scroll to the top + bottom bars in the
+    # right-side practice arena. The inset clip in the live viewer's
+    # top-right shows the two-finger scroll pose so the user can
+    # mirror the mechanic without leaving the camera view.
+    "tutorial_scrolling": "tutorial_scrolling.mp4",
+    # Volume tutorial: animated VolControl clip for the adjust phase,
+    # static Mute.png for the mute / unmute phase.
+    "volume_pose":  "VolControl.mp4",
+    "mute_pose":    "Mute.png",
 }
 
 

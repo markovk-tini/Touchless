@@ -15,7 +15,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPointF, QPropertyAnimation, QRect, Qt, QThread, QTimer, QEvent, QUrl, Signal
+from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPointF, QPropertyAnimation, QRect, QSize, Qt, QThread, QTimer, QEvent, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPainterPath, QPen, QCursor, QPixmap, QGuiApplication, QImage
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -142,7 +142,9 @@ WALKTHROUGH_PAGE_HINTS = {
     SECTION_INSTRUCTIONS:
         "What Touchless does and the 30-second start.",
     SECTION_GENERAL:
-        "Mouse, overlays, performance, and Connect Spotify all live here.",
+        "Mouse, overlays, performance, and more. "
+        "Connect Spotify premium "
+        "<a href='walkthrough:scroll-to-spotify' style='color: #58E3FF; text-decoration: underline;'>here</a>.",
     SECTION_GESTURES:
         "Every gesture and voice command, with a short demo for each.",
     SECTION_CAMERA:
@@ -634,8 +636,12 @@ class _WalkthroughEdgeGlowOverlay(QWidget):
         if rect.width() <= 0 or rect.height() <= 0:
             return
         depth = self._edge_depth()
-        if depth == self._mask_depth and not self.mask().isEmpty():
-            return
+        # Always recompute. The previous "skip when depth unchanged"
+        # short-circuit kept the OLD mask in place after a resize that
+        # didn't change the clamped depth value — the user would see
+        # the glow stuck along the old window edges while the window
+        # itself had grown / shrunk. Mask computation is cheap; just
+        # do it every time.
         self._mask_depth = depth
         outer = QRegion(rect)
         inner_rect = rect.adjusted(depth, depth, -depth, -depth)
@@ -701,21 +707,32 @@ class _WalkthroughEdgeGlowOverlay(QWidget):
 
 
 class _WalkthroughTargetGlow(QWidget):
-    """Thin accent-color border outline painted around the
-    currently-active walkthrough sidebar tab. Lives as a free-
-    floating child of the settings page so the border can sit
-    past the sidebar's edges without being clipped. Mouse-
-    transparent — the underlying button still receives every click.
+    """Accent-color glow + outline around the currently-active
+    walkthrough sidebar tab. Lives as a free-floating child of the
+    settings page so the halo can sit past the sidebar's edges
+    without being clipped. Mouse-transparent — the underlying
+    button still receives every click.
 
-    Earlier versions painted a soft glowing halo + ran a vertical
-    bounce animation on the target tab as a "click here next!"
-    affordance. The walkthrough now auto-navigates between pages
-    on each Next click, so the indicator's job is just to mark
-    the current page in the sidebar — not to attract attention.
-    A 2 px border in the active-click-green accent reads as
-    'this is where you are' without dominating the panel."""
+    Two behaviours that matter for the user:
 
-    _PADDING = 4  # px around the target on every side
+      * When the sidebar is scrolled and only the bottom half of the
+        target button is in the viewport, the outline must render
+        ONLY the visible portion. The previous version either hid
+        the whole glow (no cue at all) or painted the entire box
+        including the half that lives behind clipped viewport area
+        (a stray box hanging off the scroll edge). Now: painter is
+        clipped to the intersection of the glow rect with the
+        sidebar's QScrollArea viewport, mapped into local coords.
+
+      * The cue is a soft glow halo, not a flat 2 px line. Several
+        outer strokes at increasing widths + decreasing alpha
+        approximate a blurred glow without spending a graphics
+        effect (which would have to bypass our clipping)."""
+
+    # Padding around the button — large enough to hold the halo
+    # strokes. The crisp inner border sits roughly _PADDING in from
+    # the widget's outer edges.
+    _PADDING = 12
     _BORDER_THICK = 2
 
     def __init__(self, parent: QWidget, target_button, accent_color: str):
@@ -729,6 +746,12 @@ class _WalkthroughTargetGlow(QWidget):
             self._accent = QColor("#1DE9B6")
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setStyleSheet("background: transparent;")
+        # Filled in by update_position(): the viewport rectangle of
+        # the enclosing QScrollArea expressed in THIS widget's local
+        # coordinates. paintEvent clips to this so the glow only
+        # renders over the visible portion of the target button.
+        # None means 'no scroll area ancestor — paint everywhere'.
+        self._visible_clip_rect: QRect | None = None
 
     def update_position(self) -> None:
         target = self._target
@@ -749,36 +772,52 @@ class _WalkthroughTargetGlow(QWidget):
             top_left_global = target.mapToGlobal(QPoint(0, 0))
             top_left_in_parent = parent.mapFromGlobal(top_left_global)
             pad = self._PADDING
-            self.setGeometry(
+            geom = QRect(
                 top_left_in_parent.x() - pad,
                 top_left_in_parent.y() - pad,
                 target_size.width() + pad * 2,
                 target_size.height() + pad * 2,
             )
-            # Hide the glow if the target has been scrolled outside
-            # its enclosing QScrollArea viewport. Without this, the
-            # glow's last computed position would render even when the
-            # target itself is invisible (because the viewport clips
-            # the button but the free-floating glow is a sibling that
-            # doesn't get clipped). Walk up to the nearest QScrollArea
-            # ancestor; if the target's visible-in-parent region
-            # doesn't intersect that scroll area's viewport, hide.
+            self.setGeometry(geom)
+            # Compute the clip rect for paintEvent: viewport of the
+            # enclosing QScrollArea, in this widget's local coords.
+            # If the target button is fully out of the viewport, the
+            # clip rect ends up empty and nothing paints — same net
+            # effect as hiding, without us having to flip visibility.
             from PySide6.QtWidgets import QScrollArea
             scroll_area = target.parent()
             while scroll_area is not None and not isinstance(scroll_area, QScrollArea):
                 scroll_area = scroll_area.parent()
             if scroll_area is not None:
-                viewport_rect_global = QRect(
-                    scroll_area.viewport().mapToGlobal(QPoint(0, 0)),
-                    scroll_area.viewport().size(),
-                )
-                target_rect_global = QRect(
-                    top_left_global,
-                    target_size,
-                )
-                visible = viewport_rect_global.intersects(target_rect_global)
-                if self.isVisible() != visible:
-                    self.setVisible(visible)
+                vp = scroll_area.viewport()
+                viewport_tl_global = vp.mapToGlobal(QPoint(0, 0))
+                viewport_tl_local = self.mapFromGlobal(viewport_tl_global)
+                clip = QRect(viewport_tl_local, vp.size())
+                self._visible_clip_rect = clip.intersected(self.rect())
+                # Hard clip via window mask too. setClipRect in
+                # paintEvent alone wasn't enough on Windows — Qt's
+                # native widget composition still rendered the glow
+                # widget's full rectangle over the area above the
+                # viewport. setMask is bitmap-precise: pixels outside
+                # the mask region are simply not part of the widget
+                # at all, so no paint of ours can land there.
+                from PySide6.QtGui import QRegion
+                if self._visible_clip_rect.isEmpty():
+                    # Button fully off-viewport — hide so we don't
+                    # leave the widget alive carrying a stale paint.
+                    self.setMask(QRegion(QRect(0, 0, 0, 0)))
+                    if self.isVisible():
+                        self.setVisible(False)
+                else:
+                    self.setMask(QRegion(self._visible_clip_rect))
+                    if not self.isVisible():
+                        self.setVisible(True)
+            else:
+                self._visible_clip_rect = None
+                self.clearMask()
+                if not self.isVisible():
+                    self.setVisible(True)
+            self.update()
         except Exception:
             pass
 
@@ -786,13 +825,46 @@ class _WalkthroughTargetGlow(QWidget):
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
+            # Restrict painting to the visible portion of the target
+            # button. When the user scrolls the settings sidebar so
+            # only the bottom of the active button is in view, only
+            # that bottom slice of the glow renders.
+            if self._visible_clip_rect is not None:
+                painter.setClipRect(self._visible_clip_rect)
             painter.setBrush(Qt.NoBrush)
-            pen = QPen(self._accent)
-            pen.setWidth(self._BORDER_THICK)
+
+            accent = self._accent
+            # The button itself lives inside the padded widget rect
+            # offset by _PADDING. Paint glow strokes centred on that
+            # inner rectangle so each stroke radiates outward.
+            pad = self._PADDING
+            inner_rect = self.rect().adjusted(pad, pad, -pad, -pad)
+            radius = 12
+
+            # Halo: outer-to-inner passes with thicker, more
+            # translucent pens first so they sit underneath the
+            # narrower, more opaque passes — that's what gives the
+            # blur-like falloff.
+            for pen_width, alpha in (
+                (14.0, 20),
+                (10.0, 36),
+                (7.0, 60),
+                (4.5, 95),
+            ):
+                color = QColor(accent.red(), accent.green(), accent.blue(), alpha)
+                pen = QPen(color, pen_width)
+                pen.setCapStyle(Qt.RoundCap)
+                pen.setJoinStyle(Qt.RoundJoin)
+                painter.setPen(pen)
+                painter.drawRoundedRect(inner_rect, radius, radius)
+
+            # Crisp inner outline so the button has a clean accent
+            # frame on top of the soft halo.
+            pen = QPen(accent, self._BORDER_THICK)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
             painter.setPen(pen)
-            inset = self._BORDER_THICK // 2 + 1
-            border_rect = self.rect().adjusted(inset, inset, -inset, -inset)
-            painter.drawRoundedRect(border_rect, 14, 14)
+            painter.drawRoundedRect(inner_rect, radius, radius)
         finally:
             painter.end()
 
@@ -1809,13 +1881,15 @@ class GestureGuideCard(QFrame):
         top_row.addStretch(1)
         self._expand_card_button = QPushButton()
         self._expand_card_button.setObjectName("gestureCardExpand")
-        # Narrower than tall so the button feels like an icon button,
-        # not a square chip. Width tuned to barely contain the 16 px
-        # icon + 1 px breathing room on each side.
-        # Width reduced to ~2/3 of the prior 22 px (per user) so the
-        # button reads as a slim icon button. Height kept similar so
-        # the tap target stays vertically comfortable.
-        self._expand_card_button.setFixedSize(15, 22)
+        # Wider INVISIBLE clickable target per user: arrows stay at
+        # 14 x 14, the surrounding box is widened (more forgiving
+        # click area) and the chrome is transparent so only the
+        # arrows show through. Hover keeps a subtle highlight so
+        # users see the affordance when they actually mouse over.
+        from PySide6.QtWidgets import QSizePolicy
+        self._expand_card_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._expand_card_button.setMinimumWidth(0)
+        self._expand_card_button.setFixedSize(26, 24)
         self._expand_card_button.setCursor(Qt.PointingHandCursor)
         self._expand_card_button.setToolTip("Expand this card")
         # Diagonal-arrow icon (matches the user-supplied image) --
@@ -1826,15 +1900,15 @@ class GestureGuideCard(QFrame):
             GestureGuideCard._ICON_COLLAPSE = _make_section_chevron_icon(expand=False, size=18, color="#E8F6FF")
         self._expand_card_button.setIcon(GestureGuideCard._ICON_EXPAND)
         from PySide6.QtCore import QSize as _QSize
-        # Icon size shrunk to match the narrower button. 12 px fits
-        # the 15 px button width with breathing room.
-        self._expand_card_button.setIconSize(_QSize(12, 12))
+        self._expand_card_button.setIconSize(_QSize(14, 14))
         self._expand_card_button.setStyleSheet(
             "QPushButton#gestureCardExpand {"
-            "  background: rgba(255,255,255,0.06);"
-            "  border: 1px solid rgba(255,255,255,0.18);"
-            "  border-radius: 6px;"
+            "  background: transparent;"
+            "  border: 1px solid transparent;"
+            "  border-radius: 4px;"
             "  padding: 0;"
+            "  min-width: 26px;"
+            "  max-width: 26px;"
             "  outline: none;"
             "}"
             "QPushButton#gestureCardExpand:hover {"
@@ -2028,7 +2102,48 @@ class GestureGuideCard(QFrame):
                 )
         except Exception:
             pass
+        # Width-aware media scaling so the expanded card never overflows
+        # the settings panel horizontally.
         media_scale = self._EXPANDED_MEDIA_SCALE if is_expanded else self._COLLAPSED_MEDIA_SCALE
+        if is_expanded:
+            try:
+                # Walk up the parent chain to find a widget with a
+                # known width (panel column). At construction time
+                # parents may be 0; once the user clicks expand the
+                # layout has settled so this returns a real value.
+                available_w = 0
+                walker = self.parentWidget()
+                for _ in range(8):
+                    if walker is None:
+                        break
+                    w = walker.width()
+                    if w > 100:
+                        available_w = w
+                        break
+                    walker = walker.parentWidget()
+                if available_w <= 0:
+                    available_w = self.width() or 800
+                # Cap the card itself so its geometry never exceeds
+                # the available width when expanded. Cleared on
+                # collapse below so the card returns to natural sizing.
+                self.setMaximumWidth(available_w)
+                chrome_budget = 32 + 260
+                media_max_w = max(120, available_w - chrome_budget)
+                native_w = max(1, getattr(self._media, "_native_width", 240))
+                width_limited_scale = media_max_w / native_w
+                media_scale = max(self._COLLAPSED_MEDIA_SCALE,
+                                  min(media_scale, width_limited_scale))
+            except Exception:
+                pass
+        else:
+            # Clear any maximumWidth cap left from a prior expanded
+            # state so the collapsed card uses its natural column
+            # width (default Preferred horizontal). 16777215 is Qt's
+            # "no maximum" sentinel.
+            try:
+                self.setMaximumWidth(16777215)
+            except Exception:
+                pass
         try:
             self._media.set_scale_factor(media_scale)
         except Exception:
@@ -2124,26 +2239,26 @@ def _build_voice_command_cards() -> list[VoiceCommandCard]:
             title="Open / focus an app",
             action="Launches the named app, or brings it to focus if already running.",
             examples=[
-                "open spotify",
-                "launch chrome",
-                "fire up discord",
-                "boot up steam",
-                "show me settings",
-                "bring up file explorer",
-                "switch to outlook",
-                "go to chatgpt",
+                "Open Spotify",
+                "Launch Chrome",
+                "Fire up Discord",
+                "Boot up Steam",
+                "Show me settings",
+                "Bring up File Explorer",
+                "Switch to Outlook",
+                "Go to ChatGPT",
             ],
         ),
         VoiceCommandCard(
             title="Play music on Spotify",
             action="Plays a song / artist / playlist on Spotify (opens it first if needed).",
             examples=[
-                "play master of puppets",
-                "play master of puppets by metallica",
-                "play feel-good playlist on spotify",
-                "put on some lo-fi",
-                "queue up daft punk",
-                "play random",
+                "Play Master of Puppets",
+                "Play Master of Puppets by Metallica",
+                "Play feel-good playlist on Spotify",
+                "Put on some lo-fi",
+                "Queue up Daft Punk",
+                "Play random",
             ],
         ),
         VoiceCommandCard(
@@ -2155,24 +2270,24 @@ def _build_voice_command_cards() -> list[VoiceCommandCard]:
                 "as right-hand gestures and aren't included here on purpose."
             ),
             examples=[
-                "add this to my workout playlist",
-                "remove this song from my chill mix",
-                "save this track to liked songs",
+                "Add this to my workout playlist",
+                "Remove this song from my chill mix",
+                "Save this track to liked songs",
             ],
         ),
         VoiceCommandCard(
             title="Search / open content",
             action="Searches the web or opens the named site.",
             examples=[
-                "search for python tutorials",
-                "look up best pizza nearby",
-                "go to github",
-                "navigate to gmail",
+                "Search for Python tutorials",
+                "Look up best pizza nearby",
+                "Go to GitHub",
+                "Navigate to Gmail",
             ],
         ),
         VoiceCommandCard(
-            title="Dictation mode",
-            action="Triggered by holding LEFT-hand two; not a voice command per se. Speak naturally; pauses become spaces. Spoken punctuation: 'comma', 'period', 'question mark', 'new line', 'new paragraph'.",
+            title="Dictation mode (beta)",
+            action="Triggered by holding LEFT-hand two; not a voice command per se. Speak naturally; pauses become spaces. Spoken punctuation: 'comma', 'period', 'question mark', 'new line', 'new paragraph'. Beta — accuracy and latency are still being tuned.",
             examples=[
                 "Hey there comma how's it going question mark",
                 "Final report period new paragraph First section colon",
@@ -2213,50 +2328,47 @@ def _make_section_chevron_icon(*, expand: bool, color: str = "#FFFFFF", size: in
     pen.setJoinStyle(Qt.RoundJoin)
     painter.setPen(pen)
     edge = size * 0.18              # corner inset (where corner ends sit)
-    # head is now redefined below at 0.34 -- see comment about
-    # 'mostly arrowhead' rebalance.
-    # Rebalanced per user: 'mostly arrowhead and not the straight
-    # line'. Heads bumped from 0.22 -> 0.34 of icon width; shafts
-    # shortened. Both icons also leave a clear empty diamond in the
-    # middle (the previous expand variant had two shafts crossing
-    # almost at the centre, so the user saw them touching).
+    # Per user: 'expand should be the same arrows as the collapse
+    # arrows just inverted (pointing outwards)'. So both variants
+    # share the EXACT same two shafts -- corner end at (edge) and
+    # near-centre end at (inner) -- and we only swap WHICH end of
+    # each shaft receives the arrowhead.
     head = size * 0.34
+    inner = size * 0.32
+    # Top-right shaft endpoints.
+    tr_corner_x, tr_corner_y = size - edge, edge
+    tr_inner_x, tr_inner_y = size - inner, inner
+    # Bottom-left shaft endpoints.
+    bl_corner_x, bl_corner_y = edge, size - edge
+    bl_inner_x, bl_inner_y = inner, size - inner
+    # Shafts (same for both variants).
+    painter.drawLine(int(tr_corner_x), int(tr_corner_y), int(tr_inner_x), int(tr_inner_y))
+    painter.drawLine(int(bl_corner_x), int(bl_corner_y), int(bl_inner_x), int(bl_inner_y))
     if expand:
-        # Shafts start further FROM centre so the two shafts don't
-        # touch in the middle. inner=0.36 puts the bottom-left
-        # start at (0.36, 0.64) and the top-right shaft's start at
-        # (0.64, 0.36) -- ~0.28*size apart along the anti-diagonal,
-        # a visible gap.
-        inner = size * 0.36
-        # Top-right diagonal (shaft from near-centre UP-RIGHT to corner).
-        sx, sy = inner, size - inner
-        tx, ty = size - edge, edge
-        painter.drawLine(int(sx), int(sy), int(tx), int(ty))
-        painter.drawLine(int(tx), int(ty), int(tx - head), int(ty))
-        painter.drawLine(int(tx), int(ty), int(tx), int(ty + head))
-        # Bottom-left diagonal (mirror).
-        sx2, sy2 = size - inner, inner
-        bx, by = edge, size - edge
-        painter.drawLine(int(sx2), int(sy2), int(bx), int(by))
-        painter.drawLine(int(bx), int(by), int(bx + head), int(by))
-        painter.drawLine(int(bx), int(by), int(bx), int(by - head))
+        # Arrowheads sit at the CORNER ends, pointing OUTWARD.
+        # Top-right: legs go LEFT and DOWN from the corner so the
+        # arrowhead opens toward the top-right of the icon.
+        painter.drawLine(int(tr_corner_x), int(tr_corner_y),
+                         int(tr_corner_x - head), int(tr_corner_y))
+        painter.drawLine(int(tr_corner_x), int(tr_corner_y),
+                         int(tr_corner_x), int(tr_corner_y + head))
+        # Bottom-left: legs go RIGHT and UP from the corner.
+        painter.drawLine(int(bl_corner_x), int(bl_corner_y),
+                         int(bl_corner_x + head), int(bl_corner_y))
+        painter.drawLine(int(bl_corner_x), int(bl_corner_y),
+                         int(bl_corner_x), int(bl_corner_y - head))
     else:
-        # Shafts start at corners and stop well short of centre so a
-        # clear gap remains. inner=0.32 leaves a ~0.36*size diamond
-        # of empty space between the two inward arrowheads.
-        inner = size * 0.32
-        # Top-right corner -> down-left, tip at (size-inner, inner).
-        cx, cy = size - edge, edge
-        tx, ty = size - inner, inner
-        painter.drawLine(int(cx), int(cy), int(tx), int(ty))
-        painter.drawLine(int(tx), int(ty), int(tx + head), int(ty))
-        painter.drawLine(int(tx), int(ty), int(tx), int(ty - head))
-        # Bottom-left corner -> up-right (mirror).
-        bx, by = edge, size - edge
-        ex, ey = inner, size - inner
-        painter.drawLine(int(bx), int(by), int(ex), int(ey))
-        painter.drawLine(int(ex), int(ey), int(ex - head), int(ey))
-        painter.drawLine(int(ex), int(ey), int(ex), int(ey + head))
+        # Arrowheads sit at the NEAR-CENTRE ends, pointing INWARD.
+        # Top-right tip: legs go RIGHT and UP from the inner end.
+        painter.drawLine(int(tr_inner_x), int(tr_inner_y),
+                         int(tr_inner_x + head), int(tr_inner_y))
+        painter.drawLine(int(tr_inner_x), int(tr_inner_y),
+                         int(tr_inner_x), int(tr_inner_y - head))
+        # Bottom-left tip: legs go LEFT and DOWN from the inner end.
+        painter.drawLine(int(bl_inner_x), int(bl_inner_y),
+                         int(bl_inner_x - head), int(bl_inner_y))
+        painter.drawLine(int(bl_inner_x), int(bl_inner_y),
+                         int(bl_inner_x), int(bl_inner_y + head))
     painter.end()
     return QIcon(pix)
 
@@ -2333,7 +2445,7 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
         ),
         GestureGuideCard(
             title="Left Hand Two",
-            action="Start or stop dictation",
+            action="Start or stop dictation (beta)",
             how_to=(
                 "How To: Face your left palm toward the monitor, extend the index and middle fingers in a V shape, and "
                 "keep the thumb, ring, and pinky closed. Hold the pose steady for about half a second to toggle dictation.\n\n"
@@ -2379,11 +2491,12 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
         ),
         GestureGuideCard(
             title="Right Hand Two",
-            action="Open or focus Spotify",
+            action="Open or focus Spotify (requires Spotify Premium)",
             how_to=(
                 "How To: Face your right palm toward the monitor, extend the index and middle fingers in a V shape, and "
                 "keep the thumb, ring, and pinky closed. Hold the pose steady for about one second.\n\n"
-                "Requirements: Spotify must be installed."
+                "Requirements: Spotify must be installed AND a Spotify Premium account is required — the Web API "
+                "endpoints Touchless uses to control playback are gated behind Premium by Spotify."
             ),
             gesture_key="two",
             image_name="Two.png",
@@ -2398,6 +2511,65 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
             ),
             gesture_key="fist",
             image_name="Fist.png",
+        ),
+        GestureGuideCard(
+            title="Right Hand Three",
+            action="Open or focus Chrome",
+            how_to=(
+                "How To: Face your right palm toward the monitor. Extend the index, middle, and ring fingers "
+                "with a slight gap between them (spread, not touching); fold the thumb and pinky. Hold the pose "
+                "steady for about half a second.\n\n"
+                "What it does: launches Chrome if it isn't running, or brings the existing Chrome window to the "
+                "foreground.\n\n"
+                "Requirements: None."
+            ),
+            gesture_key="three",
+            image_name="Three.png",
+        ),
+        GestureGuideCard(
+            title="Right Hand Three Together",
+            action="Toggle Chrome mode on or off",
+            how_to=(
+                "How To: Face your right palm toward the monitor. Extend the index, middle, and ring fingers and hold "
+                "them TIGHT TOGETHER (touching, not spread); fold the thumb and pinky. Hold the pose steady for about "
+                "half a second.\n\n"
+                "What Chrome mode does: routes the right-hand 'one'/Refresh gesture to Chrome (reload tab) and lights "
+                "up the Chrome gesture wheel for tab actions. Toggling off returns those gestures to their default "
+                "targets.\n\n"
+                "Requirements: Chrome must be open. The toggle silently no-ops if no Chrome window is found."
+            ),
+            gesture_key="three_together",
+            image_name="three_together.png",
+        ),
+        GestureGuideCard(
+            title="Right Hand Four",
+            action="Open or focus Touchless",
+            how_to=(
+                "How To: Face your right palm toward the monitor. Extend the index, middle, ring, and pinky fingers "
+                "with a slight gap between them (spread, not touching); fold the thumb across the palm. Hold the pose "
+                "steady for about half a second.\n\n"
+                "What it does: brings the Touchless main window to the foreground. Useful when Touchless is "
+                "minimised, behind another window, or running from the system tray. The YouTube mode toggle lives "
+                "on the TIGHT-TOGETHER variant (next card)."
+            ),
+            gesture_key="four",
+            image_name="Four.png",
+        ),
+        GestureGuideCard(
+            title="Right Hand Four Together",
+            action="Toggle YouTube mode on or off",
+            how_to=(
+                "How To: Face your right palm toward the monitor. Extend the index, middle, ring, and pinky fingers "
+                "and hold them TIGHT TOGETHER (touching, not spread); fold the thumb across the palm. Hold the pose "
+                "steady for about three-quarters of a second.\n\n"
+                "What YouTube mode does: routes media gestures (fist play/pause, swipes, thumb up/down, etc.) to the "
+                "active YouTube tab in Chrome via the in-page video element. Toggling off returns those gestures to "
+                "their default targets.\n\n"
+                "Requirements: A YouTube tab must be open in Chrome. The toggle silently no-ops if no YouTube tab is "
+                "found."
+            ),
+            gesture_key="four_together",
+            image_name="four_together.png",
         ),
         GestureGuideCard(
             title="Mute",
@@ -2500,12 +2672,13 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
         ),
         GestureGuideCard(
             title="Refresh / Repeat",
-            action="Refresh the Chrome tab, or toggle repeat in Spotify",
+            action="Refresh the Chrome tab (Chrome mode), or toggle repeat in Spotify",
             how_to=(
                 "How To: With your right hand, extend only the index finger (other fingers folded, like pointing). Trace "
                 "a small smooth circle in the air with your fingertip — roughly the size of a coaster. The motion must "
                 "close into a loop, not just a partial arc.\n\n"
-                "Requirements: Chrome or Spotify must be the focused app."
+                "Requirements: For the Refresh action, Chrome mode must be on AND Chrome must be the focused app. "
+                "For the Repeat-toggle action, Spotify must be the focused app."
             ),
             gesture_key="one",
             video_name="Repeat.mp4",
@@ -2672,19 +2845,19 @@ def _build_gesture_guide_dynamic_cards() -> list[GestureGuideCard]:
             title="Pinch (drawings only)",
             action="Move, stretch, and resize drawings — works on the live drawing canvas and on saved drawings shown as overlays",
             how_to=(
-                "What it's for: pinch ONLY acts on DRAWINGS. While drawing mode is on it grabs the live canvas — every "
+                "What it's for: Pinch ONLY acts on DRAWINGS. While drawing mode is on it grabs the live canvas — every "
                 "stroke you've drawn so far moves, stretches, or resizes as a unit. When a saved drawing is currently "
                 "shown as a transparent overlay (via a custom gesture's 'Show a saved drawing as overlay' binding), "
                 "pinch grabs that overlay instead. Outside those two contexts the pose does nothing — it never fires "
                 "any other action.\n\n"
-                "How To: curl your middle, ring, and pinky into your palm and curve your thumb and index toward each "
+                "How To: Curl your middle, ring, and pinky into your palm and curve your thumb and index toward each "
                 "other in a C-shape — they don't have to touch. Hold the pose for about 0.7 seconds before moving so "
                 "the grab activates cleanly (this prevents accidental nudges from a transient label). Move your hand "
                 "to translate the drawing; release the pose to drop it where it is.\n\n"
-                "Two hands = stretch / resize: hold pinch with BOTH hands at once. Move your hands APART to stretch "
+                "Two hands = stretch / resize: Hold pinch with BOTH hands at once. Move your hands APART to stretch "
                 "the drawing outward, TOGETHER to squish / resize down; move both in PARALLEL to translate. Either "
                 "hand alone keeps working as a single-hand move if the other goes out of frame.\n\n"
-                "Undo: a left-hand swipe reverts the whole grab session — move + stretch + resize roll back together "
+                "Undo: A left-hand swipe reverts the whole grab session — move + stretch + resize roll back together "
                 "as one undo step."
             ),
             gesture_key="pinch",
@@ -3903,6 +4076,41 @@ class _DisplayOverrideCombo(QComboBox):
         painter.drawControl(QStyle.CE_ComboBoxLabel, option)
 
 
+class _TightWrapLabel(QLabel):
+    """QLabel that reports its actual wrapped height (heightForWidth)
+    as both sizeHint and minimumSizeHint.
+
+    Why this exists: a default QLabel with setWordWrap(True) reports
+    sizeHint().height() = the single-line height (small) but
+    minimumSizeHint().height() = the worst-case wrapped height
+    (one word per line — could be 100s of pixels). Qt's layout system
+    treats minimumSizeHint as a HARD floor, so the label widget gets
+    allocated that worst-case height even when the actual rendered
+    text only needs 1–2 lines. The visible result: a 25 px text block
+    floating in a 100+ px tall empty label widget, which the user
+    perceives as a "huge empty gap around the description".
+
+    By overriding both hints to return heightForWidth(currentWidth),
+    the widget reports the ACTUAL pixel height the wrapped text
+    consumes, so the parent layout sizes the slot exactly to the
+    text — no leading / trailing whitespace block."""
+
+    def sizeHint(self):  # type: ignore[override]
+        base = super().sizeHint()
+        try:
+            w = self.width() if self.width() > 0 else base.width()
+            if self.wordWrap() and w > 0:
+                h = self.heightForWidth(w)
+                if h > 0:
+                    return QSize(base.width(), h)
+        except Exception:
+            pass
+        return base
+
+    def minimumSizeHint(self):  # type: ignore[override]
+        return self.sizeHint()
+
+
 class _CallbackLabel(QLabel):
     """QLabel that forwards real text changes to a callback."""
 
@@ -4549,12 +4757,38 @@ class CameraPreviewDialog(QDialog):
     main loop never noticeably stalls. If we ever want a slow remote
     source previewable here, move the read off-thread."""
 
-    def __init__(self, config: AppConfig, camera_index: int, camera_label: str = "", parent=None) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        camera_index: "int | None" = None,
+        camera_label: str = "",
+        parent=None,
+        *,
+        frame_signal=None,
+        external_capture=None,
+    ) -> None:
         super().__init__(parent)
         apply_touchless_chrome(self)
         self.config = config
-        self._camera_index = int(camera_index)
-        self._camera_label = str(camera_label or f"Camera {camera_index}")
+        # frame_signal path: the camera isn't a local cv2 index (e.g. the
+        # phone-QR source while the engine is running). Instead we
+        # subscribe to the running worker's raw_frame_ready signal, which
+        # re-broadcasts each captured frame. This avoids fighting the
+        # worker for the phone capture's consume-once read() — both
+        # reading it would halve each other's framerate. Frames from that
+        # signal are ALREADY mirrored to selfie view by the engine, so
+        # the render path skips the flip.
+        #
+        # external_capture path: a cv2.VideoCapture-like object we did NOT
+        # create (e.g. the phone capture when the engine is stopped, so
+        # there's no worker re-broadcasting and no read contention). We
+        # poll it like a local camera but must NOT release it on teardown.
+        self._frame_signal = frame_signal
+        self._signal_connected = False
+        self._external_capture = external_capture
+        self._owns_cap = external_capture is None
+        self._camera_index = int(camera_index) if camera_index is not None else None
+        self._camera_label = str(camera_label or (f"Camera {camera_index}" if camera_index is not None else "Camera"))
         self._cap = None
         self.setWindowTitle("Camera Preview")
         self.setObjectName("cameraPreviewDialog")
@@ -4563,7 +4797,8 @@ class CameraPreviewDialog(QDialog):
         self._build_ui()
         self._apply_theme()
         # Poll timer driving the read+render loop. 33 ms ≈ 30 FPS — fast
-        # enough to look smooth without hammering the device.
+        # enough to look smooth without hammering the device. Only used
+        # by the local-cv2 path; the frame_signal path is event-driven.
         self._timer = QTimer(self)
         self._timer.setInterval(33)
         self._timer.timeout.connect(self._tick)
@@ -4646,6 +4881,27 @@ class CameraPreviewDialog(QDialog):
         )
 
     def _open_camera(self) -> None:
+        # Signal-driven source (phone QR via the running worker): connect
+        # to raw_frame_ready and render whatever the engine broadcasts.
+        # No cv2 device, no poll timer.
+        if self._frame_signal is not None:
+            try:
+                self._frame_signal.connect(self._on_signal_frame)
+                self._signal_connected = True
+                self.status_label.setText("Live preview")
+            except Exception as exc:
+                self.status_label.setText(
+                    f"Couldn't attach to the phone stream: {type(exc).__name__}: {exc}"
+                )
+            return
+        # External capture (e.g. phone capture with the engine stopped):
+        # poll it like a local camera, but it's owned elsewhere so
+        # teardown won't release it.
+        if self._external_capture is not None:
+            self._cap = self._external_capture
+            self.status_label.setText("Live preview")
+            self._timer.start()
+            return
         # camera_utils.open_camera_by_index returns (CameraInfo, cap)
         # — earlier code stashed the whole tuple on self._cap, which
         # made every read() raise and the preview never advanced past
@@ -4683,21 +4939,37 @@ class CameraPreviewDialog(QDialog):
             ok, frame = False, None
         if not ok or frame is None:
             return
-        # Always mirror — matches the unified selfie convention used
-        # everywhere else in the app (engine, tutorial, recorder).
-        if not bool(getattr(self.config, "camera_source_is_mirrored", False)):
-            frame = cv2.flip(frame, 1)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        bytes_per_line = w * 3
-        from PySide6.QtGui import QImage as _QImage
-        image = _QImage(rgb.data, w, h, bytes_per_line, _QImage.Format_RGB888).copy()
-        pix = QPixmap.fromImage(image).scaled(
-            self.video_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.video_label.setPixmap(pix)
+        # Local-cv2 frames arrive in camera perspective — mirror to the
+        # unified selfie convention used everywhere else in the app
+        # (engine, tutorial, recorder).
+        self._render_frame(frame, already_mirrored=False)
+
+    def _on_signal_frame(self, frame, capture_ts: float = 0.0) -> None:
+        # raw_frame_ready frames are already mirrored to selfie view by
+        # the engine, so don't flip them again.
+        if frame is None:
+            return
+        self._render_frame(frame, already_mirrored=True)
+
+    def _render_frame(self, frame, *, already_mirrored: bool) -> None:
+        try:
+            if not already_mirrored and not bool(
+                getattr(self.config, "camera_source_is_mirrored", False)
+            ):
+                frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w = rgb.shape[:2]
+            bytes_per_line = w * 3
+            from PySide6.QtGui import QImage as _QImage
+            image = _QImage(rgb.data, w, h, bytes_per_line, _QImage.Format_RGB888).copy()
+            pix = QPixmap.fromImage(image).scaled(
+                self.video_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self.video_label.setPixmap(pix)
+        except Exception:
+            pass
 
     def closeEvent(self, event):  # noqa: N802
         self._teardown()
@@ -4716,8 +4988,17 @@ class CameraPreviewDialog(QDialog):
             self._timer.stop()
         except Exception:
             pass
+        # Disconnect the worker signal if we were in signal-driven mode.
+        # We never own the worker / phone capture, so do NOT release it —
+        # that would kill the live engine's frame source.
+        if self._signal_connected and self._frame_signal is not None:
+            try:
+                self._frame_signal.disconnect(self._on_signal_frame)
+            except Exception:
+                pass
+            self._signal_connected = False
         try:
-            if self._cap is not None:
+            if self._cap is not None and self._owns_cap:
                 self._cap.release()
         except Exception:
             pass
@@ -5329,16 +5610,34 @@ def _gesture_bind_pose_lookup() -> dict[str, tuple[str, str, str, str]]:
 
 
 class _CurrentSizedStack(QStackedWidget):
-    """QStackedWidget that reports only the CURRENT widget's size hints.
+    """QStackedWidget that reports the CURRENT widget's size hints AND
+    enforces a hard `setMaximumHeight` matching the active panel's
+    actual rendered height.
 
-    The stock QStackedWidget takes max-of-all-children for sizeHint and
-    minimumSizeHint. Wrapped in a QScrollArea with widgetResizable=True
-    that means short panels (e.g. Camera) still inherit the tallest
-    sibling's minimum height — so the scroll area allows scrolling into
-    empty space below the short panel. Returning only the current
-    widget's hints keeps the scroll area in sync with whatever panel
-    is actually visible.
+    Why both: QScrollArea(widgetResizable=True) doesn't honor the
+    `Maximum` size policy flag — it sizes the contained widget to the
+    viewport (clamped only by the widget's `setMaximumHeight` pixel
+    cap and `minimumSizeHint`). Without an explicit cap, panels whose
+    natural content is shorter than the viewport got stretched to
+    viewport height; at narrower widths where wordwrap labels reflowed
+    to multiple lines, the panel's reported sizeHint stayed at the
+    single-line value while actual layout consumed more height, so
+    scroll engaged with a range that didn't line up with the content.
+
+    Refreshing `setMaximumHeight` on every layout / resize / show /
+    current-page change pins the outer scroll's range to whatever the
+    active panel needs at its current width — using
+    `layout().heightForWidth(self.width())` for accurate wordwrap
+    rendering. Expanding a Control Guide section grows the cap;
+    collapsing shrinks it back. Panels that opt into `Ignored` vertical
+    policy (Camera — manages its own internal scroll) skip the cap
+    entirely so they can fill the viewport.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._refresh_pending = False
+        self.currentChanged.connect(lambda _i: self._schedule_refresh())
 
     def sizeHint(self):  # type: ignore[override]
         w = self.currentWidget()
@@ -5346,7 +5645,82 @@ class _CurrentSizedStack(QStackedWidget):
 
     def minimumSizeHint(self):  # type: ignore[override]
         w = self.currentWidget()
-        return w.minimumSizeHint() if w is not None else super().minimumSizeHint()
+        if w is None:
+            return super().minimumSizeHint()
+        if w.sizePolicy().verticalPolicy() == QSizePolicy.Ignored:
+            return QSize(w.minimumSizeHint().width(), 0)
+        return w.sizeHint()
+
+    def event(self, e):  # type: ignore[override]
+        result = super().event(e)
+        et = e.type()
+        if et == QEvent.LayoutRequest or et == QEvent.Resize or et == QEvent.Show:
+            self._schedule_refresh()
+        return result
+
+    def _schedule_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        QTimer.singleShot(0, self._refresh_max_height)
+
+    def _refresh_max_height(self):
+        self._refresh_pending = False
+        w = self.currentWidget()
+        if w is None:
+            self.setMaximumHeight(16777215)
+            return
+        # Panels that own their internal scroll opt out of the cap so
+        # they can fill the viewport (the inner scroll handles overflow).
+        if w.sizePolicy().verticalPolicy() == QSizePolicy.Ignored:
+            self.setMaximumHeight(16777215)
+            return
+        # Use the layout's heightForWidth at the current width when
+        # available — that's the height the panel actually consumes
+        # after wordwrap labels reflow at the rendered width. Bare
+        # sizeHint() reports the single-line height for wrapped labels
+        # which underestimates the rendered total. heightForWidth is
+        # the only number that lines up with what the user sees.
+        h = w.sizeHint().height()
+        try:
+            lay = w.layout()
+            current_w = self.width()
+            if lay is not None and current_w > 0 and lay.hasHeightForWidth():
+                hfw = lay.heightForWidth(current_w)
+                if hfw > 0:
+                    h = max(h, hfw)
+        except Exception:
+            pass
+        if h > 0:
+            self.setMaximumHeight(h)
+        else:
+            self.setMaximumHeight(16777215)
+        # Force ancestor QScrollArea to re-evaluate its scrollbar
+        # visibility — without this, ScrollBarAsNeeded sometimes
+        # leaves the scrollbar hidden even after our maxHeight change
+        # creates an overflow situation (range becomes non-zero but
+        # the bar stays hidden). Walking up to the enclosing
+        # QScrollArea and calling updateGeometry + a viewport update
+        # nudges Qt's internal layout to recompute and show the bar.
+        try:
+            from PySide6.QtWidgets import QScrollArea
+            walker = self.parent()
+            for _ in range(8):
+                if walker is None:
+                    break
+                if isinstance(walker, QScrollArea):
+                    walker.updateGeometry()
+                    walker.viewport().update()
+                    # Toggle the scroll bar policy off-and-back to
+                    # force Qt to re-run its needs-scrollbar check.
+                    sb = walker.verticalScrollBar()
+                    if sb is not None and sb.maximum() > 0 and not sb.isVisible():
+                        walker.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                        walker.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                    break
+                walker = walker.parent()
+        except Exception:
+            pass
 
 
 class MainWindow(QMainWindow):
@@ -5581,13 +5955,28 @@ class MainWindow(QMainWindow):
         self._screen_record_writer = None
         self._screen_record_process: subprocess.Popen | None = None
         self._screen_record_path: Path | None = None
-        self._screen_record_fps = 12.0
+        # Bumped from 12 → 24 fps. The previous rate made clip
+        # playback look like a slideshow (the user described it as
+        # "very laggy"); 24 is cinema-standard and feels smooth
+        # enough without the CPU/GPU cost of full 30 fps. ffmpeg
+        # NVENC/AMF/QSV hardware encoders absorb this with negligible
+        # added load on machines with HW accel; libx264 -preset
+        # veryfast handles it on CPU-only paths.
+        self._screen_record_fps = 24.0
         self._screen_record_frame_size: tuple[int, int] | None = None
         self._screen_record_backend = ""
         self._screen_record_timer = QTimer(self)
         self._screen_record_timer.setInterval(int(round(1000.0 / self._screen_record_fps)))
         self._screen_record_timer.timeout.connect(self._capture_screen_record_frame)
-        self._clip_cache_fps = 8.0
+        # Bumped from 8 → 20 fps for the background "clip that"
+        # cache. The cache runs continuously while Touchless is up,
+        # so we keep it a notch under the explicit recording rate
+        # (above) to leave headroom for the game's GPU work — but
+        # 8 fps was visibly stuttery on playback and the user asked
+        # for less lag. 20 fps is close enough to real-time motion
+        # that gameplay clips feel fluid without spending the full
+        # 30-fps overhead during background capture.
+        self._clip_cache_fps = 20.0
         self._clip_cache_segment_seconds = 10.0
         self._clip_cache_max_seconds = 65.0
         self._clip_cache_region: QRect | None = None
@@ -5649,6 +6038,17 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(3000, self._kick_off_update_check)
 
     def _kick_off_update_check(self) -> None:
+        # Store builds delegate updates to the Microsoft Store — never
+        # poll GitHub. Only 'website' (direct-download) builds run the
+        # in-app GitHub auto-updater. build_channel() defaults to
+        # 'website' for source runs and pre-channel builds, so existing
+        # behavior is unchanged outside Store builds.
+        try:
+            from ...utils.runtime_paths import build_channel
+            if build_channel() == "store":
+                return
+        except Exception:
+            pass
         try:
             from ..updater import ReleaseChecker
         except Exception:
@@ -5761,6 +6161,17 @@ class MainWindow(QMainWindow):
         # Initial geometry — re-anchored on every resize via
         # _reposition_walkthrough_edge_glow().
         self._reposition_walkthrough_edge_glow()
+        # Install an event filter on the outer (central) widget so we
+        # catch its Resize / Move events directly. MainWindow's own
+        # resizeEvent fires on top-level resizes but doesn't always
+        # propagate to the outer when the custom title bar handles
+        # native edge-drag resizes via nativeEvent — leaving the
+        # overlay stuck at its pre-drag geometry. Watching the outer
+        # itself is the reliable hook.
+        try:
+            outer.installEventFilter(self)
+        except Exception:
+            pass
 
         # Game detector — only kicks in if the user already had a
         # gaming-mode flag enabled from a previous session. Idle
@@ -6049,7 +6460,12 @@ class MainWindow(QMainWindow):
         # settings tab, expand its collapsible section if any, and
         # scroll the target widget into view.
         from PySide6.QtWidgets import QListWidget
-        self._settings_search_results = QListWidget()
+        # Parent the dropdown to the MainWindow (self) rather than the
+        # sidebar so it floats above BOTH the sidebar and the right
+        # content panel. The previous in-layout placement constrained
+        # the dropdown to the sidebar's width, clipping long labels
+        # and forcing an internal scrollbar past a handful of results.
+        self._settings_search_results = QListWidget(self)
         self._settings_search_results.setObjectName("settingsSearchResults")
         self._settings_search_results.setVisible(False)
         self._settings_search_results.itemActivated.connect(self._on_settings_search_result_clicked)
@@ -6094,7 +6510,10 @@ class MainWindow(QMainWindow):
             self._settings_search_results.setUniformItemSizes(True)
         except Exception:
             pass
-        left_layout.addWidget(self._settings_search_results)
+        # No longer added to left_layout — the dropdown is a floating
+        # child of MainWindow positioned manually below the search input
+        # in _render_settings_search_results so it can overlap the right
+        # panel and grow beyond the sidebar width.
         # Populated lazily after settings_content_stack is built.
         self._settings_search_index: list = []
 
@@ -6269,6 +6688,17 @@ class MainWindow(QMainWindow):
         # can size to their text without squashing each other).
 
         self.settings_content_stack = _CurrentSizedStack()
+        # Vertical Maximum so the outer settings content_scroll
+        # (widgetResizable=True) doesn't grow the stack past the
+        # current panel's sizeHint. Without this, short panels
+        # (Colors, Tutorial, About) had the stack stretched to fill
+        # the viewport, leaving a visible band of empty space below
+        # the actual content. With Maximum, the stack stops at
+        # sizeHint, the panel sits at top of the viewport, and the
+        # area below is just transparent settings background.
+        self.settings_content_stack.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Maximum
+        )
         self.settings_content_stack.setObjectName("settingsContentStack")
         # When the active page changes, the stack's reported sizeHint /
         # minimumSizeHint changes too (each panel has its own height).
@@ -6277,6 +6707,17 @@ class MainWindow(QMainWindow):
         # exposing the previous (taller) panel's leftover scroll range.
         self.settings_content_stack.currentChanged.connect(
             lambda _i: self.settings_content_stack.updateGeometry()
+        )
+        # Per-panel outer scrollbar policy. Panels with their own
+        # internal scrollbars (Camera, Mic, Custom Gestures, Gesture
+        # Binds, Save Locations) AND panels short enough to fit
+        # without any scroll (Colors, Tutorial, About) get the outer
+        # scrollbar disabled here so users only ever see ONE scroll
+        # affordance per page. Panels with text-only content that
+        # can genuinely outgrow the viewport (Instructions, Control
+        # Guide, Updates, General) keep AsNeeded.
+        self.settings_content_stack.currentChanged.connect(
+            self._apply_settings_outer_scroll_policy
         )
         self.settings_content_stack.addWidget(self._build_instructions_panel())
         self.settings_content_stack.addWidget(self._build_gesture_guide_panel())
@@ -6339,7 +6780,7 @@ class MainWindow(QMainWindow):
             "   background: rgba(255,255,255,0.05);"
             "   width: 13px;"
             "   border-radius: 6px;"
-            "   margin: 2px 0;"
+            "   margin: 2px 0 2px 8px;"
             " }"
             f" QScrollArea#settingsContentScroll QScrollBar::handle:vertical {{"
             f"   background: {accent};"
@@ -6368,6 +6809,39 @@ class MainWindow(QMainWindow):
         # surprising and easy to miss the page header on long
         # tabs (Camera, Microphone, Save Locations).
         self._settings_content_scroll = content_scroll
+        # Install an event filter so wheel events on the outer scroll
+        # viewport are consumed when the active panel is in
+        # _SETTINGS_OUTER_SCROLL_OFF. setVerticalScrollBarPolicy
+        # (AlwaysOff) only hides the bar; wheel scrolling would
+        # otherwise still let the user scroll past content / into
+        # empty space below short panels.
+        try:
+            content_scroll.viewport().installEventFilter(self)
+        except Exception:
+            pass
+
+        # Pin the Gesture Binds floating pills to the outer scroll's
+        # VIEWPORT (which doesn't move when the panel scrolls) instead of
+        # the panel itself. Parented to the panel they scrolled out of
+        # view with the content; on the viewport they stay anchored to
+        # the bottom of the visible settings area. The viewport doesn't
+        # exist when _build_gesture_binds_panel runs (panels are built
+        # before content_scroll wraps the stack), so the pills are created
+        # parented to the panel there and re-homed here. Re-installing the
+        # resize filter on the viewport keeps _position_gesture_binds_pill
+        # firing as the window resizes.
+        try:
+            vp = content_scroll.viewport()
+            for _pill in (
+                getattr(self, "_gesture_binds_pill", None),
+                getattr(self, "_gesture_binds_pill_warning", None),
+            ):
+                if _pill is not None:
+                    _pill.setParent(vp)
+                    _pill.setVisible(False)
+            self._position_gesture_binds_pill()
+        except Exception:
+            pass
 
         # Walk-through pill + Next button — both are FLOATING overlay
         # children of the settings page. Anchored to the top-right of
@@ -6383,9 +6857,22 @@ class MainWindow(QMainWindow):
         self._walkthrough_hint_label.setObjectName("walkthroughHint")
         self._walkthrough_hint_label.setAlignment(Qt.AlignCenter)
         self._walkthrough_hint_label.setWordWrap(True)
-        # Mouse-transparent so clicks on the panel below pass through
-        # the pill (the panel content under the pill stays clickable).
-        self._walkthrough_hint_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # Rich text + link-only mouse interaction. Some walkthrough
+        # hints contain clickable links (e.g. the General page hint
+        # has "Connect Spotify for premium users here", where here
+        # scrolls the panel to the Spotify section). The label has
+        # to be NON-transparent to mouse events for the link to
+        # register, but textInteractionFlags(LinksAccessibleByMouse)
+        # ensures only the link area captures clicks — plain pill
+        # text doesn't intercept anything important since the pill
+        # sits in the upper-right strip outside the main panel
+        # content.
+        self._walkthrough_hint_label.setTextFormat(Qt.RichText)
+        self._walkthrough_hint_label.setTextInteractionFlags(Qt.LinksAccessibleByMouse)
+        self._walkthrough_hint_label.setOpenExternalLinks(False)
+        self._walkthrough_hint_label.linkActivated.connect(
+            self._on_walkthrough_hint_link_activated
+        )
         # Blue pill, green text, thick rounded border. radius=28 gives
         # the pill the rounded-end look the user asked for.
         # Font dropped from 20 px to 17 px so longer hints fit
@@ -6489,7 +6976,31 @@ class MainWindow(QMainWindow):
             )
         except Exception:
             pass
-
+        # Initial outer-scroll policy for whichever page opens first.
+        # `_apply_settings_outer_scroll_policy` is already connected to
+        # `currentChanged` above (see _SETTINGS_OUTER_SCROLL_OFF). Call
+        # it once here so the first-page outer scrollbar matches the
+        # active panel before the user navigates.
+        try:
+            self._apply_settings_outer_scroll_policy(
+                self.settings_content_stack.currentIndex()
+            )
+        except Exception:
+            pass
+        # Control Guide reset on leave: when the user navigates away
+        # from the Control Guide page, collapse any sections / cards
+        # they expanded so the next time they come back the page is
+        # in its default closed state. _control_guide_prev_active
+        # tracks whether the page being LEFT was the Control Guide.
+        self._control_guide_prev_active = (
+            self.settings_content_stack.currentIndex() == SECTION_GESTURES
+        )
+        try:
+            self.settings_content_stack.currentChanged.connect(
+                self._on_settings_page_changed_reset_guide
+            )
+        except Exception:
+            pass
         # Add the (now-styled) sidebar + content area to the top HBox.
         layout.addWidget(left_panel)
         layout.addWidget(content_scroll, 1)
@@ -6589,19 +7100,25 @@ class MainWindow(QMainWindow):
         """
         from PySide6.QtWidgets import QLabel
         index: list[dict] = []
-        # Map section button -> SECTION_* constant by index in the
-        # nav button list (same order as settings_content_stack).
+        # Map section button -> SECTION_* constant. MUST match the
+        # actual order of self._settings_nav_buttons (set up in
+        # _build_settings_page). The previous tuple was off by one
+        # because General was inserted at nav index 1 but the tuple
+        # still had SECTION_GESTURES there — so clicking 'Control
+        # Guide' in search navigated to Custom Gesture, etc.
         section_for_index = (
-            SECTION_INSTRUCTIONS, SECTION_GESTURES, SECTION_CUSTOM_GESTURE,
-            SECTION_GESTURE_BINDS, SECTION_CAMERA, SECTION_MICROPHONE,
-            SECTION_SAVE_LOCATIONS, SECTION_COLORS, SECTION_TUTORIAL,
-            SECTION_UPDATES,
-            # Newer tabs that were missing from search indexing -- General
-            # (Mouse / Overlay / System Modes / Spotify / Startup) and
-            # About (legal / credits) -- both still navigable via the
-            # tab buttons themselves now that they're in the tuple.
-            SECTION_GENERAL,
-            SECTION_ABOUT,
+            SECTION_INSTRUCTIONS,    # 0 - Instructions
+            SECTION_GENERAL,         # 1 - General
+            SECTION_GESTURES,        # 2 - Control Guide
+            SECTION_CUSTOM_GESTURE,  # 3 - Custom Gesture
+            SECTION_GESTURE_BINDS,   # 4 - Gesture Binds
+            SECTION_CAMERA,          # 5 - Camera
+            SECTION_MICROPHONE,      # 6 - Microphone
+            SECTION_SAVE_LOCATIONS,  # 7 - Save Locations
+            SECTION_COLORS,          # 8 - Colors
+            SECTION_TUTORIAL,        # 9 - Tutorial
+            SECTION_UPDATES,         # 10 - Updates
+            SECTION_ABOUT,           # 11 - About & Privacy
         )
         # 1. Gesture / voice cards inside the Control Guide. For each
         # GestureGuideCard / VoiceCommandCard in any panel, walk up
@@ -6951,9 +7468,59 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(entry["label"])
             item.setData(_Qt.UserRole, entry)
             self._settings_search_results.addItem(item)
-        self._settings_search_results.setVisible(bool(matches))
         if matches:
             self._settings_search_results.setCurrentRow(0)
+            self._position_settings_search_dropdown(matches)
+            self._settings_search_results.raise_()
+            self._settings_search_results.setVisible(True)
+        else:
+            self._settings_search_results.setVisible(False)
+
+    def _position_settings_search_dropdown(self, matches) -> None:
+        """Place the floating dropdown directly below the search input,
+        sized to the actual result count up to ~70% of the window
+        height, and wide enough to span into the right content panel
+        so long labels read in full. Skips silently if the search
+        input or dropdown aren't ready yet."""
+        results = getattr(self, "_settings_search_results", None)
+        search = getattr(self, "_settings_search_input", None)
+        if results is None or search is None:
+            return
+        try:
+            row_height = results.sizeHintForRow(0)
+            if row_height <= 0:
+                row_height = 36
+            # Per-row + frame padding (border 1 px each side + 4 px
+            # internal padding from the QSS). Slight over-allocation
+            # keeps the last row from clipping at the very bottom.
+            chrome = 14
+            content_height = row_height * len(matches) + chrome
+            window_height = max(400, int(self.height()))
+            # Generous height cap: up to 70 % of the window so the
+            # dropdown can show ~20 results without a scrollbar on a
+            # normal-size window. Leaves ~30 % below for the rest of
+            # the page chrome.
+            cap = max(200, int(window_height * 0.7))
+            target_height = min(content_height, cap)
+            results.setMinimumHeight(min(200, target_height))
+            results.setMaximumHeight(target_height)
+            # Width: take the widest item, add some padding, cap at
+            # 70 % of the window width so it never crosses into the
+            # right edge controls but does overlap a healthy portion
+            # of the content panel.
+            width_hint = results.sizeHintForColumn(0)
+            window_width = max(600, int(self.width()))
+            width_cap = max(360, int(window_width * 0.7))
+            target_width = min(max(width_hint + 32, 360), width_cap)
+            results.setFixedWidth(target_width)
+            # Position: directly below the search input, in MainWindow
+            # coordinates. mapTo handles the sidebar -> MainWindow
+            # translation so the dropdown lines up with the input
+            # regardless of how the page is laid out.
+            pos = search.mapTo(self, QPoint(0, search.height()))
+            results.move(pos)
+        except Exception:
+            pass
 
     def _on_settings_search_activate_first(self) -> None:
         # Enter on the search box activates the first match.
@@ -7009,27 +7576,59 @@ class MainWindow(QMainWindow):
     def _make_content_panel(self, title: str, subtitle: str) -> tuple[QFrame, QVBoxLayout]:
         panel = QFrame()
         panel.setObjectName("settingsContentPanel")
+        # Override the global QSS that gives `#settingsContentPanel`
+        # the same card background as inner cards. With a visible
+        # outer card, the panel's bottom border was always extending
+        # past the inner content, leaving an empty band below the
+        # last item. Making the outer panel transparent leaves the
+        # inner cards (which hug their content naturally) as the
+        # only visible boxes — the panel "ends" right where its last
+        # inner card ends, matching the Camera / Microphone look.
+        panel.setStyleSheet(
+            "QFrame#settingsContentPanel { background: transparent; border: none; }"
+        )
+        # Cap the panel's vertical size at its sizeHint so the outer
+        # content_scroll's widgetResizable doesn't stretch the panel
+        # to fill the viewport. Without this, panels with little
+        # content (Colors, Tutorial, About) showed a large empty
+        # area below their last item — the panel was being grown to
+        # viewport height even though there was nothing to render.
+        # Camera explicitly overrides this to Ignored AFTER
+        # _make_content_panel returns (it manages its own size via
+        # its inner scroll), so this default is safely overridden
+        # there.
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(20, 20, 20, 20)
-        panel_layout.setSpacing(12)
+        panel_layout.setContentsMargins(16, 12, 16, 12)
+        # Tight inter-row spacing. The header rows (title + subtitle)
+        # sit immediately next to each other at this spacing; cards
+        # below add their own breathing room via inner margins.
+        panel_layout.setSpacing(6)
 
         title_label = QLabel(title)
         title_label.setObjectName("settingsPanelTitle")
+        # Fixed vertical pins the title to exactly its font line
+        # height — Qt's default Preferred allows the parent layout to
+        # grow the label into a tall whitespace block when there's
+        # spare vertical room, which is what produced the "title
+        # floating in a giant empty area" look the user reported.
+        title_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        title_label.setContentsMargins(0, 0, 0, 0)
         panel_layout.addWidget(title_label)
 
         if str(subtitle or "").strip():
-            # Targeted spacing between the page title and its
-            # description text — gives the walkthrough hint pill
-            # (which anchors above the title and grows downward when
-            # its text wraps) clearance from the description below.
-            # Layout-level setSpacing would push every subsequent
-            # widget down too; addSpacing only widens the title →
-            # description gap so the panel content otherwise stays
-            # exactly where it was.
-            panel_layout.addSpacing(20)
-            subtitle_label = QLabel(subtitle)
+            # _TightWrapLabel overrides minimumSizeHint to return the
+            # heightForWidth at the current rendered width, so the
+            # subtitle widget is sized to the ACTUAL wrapped text
+            # height — not the worst-case "one word per line" height
+            # that a vanilla QLabel + setWordWrap(True) reports. That
+            # was the source of the big empty band around the
+            # description text.
+            subtitle_label = _TightWrapLabel(subtitle)
             subtitle_label.setObjectName("settingsPanelSubtitle")
             subtitle_label.setWordWrap(True)
+            subtitle_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            subtitle_label.setContentsMargins(0, 0, 0, 0)
             panel_layout.addWidget(subtitle_label)
         return panel, panel_layout
 
@@ -7308,6 +7907,13 @@ class MainWindow(QMainWindow):
 
         inner = QWidget()
         inner.setStyleSheet("background: transparent;")
+        # Cap inner widget at its content height so the panel layout
+        # gives it exactly sizeHint vertically. Without this the
+        # inner widget defaults to Preferred / Preferred and Qt
+        # stretches it to fill any extra room in the parent layout,
+        # which pushes the panel's effective height past the last
+        # card and leaves scroll-into-empty-space below.
+        inner.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         scroll.setWidget(inner)
         inner_layout = QVBoxLayout(inner)
         inner_layout.setContentsMargins(0, 0, SPACE_SM, 0)
@@ -7408,7 +8014,7 @@ class MainWindow(QMainWindow):
             ("Apps",                "Control Spotify, Chrome, and YouTube with gestures or voice — play, pause, skip, search, switch tabs."),
             ("System",              "Mouse cursor + click + scroll, system volume / mute, and window control (close, minimize, maximize, restore)."),
             ("Open Apps & Files",   "Voice: “open Notepad”, “open notes.docx”, “open Documents”. Or bind any file or shell command to a custom gesture."),
-            ("Voice & Dictation",   "Hold a left-hand gesture to issue voice commands or dictate text into the focused field with grammar correction."),
+            ("Voice & Dictation (beta)", "Hold a left-hand gesture to issue voice commands or dictate text into the focused field with grammar correction. Dictation is in beta — accuracy and latency are still being tuned."),
             ("Drawing & Capture",   "Sketch over your screen, save as PNG, show saved drawings as overlays. Capture clips or screenshots with a gesture."),
             ("Gestures",            "Built-in static (held poses) and dynamic (motion) gestures, plus your own custom poses bound to almost any action."),
         ]
@@ -7449,18 +8055,25 @@ class MainWindow(QMainWindow):
         # ---- Card 4: Where to learn more ---------------------------
         more_card = self._make_instructions_card(
             "Where to learn more",
-            "<b>Tutorial</b> — guided practice with live camera feedback. "
+            "<b>Tutorial</b> — Guided practice with live camera feedback. "
             "Best place to start.<br>"
-            "<b>Control Guide</b> — every gesture and voice command, with "
+            "<b>Control Guide</b> — Every gesture and voice command, with "
             "a short demo for each. Use as a reference.<br>"
-            "<b>General settings</b> — mouse sensitivity, overlays, "
+            "<b>General settings</b> — Mouse sensitivity, overlays, "
             "performance modes, and the Connect Spotify button.",
             allow_html=True,
         )
         inner_layout.addWidget(more_card)
 
-        inner_layout.addStretch(1)
-        layout.addWidget(inner, 1)
+        # Panel sizes to exactly the four cards stacked + margins. No
+        # stretch on inner / on the panel layout — stretching either
+        # one caused the panel to grow past its content when the
+        # viewport was taller than needed, which the user perceived
+        # as "scrolls past the bottom of the last card into empty
+        # space". The outer settings_content_stack uses Maximum
+        # vertical policy, so the stack ends right where this panel
+        # ends.
+        layout.addWidget(inner)
         return panel
 
     def _make_instructions_card(
@@ -7586,11 +8199,16 @@ class MainWindow(QMainWindow):
         self._general_baseline: dict[str, object] = {}
         self._general_controls: dict[str, "QWidget"] = {}
 
+        inner_layout.addWidget(self._build_general_handedness_section())
         inner_layout.addWidget(self._build_general_mouse_section())
+        inner_layout.addWidget(self._build_general_clip_section())
         inner_layout.addWidget(self._build_general_overlay_section())
         inner_layout.addWidget(self._build_general_system_modes_section())
+        inner_layout.addWidget(self._build_general_voice_upgrade_section())
         inner_layout.addWidget(self._build_general_spotify_section())
+        inner_layout.addWidget(self._build_general_discord_section())
         inner_layout.addWidget(self._build_general_startup_section())
+        inner_layout.addWidget(self._build_general_diagnostics_section())
 
         # Bottom Save button removed — only the top-right one
         # remains. General still uses the DEFERRED-save model:
@@ -7824,6 +8442,122 @@ class MainWindow(QMainWindow):
             hbar = scroll.horizontalScrollBar()
             if hbar is not None:
                 hbar.setValue(0)
+        except Exception:
+            pass
+
+    # Settings sections whose content always fits a normal-size
+    # window — explicitly disable the outer scroll bar on these so
+    # the user never sees a phantom scroll affordance when there's
+    # nothing to scroll into.
+    _SETTINGS_NEVER_SCROLL_SECTIONS = frozenset({
+        SECTION_COLORS,
+        SECTION_TUTORIAL,
+        SECTION_ABOUT,
+        SECTION_MICROPHONE,
+    })
+
+    def _apply_settings_panel_scroll_policy(self, idx: int) -> None:
+        """Toggle the outer settings scrollbar per-panel.
+
+        AlwaysOff for the never-scroll panels (Colors / Tutorial /
+        About / Microphone — their content is short enough to fit
+        any normal-size window, and the scrollbar appearing in
+        their default state was distracting). AsNeeded everywhere
+        else, where _CurrentSizedStack's setMaximumHeight cap keeps
+        the scroll range tight against the active panel's actual
+        rendered height."""
+        scroll = getattr(self, "_settings_content_scroll", None)
+        if scroll is None:
+            return
+        try:
+            if idx in self._SETTINGS_NEVER_SCROLL_SECTIONS:
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            else:
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        except Exception:
+            pass
+
+    def _on_walkthrough_hint_link_activated(self, link: str) -> None:
+        """Handle links embedded inside the walkthrough hint pill.
+        Used by the General-page hint's 'here' link to scroll the
+        General panel to its Spotify section so the user can find
+        Set Up / Connect without hunting.
+        """
+        if not link:
+            return
+        if link == "walkthrough:scroll-to-spotify":
+            self._scroll_general_to_spotify_section()
+
+    def _scroll_general_to_spotify_section(self) -> None:
+        """Scroll the outer settings content scroll so the Spotify
+        section of the General panel is in view. The Spotify section
+        is the last card built by _build_general_panel; we find its
+        Connect Spotify button (always present after build) and ask
+        the outer scroll to make it visible.
+        """
+        try:
+            self.show_settings_section(SECTION_GENERAL)
+        except Exception:
+            return
+        scroll = getattr(self, "_settings_content_scroll", None)
+        if scroll is None:
+            return
+        target = getattr(self, "connect_spotify_button", None)
+        if target is None:
+            return
+        try:
+            scroll.ensureWidgetVisible(target, 12, 60)
+        except Exception:
+            pass
+
+    def _on_settings_page_changed_reset_guide(self, new_index: int) -> None:
+        """If the user just navigated AWAY from the Control Guide
+        page, collapse every section / card so the page is back to
+        its default closed state next time they open it.
+
+        Detecting 'leaving' is done by tracking whether the page that
+        was active BEFORE this signal was the Control Guide — the
+        currentChanged signal fires with the new index, not the old
+        one, so we cache the previous-active flag ourselves."""
+        was_control_guide = bool(getattr(self, "_control_guide_prev_active", False))
+        self._control_guide_prev_active = (new_index == SECTION_GESTURES)
+        if was_control_guide and new_index != SECTION_GESTURES:
+            self._reset_control_guide_state()
+
+    def _reset_control_guide_state(self) -> None:
+        """Collapse every GestureGuideSection and GestureGuideCard
+        inside the Control Guide page. Called when the user
+        navigates away so the page opens fresh on next visit."""
+        try:
+            panel = self.settings_content_stack.widget(SECTION_GESTURES)
+        except Exception:
+            return
+        if panel is None:
+            return
+        try:
+            for section in panel.findChildren(GestureGuideSection):
+                try:
+                    if section.header_button.isChecked():
+                        # _toggle_expanded reads the new checked state
+                        # to decide visibility + chevron char, so flip
+                        # the button first then call it explicitly.
+                        section.header_button.setChecked(False)
+                        section._toggle_expanded(False)
+                    else:
+                        # Belt-and-braces: even if not checked, make
+                        # sure the content is hidden (in case state
+                        # drifted).
+                        section.content.setVisible(False)
+                except Exception:
+                    pass
+            for card in panel.findChildren(GestureGuideCard):
+                try:
+                    if getattr(card, "_card_expanded", False) or getattr(card, "_details_expanded", False):
+                        card._card_expanded = False
+                        card._details_expanded = False
+                        card._apply_states()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -8142,6 +8876,67 @@ class MainWindow(QMainWindow):
 
         return card
 
+    def _build_general_clip_section(self) -> "QFrame":
+        card, body = self._make_general_section(
+            "Clip & Record",
+            "Pick which monitor the \"clip that\" voice command captures by default.",
+            details=(
+                "On a multi-monitor setup the voice trigger used to grab "
+                "the full virtual desktop, which made the clips include "
+                "the off-screen secondary monitor. Set this to your main "
+                "monitor (or whichever one your game / main app lives on) "
+                "and \"clip that\" will record only that screen — no "
+                "monitor-picker dialog interrupting the moment. Choose "
+                "All Monitors here if you really want the stitched union."
+            ),
+        )
+        text_color = str(self.config.text_color or "#E5F6FF")
+        body.setSpacing(10)
+
+        clip_monitor_combo = QComboBox()
+        clip_monitor_combo.setStyleSheet(self._general_text_qss())
+        # Primary monitor is the default. The combo always offers
+        # Primary first so the dropdown reads naturally when scanned
+        # top-to-bottom; specific screens follow in QGuiApplication
+        # order; All Monitors at the bottom for users who want the
+        # stitched union.
+        clip_monitor_combo.addItem("Main Monitor (auto-detect)", None)
+        try:
+            for index, screen in enumerate(QGuiApplication.screens() or []):
+                if screen is None:
+                    continue
+                geo = screen.geometry()
+                label = f"Monitor {index + 1} ({geo.width()}×{geo.height()})"
+                if screen == QGuiApplication.primaryScreen():
+                    label += "  (Main)"
+                clip_monitor_combo.addItem(label, index)
+        except Exception:
+            pass
+        clip_monitor_combo.addItem("All Monitors", -1)
+        initial_clip_monitor = getattr(self.config, "clip_default_monitor_index", None)
+        for row in range(clip_monitor_combo.count()):
+            if clip_monitor_combo.itemData(row) == initial_clip_monitor:
+                clip_monitor_combo.setCurrentIndex(row)
+                break
+        self._register_general_baseline("clip_default_monitor_index", initial_clip_monitor)
+
+        def _on_clip_monitor_changed(_idx: int) -> None:
+            data = clip_monitor_combo.currentData()
+            if data is None:
+                value = None
+            else:
+                try:
+                    value = int(data)
+                except Exception:
+                    value = None
+            self._on_general_control_changed("clip_default_monitor_index", value)
+
+        clip_monitor_combo.currentIndexChanged.connect(_on_clip_monitor_changed)
+        body.addWidget(clip_monitor_combo)
+        self._general_controls["clip_default_monitor_index"] = clip_monitor_combo
+
+        return card
+
     def _build_general_overlay_section(self) -> "QFrame":
         card, body = self._make_general_section(
             "Overlay",
@@ -8287,6 +9082,87 @@ class MainWindow(QMainWindow):
         self._general_controls["auto_start_on_login"] = checkbox
         return card
 
+    def _build_general_diagnostics_section(self) -> "QFrame":
+        """Settings → General → Diagnostics. Single toggle that
+        extends the home-screen Tracking pill with the live stable
+        gesture + confidence so testers / debuggers can see what the
+        recognizer is reading without opening a separate window."""
+        card, body = self._make_general_section(
+            "Diagnostics",
+            "Show live gesture + confidence in the home Tracking pill.",
+            details=(
+                "When enabled, the 'Tracking: Good / Marginal' pill on "
+                "the home screen gets extended with the current stable "
+                "gesture name and confidence score (e.g. 'Tracking: "
+                "Good · Right one (0.87)'). Useful while testing a new "
+                "pose or debugging why a gesture isn't firing — the "
+                "value updates ~4× per second. Off by default; toggle "
+                "on only when you need it."
+            ),
+        )
+        from PySide6.QtWidgets import QCheckBox
+        checkbox_qss = self._general_checkbox_qss()
+        current = bool(getattr(self.config, "diagnostic_overlay_enabled", False))
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        checkbox = QCheckBox("Show live diagnostics in the tracking pill")
+        checkbox.setStyleSheet(checkbox_qss)
+        checkbox.setToolTip(
+            "Appends the recognizer's current gesture + confidence to the "
+            "home-screen tracking pill. No additional CPU cost."
+        )
+        checkbox.setChecked(current)
+        self._register_general_baseline("diagnostic_overlay_enabled", current)
+
+        def _on_toggled(state: int) -> None:
+            new_value = bool(state)
+            try:
+                self.config.diagnostic_overlay_enabled = new_value
+                save_config(self.config)
+            except Exception:
+                pass
+            self._register_general_baseline("diagnostic_overlay_enabled", new_value)
+
+        checkbox.stateChanged.connect(_on_toggled)
+        row.addWidget(checkbox)
+        row.addStretch(1)
+        body.addLayout(row)
+        self._general_controls["diagnostic_overlay_enabled"] = checkbox
+
+        # Second toggle: TOP-3 recognizer scores. Sub-feature of the
+        # main diagnostic toggle — only useful when the pill is being
+        # extended in the first place, so we don't gate enabling it,
+        # but we surface the dependency via the description.
+        top_current = bool(getattr(self.config, "show_recognizer_top_scores", False))
+        top_row = QHBoxLayout()
+        top_row.setSpacing(10)
+        top_checkbox = QCheckBox("Show TOP-3 recognizer scores (instead of just the stable label)")
+        top_checkbox.setStyleSheet(checkbox_qss)
+        top_checkbox.setToolTip(
+            "Replaces the single 'stable_label (conf)' in the tracking pill "
+            "with the recognizer's top 3 candidates each frame — e.g. "
+            "'fist 0.87 · neutral 0.08 · three 0.05'. Lets you see runner-up "
+            "poses when a gesture isn't firing. Requires the toggle above."
+        )
+        top_checkbox.setChecked(top_current)
+        self._register_general_baseline("show_recognizer_top_scores", top_current)
+
+        def _on_top_toggled(state: int) -> None:
+            new_value = bool(state)
+            try:
+                self.config.show_recognizer_top_scores = new_value
+                save_config(self.config)
+            except Exception:
+                pass
+            self._register_general_baseline("show_recognizer_top_scores", new_value)
+
+        top_checkbox.stateChanged.connect(_on_top_toggled)
+        top_row.addWidget(top_checkbox)
+        top_row.addStretch(1)
+        body.addLayout(top_row)
+        self._general_controls["show_recognizer_top_scores"] = top_checkbox
+        return card
+
     def _build_general_system_modes_section(self) -> "QFrame":
         """Per-mode card layout that mirrors the Camera tab: each
         mode gets its own short summary + 'Show more...' expandable
@@ -8398,13 +9274,247 @@ class MainWindow(QMainWindow):
 
         return card
 
+    def _build_general_handedness_section(self) -> "QFrame":
+        """Left-handed mode toggle: swaps every Left/Right hand role
+        across the app (gestures, air mouse, drawing, wheels, etc.).
+        Uses the deferred-save buffer like the other General controls;
+        the engine reads the flag live so it takes effect on the next
+        frame after Save Changes."""
+        card, body = self._make_general_section(
+            "Handedness",
+            "Switch all hand controls to your left hand.",
+            details=None,
+        )
+        body.setSpacing(14)
+        body.addWidget(
+            self._build_expandable_note(
+                "Swaps the left and right hand roles everywhere.",
+                "By default the right hand drives gestures, the air mouse, drawing, and the wheels, while the left hand is the toggle/off hand. Left-handed mode swaps the two, so your left hand drives everything and the right hand becomes the toggle hand.",
+                object_name="cameraNote",
+            )
+        )
+        lh_btn = QPushButton()
+        lh_btn.setCheckable(True)
+        lh_btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        lh_btn.setStyleSheet(self._settings_panel_button_stylesheet())
+        lh_initial = bool(getattr(self.config, "left_handed_mode", False))
+        lh_btn.setChecked(lh_initial)
+        lh_btn.setText("Left-handed mode: ON" if lh_initial else "Left-handed mode")
+        self._register_general_baseline("left_handed_mode", lh_initial)
+
+        def _on_left_handed_clicked(checked: bool) -> None:
+            lh_btn.setText("Left-handed mode: ON" if checked else "Left-handed mode")
+            self._on_general_control_changed("left_handed_mode", bool(checked))
+
+        lh_btn.clicked.connect(_on_left_handed_clicked)
+        lh_row = QHBoxLayout()
+        lh_row.addWidget(lh_btn)
+        lh_row.addStretch(1)
+        body.addLayout(lh_row)
+        self._general_controls["left_handed_mode"] = lh_btn
+        return card
+
+    def _build_general_voice_upgrade_section(self) -> "QFrame":
+        """Optional download of the higher-accuracy dictation model
+        (medium.en). The whole card is hidden when the model is already
+        present — bundled (website builds ship it) or previously
+        downloaded — so it only surfaces on the slim Store build where
+        the upgrade is actually available to install."""
+        from PySide6.QtWidgets import QProgressBar
+        card, body = self._make_general_section(
+            "Voice Recognition Upgrade",
+            "Download the high-accuracy voice model for sharper dictation.",
+            details=(
+                "Touchless ships with a fast, lightweight voice model that "
+                "handles voice commands and everyday dictation well. This "
+                "optional upgrade adds a larger, higher-accuracy model that "
+                "improves transcription of tricky words, names, and speech "
+                "in noisier rooms.\n\n"
+                "It's about 1.5 GB and downloads in the background — you can "
+                "keep using Touchless while it installs. Once it's done the "
+                "app uses it automatically; this option then disappears."
+            ),
+        )
+        self._voice_upgrade_card = card
+
+        self._voice_upgrade_button = QPushButton("Download Upgrade")
+        self._voice_upgrade_button.setObjectName("voiceUpgradeButton")
+        self._voice_upgrade_button.setCursor(Qt.PointingHandCursor)
+        self._mark_settings_panel_button(self._voice_upgrade_button)
+        self._voice_upgrade_button.clicked.connect(self._on_voice_upgrade_clicked)
+        body.addWidget(self._voice_upgrade_button, 0, Qt.AlignLeft)
+
+        self._voice_upgrade_progress = QProgressBar()
+        self._voice_upgrade_progress.setRange(0, 100)
+        self._voice_upgrade_progress.setValue(0)
+        self._voice_upgrade_progress.setTextVisible(True)
+        self._voice_upgrade_progress.setVisible(False)
+        self._voice_upgrade_progress.setMinimumHeight(22)
+        body.addWidget(self._voice_upgrade_progress)
+
+        self._voice_upgrade_status = QLabel("")
+        self._voice_upgrade_status.setWordWrap(True)
+        self._voice_upgrade_status.setStyleSheet(
+            f"color: {self.config.text_color}; opacity: 0.85; font-size: 12px;"
+        )
+        self._voice_upgrade_status.setVisible(False)
+        body.addWidget(self._voice_upgrade_status)
+
+        # Hide the whole card when the model is already available.
+        try:
+            from ...voice.voice_model_download import medium_model_present
+            if medium_model_present():
+                card.setVisible(False)
+        except Exception:
+            pass
+        return card
+
+    def _on_voice_upgrade_clicked(self) -> None:
+        if not hasattr(self, "_voice_upgrade_button"):
+            return
+        # Re-entry guard: a download already running.
+        existing = getattr(self, "_voice_model_downloader", None)
+        if existing is not None:
+            return
+        try:
+            from ...voice.voice_model_download import VoiceModelDownloader
+        except Exception as exc:
+            if hasattr(self, "_voice_upgrade_status"):
+                self._voice_upgrade_status.setVisible(True)
+                self._voice_upgrade_status.setText(f"Couldn't start the download: {exc}")
+            return
+        self._voice_upgrade_button.setEnabled(False)
+        self._voice_upgrade_button.setText("Downloading…")
+        self._voice_upgrade_progress.setValue(0)
+        self._voice_upgrade_progress.setVisible(True)
+        self._voice_upgrade_status.setVisible(True)
+        self._voice_upgrade_status.setText("Starting download…")
+        dl = VoiceModelDownloader(parent=self)
+        dl.progress.connect(self._on_voice_upgrade_progress)
+        dl.finished.connect(self._on_voice_upgrade_finished)
+        self._voice_model_downloader = dl
+        dl.start()
+
+    def _on_voice_upgrade_progress(self, downloaded: int, total: int) -> None:
+        if not hasattr(self, "_voice_upgrade_progress"):
+            return
+        if total > 0:
+            pct = int((downloaded * 100) / total)
+            self._voice_upgrade_progress.setValue(max(0, min(100, pct)))
+            mb_done = downloaded / (1024 * 1024)
+            mb_total = total / (1024 * 1024)
+            self._voice_upgrade_status.setText(
+                f"Downloading… {mb_done:.0f} MB of {mb_total:.0f} MB"
+            )
+
+    def _on_voice_upgrade_finished(self, success: bool, message: str) -> None:
+        self._voice_model_downloader = None
+        if success:
+            try:
+                self.config.voice_model_upgrade_installed = True
+                save_config(self.config)
+            except Exception:
+                pass
+            if hasattr(self, "_voice_upgrade_card"):
+                self._voice_upgrade_card.setVisible(False)
+            try:
+                TouchlessNotice.show_info(
+                    self,
+                    "Voice Recognition Upgrade",
+                    "Done — Touchless will use the high-accuracy voice model "
+                    "from now on. No restart needed; it kicks in on your next "
+                    "dictation.",
+                )
+            except Exception:
+                pass
+        else:
+            if hasattr(self, "_voice_upgrade_button"):
+                self._voice_upgrade_button.setEnabled(True)
+                self._voice_upgrade_button.setText("Download Upgrade")
+            if hasattr(self, "_voice_upgrade_progress"):
+                self._voice_upgrade_progress.setVisible(False)
+            if hasattr(self, "_voice_upgrade_status"):
+                self._voice_upgrade_status.setVisible(True)
+                self._voice_upgrade_status.setText(str(message or "Download failed."))
+
     def _build_general_spotify_section(self) -> "QFrame":
         card, body = self._make_general_section(
             "Spotify",
-            "Connect Touchless to Spotify so voice commands and "
-            "gestures can control playback.",
-            details=None,
+            "Run the one-time setup, then click Connect Spotify.",
+            details=(
+                "Spotify caps shared developer apps at 5 testers per "
+                "release, so every Touchless user creates their own "
+                "free Spotify Developer app once — Set up your own "
+                "Spotify app walks you through it in about a minute "
+                "(every value has a Copy button, your Spotify "
+                "password never leaves the official Spotify "
+                "website). Touchless only receives a public Client "
+                "ID; tokens stay on your machine.\n\n"
+                "Connect Spotify opens Spotify's OAuth consent "
+                "screen in your browser and saves the resulting "
+                "tokens locally. Click it again any time you need "
+                "to re-authorise — for example after changing your "
+                "Spotify password, switching accounts, or if voice "
+                "control of Spotify suddenly stops working."
+            ),
         )
+        # Premium-required warning line. Spotify gates its Web API
+        # playback endpoints (play / pause / next / etc.) behind
+        # Premium accounts, so Touchless can't drive playback on a
+        # Free-tier account no matter how the auth flow ends. The
+        # warning has an X dismiss button so users who already know
+        # can latch it off — config.spotify_premium_warning_dismissed
+        # persists the dismissal across launches.
+        self._spotify_premium_warning_frame = QFrame()
+        self._spotify_premium_warning_frame.setObjectName("spotifyPremiumWarning")
+        self._spotify_premium_warning_frame.setAttribute(Qt.WA_StyledBackground, True)
+        self._spotify_premium_warning_frame.setStyleSheet(
+            "QFrame#spotifyPremiumWarning {"
+            "  background: rgba(255, 196, 80, 0.10);"
+            "  border: 1px solid rgba(255, 196, 80, 0.40);"
+            "  border-radius: 8px;"
+            "}"
+        )
+        warn_row = QHBoxLayout(self._spotify_premium_warning_frame)
+        warn_row.setContentsMargins(12, 8, 8, 8)
+        warn_row.setSpacing(6)
+        premium_text = QLabel(
+            "⚠ Spotify Premium required. Free accounts can authorise but the "
+            "Web API won't accept playback commands. Spotify offers a one-month "
+            "free Premium trial if you want to test Touchless control before "
+            "committing."
+        )
+        premium_text.setWordWrap(True)
+        premium_text.setStyleSheet(
+            "color: #FFD27A; font-size: 12px; font-weight: 600; background: transparent; border: none;"
+        )
+        warn_row.addWidget(premium_text, 1)
+        dismiss_btn = QPushButton("✕")
+        dismiss_btn.setObjectName("spotifyPremiumWarningDismiss")
+        dismiss_btn.setCursor(Qt.PointingHandCursor)
+        dismiss_btn.setToolTip("Dismiss (won't show again)")
+        dismiss_btn.setFlat(True)
+        dismiss_btn.setStyleSheet(
+            "QPushButton#spotifyPremiumWarningDismiss {"
+            "  background: transparent;"
+            "  color: #FFD27A;"
+            "  border: none;"
+            "  font-size: 12px;"
+            "  font-weight: 700;"
+            "  padding: 0 2px;"
+            "  min-width: 0;"
+            "}"
+            "QPushButton#spotifyPremiumWarningDismiss:hover {"
+            "  color: #FFFFFF;"
+            "}"
+        )
+        dismiss_btn.clicked.connect(self._dismiss_spotify_premium_warning)
+        warn_row.addWidget(dismiss_btn, 0, Qt.AlignTop)
+        body.addWidget(self._spotify_premium_warning_frame)
+        # Hide if user has dismissed it previously.
+        if bool(getattr(self.config, "spotify_premium_warning_dismissed", False)):
+            self._spotify_premium_warning_frame.setVisible(False)
+
         # Connect Spotify button — opens OAuth in a browser. Not
         # gated on the deferred-save mechanism (it does its own
         # token persistence).
@@ -8412,42 +9522,225 @@ class MainWindow(QMainWindow):
         self.connect_spotify_button.setObjectName("connectSpotifyButton")
         self.connect_spotify_button.setCursor(Qt.PointingHandCursor)
         self.connect_spotify_button.clicked.connect(self._on_connect_spotify_clicked)
+
+        # Wizard button — opens the in-app Spotify setup flow that
+        # lets every user supply their own client_id (lifting the
+        # 5-user cap Spotify enforces on the bundled default).
+        setup_btn = QPushButton("Set up your own Spotify app")
+        setup_btn.setObjectName("spotifySetupButton")
+        setup_btn.setCursor(Qt.PointingHandCursor)
+        setup_btn.setStyleSheet(self._settings_panel_button_stylesheet())
+        setup_btn.clicked.connect(self._open_spotify_setup_wizard)
+
         row = QHBoxLayout()
+        row.setSpacing(10)
         row.addStretch(1)
+        row.addWidget(setup_btn)
         row.addWidget(self.connect_spotify_button)
         row.addStretch(1)
         body.addLayout(row)
         return card
 
+    def _dismiss_spotify_premium_warning(self) -> None:
+        """Hide the Spotify Premium warning and persist the dismissal
+        so it doesn't reappear on subsequent launches."""
+        try:
+            self.config.spotify_premium_warning_dismissed = True
+            save_config(self.config)
+        except Exception:
+            pass
+        frame = getattr(self, "_spotify_premium_warning_frame", None)
+        if frame is not None:
+            try:
+                frame.setVisible(False)
+            except Exception:
+                pass
+
+    def _open_spotify_setup_wizard(self) -> None:
+        """Open the guided wizard that walks the user through creating
+        their own Spotify Developer app and pasting the resulting
+        client_id back into Touchless. Reloads the engine's
+        SpotifyController on success so the new client_id takes
+        effect immediately without a restart."""
+        try:
+            from .spotify_setup_wizard import SpotifySetupWizard
+        except Exception as exc:
+            try:
+                self.last_action_label.setText(
+                    f"Last action: Spotify setup wizard failed to load ({exc})"
+                )
+            except Exception:
+                pass
+            return
+        dialog = SpotifySetupWizard(self.config, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            # The engine's existing SpotifyController instance loaded
+            # the OLD client_id (or the embedded default) at init. The
+            # new client_id is in config — force the controller to
+            # rebuild its credentials so subsequent auth uses the new
+            # value. _load_credentials reads config fresh.
+            worker = getattr(self, "_worker", None)
+            controller = getattr(worker, "spotify_controller", None) if worker is not None else None
+            if controller is not None and hasattr(controller, "_load_credentials"):
+                try:
+                    controller._load_credentials()
+                except Exception:
+                    pass
+            try:
+                self.last_action_label.setText(
+                    "Last action: Spotify client_id saved — authorising now…"
+                )
+            except Exception:
+                pass
+            # Auto-fire the Connect-Spotify flow so the user lands on
+            # the browser-based authorize step immediately instead of
+            # having to click Connect Spotify as a separate action.
+            QTimer.singleShot(50, self._on_connect_spotify_clicked)
+
+    # ----- Discord (Settings → General) -----------------------------------
+
+    def _build_general_discord_section(self) -> "QFrame":
+        """Settings → General → Discord card. Unconditionally rendered
+        as a "Coming soon" placeholder — the full Connect / Setup-wizard
+        flow is shelved behind a future feature update while we wait on
+        Discord's public-distribution review of the RPC scope. The
+        underlying controllers, router, and voice parser are still in
+        the codebase but gated off everywhere (here, in noop_engine, in
+        command_processor) so we can land the rest of the build without
+        exposing a half-working integration."""
+        card, body = self._make_general_section(
+            "Discord",
+            "Coming soon — Discord control will arrive in a future Touchless update.",
+            details=(
+                "Touchless will be able to mute, deafen, and switch "
+                "voice channels in Discord directly from your hand "
+                "and voice. Roll-out is gated on Discord's public-"
+                "distribution review of our RPC scope; once that "
+                "lands, a future Touchless update will enable this "
+                "panel for everyone — no separate sign-up needed."
+            ),
+        )
+        return card
+
+    def _open_discord_setup_wizard(self) -> None:
+        """Open the guided wizard that walks the user through creating
+        their own Discord Developer app and pasting the resulting
+        Application ID + Client Secret back into Touchless. Reloads
+        the engine's DiscordController on success so the new
+        credentials take effect immediately without a restart."""
+        try:
+            from .discord_setup_wizard import DiscordSetupWizard
+        except Exception as exc:
+            try:
+                self.last_action_label.setText(
+                    f"Last action: Discord setup wizard failed to load ({exc})"
+                )
+            except Exception:
+                pass
+            return
+        dialog = DiscordSetupWizard(self.config, parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            # Force the engine's existing DiscordController to rebuild
+            # its credentials from config — same dance as the Spotify
+            # wizard does after the user finishes the flow.
+            worker = getattr(self, "_worker", None)
+            controller = (
+                getattr(worker, "discord_controller", None) if worker is not None else None
+            )
+            if controller is not None and hasattr(controller, "_load_credentials"):
+                try:
+                    controller._load_credentials()
+                except Exception:
+                    pass
+            try:
+                self.last_action_label.setText(
+                    "Last action: Discord credentials saved — connecting now…"
+                )
+            except Exception:
+                pass
+            # Auto-fire the Connect-Discord flow so the user lands on
+            # the AUTHORIZE prompt inside the Discord client immediately
+            # instead of having to click Connect Discord as a separate
+            # action.
+            QTimer.singleShot(50, self._on_connect_discord_clicked)
+
+    def _on_connect_discord_clicked(self) -> None:
+        """Open the Discord OAuth flow on a background thread. The
+        controller's authorize_full_scopes blocks for up to ~2 minutes
+        waiting for the user to click Authorize inside the Discord
+        desktop client — calling it from the UI thread would freeze
+        the camera and the rest of the UI. Mirrors
+        _on_connect_spotify_clicked's structure 1:1."""
+        from ..integration.noop_engine import DiscordController as _DiscordController
+
+        worker = getattr(self, "_worker", None)
+        controller = getattr(worker, "discord_controller", None) if worker is not None else None
+        if controller is None:
+            controller = _DiscordController()
+
+        if hasattr(self, "last_action_label"):
+            self.last_action_label.setText(
+                "Last action: opening Discord — click Authorize in the Discord window…"
+            )
+
+        def _run_auth() -> None:
+            try:
+                ok = controller.authorize_full_scopes()
+            except Exception as exc:
+                ok = False
+                try:
+                    print(f"[discord] authorize_full_scopes raised: {exc}")
+                except Exception:
+                    pass
+            QTimer.singleShot(
+                0,
+                lambda: self._on_discord_auth_done(ok, getattr(controller, "message", "")),
+            )
+
+        threading.Thread(target=_run_auth, name="discord-authorize", daemon=True).start()
+
+    def _on_discord_auth_done(self, ok: bool, message: str) -> None:
+        if ok:
+            short = "Discord connected"
+            label = "discord_connect_ok"
+        else:
+            detail = message or "see terminal"
+            short = f"Discord connect failed — {detail}"
+            label = "discord_connect_failed"
+        if hasattr(self, "last_action_label"):
+            self.last_action_label.setText(f"Last action: {short}")
+        worker = getattr(self, "_worker", None)
+        if worker is not None:
+            try:
+                worker._record_action(label, short)
+            except Exception:
+                pass
+
     def _build_gesture_guide_panel(self) -> QWidget:
         panel, layout = self._make_content_panel(
             "Control Guide",
             "Open a section below to view each control and how to use it. "
-            "Static gestures are held poses; dynamic gestures are motion-based; "
-            "voice commands are spoken phrases recognized after the listener trigger.",
+            "Static gestures are held poses, dynamic gestures are motion-based, "
+            "and voice commands are spoken phrases recognized after the listener trigger.",
         )
-
-        info_box = QFrame()
-        info_box.setObjectName("innerCard")
-        info_box.setAttribute(Qt.WA_StyledBackground, True)
-        info_box.setStyleSheet(self._settings_inner_card_stylesheet())
-        info_layout = QVBoxLayout(info_box)
-        info_layout.setContentsMargins(14, 12, 14, 12)
-        info_layout.setSpacing(4)
-        note = QLabel(
-            "Static gestures = held hand poses. "
-            "Dynamic gestures = motion-based (swipes, circles, slides). "
-            "Voice commands = phrases spoken after holding LEFT-hand 'one' to start the listener."
-        )
-        note.setWordWrap(True)
-        info_layout.addWidget(note)
-        layout.addWidget(info_box, 0)
 
         # Bypass build_gesture_guide_scroll_area's inner QScrollArea
         # so we only have ONE visible scrollbar (the outer green
         # settingsContentScroll). The function builds the content
         # widget separately, so we just use that directly.
-        layout.addWidget(build_gesture_guide_content_widget(), 1)
+        # Stretch=0 + Maximum on the content widget: the guide
+        # content sizes to its NATURAL collapsed height. The outer
+        # scroll only engages once the user expands a section whose
+        # cards push the content past the viewport.
+        guide = build_gesture_guide_content_widget()
+        # Cap the guide content widget at its sizeHint. Without this,
+        # the outer scroll's widgetResizable=True forced the guide
+        # taller than its collapsed content (3 section headers), which
+        # showed a scrollbar in the default state even though there
+        # was nothing below the headers to scroll into.
+        guide.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        layout.addWidget(guide, 0)
+        layout.addStretch(1)
         return panel
 
     def _build_custom_gesture_panel(self) -> QWidget:
@@ -8457,6 +9750,11 @@ class MainWindow(QMainWindow):
             "text snippet, URL, or shell command. Static poses only — "
             "see the How it works card below for limitations.",
         )
+        # Use the default panel sizePolicy (Preferred/Maximum) so the
+        # outer settingsContentScroll handles overflow — same
+        # architecture as Save Locations, which the user confirmed
+        # has the layout they want. CustomGesturesPanel has NO inner
+        # page_scroll for the same reason.
         from .custom_gestures_panel import CustomGesturesPanel
 
         self._custom_gestures_panel = CustomGesturesPanel(
@@ -8483,7 +9781,12 @@ class MainWindow(QMainWindow):
         self._custom_gestures_panel.export_one_requested.connect(
             self._export_one_custom_gesture
         )
-        layout.addWidget(self._custom_gestures_panel)
+        # Stretch=0 + trailing stretch so the panel sizes to its
+        # natural content height (Save Locations pattern). The outer
+        # settingsContentScroll handles overflow when content
+        # exceeds the viewport.
+        layout.addWidget(self._custom_gestures_panel, 0)
+        layout.addStretch(1)
         return panel
 
     # -------- Gesture Binds tab ------------------------------------------
@@ -8619,6 +9922,17 @@ class MainWindow(QMainWindow):
         if title_label is not None:
             header_row.addWidget(title_label)
         header_row.addStretch(1)
+        # Reset-to-defaults: clears every user remap so all actions
+        # return to their built-in poses. Styled as a secondary button
+        # so it doesn't compete with Save Changes. Confirms first since
+        # it discards the user's customizations.
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.setObjectName("gestureBindsResetButton")
+        reset_btn.setCursor(Qt.PointingHandCursor)
+        reset_btn.setStyleSheet(self._settings_panel_button_stylesheet())
+        reset_btn.clicked.connect(self._reset_gesture_bindings_to_defaults)
+        header_row.addWidget(reset_btn, 0, Qt.AlignTop)
+        self._gesture_binds_reset_button = reset_btn
         save_btn = QPushButton("Save Changes")
         save_btn.setObjectName("settingsSaveButton")
         save_btn.setProperty("pendingSave", False)
@@ -8641,57 +9955,6 @@ class MainWindow(QMainWindow):
         self._gesture_binds_hover_timer: QTimer | None = None
         self._gesture_binds_hover_popup: QFrame | None = None
         self._gesture_binds_hover_pose_id: str | None = None
-
-        scroll = QScrollArea()
-        scroll.setObjectName("gestureBindsScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        # Allow this inner scroll to shrink very small. Without this,
-        # the bindings table + poses list push the scroll's minimum
-        # size hint past the settings viewport, which makes the
-        # OUTER content_scroll engage and scroll the page header
-        # (title + Save Changes) out of view. Capping the min height
-        # at 120 keeps the panel's minimumSizeHint within the
-        # viewport so the outer scroll never engages — the inner
-        # scroll absorbs overflow, and the header stays pinned.
-        scroll.setMinimumHeight(120)
-        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        scroll.setStyleSheet(
-            f"""
-            QScrollArea#gestureBindsScroll,
-            QScrollArea#gestureBindsScroll > QWidget,
-            QScrollArea#gestureBindsScroll QWidget#qt_scrollarea_viewport {{
-                background: transparent;
-                border: none;
-            }}
-            QScrollArea#gestureBindsScroll QScrollBar:vertical {{
-                background: rgba(255,255,255,0.10);
-                width: 12px;
-                margin: 6px 2px 6px 2px;
-                border-radius: 6px;
-            }}
-            QScrollArea#gestureBindsScroll QScrollBar::handle:vertical {{
-                background: {accent};
-                border-radius: 6px;
-                min-height: 40px;
-            }}
-            QScrollArea#gestureBindsScroll QScrollBar::handle:vertical:hover {{
-                background: {accent};
-                border: 1px solid rgba(255,255,255,0.35);
-            }}
-            QScrollArea#gestureBindsScroll QScrollBar::add-line:vertical,
-            QScrollArea#gestureBindsScroll QScrollBar::sub-line:vertical {{
-                height: 0px;
-                background: transparent;
-            }}
-            QScrollArea#gestureBindsScroll QScrollBar::add-page:vertical,
-            QScrollArea#gestureBindsScroll QScrollBar::sub-page:vertical {{
-                background: transparent;
-            }}
-            """
-        )
 
         body = QWidget()
         body.setObjectName("gestureBindsBody")
@@ -8824,6 +10087,15 @@ class MainWindow(QMainWindow):
         poses_list.itemClicked.connect(self._on_gesture_pose_clicked)
         poses_list.itemEntered.connect(self._on_gesture_pose_hover_enter)
         poses_list.viewport().installEventFilter(self)
+        # Disable the QListWidget's internal vertical scrollbar so the
+        # page shows ONE scroll (the outer settingsContentScroll) instead
+        # of two stacked scrollbars. The list expands to fit every pose
+        # so the outer scroll handles overflow uniformly across the
+        # bindings table + poses list together.
+        poses_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        poses_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        poses_list.setSizeAdjustPolicy(QListWidget.AdjustToContents)
+        poses_list.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         self._gesture_binds_poses_list = poses_list
         self._refresh_gesture_binds_poses_list()
         poses_layout.addWidget(poses_list, 1)
@@ -8831,8 +10103,15 @@ class MainWindow(QMainWindow):
         columns.addWidget(poses_box, 2)
         body_layout.addLayout(columns, 1)
 
-        scroll.setWidget(body)
-        layout.addWidget(scroll, 1)
+        # Add the body directly to the panel; the OUTER settingsContentScroll
+        # provides the (single, visible green) scrollbar and handles overflow.
+        # An inner scroll here produced no working scrollbar on this build,
+        # so we rely on the proven outer scroll. The floating pills are
+        # re-parented to the outer scroll's viewport after the page is built
+        # (see _build_settings_page) so they stay pinned + visible while the
+        # bindings table / poses list scroll.
+        layout.addWidget(body, 0)
+        layout.addStretch(1)
 
         # Style for the active-gesture buttons + the poses list.
         panel.setStyleSheet(
@@ -9440,6 +10719,54 @@ class MainWindow(QMainWindow):
             "Bindings saved. Restart Touchless or restart your camera session for them to take effect.",
         )
 
+    def _reset_gesture_bindings_to_defaults(self) -> None:
+        """Clear every user remap so all actions return to their built-in
+        poses. Discards both saved overrides and any unsaved pending
+        changes, then persists immediately. Confirms first because it
+        throws away the user's customizations."""
+        has_saved = bool(getattr(self.config, "gesture_bindings", None) or {})
+        has_pending = bool(getattr(self, "_gesture_binds_pending_changes", None) or {})
+        if not has_saved and not has_pending:
+            TouchlessNotice.show_info(
+                self,
+                "Gesture Binds",
+                "All actions are already on their default gestures.",
+            )
+            return
+        if not TouchlessNotice.show_confirm(
+            self,
+            "Reset Gesture Binds",
+            "Reset every action to its default gesture? This clears all of "
+            "your custom rebindings and can't be undone.",
+            confirm_label="Reset",
+            cancel_label="Cancel",
+        ):
+            return
+        # Cancel any in-progress rebind so the table isn't left in a
+        # half-armed state after the wipe.
+        if getattr(self, "_gesture_binds_pending_action", None):
+            self._clear_gesture_bind_pending()
+        self._gesture_binds_pending_changes.clear()
+        self.config.gesture_bindings = {}
+        try:
+            save_config(self.config)
+        except Exception as exc:
+            TouchlessNotice.show_warn(self, "Reset failed", f"Could not write settings: {exc}")
+            return
+        # Repaint the table to the defaults and clear the Save button's
+        # pending tint + any conflict warnings.
+        self._populate_gesture_binds_table()
+        self._set_settings_save_button_pending(
+            getattr(self, "_gesture_binds_save_button", None), False
+        )
+        self._refresh_gesture_binds_warnings()
+        TouchlessNotice.show_info(
+            self,
+            "Gesture Binds",
+            "All gestures reset to defaults. Restart Touchless or restart your "
+            "camera session for them to take effect.",
+        )
+
     # -------- Hover preview popup ---------------------------------------
     def _start_gesture_pose_hover_timer(self, pose_id: str) -> None:
         if not pose_id:
@@ -9587,6 +10914,22 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QDialog
         from .custom_gestures_recorder import RecordingWindow
         from .custom_gestures_wizard import CreateGestureWizard
+        from hgr.custom_gestures.registry import GestureRegistry, MAX_CUSTOM_GESTURES
+
+        # Enforce the custom-gesture cap before opening the wizard so
+        # the user can't sink time into recording a gesture that can't
+        # be saved.
+        registry = GestureRegistry()
+        registry.load()
+        if len(registry.list()) >= MAX_CUSTOM_GESTURES:
+            TouchlessNotice.show_info(
+                self,
+                "Custom gesture limit",
+                f"Touchless currently supports up to {MAX_CUSTOM_GESTURES} "
+                f"custom gestures. Delete one of your existing gestures to "
+                f"make room for a new one.",
+            )
+            return
 
         accent = self.config.accent_color or "#1DE9B6"
         wizard = CreateGestureWizard(accent_color=accent, parent=self)
@@ -9799,7 +11142,10 @@ class MainWindow(QMainWindow):
         On import success the live runner reloads automatically via
         the panel's existing refresh_cards() worker-ping."""
         from PySide6.QtWidgets import QFileDialog
-        from hgr.custom_gestures.registry import GestureRegistry
+        from hgr.custom_gestures.registry import (
+            GestureRegistry,
+            MAX_CUSTOM_GESTURES,
+        )
         from hgr.custom_gestures.sharing import (
             BundleError,
             RESOLVE_OVERWRITE,
@@ -9827,6 +11173,25 @@ class MainWindow(QMainWindow):
         registry.load()
         existing_names = {g.name for g in registry.list()}
         conflicts = [g.name for g in peeked if g.name in existing_names]
+
+        # Enforce the custom-gesture cap. Only gestures whose names
+        # aren't already present add to the total — overwrites replace
+        # an existing slot, so they don't count against the limit.
+        # Block the whole import if accepting the new ones would exceed
+        # the cap, rather than partially importing (which would leave
+        # the user guessing which gestures made the cut).
+        new_names = [g.name for g in peeked if g.name not in existing_names]
+        if len(existing_names) + len(new_names) > MAX_CUSTOM_GESTURES:
+            room = max(0, MAX_CUSTOM_GESTURES - len(existing_names))
+            TouchlessNotice.show_info(
+                self,
+                "Custom gesture limit",
+                f"Touchless currently supports up to {MAX_CUSTOM_GESTURES} "
+                f"custom gestures. This pack would add {len(new_names)} new "
+                f"gesture(s), but you only have room for {room} more. "
+                f"Delete some existing gestures and try again.",
+            )
+            return
 
         decision = RESOLVE_SKIP
         if conflicts:
@@ -9973,6 +11338,12 @@ class MainWindow(QMainWindow):
             "Colors",
             "Choose app colors. Apply Changes saves them, and Revert to Original restores the original Touchless theme.",
         )
+        # Cap vertical size so the panel never pushes the outer
+        # settings scroll to engage. Colors content fits comfortably
+        # inside a normal window — the previous Preferred/Preferred
+        # default let the layout system grow the panel until the
+        # outer scroll showed an unnecessary scrollbar.
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
         colors_box = QFrame()
         colors_box.setObjectName("innerCard")
@@ -10170,28 +11541,20 @@ class MainWindow(QMainWindow):
             "Camera",
             "",
         )
-        # The global QSS gives `#settingsContentPanel` the same
-        # rounded-card background as the inner `#innerCard`. With
-        # only one inner card in the camera panel, the outer panel's
-        # tinted background showed up as visible "empty space"
-        # extending past the inner card's bottom border. Override
-        # the camera panel to be transparent so the inner box is the
-        # only visible card — the surrounding area reads as plain
-        # settings-stack background instead of an empty card.
-        panel.setStyleSheet("QFrame#settingsContentPanel { background: transparent; border: none; }")
-        # Tighten the panel's outer margins so the camera content
-        # fits within the default settings viewport.
+        # _make_content_panel already applies the transparent-bg
+        # override and tightened margins. Camera-specific tweak:
+        # tighten further so the camera content fits inside the
+        # default settings viewport without triggering an outer
+        # scroll.
         layout.setContentsMargins(16, 8, 16, 8)
         layout.setSpacing(8)
-        # Tell the outer QStackedWidget to IGNORE this panel's
-        # vertical sizeHint when sizing itself. The stack normally
-        # takes the MAX of all children's sizeHints; without this
-        # the camera panel pushed the stack past the viewport,
-        # which made the OUTER settings content_scroll show a
-        # scrollbar that scrolled into nothing. With Ignored vertical
-        # the panel sizes to whatever the viewport gives it and the
-        # inner cameraScroll handles overflow locally.
-        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+        # Default panel sizePolicy (Preferred/Maximum) so the OUTER
+        # settingsContentScroll caps the stack at this panel's true
+        # rendered height (_CurrentSizedStack uses heightForWidth, which
+        # accounts for wordwrap) and engages its visible green scrollbar
+        # when the content overflows. The old inner cameraScroll
+        # under-reported height and clipped the bottom, so we add the
+        # content directly and let the outer scroll handle it.
         title_item = layout.takeAt(0)
         title_label = title_item.widget() if title_item is not None else None
         header_row = QHBoxLayout()
@@ -10212,53 +11575,9 @@ class MainWindow(QMainWindow):
         self._set_settings_save_button_pending(self.save_camera_button, False)
         self.clear_camera_button = None
 
-        # Inner QScrollArea around the camera content. Without it,
-        # the camera panel's natural height drove the outer settings
-        # content_scroll into a "scrolls to show nothing" state at
-        # default window size — the panel itself was the right size,
-        # but the stack widget rounded UP to a slightly taller value
-        # because of other panels' sizeHints, and the outer scroll
-        # exposed that extra empty space. The inner scroll absorbs
-        # the overflow locally: at default size the content fits and
-        # the scrollbar stays hidden (ScrollBarAsNeeded); when the
-        # user shrinks the window below the natural content height,
-        # the scrollbar appears INSIDE the camera panel.
-        scroll = QScrollArea()
-        scroll.setObjectName("cameraScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setStyleSheet(
-            f"""
-            QScrollArea#cameraScroll, QScrollArea#cameraScroll > QWidget,
-            QScrollArea#cameraScroll QWidget#qt_scrollarea_viewport {{
-                background: transparent;
-                border: none;
-            }}
-            QScrollArea#cameraScroll QScrollBar:vertical {{
-                background: rgba(255,255,255,0.04);
-                width: 10px;
-                margin: 6px 3px 6px 3px;
-                border-radius: 5px;
-            }}
-            QScrollArea#cameraScroll QScrollBar::handle:vertical {{
-                background: {self.config.accent_color};
-                border-radius: 5px;
-                min-height: 32px;
-            }}
-            QScrollArea#cameraScroll QScrollBar::add-line:vertical,
-            QScrollArea#cameraScroll QScrollBar::sub-line:vertical {{
-                height: 0px;
-                background: transparent;
-            }}
-            QScrollArea#cameraScroll QScrollBar::add-page:vertical,
-            QScrollArea#cameraScroll QScrollBar::sub-page:vertical {{
-                background: transparent;
-            }}
-            """
-        )
-
+        # Single inner card holding all camera content; the outer
+        # settingsContentScroll provides the scrollbar (see panel
+        # sizePolicy note above).
         box = QFrame()
         box.setObjectName("innerCard")
         box.setAttribute(Qt.WA_StyledBackground, True)
@@ -10415,18 +11734,35 @@ class MainWindow(QMainWindow):
         #    related toggles still exist in AppConfig for backwards
         #    compatibility but the UI surface is gone.)
         # ============================================================
-        box_layout.addWidget(_section_header("Phone Camera — Via QR Code"))
+        # ============================================================
+        # CONNECT PHONE  (pairing-code / WebRTC primary + QR fallback in
+        #   one compact section so the panel doesn't overflow)
+        # ============================================================
+        box_layout.addWidget(_section_header("Connect Phone"))
 
         qr_note = self._build_expandable_note(
-            "Use your phone as the camera by scanning a QR code from its browser.",
-            "No phone app is needed. Touchless opens a small phone page that streams the camera directly to this PC after you scan the QR code and works on iPhone and Android.",
+            "Use your phone as the camera — Connect Phone to enter a code via touchless-control.com, or LAN via QR code.",
+            "No phone app needed. Connect Phone shows a 6-digit code to type on touchless-control.com/connect (works across networks, no certificate warning). The QR option pairs over your local Wi-Fi instead.",
         )
+        # Held on self so the pair / unpair handlers can hide it when a
+        # phone is connected (the instruction is redundant once paired)
+        # and show it again on disconnect. Hiding it reclaims roughly
+        # the same vertical space the "Paired — <device>" status row
+        # adds, so the camera panel doesn't grow past the viewport (and
+        # trip the scrollbar) the moment a phone connects.
+        self._phone_qr_note = qr_note
+        qr_note.setVisible(not bool(getattr(self.config, "phone_camera_qr_paired", False)))
         box_layout.addWidget(qr_note)
 
         qr_row = QHBoxLayout()
         qr_row.setSpacing(8)
         already_paired = bool(getattr(self.config, "phone_camera_qr_paired", False))
-        self.phone_camera_qr_button = QPushButton("Show QR Code" if already_paired else "Connect Phone (QR)")
+        self.connect_phone_button = QPushButton("Connect Phone")
+        self.connect_phone_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.connect_phone_button.clicked.connect(self._on_connect_phone_clicked)
+        self.connect_phone_button.setStyleSheet(camera_button_style)
+        qr_row.addWidget(self.connect_phone_button)
+        self.phone_camera_qr_button = QPushButton("Show QR Code" if already_paired else "Use QR code")
         self.phone_camera_qr_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.phone_camera_qr_button.clicked.connect(self._on_phone_camera_qr_clicked)
         self.phone_camera_qr_button.setStyleSheet(camera_button_style)
@@ -10579,24 +11915,12 @@ class MainWindow(QMainWindow):
         self._refresh_phone_camera_controls()
         self._refresh_camera_settings_save_state()
 
-        # Wrap the inner card in a transparent scroll_container with
-        # a terminal addStretch so the box sits at its natural
-        # height inside the scroll viewport. The wrapper absorbs
-        # extra viewport height as invisible background — same
-        # pattern the Microphone panel uses (see _build_microphone_panel).
-        scroll_container = QWidget()
-        scroll_container.setAutoFillBackground(False)
-        scroll_container.setAttribute(Qt.WA_StyledBackground, False)
-        scroll_container.setStyleSheet("background: transparent;")
-        scroll_vbox = QVBoxLayout(scroll_container)
-        scroll_vbox.setContentsMargins(0, 0, 0, 0)
-        scroll_vbox.setSpacing(8)
-        scroll_vbox.addWidget(box)
-        scroll_vbox.addStretch(1)
-
-        scroll.setWidget(scroll_container)
-        self._install_scroll_wheel_forwarder(scroll)
-        layout.addWidget(scroll, 1)
+        # Add the inner card directly; the OUTER settingsContentScroll
+        # provides the (single, visible green) scrollbar and handles
+        # overflow. Trailing stretch keeps the card at its natural height
+        # with empty space below when the window is tall.
+        layout.addWidget(box, 0)
+        layout.addStretch(1)
         return panel
 
     def _install_scroll_wheel_forwarder(self, scroll_area: QScrollArea) -> None:
@@ -10723,6 +12047,15 @@ class MainWindow(QMainWindow):
             fps_value = float(info.get("fps", 0.0) or 0.0)
         except (TypeError, ValueError):
             fps_value = 0.0
+        # Sample FPS for telemetry's session-end distribution stats.
+        # ~4 Hz throttle on this method gives ~240 samples / minute,
+        # which is plenty for a robust median + p95 read without
+        # ballooning memory.
+        if fps_value > 0.0:
+            try:
+                self._fps_samples.append(fps_value)
+            except AttributeError:
+                self._fps_samples = [fps_value]
         # Tracking quality logic:
         #   - good  : hand found AND confidence ≥ 0.65
         #   - fair  : hand found AND confidence ≥ 0.45  (some flicker)
@@ -10730,11 +12063,48 @@ class MainWindow(QMainWindow):
         # Between "found=False" and 1.5 s timeout we keep showing
         # the previous state so a single dropped frame doesn't
         # flash the pill red.
+        # When the user has flipped the diagnostic-overlay toggle on
+        # (Settings → General → Diagnostics), append the live stable
+        # gesture + confidence to the pill text so they can see what
+        # the recognizer is reading at a glance.
+        diag_enabled = bool(getattr(self.config, "diagnostic_overlay_enabled", False))
+        top_scores_enabled = bool(getattr(self.config, "show_recognizer_top_scores", False))
+        gesture_suffix = ""
+        if diag_enabled:
+            stable_label = str(info.get("stable_label", "") or "")
+            handedness = str(info.get("handedness", "") or "").title()
+            # Top-3 mode: list runner-up poses so the user can debug
+            # "I tried to make a fist but nothing fired" by seeing
+            # which other poses the recognizer was scoring high. The
+            # `top_static_scores` field is a list of (label, score)
+            # tuples already sorted by the engine, capped at 3.
+            if top_scores_enabled and found:
+                top_scores = info.get("top_static_scores") or []
+                if top_scores:
+                    parts = [
+                        f"{label} {float(score):.2f}"
+                        for label, score in top_scores[:3]
+                        if str(label).strip()
+                    ]
+                    if parts:
+                        prefix = f"{handedness} " if handedness else ""
+                        gesture_suffix = "  ·  " + prefix + " · ".join(parts)
+            # Fall back to the original single-label rendering when the
+            # top-scores toggle is off OR when the recognizer didn't
+            # produce any score data for this frame.
+            if not gesture_suffix:
+                if stable_label and stable_label != "neutral":
+                    if handedness:
+                        gesture_suffix = f"  ·  {handedness} {stable_label} ({confidence:.2f})"
+                    else:
+                        gesture_suffix = f"  ·  {stable_label} ({confidence:.2f})"
+                elif found:
+                    gesture_suffix = f"  ·  conf {confidence:.2f}"
         time_since_hand = now - float(getattr(self, "_camera_health_last_hand_ts", 0.0))
         if found and confidence >= 0.65:
-            self._set_camera_health_pill_state("good")
+            self._set_camera_health_pill_state("good", custom_text=("Tracking: Good" + gesture_suffix) if gesture_suffix else None)
         elif found and confidence >= 0.45:
-            self._set_camera_health_pill_state("fair")
+            self._set_camera_health_pill_state("fair", custom_text=("Tracking: Marginal" + gesture_suffix) if gesture_suffix else None)
         elif time_since_hand >= 1.5:
             self._set_camera_health_pill_state("poor")
         # FPS readout — show one decimal, with colour hint when
@@ -10787,9 +12157,15 @@ class MainWindow(QMainWindow):
         out of the box without forcing the user to pick first."""
         if not hasattr(self, "camera_combo"):
             return
+        idx_data = self.camera_combo.currentData()
+        # Phone-QR source: it's not a local cv2 index (the dropdown stores
+        # the _PHONE_CAMERA_DROPDOWN_VALUE sentinel). Preview it from the
+        # running worker's broadcast instead of trying to open a webcam.
+        if idx_data == self._PHONE_CAMERA_DROPDOWN_VALUE:
+            self._open_phone_camera_preview()
+            return
         camera_index = None
         try:
-            idx_data = self.camera_combo.currentData()
             camera_index = int(idx_data) if idx_data is not None else None
         except (TypeError, ValueError):
             camera_index = None
@@ -10811,6 +12187,57 @@ class MainWindow(QMainWindow):
             label_text = f"Camera {camera_index} (auto-selected)"
         dialog = CameraPreviewDialog(
             self.config, camera_index, camera_label=label_text, parent=self
+        )
+        dialog.show()
+
+    def _open_phone_camera_preview(self) -> None:
+        """Preview the QR-paired phone camera. When the engine is running
+        we tap its raw_frame_ready broadcast (no contention with the
+        worker's consume-once read of the phone capture). When the engine
+        is stopped, no worker is broadcasting, so we poll the phone
+        capture directly — frames keep flowing into it from the phone's
+        HTTP push regardless of engine state."""
+        server = self._current_phone_camera_qr_server()
+        if server is None:
+            TouchlessNotice.show_warn(
+                self,
+                "Camera Preview",
+                "No phone is paired yet. Connect a phone with the QR code first.",
+            )
+            return
+        worker = getattr(self, "_worker", None)
+        worker_running = (
+            worker is not None
+            and bool(getattr(worker, "is_running", False))
+            and hasattr(worker, "raw_frame_ready")
+        )
+        if worker_running:
+            dialog = CameraPreviewDialog(
+                self.config,
+                camera_label="Phone Camera (QR)",
+                parent=self,
+                frame_signal=worker.raw_frame_ready,
+            )
+            dialog.show()
+            return
+        # Engine stopped — read the phone capture directly.
+        try:
+            capture = server.capture
+        except Exception:
+            capture = None
+        if capture is None:
+            TouchlessNotice.show_warn(
+                self,
+                "Camera Preview",
+                "The phone camera stream isn't ready. Make sure the phone "
+                "page is open and streaming, then try again.",
+            )
+            return
+        dialog = CameraPreviewDialog(
+            self.config,
+            camera_label="Phone Camera (QR)",
+            parent=self,
+            external_capture=capture,
         )
         dialog.show()
 
@@ -10937,6 +12364,96 @@ class MainWindow(QMainWindow):
         prefix = "OK — " if ok else "Failed — "
         self.phone_camera_status_label.setText(prefix + message)
 
+    def _on_connect_phone_clicked(self) -> None:
+        """Pairing-code phone-camera flow (touchless-control.com/connect).
+
+        Starts a WebRTC receiver, shows the code + QR popup (modeless, so
+        the live camera keeps running), and points the engine at the
+        received stream via a slim adopt that reuses the QR flow's worker
+        hookup without forcing the phone mic on.
+        """
+        from ...debug.phone_camera.webengine_host import WebEnginePhoneServer
+        from .phone_connect_dialog import PhoneConnectDialog
+        # Already connected (e.g. from the Camera tab)? Reuse the running
+        # receiver — starting a second one would collide on the local port.
+        # Just re-show its code (and its connected state).
+        existing = getattr(self, "_phone_camera_qr_server", None)
+        if isinstance(existing, WebEnginePhoneServer) and existing.is_running and existing.info is not None:
+            dialog = PhoneConnectDialog(existing.info.code, parent=self,
+                                        connect_url=existing.info.connect_url, config=self.config)
+            self._phone_connect_dialog = dialog
+            dialog.closed.connect(lambda: setattr(self, "_phone_connect_dialog", None))
+            if existing.connected_clients > 0:
+                dialog.set_status("Phone connected", connected=True)
+            dialog.show()
+            return
+        try:
+            server = WebEnginePhoneServer(on_status=self._forward_phone_server_status)
+            info = server.start()
+        except Exception as exc:
+            TouchlessNotice.show_warn(
+                self,
+                "Connect Phone",
+                "Couldn't start the phone connection: "
+                f"{type(exc).__name__}: {exc}\n\n"
+                "The QR-code option below still works.",
+            )
+            return
+        dialog = PhoneConnectDialog(info.code, parent=self, connect_url=info.connect_url, config=self.config)
+        self._phone_connect_dialog = dialog
+        dialog.closed.connect(lambda: setattr(self, "_phone_connect_dialog", None))
+        dialog.show()
+        self._adopt_webrtc_phone_server(server)
+        if hasattr(self, "last_action_label"):
+            self.last_action_label.setText("Last action: phone connection started")
+
+    def _adopt_webrtc_phone_server(self, server) -> None:
+        """Point the engine at a WebRTC phone server's capture.
+
+        Mirrors the camera-switch parts of _adopt_phone_camera_server (the
+        WebRTC server exposes the same `.capture` surface), but deliberately
+        does NOT force `phone_camera_qr_use_mic` on. Audio-over-WebRTC IS
+        consumed now (the host page captures the phone's mic track and posts
+        PCM into the server's PhoneAudioSource), but the user opts into it via
+        the "Use phone microphone" toggle — leaving it off here keeps the
+        local mic as the voice source until they explicitly switch.
+        """
+        prev = getattr(self, "_phone_camera_qr_server", None)
+        if prev is not None and prev is not server:
+            try:
+                prev.stop()
+            except Exception:
+                pass
+        self._phone_camera_qr_server = server
+        self.config.phone_camera_enabled = False
+        self.config.phone_camera_qr_paired = True
+        self.config.phone_camera_qr_active = True
+        save_config(self.config)
+        try:
+            server.set_status_callback(self._forward_phone_server_status)
+        except Exception:
+            pass
+        if hasattr(self, "phone_camera_qr_disconnect_button"):
+            self.phone_camera_qr_disconnect_button.setVisible(True)
+        if hasattr(self, "phone_camera_qr_disconnect_button_mic"):
+            self.phone_camera_qr_disconnect_button_mic.setVisible(True)
+        # Rebuild the camera dropdown so the phone entry appears + is
+        # selected, then (re)start the camera on the phone source.
+        self._rebuild_camera_combo()
+        self._refresh_camera_combo_selection(self._PHONE_CAMERA_DROPDOWN_VALUE)
+        self._restart_camera_for_phone_toggle()
+        # Reflect the connection on the Microphone tab too: the phone mic
+        # becomes available in the dropdown and the "Use phone microphone"
+        # box is usable. We don't auto-enable it — the user opts in, so
+        # voice stays on the local mic until they choose the phone.
+        try:
+            if hasattr(self, "use_phone_mic_checkbox"):
+                self.use_phone_mic_checkbox.setEnabled(True)
+            self._rebuild_microphone_combo()
+            self._refresh_phone_mic_dependent_ui()
+        except Exception:
+            pass
+
     def _on_phone_camera_qr_clicked(self) -> None:
         from .phone_camera_connect_dialog import PhoneCameraConnectDialog
         # Reuse the already-running server if one exists (auto-started at
@@ -11011,6 +12528,12 @@ class MainWindow(QMainWindow):
         self._set_phone_camera_qr_status_text(self._phone_paired_status_text())
         self.phone_camera_qr_disconnect_button.setVisible(True)
         self.phone_camera_qr_button.setText("Show QR Code")
+        # Hide the now-redundant QR instructional note to reclaim the
+        # vertical space the "Paired — <device>" status row consumes,
+        # keeping the panel from growing past the viewport.
+        note = getattr(self, "_phone_qr_note", None)
+        if note is not None:
+            note.setVisible(False)
         # Rebuild camera dropdown so the new "Phone Camera (QR)"
         # entry appears, then select it (since this pair flow sets
         # phone_camera_qr_active=True above).
@@ -11037,6 +12560,17 @@ class MainWindow(QMainWindow):
         Settings → Camera "Paired — ..." line."""
         if not isinstance(data, dict):
             data = {}
+        # Flip the pairing-code popup (if open) from "Waiting…" to
+        # "Phone connected" the moment frames start arriving.
+        dlg = getattr(self, "_phone_connect_dialog", None)
+        if dlg is not None:
+            try:
+                if event in ("client_connected", "streaming"):
+                    dlg.set_status("Phone connected", connected=True)
+                elif event in ("client_disconnected", "peer-left", "stopped"):
+                    dlg.set_status("Waiting for your phone…")
+            except Exception:
+                pass
         label = str(data.get("label") or "").strip()
         if event == "phone_identified" and label:
             self._phone_connected_label = label
@@ -11091,6 +12625,13 @@ class MainWindow(QMainWindow):
         save_config(self.config)
         self._set_phone_camera_qr_status_text("Phone unpaired. The server is stopped.")
         self.phone_camera_qr_disconnect_button.setVisible(False)
+        if hasattr(self, "phone_camera_qr_disconnect_button_mic"):
+            self.phone_camera_qr_disconnect_button_mic.setVisible(False)
+        # Restore the QR instructional note now that there's no paired
+        # status row taking its place.
+        note = getattr(self, "_phone_qr_note", None)
+        if note is not None:
+            note.setVisible(True)
         self.phone_camera_qr_button.setText("Connect Phone (QR)")
         if hasattr(self, "use_phone_camera_qr_checkbox"):
             self.use_phone_camera_qr_checkbox.blockSignals(True)
@@ -11360,6 +12901,12 @@ class MainWindow(QMainWindow):
             "Microphone",
             "",
         )
+        # Ignored vertical so the OUTER settingsContentScroll never
+        # engages — the internal micScroll absorbs overflow locally.
+        # Without this the panel's natural sizeHint can exceed the
+        # outer viewport and a second (outer) scrollbar appears next
+        # to the inner one.
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
         title_item = layout.takeAt(0)
         title_label = title_item.widget() if title_item is not None else None
         header_row = QHBoxLayout()
@@ -11388,7 +12935,12 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # Per user request: Microphone panel should never show a
+        # scrollbar. Inner card margins are tightened below so the
+        # whole panel content fits the typical settings viewport
+        # without overflow — Local + Phone Mic stack into one card,
+        # Test Microphone stacks into the second card right below.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet(
             f"""
             QScrollArea#micScroll, QScrollArea#micScroll > QWidget,
@@ -11399,7 +12951,7 @@ class MainWindow(QMainWindow):
             QScrollArea#micScroll QScrollBar:vertical {{
                 background: rgba(255,255,255,0.04);
                 width: 10px;
-                margin: 6px 3px 6px 3px;
+                margin: 6px 3px 6px 8px;
                 border-radius: 5px;
             }}
             QScrollArea#micScroll QScrollBar::handle:vertical {{
@@ -11433,7 +12985,9 @@ class MainWindow(QMainWindow):
         scroll_container.setStyleSheet("background: transparent;")
         scroll_vbox = QVBoxLayout(scroll_container)
         scroll_vbox.setContentsMargins(0, 0, 0, 0)
-        scroll_vbox.setSpacing(8)
+        # Tight inter-card spacing so Local-Mic-card + Test-Mic-card
+        # fit in the settings viewport without forcing a scroll.
+        scroll_vbox.setSpacing(6)
 
         section_style = (
             f"QLabel#micSectionHeader {{"
@@ -11457,8 +13011,13 @@ class MainWindow(QMainWindow):
         box.setAttribute(Qt.WA_StyledBackground, True)
         box.setStyleSheet(self._settings_inner_card_stylesheet())
         box_layout = QVBoxLayout(box)
-        box_layout.setContentsMargins(16, 16, 16, 16)
-        box_layout.setSpacing(8)
+        # Tighter inner padding + line spacing so the combined
+        # Local-Mic + Phone-Mic card stays compact enough that the
+        # whole Microphone panel fits the settings viewport without
+        # exposing a scrollbar (per user request: no scroll, no
+        # cut-off).
+        box_layout.setContentsMargins(14, 12, 14, 12)
+        box_layout.setSpacing(6)
 
         # ============================================================
         # LOCAL MICROPHONE
@@ -11478,11 +13037,11 @@ class MainWindow(QMainWindow):
         # ============================================================
         # PHONE MICROPHONE (QR)
         # ============================================================
-        box_layout.addWidget(_section_header("Phone Microphone (QR)"))
+        box_layout.addWidget(_section_header("Connect Phone"))
 
         phone_mic_note = self._build_expandable_note(
-            "Pair your phone with the QR button below to use its microphone in Touchless.",
-            "Once paired, Touchless can route your phone's microphone into voice commands and dictation. Phone mics often sound cleaner than laptop mics, especially on noisy rooms or thin laptops.",
+            "Connect your phone to use its microphone in Touchless, then tick the box below.",
+            "Tap Connect Phone and enter the code on touchless-control.com/connect (works across networks), or use the QR option for local Wi-Fi. Once connected, enable 'Use phone microphone' to route your phone's mic into voice commands and dictation — phone mics often sound cleaner than laptop mics.",
         )
         box_layout.addWidget(phone_mic_note)
 
@@ -11492,13 +13051,24 @@ class MainWindow(QMainWindow):
         # panel so users don't have to cross tabs to pair.
         mic_qr_row = QHBoxLayout()
         mic_qr_row.setContentsMargins(0, 0, 0, 0)
+        self.connect_phone_button_mic = QPushButton("Connect Phone")
+        self.connect_phone_button_mic.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.connect_phone_button_mic.clicked.connect(self._on_connect_phone_clicked)
+        self.connect_phone_button_mic.setStyleSheet(self._settings_panel_button_stylesheet())
+        mic_qr_row.addWidget(self.connect_phone_button_mic)
         self.phone_camera_qr_button_mic = QPushButton(
-            "Show QR Code" if already_paired else "Connect Phone (QR)"
+            "Show QR Code" if already_paired else "Use QR code"
         )
         self.phone_camera_qr_button_mic.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.phone_camera_qr_button_mic.clicked.connect(self._on_phone_camera_qr_clicked)
         self.phone_camera_qr_button_mic.setStyleSheet(self._settings_panel_button_stylesheet())
         mic_qr_row.addWidget(self.phone_camera_qr_button_mic)
+        self.phone_camera_qr_disconnect_button_mic = QPushButton("Disconnect Phone")
+        self.phone_camera_qr_disconnect_button_mic.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.phone_camera_qr_disconnect_button_mic.clicked.connect(self._on_phone_camera_qr_disconnect_clicked)
+        self.phone_camera_qr_disconnect_button_mic.setStyleSheet(self._settings_panel_button_stylesheet())
+        self.phone_camera_qr_disconnect_button_mic.setVisible(already_paired)
+        mic_qr_row.addWidget(self.phone_camera_qr_disconnect_button_mic)
         mic_qr_row.addStretch(1)
         box_layout.addLayout(mic_qr_row)
 
@@ -11563,8 +13133,10 @@ class MainWindow(QMainWindow):
         test_box.setAttribute(Qt.WA_StyledBackground, True)
         test_box.setStyleSheet(self._settings_inner_card_stylesheet())
         test_layout = QVBoxLayout(test_box)
-        test_layout.setContentsMargins(16, 16, 16, 16)
-        test_layout.setSpacing(8)
+        # Same tighter padding as the Local/Phone card above so the
+        # full Microphone panel fits without scroll.
+        test_layout.setContentsMargins(14, 12, 14, 12)
+        test_layout.setSpacing(6)
 
         test_title = QLabel("Test Microphone")
         test_title.setStyleSheet(
@@ -11641,6 +13213,17 @@ class MainWindow(QMainWindow):
         self._mic_test_level_value = 0.0
         self._mic_test_gain = saved_gain
         self._mic_test_sample_rate = 48000
+        # Sample rate the most recent recording was captured at — local
+        # devices record at _mic_test_sample_rate, the phone records at
+        # its own PhoneAudioSource rate. Playback uses this so phone
+        # recordings don't get pitch-shifted.
+        self._mic_test_recorded_sample_rate = 48000
+        # Phone-mic test polling thread + stop flag (the phone streams
+        # audio over the network, not through sounddevice, so it needs
+        # a poll loop reading PhoneAudioSource.read instead of an
+        # sd.InputStream callback).
+        self._mic_test_phone_thread = None
+        self._mic_test_phone_stop = None
         self._mic_test_recorded_chunks: list[np.ndarray] = []
         self._mic_test_is_recording = False
         self._mic_test_playback_thread = None
@@ -11703,6 +13286,33 @@ class MainWindow(QMainWindow):
             self._stop_mic_test()
 
     def _start_mic_test(self) -> None:
+        self._stop_mic_test_streams()
+        self._stop_mic_test_playback()
+        self._mic_test_recorded_chunks = []
+        # Phone-mic path: when the camera/mic dropdown is set to the
+        # phone, the audio arrives over the network via the QR server's
+        # PhoneAudioSource, NOT through a local sounddevice device.
+        # _selected_mic_test_device returns None for the phone, which
+        # would otherwise make sd.InputStream open the SYSTEM DEFAULT
+        # mic — testing the wrong device. Route to the phone source
+        # instead so the test reflects whatever device is selected.
+        combo = getattr(self, "microphone_combo", None)
+        is_phone = (
+            combo is not None
+            and combo.currentData() == self._PHONE_MICROPHONE_DROPDOWN_VALUE
+        )
+        if is_phone:
+            if self._start_mic_test_phone():
+                self.mic_test_toggle_button.setText("Stop Mic Test")
+                self.mic_test_status_label.setText("")
+                self._update_mic_test_playback_button_state()
+                self._mic_test_level_timer.start()
+            else:
+                self._mic_test_is_recording = False
+                self.mic_test_toggle_button.blockSignals(True)
+                self.mic_test_toggle_button.setChecked(False)
+                self.mic_test_toggle_button.blockSignals(False)
+            return
         try:
             import sounddevice as sd
         except Exception as exc:
@@ -11711,12 +13321,10 @@ class MainWindow(QMainWindow):
             self.mic_test_toggle_button.setChecked(False)
             self.mic_test_toggle_button.blockSignals(False)
             return
-        self._stop_mic_test_streams()
-        self._stop_mic_test_playback()
         device = self._selected_mic_test_device()
         sample_rate = self._mic_test_sample_rate
+        self._mic_test_recorded_sample_rate = sample_rate
         channels = 1
-        self._mic_test_recorded_chunks = []
         self._mic_test_is_recording = True
         try:
             def _callback(indata, frames, time_info, status):
@@ -11753,6 +13361,54 @@ class MainWindow(QMainWindow):
         self._update_mic_test_playback_button_state()
         self._mic_test_level_timer.start()
 
+    def _start_mic_test_phone(self) -> bool:
+        """Drive the mic-test level meter + recording from the phone's
+        network audio stream (PhoneAudioSource) instead of a local
+        sounddevice device. Returns False (with a status message) when
+        no phone audio is reachable."""
+        server = getattr(self, "_phone_camera_qr_server", None)
+        source = getattr(server, "audio_source", None) if server is not None else None
+        if source is None or getattr(source, "is_closed", True):
+            self.mic_test_status_label.setText(
+                "Phone audio not connected — open the phone page and set its "
+                "Mic dropdown to 'send to PC', then try again."
+            )
+            return False
+        rate = int(getattr(source, "sample_rate", 16000) or 16000)
+        self._mic_test_recorded_sample_rate = rate
+        try:
+            source.drain()  # discard stale buffered audio from before the test
+        except Exception:
+            pass
+        import threading
+        stop_event = threading.Event()
+        self._mic_test_phone_stop = stop_event
+        self._mic_test_is_recording = True
+
+        def _poll():
+            chunk_frames = max(256, int(rate * 0.1))
+            while not stop_event.is_set():
+                try:
+                    data, _overflow = source.read(chunk_frames, timeout=0.5)
+                except Exception:
+                    break
+                if data is None or getattr(data, "size", 0) == 0:
+                    continue
+                try:
+                    mono = data[:, 0] if data.ndim > 1 else data
+                    mono = np.asarray(mono, dtype=np.float32) * float(self._mic_test_gain)
+                    peak = float(np.max(np.abs(mono))) if mono.size else 0.0
+                    self._mic_test_level_value = min(1.0, peak)
+                    if self._mic_test_is_recording:
+                        self._mic_test_recorded_chunks.append(np.clip(mono, -1.0, 1.0).copy())
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=_poll, name="mic-test-phone", daemon=True)
+        self._mic_test_phone_thread = thread
+        thread.start()
+        return True
+
     def _stop_mic_test_streams(self) -> None:
         stream = self._mic_test_input_stream
         self._mic_test_input_stream = None
@@ -11766,6 +13422,24 @@ class MainWindow(QMainWindow):
                 stream.close()
             except Exception:
                 pass
+        # Phone-mic poll thread teardown — signal stop and join briefly
+        # so a lingering poll loop doesn't keep mutating the level meter
+        # after the test ends.
+        stop_event = getattr(self, "_mic_test_phone_stop", None)
+        if stop_event is not None:
+            try:
+                stop_event.set()
+            except Exception:
+                pass
+        thread = getattr(self, "_mic_test_phone_thread", None)
+        if thread is not None:
+            try:
+                if thread.is_alive():
+                    thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self._mic_test_phone_thread = None
+        self._mic_test_phone_stop = None
 
     def _stop_mic_test(self) -> None:
         self._stop_mic_test_streams()
@@ -11816,7 +13490,10 @@ class MainWindow(QMainWindow):
             self.mic_test_status_label.setText("Nothing recorded yet.")
             return
         self._mic_test_playback_stop = False
-        sample_rate = self._mic_test_sample_rate
+        # Play back at the rate the recording was captured at (local
+        # device = 48 kHz, phone = its own PhoneAudioSource rate) so
+        # phone recordings aren't pitch-shifted.
+        sample_rate = getattr(self, "_mic_test_recorded_sample_rate", None) or self._mic_test_sample_rate
 
         import threading
         def _play():
@@ -11898,13 +13575,11 @@ class MainWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setFocusPolicy(Qt.StrongFocus)
-        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # See _build_gesture_binds_panel for the rationale — cap the
-        # min height so the panel's minimumSizeHint fits inside the
-        # outer settings viewport, keeping the header (title + Save
-        # Changes) pinned at the top while the inner scroll handles
-        # all content overflow.
-        scroll.setMinimumHeight(120)
+        # See _build_gesture_binds_panel for the rationale —
+        # Preferred (not Expanding) lets the inner scroll hug its
+        # content height instead of leaving a visible band of empty
+        # viewport below the last save-location row.
+        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         scroll_content = QWidget()
         scroll_content.setObjectName("saveLocationsScrollContent")
@@ -12028,7 +13703,12 @@ class MainWindow(QMainWindow):
 
         # Outer settingsContentScroll handles overflow; inner scroll
         # is bypassed so this panel shows only ONE green scrollbar.
-        layout.addWidget(scroll_content, 1)
+        # Stretch=0 + trailing addStretch so the content sizes to
+        # its natural height — without this the panel filled the
+        # full viewport, leaving a visible band of empty space below
+        # the last save-location row.
+        layout.addWidget(scroll_content, 0)
+        layout.addStretch(1)
         return panel
 
     def _on_save_locations_mouse_monitor_changed(self, _index: int) -> None:
@@ -12150,8 +13830,12 @@ class MainWindow(QMainWindow):
     def _build_tutorial_panel(self) -> QWidget:
         panel, layout = self._make_content_panel(
             "Tutorial",
-            "The tutorial walks through the six main control groups using the same live runtime as the app, so the gestures and voice actions you practice there behave like the real app behavior.",
+            "The tutorial walks through the five core control groups using the same live runtime as the app, so the gestures and voice actions you practice there behave like the real app. Click any part below to jump straight to it.",
         )
+        # Cap vertical so the panel never artificially expands and
+        # triggers the outer settings scrollbar. Same rationale as
+        # _build_colors_panel.
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         tutorial_box = QFrame()
         tutorial_box.setObjectName("innerCard")
         tutorial_box.setAttribute(Qt.WA_StyledBackground, True)
@@ -12160,18 +13844,22 @@ class MainWindow(QMainWindow):
         tutorial_layout.setContentsMargins(16, 16, 16, 16)
         tutorial_layout.setSpacing(10)
 
+        # These mirror the live tutorial's five practice steps in order
+        # (see TutorialWindow._practice_steps). The link index below is
+        # 0-based to match start_step_index, so "Part N" jumps to step
+        # N-1. Keep this list in sync if the tutorial steps change.
         part_descriptions = [
-            "practice three right swipes and three left swipes. After that, swipe right moves to the next tutorial step and swipe left moves to the previous step.",
-            "use the right-hand two gesture to actually open or focus Spotify.",
-            "use the right-hand fist gesture to actually pause and play Spotify so you can verify the app control is working.",
-            "use the wheel pose to open the real Spotify gesture wheel. There is also a separate Google Chrome gesture wheel in the full app.",
-            "turn mouse mode on, learn how the right hand controls the cursor, click the tutorial targets, then turn mouse mode off again.",
-            "hold left-hand 'one' to start the voice listener, then speak a command. The tutorial confirms each phrase before advancing - a quick check that your microphone is wired up and the listener trigger feels right.",
+            ("Swipe Gestures", "Practice three right swipes and three left swipes with your right hand. In the tutorial, swipe right moves to the next part and swipe left goes back."),
+            ("Mouse Control", "Turn mouse mode on, move the cursor and click the practice targets with your right hand, then turn it off — left hand toggles the mode."),
+            ("Voice Command", "Hold left-hand 'one' to start the voice listener, then speak a command like “play a song on Spotify.” Confirms your mic and the listener trigger work."),
+            ("Volume Control", "Practice raising and lowering your system volume with the volume gesture."),
+            ("Pause / Play", "Use the right-hand fist to pause and play whatever media is running, so you can confirm app control works."),
         ]
         accent = self.config.accent_color or "#1DE9B6"
-        for index, description in enumerate(part_descriptions, start=1):
+        for index, (part_name, description) in enumerate(part_descriptions, start=1):
             lbl = QLabel(
-                f'- <a href="tutorial_part:{index - 1}" style="color: {accent};">Part {index}</a>: {description}'
+                f'- <a href="tutorial_part:{index - 1}" style="color: {accent};">'
+                f'Part {index}: {part_name}</a> — {description}'
             )
             lbl.setWordWrap(True)
             lbl.setTextFormat(Qt.RichText)
@@ -12210,6 +13898,9 @@ class MainWindow(QMainWindow):
             "What Touchless does with your data, and how to change "
             "your usage-data preference anytime.",
         )
+        # Cap vertical so the panel never artificially expands and
+        # triggers the outer settings scrollbar when content fits.
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
         # ---- Version ----
         version_box = QFrame()
@@ -12359,7 +14050,17 @@ class MainWindow(QMainWindow):
         client = getattr(self, "_telemetry", None)
         if client is not None:
             try:
-                client.set_user_opt_in(new_value)
+                try:
+                    from ...custom_gestures.registry import GestureRegistry as _Registry
+                    _reg = _Registry()
+                    _reg.load()
+                    _custom_gesture_count = len(_reg.list())
+                except Exception:
+                    _custom_gesture_count = 0
+                client.set_user_opt_in(
+                    new_value,
+                    replay_properties={"custom_gesture_count": int(_custom_gesture_count)},
+                )
             except Exception:
                 pass
 
@@ -12384,13 +14085,35 @@ class MainWindow(QMainWindow):
         version_row.addWidget(version_label)
         version_row.addStretch(1)
 
+        # Store builds get updates from the Microsoft Store, not the
+        # in-app GitHub checker — disable the manual check and explain
+        # where updates come from. Website builds keep the live button.
+        try:
+            from ...utils.runtime_paths import build_channel as _build_channel
+            _is_store_build = _build_channel() == "store"
+        except Exception:
+            _is_store_build = False
+
         self._updates_check_button = QPushButton("Check for Updates")
         self._mark_settings_panel_button(self._updates_check_button)
         self._updates_check_button.clicked.connect(self._on_updates_panel_check_clicked)
+        if _is_store_build:
+            self._updates_check_button.setEnabled(False)
+            self._updates_check_button.setToolTip(
+                "Updates for the Microsoft Store version are delivered "
+                "automatically by the Store."
+            )
         version_row.addWidget(self._updates_check_button)
         current_layout.addLayout(version_row)
 
-        self._updates_status_label = QLabel("Click 'Check for Updates' to look for a newer version.")
+        if _is_store_build:
+            initial_updates_status = (
+                "This is the Microsoft Store version — updates are "
+                "installed automatically through the Store."
+            )
+        else:
+            initial_updates_status = "Click 'Check for Updates' to look for a newer version."
+        self._updates_status_label = QLabel(initial_updates_status)
         self._updates_status_label.setWordWrap(True)
         self._updates_status_label.setStyleSheet(
             f"color: {self.config.text_color}; opacity: 0.85; font-size: 12px;"
@@ -12409,14 +14132,30 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QScrollArea
         self._updates_history_scroll = QScrollArea()
         self._updates_history_scroll.setWidgetResizable(True)
+        # Give the history scroll a sensible minimum so it gets enough
+        # vertical real-estate even when the outer panel sizes to its
+        # content. Without this, the inner scroll defaulted to QScrollArea's
+        # tiny built-in sizeHint and the history block looked cropped
+        # to ~150 px.
+        self._updates_history_scroll.setMinimumHeight(360)
         self._updates_history_scroll.setStyleSheet(
             "QScrollArea { background: transparent; border: none; }"
         )
         history_container = QWidget()
         history_container.setStyleSheet("background: transparent;")
+        # Cap container at its content height so widgetResizable=True
+        # on the scroll doesn't stretch the container taller than its
+        # entries, leaving a band of empty scroll range below the last
+        # release card.
+        history_container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         self._updates_history_layout = QVBoxLayout(history_container)
         self._updates_history_layout.setContentsMargins(4, 4, 4, 4)
         self._updates_history_layout.setSpacing(8)
+        # Trailing stretch kept so the existing insertWidget(count()-1)
+        # insertion logic still targets the right slot — combined with
+        # the container's Maximum vertical policy, the stretch
+        # contributes 0 to the container's sizeHint so it doesn't
+        # inflate the scroll range past the last entry.
         self._updates_history_layout.addStretch(1)
         self._updates_history_scroll.setWidget(history_container)
         layout.addWidget(self._updates_history_scroll, 1)
@@ -12428,6 +14167,20 @@ class MainWindow(QMainWindow):
 
     def _on_updates_panel_check_clicked(self) -> None:
         """Manual update check from the Updates settings panel."""
+        # Belt-and-suspenders: Store builds never check GitHub. The
+        # button is already disabled at build time for store channel,
+        # but guard here too in case it's reached programmatically.
+        try:
+            from ...utils.runtime_paths import build_channel
+            if build_channel() == "store":
+                if hasattr(self, "_updates_status_label"):
+                    self._updates_status_label.setText(
+                        "This is the Microsoft Store version — updates "
+                        "are installed automatically through the Store."
+                    )
+                return
+        except Exception:
+            pass
         from ..updater import ReleaseChecker
         if hasattr(self, "_updates_check_button"):
             self._updates_check_button.setEnabled(False)
@@ -13089,23 +14842,60 @@ Admin elevation
         from PySide6.QtWidgets import QApplication as _QApplication
         _QApplication.processEvents()
 
-        # If the engine is currently running, freeze its pipeline
-        # while the tutorial is open — same pattern used by the
-        # custom-gesture recorder. Tutorial runs its own MediaPipe
-        # pass on its own camera handle, so running the main pipeline
-        # in parallel is wasted CPU AND would let gestures fire real
-        # actions in the middle of demonstrating poses to the tutorial.
-        # Tracked on self so _on_tutorial_closed knows whether to unfreeze.
+        # Tutorial runs its OWN GestureWorker with its own
+        # ThreadedCvCapture pointing at the same camera index the
+        # main app uses. Windows enforces exclusive access on most
+        # webcams — two open handles fighting over the same device
+        # serialise their reads and the tutorial limps along at
+        # 2-5 FPS instead of 25-30.
+        #
+        # When launched from Settings (engine is already running and
+        # holds the camera), fully STOP the main engine so the
+        # camera handle is released before the tutorial tries to
+        # open it. set_pipeline_frozen alone wasn't enough — it only
+        # paused processing; the camera stayed held, and the
+        # tutorial's camera-grab became contended → laggy.
+        #
+        # When launched from Walkthrough (engine not running yet),
+        # there's no contention to resolve, so we skip the stop.
+        #
+        # Tracked on self so _on_tutorial_closed knows whether to
+        # restart the main engine after the tutorial closes.
         self._tutorial_paused_engine = False
-        worker = getattr(self, "_worker", None)
-        if worker is not None and hasattr(worker, "set_pipeline_frozen"):
+        self._tutorial_stopped_engine = False
+        # Strategy: never hard-stop the main engine. The tutorial's
+        # _start_session detects the running parent worker via
+        # _resolve_parent_worker() and reuses it as a SHARED worker —
+        # same path the walkthrough → tutorial transition uses. No
+        # new camera open, no second MediaPipe session.
+        #
+        # The other half of the walkthrough's speed: it switches the
+        # page_stack to the HOME page before opening the tutorial. The
+        # Settings page has a heavy widget tree (sidebar nav + content
+        # stack with every panel + search dropdown + walkthrough
+        # overlay) that keeps repainting / processing layout events
+        # while the tutorial dialog is open on top. Home page is much
+        # lighter — moving to it before opening the tutorial drops the
+        # background CPU/paint load. _on_tutorial_closed already
+        # returns to Settings → Tutorial when launched_from_settings,
+        # so the user doesn't lose their place.
+        if from_settings:
             try:
-                if getattr(worker, "is_running", False):
-                    worker.set_pipeline_frozen(True)
-                    self._tutorial_paused_engine = True
+                self.show_home_page()
             except Exception:
                 pass
+        self._construct_and_show_tutorial(
+            from_settings=from_settings,
+            start_step_index=start_step_index,
+        )
 
+    def _construct_and_show_tutorial(
+        self, *, from_settings: bool, start_step_index: int
+    ) -> None:
+        """Tail-half of `open_tutorial` — split out so the from_settings
+        path can defer construction (via QTimer.singleShot) until the
+        Windows webcam driver has fully released the camera handle the
+        main engine was holding."""
         if self.tutorial_window is None:
             self.tutorial_window = TutorialWindow(self.config, self)
             self.tutorial_window.tutorial_closed.connect(self._on_tutorial_closed)
@@ -13169,6 +14959,20 @@ Admin elevation
                 except Exception:
                     pass
             self._tutorial_paused_engine = False
+        # Counterpart to the from_settings hard-stop in open_tutorial:
+        # the main engine was fully shut down to release the camera
+        # before the tutorial spun up. Restart it now so the user
+        # returns to a live app instead of a paused one. Defer one
+        # event-loop tick so the tutorial-camera teardown (which
+        # ALSO closes its capture) finishes first — re-grabbing the
+        # camera while the tutorial's release is still settling can
+        # land us right back in contention.
+        if getattr(self, "_tutorial_stopped_engine", False):
+            self._tutorial_stopped_engine = False
+            QTimer.singleShot(
+                250,
+                lambda: self.start_engine(skip_tutorial_prompt=True),
+            )
 
         if launched_from_settings:
             self.show_settings_page(SECTION_TUTORIAL)
@@ -13188,6 +14992,91 @@ Admin elevation
         self.show_settings_page(SECTION_GESTURES)
         self.last_action_label.setText("Last action: opened gesture guide from tutorial")
 
+
+    # Indices whose panels should NEVER show the outer settings
+    # scrollbar. Two groups:
+    #   1) Panels with their own internal QScrollArea — Camera,
+    #      Microphone, Custom Gestures, Gesture Binds, Save Locations.
+    #      They handle vertical overflow locally; a second outer
+    #      scrollbar next to the inner one looks duplicate and
+    #      confuses users about which one scrolls what.
+    #   2) Short panels whose content is small enough to fit in the
+    #      default settings viewport on every supported window size —
+    #      Colors, Tutorial, About / Privacy. The user explicitly
+    #      asked these to have no scroll at all.
+    _SETTINGS_OUTER_SCROLL_OFF = frozenset({
+        # Microphone keeps its own inner scroll (short content, fits).
+        SECTION_MICROPHONE,
+        # Panels whose content is short enough to always fit in a
+        # reasonable window — no scroll affordance needed at all.
+        SECTION_COLORS,
+        SECTION_TUTORIAL,
+        # Camera, Custom Gesture, Gesture Binds, Save Locations, and
+        # About & Privacy stay on AsNeeded: their content can genuinely
+        # outgrow the viewport, so the outer scroll needs to engage —
+        # it's the SOLE visible scrollbar for these. Camera in particular
+        # grew past the viewport once the Live View Overlays diagnostics
+        # were added, and its inner scroll under-reported the wordwrapped
+        # height and clipped the bottom; the outer scroll size-corrects
+        # via _CurrentSizedStack.heightForWidth so it scrolls reliably.
+    })
+
+    def _apply_settings_outer_scroll_policy(self, index: int) -> None:
+        """Flip the outer settings scrollbar between AsNeeded and
+        AlwaysOff based on which panel is active. Also reset the
+        scrollbar position to 0 on every switch so the new panel
+        opens at its top instead of inheriting the previous panel's
+        scroll offset."""
+        scroll = getattr(self, "_settings_content_scroll", None)
+        if scroll is None:
+            return
+        try:
+            if index in self._SETTINGS_OUTER_SCROLL_OFF:
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                # Belt-and-suspenders: AlwaysOff alone wasn't enough
+                # to hide the bar on the Tutorial page — likely because
+                # the QSS rule that styles QScrollBar:vertical for
+                # #settingsContentScroll was keeping the widget
+                # rendered even with the policy off. Explicitly hide
+                # the scrollbar widgets so neither the styled track nor
+                # the thumb is drawable.
+                try:
+                    scroll.verticalScrollBar().setVisible(False)
+                    scroll.horizontalScrollBar().setVisible(False)
+                except Exception:
+                    pass
+            else:
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                # Re-enable when leaving an off-list panel so the
+                # scroll bars can render again for panels that need them.
+                try:
+                    scroll.verticalScrollBar().setVisible(True)
+                    scroll.horizontalScrollBar().setVisible(True)
+                except Exception:
+                    pass
+            scroll.verticalScrollBar().setValue(0)
+        except Exception:
+            pass
+        # The Gesture Binds pills live on the shared scroll viewport, so
+        # they must be hidden on every other page and only re-evaluated
+        # on the Gesture Binds page itself. Leaving the page also cancels
+        # any in-progress rebind so the table isn't left half-armed.
+        try:
+            if index == SECTION_GESTURE_BINDS:
+                self._refresh_gesture_binds_warnings()
+            else:
+                if getattr(self, "_gesture_binds_pending_action", None):
+                    self._clear_gesture_bind_pending()
+                for _pill in (
+                    getattr(self, "_gesture_binds_pill", None),
+                    getattr(self, "_gesture_binds_pill_warning", None),
+                ):
+                    if _pill is not None:
+                        _pill.setVisible(False)
+        except Exception:
+            pass
 
     def show_settings_section(self, index: int) -> None:
         # Walk-through gate: when the guided tour is active, only the
@@ -13618,7 +15507,7 @@ Admin elevation
             background: rgba(255,255,255,0.06);
             width: 14px;
             border-radius: 7px;
-            margin: 2px 0;
+            margin: 2px 0 2px 8px;
         }}
         QScrollArea#gestureGuideScroll QScrollBar::handle:vertical {{
             background: {self.config.accent_color};
@@ -13690,7 +15579,7 @@ Admin elevation
             background: rgba(255,255,255,0.06);
             width: 14px;
             border-radius: 7px;
-            margin: 2px 0;
+            margin: 2px 0 2px 8px;
         }}
         QScrollArea#saveLocationsScroll QScrollBar::handle:vertical {{
             background: {self.config.accent_color};
@@ -14558,6 +16447,53 @@ Admin elevation
                     self.stop_engine()
             except Exception:
                 pass
+        # One-time Voice Recognition Upgrade offer after the walk-through.
+        # Deferred so it shows after the page transition settles (and,
+        # on the tutorial path, doesn't fight the tutorial window for
+        # focus — it no-ops there because the tutorial is foreground).
+        QTimer.singleShot(700, self._maybe_offer_voice_upgrade_prompt)
+
+    def _maybe_offer_voice_upgrade_prompt(self) -> None:
+        """Offer the higher-accuracy voice model once, after the
+        walk-through. No-op when the model is already present (website
+        builds, or already downloaded) or when we've offered before."""
+        if bool(getattr(self.config, "voice_model_upgrade_prompt_shown", False)):
+            return
+        try:
+            from ...voice.voice_model_download import medium_model_present
+            if medium_model_present():
+                return
+        except Exception:
+            return
+        # Latch immediately so it's never shown twice even if the user
+        # dismisses without choosing.
+        self.config.voice_model_upgrade_prompt_shown = True
+        try:
+            save_config(self.config)
+        except Exception:
+            pass
+        try:
+            accept = TouchlessNotice.show_confirm(
+                self,
+                "Voice Recognition Upgrade",
+                "Want sharper dictation? You can download a free high-accuracy "
+                "voice model (about 1.5 GB) that improves transcription of "
+                "tricky words and noisy speech. It downloads in the background "
+                "and Touchless keeps working while it installs.\n\n"
+                "You can also do this any time from Settings → General.",
+                confirm_label="Download now",
+                cancel_label="Maybe later",
+            )
+        except Exception:
+            return
+        if accept:
+            # Jump to General so the progress bar is visible, then kick
+            # off the same download the button uses.
+            try:
+                self.show_settings_page(SECTION_GENERAL)
+            except Exception:
+                pass
+            QTimer.singleShot(150, self._on_voice_upgrade_clicked)
 
     # ---- pointing-phase visuals --------------------------------------
 
@@ -15575,10 +17511,19 @@ Admin elevation
             del counts[:-max_entries]
         if isinstance(widget, QPlainTextEdit):
             scrollbar = widget.verticalScrollBar()
-            should_follow = scrollbar.value() >= max(0, scrollbar.maximum() - 8)
-            widget.appendPlainText(line)
+            # Newest entry goes at the TOP of the log per user request.
+            # "Following" the latest means keeping the scroll near
+            # the top (value <= 8 px from start) instead of the
+            # bottom — same UX (latest is what jumps into view) but
+            # mirrored.
+            should_follow = scrollbar.value() <= 8
+            # Insert at the very start of the document.
+            from PySide6.QtGui import QTextCursor
+            cursor = widget.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            cursor.insertText(line + "\n")
             if should_follow:
-                scrollbar.setValue(scrollbar.maximum())
+                scrollbar.setValue(0)
 
     def _sync_home_debug_log_widget(self) -> None:
         widget = getattr(self, "home_debug_log", None)
@@ -15586,10 +17531,12 @@ Admin elevation
             return
         entries = list(getattr(self, "_home_debug_log_entries", []) or [])
         scrollbar = widget.verticalScrollBar()
-        should_follow = scrollbar.value() >= max(0, scrollbar.maximum() - 8)
-        widget.setPlainText("\n".join(entries))
+        should_follow = scrollbar.value() <= 8
+        # Reverse so the most-recent entry sits at the top of the
+        # rendered text block.
+        widget.setPlainText("\n".join(reversed(entries)))
         if should_follow:
-            scrollbar.setValue(scrollbar.maximum())
+            scrollbar.setValue(0)
 
     def _set_home_camera_display_text(self, text: str, *, enabled: bool = True) -> None:
         self._set_home_device_combo_text("home_camera_combo", text, enabled=enabled)
@@ -16280,6 +18227,27 @@ Admin elevation
         if ok:
             short = "Spotify connected"
             label = "spotify_connect_ok"
+            # Defensive: regardless of WHICH SpotifyController instance
+            # did the auth, force the engine's controller to reload
+            # tokens from disk. Covers two real failure modes that
+            # leave the user's commands silently dead:
+            #   (a) user clicked Connect from a cold launch (engine
+            #       not yet up) so a one-shot SpotifyController did
+            #       the auth and saved tokens; the engine later
+            #       constructed its own controller and read tokens
+            #       at init, but if the timing slipped the other way
+            #       (engine init started BEFORE auth saved) the
+            #       engine's controller has no tokens in memory.
+            #   (b) the prior session left _needs_reauth=True latched
+            #       on the engine's controller; reload_tokens clears
+            #       it so the post-auth toast stops nagging.
+            worker = getattr(self, "_worker", None)
+            engine_controller = getattr(worker, "spotify_controller", None) if worker is not None else None
+            if engine_controller is not None:
+                try:
+                    engine_controller.reload_tokens()
+                except Exception:
+                    pass
         else:
             detail = message or "see browser"
             short = f"Spotify connect failed — {detail}"
@@ -16303,21 +18271,23 @@ Admin elevation
     def _maybe_show_privacy_prompt(self) -> None:
         """First-run privacy & analytics opt-in dialog.
 
-        - Installed app (PyInstaller, `sys.frozen=True`): fires
-          ONCE per install, gated by `config.privacy_disclosure_shown`.
-          Subsequent launches bypass the dialog entirely.
-        - Dev mode (`python run_app.py`, `sys.frozen` unset): ALWAYS
-          fires so it's easy to iterate on copy / layout / button
-          flow without nuking the config flag between runs.
+        Fires whenever `config.analytics_enabled` is False — meaning
+        the user hasn't explicitly opted in. After the user clicks
+        Allow, `analytics_enabled` is True and the popup never
+        re-fires (unless they later uncheck the Settings → About &
+        Privacy toggle, which puts them back in the opt-out state).
 
-        On any exit (Allow OR Don't Allow): latches
-        `privacy_disclosure_shown=True`, captures the analytics
-        choice, saves config, and flips the live TelemetryClient's
-        user-consent flag so the choice takes effect immediately
-        without an app restart.
+        Previously the popup was gated by `privacy_disclosure_shown`,
+        a "has the user seen this once?" flag set on any close. That
+        was confusing for testers who saw an unchecked Settings box
+        and expected the popup to ask them again.
+
+        Dev mode (`python run_app.py`, `sys.frozen` unset) is
+        unchanged: always shows so copy / layout / button flow is
+        easy to iterate on without nuking config between runs.
         """
         is_frozen = bool(getattr(sys, "frozen", False))
-        if is_frozen and bool(getattr(self.config, "privacy_disclosure_shown", False)):
+        if is_frozen and bool(getattr(self.config, "analytics_enabled", False)):
             return
         try:
             dialog = TouchlessPrivacyDialog(self)
@@ -16334,7 +18304,17 @@ Admin elevation
             client = getattr(self, "_telemetry", None)
             if client is not None:
                 try:
-                    client.set_user_opt_in(bool(self.config.analytics_enabled))
+                    try:
+                        from ...custom_gestures.registry import GestureRegistry as _Registry
+                        _reg = _Registry()
+                        _reg.load()
+                        _custom_gesture_count = len(_reg.list())
+                    except Exception:
+                        _custom_gesture_count = 0
+                    client.set_user_opt_in(
+                        bool(self.config.analytics_enabled),
+                        replay_properties={"custom_gesture_count": int(_custom_gesture_count)},
+                    )
                 except Exception:
                     pass
             # Mirror the dialog's choice into the live Settings →
@@ -16354,19 +18334,45 @@ Admin elevation
             pass
 
     def _maybe_show_spotify_reauth_toast(self) -> None:
-        """One-shot 'reconnect Spotify' toast. Fires when the
-        controller's refresh token has been rejected by Spotify's
-        auth server (revoked / expired / password-changed). After
-        showing once the flag clears; it re-arms only if Spotify
-        rejects another refresh, so the toast doesn't spam."""
+        """One-shot 'reconnect Spotify' toast. Fires when EITHER:
+          1. controller.needs_reauth — refresh token rejected by
+             Spotify's auth server (revoked / expired / password-
+             changed); OR
+          2. user has a configured custom client_id (= ran the setup
+             wizard) BUT has_authorization is False (= no tokens).
+             Catches 'user did setup, never connected, then tried a
+             Spotify gesture'.
+
+        Latches `_spotify_reauth_prompted_this_session` after the
+        first show so we don't respawn the dialog on every debug
+        frame when the user closes it without authorising. Cleared
+        when the user actually authorises (has_authorization flips
+        True) so a later token expiry can re-fire it."""
         worker = getattr(self, "_worker", None)
         controller = getattr(worker, "spotify_controller", None) if worker is not None else None
         if controller is None:
             return
-        if not bool(getattr(controller, "needs_reauth", False)):
+        has_auth = bool(getattr(controller, "has_authorization", False))
+        # Reset the per-session latch once the user is authorised
+        # again — that way a future token rejection can re-prompt.
+        if has_auth:
+            self._spotify_reauth_prompted_this_session = False
+        needs_reauth = bool(getattr(controller, "needs_reauth", False))
+        has_user_client_id = bool(getattr(self.config, "spotify_client_id", "") or "")
+        unauthorized = not has_auth
+        # Show if Spotify revoked us, OR if user finished setup-wizard
+        # but never authorised (and isn't authorised now).
+        should_show = needs_reauth or (has_user_client_id and unauthorized)
+        if not should_show:
             return
         if getattr(self, "_spotify_reauth_toast_in_flight", False):
             return
+        # Session-scoped latch — only prompt once per app run. Without
+        # this the popup would re-fire on every debug frame after the
+        # user closes it (which would be horrible UX).
+        if getattr(self, "_spotify_reauth_prompted_this_session", False):
+            return
+        self._spotify_reauth_prompted_this_session = True
         self._spotify_reauth_toast_in_flight = True
         try:
             controller.clear_reauth_flag()
@@ -16439,10 +18445,25 @@ Admin elevation
         the user has no saved tokens (already authorised users
         skip it entirely). The in-flight latch keeps multiple
         rapid frames from stacking modals while the user is
-        deciding."""
+        deciding.
+
+        TESTING (source-only): env var TOUCHLESS_TEST_SPOTIFY_PROMPT=1
+        bypasses both the "already shown" latch and the "already
+        authorized" short-circuit so the prompt fires every time
+        Spotify is detected open, regardless of saved state. Use
+        this when verifying the flow from source without wiping
+        config / auth_token.json each round.
+        """
+        import os as _os
+        test_force = bool(_os.environ.get("TOUCHLESS_TEST_SPOTIFY_PROMPT"))
         if getattr(self, "_spotify_first_prompt_in_flight", False):
+            if test_force:
+                try:
+                    print("[spotify-test] prompt already in-flight — skipping")
+                except Exception:
+                    pass
             return
-        if bool(getattr(self.config, "spotify_first_active_prompt_shown", False)):
+        if not test_force and bool(getattr(self.config, "spotify_first_active_prompt_shown", False)):
             return
         # Connect-Spotify is an authorization prompt, NOT a transient
         # text pop-up — it's required for the feature to work and the
@@ -16460,9 +18481,15 @@ Admin elevation
                 from ..integration.noop_engine import SpotifyController as _SpotifyController
                 controller = _SpotifyController()
             except Exception:
+                if test_force:
+                    try:
+                        print("[spotify-test] failed to build SpotifyController fallback")
+                    except Exception:
+                        pass
                 return
         try:
-            if bool(getattr(controller, "has_authorization", False)):
+            is_auth = bool(getattr(controller, "has_authorization", False))
+            if is_auth and not test_force:
                 # Already authorised in a prior run — silently
                 # latch the flag so we don't poll on every frame.
                 self.config.spotify_first_active_prompt_shown = True
@@ -16471,6 +18498,15 @@ Admin elevation
                 except Exception:
                     pass
                 return
+            if test_force:
+                try:
+                    print(
+                        f"[spotify-test] firing prompt "
+                        f"(has_authorization={is_auth}, "
+                        f"flag={getattr(self.config, 'spotify_first_active_prompt_shown', False)})"
+                    )
+                except Exception:
+                    pass
         except Exception:
             return
         self._spotify_first_prompt_in_flight = True
@@ -16490,33 +18526,96 @@ Admin elevation
 
         Cheap to run: _has_real_spotify_process iterates psutil
         and short-circuits on the first matching exe. has_authorization
-        is a cached property read from the on-disk token file."""
-        if bool(getattr(self.config, "spotify_first_active_prompt_shown", False)):
+        is a cached property read from the on-disk token file.
+
+        TESTING:
+          • Run `python reset_spotify_test_state.py` from the repo
+            root to wipe the latch flag + token file. The next launch
+            will treat you as a first-run user.
+          • OR set TOUCHLESS_TEST_SPOTIFY_PROMPT=1 before launching
+            to bypass the latch + already-authorised gates for the
+            current run only (no on-disk changes).
+
+        Diagnostics: this method ALWAYS prints `[spotify]` lines to
+        stderr so a developer running from a terminal can see exactly
+        which gate fired and whether the popup will / won't appear.
+        Cheap (4 short prints once at 2.2s); end users running the
+        packaged app don't see stderr.
+        """
+        import os as _os, sys as _sys
+        def _log(msg: str) -> None:
+            try:
+                _sys.stderr.write(f"[spotify] {msg}\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
+
+        test_force = bool(_os.environ.get("TOUCHLESS_TEST_SPOTIFY_PROMPT"))
+        if test_force:
+            try:
+                self.config.spotify_first_active_prompt_shown = False
+                save_config(self.config)
+            except Exception:
+                pass
+            _log("TOUCHLESS_TEST_SPOTIFY_PROMPT=1 — flag reset, gates bypassed")
+
+        latched = bool(getattr(self.config, "spotify_first_active_prompt_shown", False))
+        _log(f"startup check — spotify_first_active_prompt_shown={latched}")
+        if latched and not test_force:
+            _log(
+                "skipped: latch flag is True (user already saw the prompt or "
+                "is already connected). Run `python reset_spotify_test_state.py` "
+                "to clear it."
+            )
             return
         try:
             from ..integration.noop_engine import SpotifyController as _SpotifyController
             controller = _SpotifyController()
-            if bool(getattr(controller, "has_authorization", False)):
-                # Already authorised — latch and skip.
+            already_authorized = bool(getattr(controller, "has_authorization", False))
+            _log(f"controller built — has_authorization={already_authorized}")
+            if already_authorized and not test_force:
+                _log(
+                    "skipped: tokens already on disk. Run "
+                    "`python reset_spotify_test_state.py` to delete them and test "
+                    "the fresh-install flow."
+                )
                 self.config.spotify_first_active_prompt_shown = True
                 try:
                     save_config(self.config)
                 except Exception:
                     pass
                 return
-            if not controller._has_real_spotify_process():
+            running = controller._has_real_spotify_process()
+            _log(f"spotify process detected — _has_real_spotify_process={running}")
+            if not running:
+                _log(
+                    "skipped: no real Spotify.exe process found. Open Spotify "
+                    "desktop, then either open the tutorial or the per-frame "
+                    "engine path will pick it up within ~1 s of the window "
+                    "appearing."
+                )
                 return
-        except Exception:
+        except Exception as exc:
+            _log(f"controller build / detection raised: {exc}")
             return
-        # Spotify is running, user has no tokens — pop the prompt.
+        _log("all gates passed — calling _maybe_show_spotify_first_active_prompt")
         self._maybe_show_spotify_first_active_prompt()
 
     def _show_spotify_first_active_prompt(self) -> None:
         try:
+            # Copy mentions the 5-user cap + the setup wizard so a user
+            # who hits "user_not_listed" later knows where to look.
             allow = TouchlessNotice.show_confirm(
                 self,
                 "Connect Spotify?",
-                "Allow Touchless to connect to Spotify?",
+                (
+                    "Allow Touchless to connect to Spotify? Spotify caps "
+                    "shared apps at 5 testers — if you're outside the "
+                    "allow-list, you can open Settings → General → "
+                    "Spotify and click \"Set up your own Spotify app\" "
+                    "to use your own free Spotify Developer account "
+                    "(unlimited users, ~1 minute setup)."
+                ),
                 confirm_label="Allow",
                 cancel_label="Don't Allow",
             )
@@ -16831,6 +18930,9 @@ Admin elevation
                 # of start_engine never leave a stale stamp pointing
                 # at the PREVIOUS run's start time.
                 self._engine_started_at = time.monotonic()
+                # Reset per-session FPS samples so engine_stopped reports
+                # a distribution scoped to this run, not all-time.
+                self._fps_samples = []
             except Exception:
                 pass
 
@@ -17053,6 +19155,11 @@ Admin elevation
                     self._worker.mouse_mode_activated.connect(self._on_mouse_mode_activated)
                 except Exception:
                     pass
+            if hasattr(self._worker, "open_touchless_requested"):
+                try:
+                    self._worker.open_touchless_requested.connect(self._on_open_touchless_requested)
+                except Exception:
+                    pass
             if hasattr(self._worker, "drawing_overlay_toggle_requested"):
                 try:
                     self._worker.drawing_overlay_toggle_requested.connect(
@@ -17169,12 +19276,35 @@ Admin elevation
                 # (defensive — engine_stopped fires from defensive
                 # paths that don't always pair with a start).
                 started_at = getattr(self, "_engine_started_at", None)
+                # FPS distribution for this run — median + p95 give a
+                # robust read on perceived smoothness without leaking
+                # individual frame timings. Skipped when the engine
+                # didn't run long enough to collect samples.
+                fps_payload: dict[str, float | int] = {}
+                samples = list(getattr(self, "_fps_samples", []) or [])
+                if samples:
+                    samples.sort()
+                    n = len(samples)
+                    mid = n // 2
+                    median = (
+                        samples[mid]
+                        if n % 2 == 1
+                        else (samples[mid - 1] + samples[mid]) / 2.0
+                    )
+                    p95_idx = min(n - 1, max(0, int(round(0.95 * (n - 1)))))
+                    fps_payload = {
+                        "fps_median": round(median, 1),
+                        "fps_p95": round(samples[p95_idx], 1),
+                        "fps_sample_count": n,
+                    }
                 if started_at is not None:
                     engine_seconds = max(0.0, time.monotonic() - float(started_at))
-                    _telemetry.track("engine_stopped", {"engine_seconds": round(engine_seconds, 1)})
+                    payload = {"engine_seconds": round(engine_seconds, 1), **fps_payload}
+                    _telemetry.track("engine_stopped", payload)
                     self._engine_started_at = None
                 else:
-                    _telemetry.track("engine_stopped")
+                    _telemetry.track("engine_stopped", fps_payload or None)
+                self._fps_samples = []
             except Exception:
                 pass
             self._hide_mini_live_viewer()
@@ -18126,6 +20256,40 @@ Admin elevation
 
         return row, ts_label
 
+    def _on_open_touchless_requested(self) -> None:
+        """Bring the Touchless main window to the foreground in
+        response to the open_touchless gesture binding (default:
+        right-hand plain four). The window is usually already open but
+        may be minimized or buried behind other apps, so a plain
+        show()/raise_()/activateWindow() isn't enough — Qt's activate
+        won't un-minimize and Windows ignores a background raise.
+
+        Mirror Spotify's _activate_window_handle (right-hand 'two'):
+        un-minimize via showNormal(), then drive the Win32 path
+        (ShowWindow SW_RESTORE -> BringWindowToTop -> SetForegroundWindow)
+        on our own HWND so the window reliably comes to the front."""
+        try:
+            if self.isMinimized():
+                self.showNormal()
+            else:
+                self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        # Win32 foreground path for parity with the Spotify focus
+        # gesture — robust against the minimized/behind-other-windows
+        # cases the plain Qt calls above don't reliably handle.
+        try:
+            SW_RESTORE = 9
+            user32 = ctypes.windll.user32
+            hwnd = int(self.winId())
+            user32.ShowWindow(wintypes.HWND(hwnd), SW_RESTORE)
+            user32.BringWindowToTop(wintypes.HWND(hwnd))
+            user32.SetForegroundWindow(wintypes.HWND(hwnd))
+        except Exception:
+            pass
+
     def _on_mouse_mode_activated(self) -> None:
         """Show the monitor picker on mouse-mode-on. Skipped silently
         when the user already has a saved preset
@@ -18878,6 +21042,44 @@ Admin elevation
             options.append((label, QRect(screen.geometry())))
         options.append(("All Monitors", QRect(self._screens_union_geometry())))
         return options
+
+    def _clip_default_monitor_region(self, options: list[tuple[str, QRect]]) -> QRect:
+        """Resolve the configured clip-default-monitor preset to a
+        QRect for voice-triggered clips. Reads
+        config.clip_default_monitor_index:
+
+          None / out-of-range → primary monitor (Qt's primaryScreen).
+          0..N                → that screen by Qt's screens() order.
+          -1                  → All-monitors union (legacy behaviour
+                                for users who explicitly want it).
+
+        Falls back through the same hierarchy on any failure so the
+        voice path always produces a valid region — never a captured
+        empty rect."""
+        try:
+            preset = getattr(self.config, "clip_default_monitor_index", None)
+        except Exception:
+            preset = None
+        screens = [s for s in QGuiApplication.screens() if s is not None]
+        if not screens:
+            return self._screens_union_geometry()
+        if isinstance(preset, int) and preset == -1:
+            return QRect(self._screens_union_geometry())
+        if isinstance(preset, int) and 0 <= preset < len(screens):
+            try:
+                return QRect(screens[preset].geometry())
+            except Exception:
+                pass
+        try:
+            primary = QGuiApplication.primaryScreen()
+            if primary is not None:
+                return QRect(primary.geometry())
+        except Exception:
+            pass
+        # Last-ditch: first available monitor option, or full union.
+        if options:
+            return QRect(options[0][1])
+        return self._screens_union_geometry()
 
     def _choose_full_capture_region(self, action_label: str) -> QRect | None:
         options = self._capture_monitor_options()
@@ -20534,12 +22736,15 @@ Admin elevation
             )
 
         if len(options) == 1 or auto_select_monitor:
-            # Use the cache's full union geometry whenever possible
-            # so no per-monitor cropping is needed — that's what the
-            # ffmpeg cache already records. The `auto_select_monitor`
-            # path is the voice-trigger fast path.
+            # Voice-trigger fast path. Previously this used the full
+            # screens-union geometry (all monitors stitched together),
+            # which on multi-monitor rigs produced clips that captured
+            # the off-screen secondary as well as the action. User
+            # asked for the voice command to default to a SINGLE
+            # monitor — primary by default, configurable in General
+            # settings via clip_default_monitor_index.
             if auto_select_monitor:
-                target_region = self._screens_union_geometry()
+                target_region = self._clip_default_monitor_region(options)
             else:
                 target_region = options[0][1]
             _kickoff_export(QRect(target_region))
@@ -21519,8 +23724,26 @@ Admin elevation
         # opened, opened by voice, opened by the right-hand 'two'
         # gesture. The flag is read directly from the payload the
         # engine ticks each frame.
-        if bool(info.get("spotify_window_open", False)):
+        spotify_window_open_now = bool(info.get("spotify_window_open", False))
+        if spotify_window_open_now:
             self._maybe_show_spotify_first_active_prompt()
+        # Diagnostic: always log the spotify_window_open transitions
+        # (False → True → False) so a developer running from a
+        # terminal can confirm the engine is actually detecting
+        # Spotify's window. Logged once per transition — at 30 fps
+        # without this gate it would flood stderr.
+        prev = getattr(self, "_prev_spotify_window_open_seen", None)
+        if prev != spotify_window_open_now:
+            try:
+                import sys as _sys_diag
+                _sys_diag.stderr.write(
+                    f"[spotify] engine spotify_window_open = "
+                    f"{spotify_window_open_now}\n"
+                )
+                _sys_diag.stderr.flush()
+            except Exception:
+                pass
+            self._prev_spotify_window_open_seen = spotify_window_open_now
         # Also fire the prompt when the user has just ATTEMPTED a
         # Spotify gesture / voice command without ever connecting —
         # the prompt's own gating handles the per-install latch and
@@ -21793,6 +24016,28 @@ Admin elevation
         super().keyPressEvent(event)
 
     def eventFilter(self, obj, event):  # noqa: N802
+        # Outer settings-scroll wheel suppression. AlwaysOff hides the
+        # scrollbar but doesn't stop wheel/keyboard scrolling — so on
+        # panels we want to render without ANY outer scroll (Colors,
+        # Tutorial, About) or panels with their own internal scroll
+        # (Camera / Mic / Custom Gestures / Gesture Binds / Save
+        # Locations), the user could still wheel-scroll the outer
+        # area into empty space below the content. Consume the wheel
+        # event here when the active panel is in the no-scroll set.
+        if event.type() == QEvent.Wheel:
+            scroll = getattr(self, "_settings_content_scroll", None)
+            stack = getattr(self, "settings_content_stack", None)
+            if (
+                scroll is not None
+                and stack is not None
+                and obj is scroll.viewport()
+            ):
+                try:
+                    if stack.currentIndex() in self._SETTINGS_OUTER_SCROLL_OFF:
+                        event.accept()
+                        return True
+                except Exception:
+                    pass
         # Walk-through overlay: re-anchor the pill + Next button
         # whenever the page or content stack resizes / moves so the
         # overlay stays parked over the active panel's top-right.
@@ -21802,6 +24047,18 @@ Admin elevation
             if obj is page or obj is stack:
                 try:
                     self._position_walkthrough_overlay()
+                except Exception:
+                    pass
+            # Outer central widget resize/move: the edge-glow overlay
+            # is parented to outer, but its setGeometry doesn't auto-
+            # follow outer's rect on native-resize paths (custom title
+            # bar handles edge drags through nativeEvent). Re-anchor
+            # here so the glow tracks the window when the user resizes
+            # mid-walkthrough.
+            outer = getattr(self, "_root_outer", None)
+            if outer is not None and obj is outer:
+                try:
+                    self._reposition_walkthrough_edge_glow()
                 except Exception:
                     pass
         # Walk-through target glow: keep the soft halo glued to the
@@ -23289,6 +25546,28 @@ def _stop_screen_recording(self) -> bool:
         super().keyPressEvent(event)
 
     def eventFilter(self, obj, event):  # noqa: N802
+        # Outer settings-scroll wheel suppression. AlwaysOff hides the
+        # scrollbar but doesn't stop wheel/keyboard scrolling — so on
+        # panels we want to render without ANY outer scroll (Colors,
+        # Tutorial, About) or panels with their own internal scroll
+        # (Camera / Mic / Custom Gestures / Gesture Binds / Save
+        # Locations), the user could still wheel-scroll the outer
+        # area into empty space below the content. Consume the wheel
+        # event here when the active panel is in the no-scroll set.
+        if event.type() == QEvent.Wheel:
+            scroll = getattr(self, "_settings_content_scroll", None)
+            stack = getattr(self, "settings_content_stack", None)
+            if (
+                scroll is not None
+                and stack is not None
+                and obj is scroll.viewport()
+            ):
+                try:
+                    if stack.currentIndex() in self._SETTINGS_OUTER_SCROLL_OFF:
+                        event.accept()
+                        return True
+                except Exception:
+                    pass
         # Walk-through overlay: re-anchor the pill + Next button
         # whenever the page or content stack resizes / moves so the
         # overlay stays parked over the active panel's top-right.
@@ -23298,6 +25577,18 @@ def _stop_screen_recording(self) -> bool:
             if obj is page or obj is stack:
                 try:
                     self._position_walkthrough_overlay()
+                except Exception:
+                    pass
+            # Outer central widget resize/move: the edge-glow overlay
+            # is parented to outer, but its setGeometry doesn't auto-
+            # follow outer's rect on native-resize paths (custom title
+            # bar handles edge drags through nativeEvent). Re-anchor
+            # here so the glow tracks the window when the user resizes
+            # mid-walkthrough.
+            outer = getattr(self, "_root_outer", None)
+            if outer is not None and obj is outer:
+                try:
+                    self._reposition_walkthrough_edge_glow()
                 except Exception:
                     pass
         # Walk-through target glow: keep the soft halo glued to the
@@ -23424,6 +25715,48 @@ def _stop_screen_recording(self) -> bool:
         super().resizeEvent(event)
         self._update_home_status_card_width()
         self._reposition_walkthrough_edge_glow()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        """Modern Qt edge-drag resize via QWindow.startSystemResize.
+        The existing nativeEvent / WM_NCHITTEST path occasionally
+        becomes inert after the first successful drag on Windows
+        11 — `startSystemResize` is the supported PySide6 path and
+        works reliably every time.
+
+        Detects whether the press landed within an 8 px band of the
+        window edge and, if so, hands control to the platform's
+        system resize loop. Misses (clicks inside the content area)
+        fall through to the default mousePressEvent so child widgets
+        still receive their press.
+        """
+        try:
+            if event.button() != Qt.LeftButton or self.is_custom_maximized:
+                super().mousePressEvent(event)
+                return
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            border = 8
+            on_left = pos.x() <= border
+            on_right = pos.x() >= self.width() - border
+            on_top = pos.y() <= border
+            on_bottom = pos.y() >= self.height() - border
+            edge = Qt.Edges()
+            if on_left:
+                edge |= Qt.LeftEdge
+            if on_right:
+                edge |= Qt.RightEdge
+            if on_top:
+                edge |= Qt.TopEdge
+            if on_bottom:
+                edge |= Qt.BottomEdge
+            if int(edge) != 0:
+                handle = self.windowHandle()
+                if handle is not None:
+                    handle.startSystemResize(edge)
+                    event.accept()
+                    return
+        except Exception:
+            pass
+        super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)

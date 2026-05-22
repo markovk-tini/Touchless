@@ -7,12 +7,14 @@ import time
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 from ..config.app_config import CONFIG_DIR
 from ..debug.chrome_controller import KNOWN_WEB_TARGETS, ChromeController
 from ..debug.desktop_controller import DesktopAppEntry, DesktopController
+from ..debug.discord_controller import DiscordController
 from ..debug.spotify_controller import SpotifyController
+from ..debug.text_input_controller import TextInputController
 from ..debug.youtube_controller import YouTubeController
 
 
@@ -75,6 +77,7 @@ APP_ALIASES: dict[str, tuple[str, ...]] = {
     "settings": ("settings", "device settings", "windows settings", "system settings"),
     "file_explorer": ("file explorer", "explorer"),
     "outlook": ("outlook", "mail app"),
+    "discord": ("discord",),
 }
 
 
@@ -197,6 +200,85 @@ APP_OBJECT_HINTS = (
     "titled",
 )
 SPOTIFY_CONTEXT_PHRASES = ("on spotify", "in spotify", "from spotify", "using spotify")
+
+# Phrases that gate the Discord parser. If any of these appear in the
+# normalised text, the parser will accept its action keywords (mute,
+# deafen, leave, join, send, open) as Discord-targeted. The aliases
+# below (in APP_ALIASES["discord"]) and the parser's matched_alias
+# check do the same job — context phrases let users say things like
+# "mute me on discord" instead of "mute discord" / "discord mute".
+DISCORD_CONTEXT_PHRASES = (
+    "on discord",
+    "in discord",
+    "from discord",
+    "using discord",
+    "to discord",
+)
+# Disconnect phrases — any of these (with or without discord context)
+# treated as "leave the current voice call".
+DISCORD_LEAVE_PHRASES = (
+    "leave call",
+    "leave the call",
+    "hang up",
+    "hangup",
+    "disconnect call",
+    "disconnect from call",
+    "leave voice",
+    "leave voice channel",
+    "leave channel",
+    "drop call",
+    "end call",
+)
+# Phrases that prefix a voice-channel join. "Join" alone is too
+# generic (it could mean a server join, a chat join, etc.) so we
+# require "join" + optional qualifier + channel name.
+DISCORD_JOIN_PHRASES = (
+    "join voice",
+    "join voice channel",
+    "join channel",
+    "join the channel",
+    "join",
+)
+# Phrases that prefix a text-channel focus. Two tiers:
+#
+#   STRONG — explicit "channel" keyword. Fire regardless of whether
+#   the user mentioned Discord. "open channel general" is
+#   unambiguous; no other app uses the word "channel" the same way.
+#
+#   WEAK — bare "switch to" / "go to". Require Discord context
+#   (matched alias, "on discord", etc.) so the parser doesn't grab
+#   "switch to dark mode" / "go to settings".
+DISCORD_OPEN_TEXT_PHRASES_STRONG = (
+    "go to channel",
+    "switch to channel",
+    "switch channel to",
+    "open channel",
+    "go to the channel",
+    "open the channel",
+)
+DISCORD_OPEN_TEXT_PHRASES_WEAK = (
+    "switch to",
+    "go to",
+)
+# Phrases that prefix a server (guild) switch.
+DISCORD_OPEN_SERVER_PHRASES = (
+    "switch to server",
+    "open server",
+    "go to server",
+    "switch server to",
+    "open the server",
+)
+# Send-message prefixes. Anything starting with these is treated as
+# "send a message to <target>". The destination and message body are
+# separated by " in " / " to " in the spoken text — last occurrence
+# wins to avoid splitting on an "in"/"to" inside the message itself.
+DISCORD_SEND_PHRASES = (
+    "send message",
+    "send a message",
+    "send dm",
+    "send",
+)
+DISCORD_SEND_TARGET_SEPARATORS = (" in ", " to ")
 YOUTUBE_CONTEXT_PHRASES = (
     "on youtube",
     "in youtube",
@@ -480,8 +562,21 @@ class VoiceCommandProcessor:
         spotify_controller: SpotifyController | None = None,
         desktop_controller: DesktopController | None = None,
         youtube_controller: YouTubeController | None = None,
+        discord_controller: DiscordController | None = None,
+        text_input_controller: TextInputController | None = None,
         profile_store: VoiceProfileStore | None = None,
+        log_step: "Optional[Callable[[str], None]]" = None,
     ) -> None:
+        # Step-emit callback for the detailed log surface. The engine
+        # wires this to its `engine_log` Qt signal so every step of
+        # every multi-step command (resolve destination → fuzzy-match
+        # → focus window → paste → press enter) becomes a line the
+        # user sees in real time. When a command fails midway, the
+        # log tells them exactly which step broke and why instead of
+        # the bare "(failed)" summary the executor returns. Optional
+        # — falls back to a no-op so unit tests and standalone uses
+        # don't have to provide it.
+        self._log_step: Callable[[str], None] = log_step or (lambda _msg: None)
         self.chrome_controller = chrome_controller or ChromeController()
         self.spotify_controller = spotify_controller or SpotifyController()
         self.desktop_controller = desktop_controller or DesktopController()
@@ -490,8 +585,27 @@ class VoiceCommandProcessor:
         # gestures) — both operate on the same Chrome window via
         # separate API surfaces, so sharing isn't required.
         self.youtube_controller = youtube_controller or YouTubeController()
+        # Discord RPC controller — same instance as the engine's so
+        # commands run against the connection the user already
+        # authorised. Falls back to a fresh instance for unit tests
+        # / from-cold launches.
+        self.discord_controller = discord_controller or DiscordController()
+        # Text input controller is reused for the Discord "send X"
+        # voice command — after SELECT_TEXT_CHANNEL focuses the
+        # channel, the message is typed via clipboard-paste + Enter.
+        # Same instance the engine uses so we don't fight over the
+        # clipboard.
+        self.text_input_controller = text_input_controller or TextInputController()
         self.profile_store = profile_store or VoiceProfileStore()
         self._pending_selection: dict[str, Any] | None = None
+        # Awaiting-destination state for the Discord "send X" voice
+        # command when no destination was provided AND the controller
+        # fallback chain (voice channel → last focused) found nothing.
+        # The next user utterance is consumed as the channel name; the
+        # parser is bypassed and the message is sent verbatim. Stored
+        # as None when no send is pending. Cleared on success/cancel/
+        # 30 s timeout.
+        self._discord_pending_send: dict[str, Any] | None = None
 
     def parse(self, spoken_text: str, *, context: VoiceCommandContext | None = None) -> ParsedVoiceCommand | None:
         normalized = self._normalize_text(spoken_text)
@@ -506,6 +620,13 @@ class VoiceCommandProcessor:
             # is handled as a YouTube play (search + open) rather than
             # being intercepted by the chrome web-target heuristic.
             self._parse_youtube(normalized, raw_text=spoken_text, context=context),
+            # Discord parser runs before chrome / catalog so phrases
+            # like "open general" (channel) aren't swallowed by the
+            # generic-open heuristic. The discord context check is
+            # strict: parser only fires if the text has a discord
+            # marker OR uses one of the high-specificity verb prefixes
+            # (mute/deafen/hang up/leave call/join voice).
+            self._parse_discord(normalized, raw_text=spoken_text, context=context),
             self._parse_chrome(normalized, raw_text=spoken_text, context=context),
             self._parse_settings(normalized, raw_text=spoken_text, context=context),
             self._parse_close_window(normalized, raw_text=spoken_text, context=context),
@@ -543,6 +664,16 @@ class VoiceCommandProcessor:
         return best if best.confidence >= 0.56 else None
 
     def execute(self, spoken_text: str, *, context: VoiceCommandContext | None = None) -> VoiceExecutionResult:
+        # Discord send-message in awaiting-destination state takes
+        # precedence over normal parsing. The next utterance after a
+        # destination-less "send X" prompt is consumed as the channel
+        # name verbatim (no parser run — the channel name might
+        # otherwise look like a different intent, e.g. "general" →
+        # generic-open).
+        pending_send_result = self._execute_discord_pending_send(spoken_text)
+        if pending_send_result is not None:
+            return pending_send_result
+
         pending_result = self._execute_pending_selection(spoken_text)
         if pending_result is not None:
             return pending_result
@@ -778,6 +909,8 @@ class VoiceCommandProcessor:
             result = self._execute_chrome(intent)
         elif intent.app_name == "youtube":
             result = self._execute_youtube(intent)
+        elif intent.app_name == "discord":
+            result = self._execute_discord(intent)
         elif intent.app_name == "settings":
             result = self._execute_settings(intent)
         elif intent.app_name == "file_explorer":
@@ -794,7 +927,81 @@ class VoiceCommandProcessor:
         if a tab keyword was matched, navigate to that section.
         Runs in-process: we find the MainWindow via QApplication's
         top-level widgets and dispatch the show + navigate calls
-        on the GUI thread via QTimer.singleShot(0, ...)."""
+        on the GUI thread via QTimer.singleShot(0, ...).
+
+        Special action 'open_save_folder' (set by _parse_touchless_app
+        when the user says e.g. "open touchless clip / drawing /
+        screenshot / recording"): instead of focusing Touchless,
+        open the user's configured save folder for that output
+        kind in Windows Explorer. Without this the parser would
+        have routed those phrases to the generic launch path and
+        the user would see Touchless come to the foreground —
+        which is what they reported as wrong."""
+        if intent.action == "open_save_folder":
+            output_kind = ""
+            try:
+                slots = dict(getattr(intent, "slots", {}) or {})
+                output_kind = str(slots.get("output_kind", "") or intent.query or "").strip().lower()
+            except Exception:
+                output_kind = str(intent.query or "").strip().lower()
+            try:
+                # Locate the MainWindow so we can read its live
+                # config (the user's chosen save folders). Falls
+                # back to the AppConfig defaults if MainWindow is
+                # somehow missing.
+                from PySide6.QtWidgets import QApplication
+                from ...config.app_config import (
+                    SAVE_LOCATION_CONFIG_FIELDS,
+                    SAVE_LOCATION_LABELS,
+                    default_save_directory,
+                )
+                target_dir: Path | None = None
+                main_window = None
+                app = QApplication.instance()
+                if app is not None:
+                    for widget in app.topLevelWidgets():
+                        if widget.__class__.__name__ == "MainWindow":
+                            main_window = widget
+                            break
+                config_field = SAVE_LOCATION_CONFIG_FIELDS.get(output_kind, "")
+                if main_window is not None and config_field:
+                    raw_path = str(getattr(main_window.config, config_field, "") or "").strip()
+                    if raw_path:
+                        candidate = Path(raw_path).expanduser()
+                        if candidate.exists() and candidate.is_dir():
+                            target_dir = candidate
+                if target_dir is None:
+                    target_dir = default_save_directory(output_kind)
+                if target_dir is None or not target_dir.exists():
+                    label = SAVE_LOCATION_LABELS.get(output_kind, output_kind or "file")
+                    info = f"touchless {label.lower()} folder not found"
+                    return VoiceExecutionResult(
+                        success=False,
+                        target="touchless_app",
+                        heard_text=intent.raw_text,
+                        control_text=info,
+                        info_text=info,
+                    )
+                import os as _os
+                _os.startfile(str(target_dir))
+                label = SAVE_LOCATION_LABELS.get(output_kind, output_kind)
+                info = f"opening Touchless {label.lower()} folder"
+                return VoiceExecutionResult(
+                    success=True,
+                    target="touchless_app",
+                    heard_text=intent.raw_text,
+                    control_text=info,
+                    info_text=info,
+                )
+            except Exception as exc:
+                info = f"open touchless {output_kind} folder failed: {exc}"
+                return VoiceExecutionResult(
+                    success=False,
+                    target="touchless_app",
+                    heard_text=intent.raw_text,
+                    control_text=info,
+                    info_text=info,
+                )
         target_key = intent.query
         info: str
         try:
@@ -1004,41 +1211,104 @@ class VoiceCommandProcessor:
     def _execute_spotify(self, intent: ParsedVoiceCommand) -> VoiceExecutionResult:
         success = False
         info_text = "-"
+        self._log_step(
+            f"[spotify] action={intent.action} query={(intent.query or '')[:60]!r}"
+        )
         if intent.action == "open":
             if self._is_spotify_resume_phrase(intent.raw_text):
+                self._log_step("[spotify] resume phrase detected; focusing then playing")
+                self._log_step("[spotify] focus_or_open_window...")
                 focused = self.spotify_controller.focus_or_open_window()
+                self._log_step(
+                    f"[spotify] focus → {'ok' if focused else 'failed'} "
+                    f"({self.spotify_controller.message})"
+                )
+                self._log_step("[spotify] sending play...")
                 played = self.spotify_controller.play()
+                self._log_step(
+                    f"[spotify] play → {'ok' if played else 'failed'} "
+                    f"({self.spotify_controller.message})"
+                )
                 success = focused and played
                 details = self.spotify_controller.get_current_track_details() if success else None
                 if details is not None:
                     info_text = details.summary()
+                    self._log_step(f"[spotify] now playing: {info_text}")
             else:
+                self._log_step("[spotify] focus_or_open_window...")
                 success = self.spotify_controller.focus_or_open_window()
+                self._log_step(
+                    f"[spotify] open → {'ok' if success else 'failed'} "
+                    f"({self.spotify_controller.message})"
+                )
         elif intent.action == "play":
             preferred_types = tuple(intent.slots.get("preferred_types", ()))
+            self._log_step(
+                f"[spotify] play_search_request query={intent.query!r} "
+                f"types={preferred_types or 'default'}"
+            )
             success = self.spotify_controller.play_search_request(intent.query or "", preferred_types=preferred_types)
+            self._log_step(
+                f"[spotify] play_search_request → {'ok' if success else 'failed'} "
+                f"({self.spotify_controller.message})"
+            )
             details = self.spotify_controller.get_current_track_details() if success else None
             if details is not None:
                 info_text = details.summary()
+                self._log_step(f"[spotify] now playing: {info_text}")
             elif intent.query:
                 info_text = f"Spotify request: {intent.query}"
         elif intent.action == "pause":
+            self._log_step("[spotify] sending pause...")
             success = self.spotify_controller.pause()
+            self._log_step(
+                f"[spotify] pause → {'ok' if success else 'failed'} "
+                f"({self.spotify_controller.message})"
+            )
         elif intent.action == "resume":
+            self._log_step("[spotify] resume: focus then play")
             focused = self.spotify_controller.focus_or_open_window()
+            self._log_step(
+                f"[spotify] focus → {'ok' if focused else 'failed'}"
+            )
             played = self.spotify_controller.play()
+            self._log_step(
+                f"[spotify] play → {'ok' if played else 'failed'} "
+                f"({self.spotify_controller.message})"
+            )
             success = focused and played
             details = self.spotify_controller.get_current_track_details() if success else None
             if details is not None:
                 info_text = details.summary()
+                self._log_step(f"[spotify] now playing: {info_text}")
         elif intent.action == "next":
+            self._log_step("[spotify] next_track...")
             success = self.spotify_controller.next_track()
+            self._log_step(
+                f"[spotify] next_track → {'ok' if success else 'failed'} "
+                f"({self.spotify_controller.message})"
+            )
         elif intent.action == "previous":
+            self._log_step("[spotify] previous_track...")
             success = self.spotify_controller.previous_track()
+            self._log_step(
+                f"[spotify] previous_track → {'ok' if success else 'failed'} "
+                f"({self.spotify_controller.message})"
+            )
         elif intent.action == "shuffle":
+            self._log_step("[spotify] toggle_shuffle...")
             success = self.spotify_controller.toggle_shuffle()
+            self._log_step(
+                f"[spotify] toggle_shuffle → {'ok' if success else 'failed'} "
+                f"({self.spotify_controller.message})"
+            )
         elif intent.action == "repeat":
+            self._log_step("[spotify] toggle_repeat_track...")
             success = self.spotify_controller.toggle_repeat_track()
+            self._log_step(
+                f"[spotify] toggle_repeat_track → {'ok' if success else 'failed'} "
+                f"({self.spotify_controller.message})"
+            )
         if info_text == "-" and intent.query:
             info_text = f"Spotify request: {intent.query}"
         return VoiceExecutionResult(
@@ -1048,6 +1318,607 @@ class VoiceCommandProcessor:
             control_text=self.spotify_controller.message,
             info_text=info_text,
         )
+
+    # ---- Discord -----------------------------------------------------------
+
+    def _execute_discord(self, intent: ParsedVoiceCommand) -> VoiceExecutionResult:
+        """Drive the Discord RPC controller from a parsed intent.
+
+        Action contract (`intent.action` → controller call):
+
+          * `mute` / `unmute`       → controller.set_self_mute(bool)
+          * `deafen` / `undeafen`   → controller.set_self_deafen(bool)
+          * `leave_call`            → controller.leave_voice_channel()
+          * `join_voice`            → find voice channel by name + select
+          * `open_text`             → find text channel by name + select
+          * `switch_server`         → find guild + focus its first text channel
+          * `send`                  → focus channel (if specified) + paste
+                                       the message via text_input_controller
+                                       and press Enter
+
+        Returns the standard VoiceExecutionResult shape with `target="discord"`.
+
+        Currently short-circuits to a "Coming soon" response in every
+        build — Discord is shelved behind a future feature update,
+        matching the Settings → General → Discord card placeholder and
+        the engine's idle Discord-mode router. The full parser + action
+        contract is kept intact below for when we re-enable it.
+        """
+        return VoiceExecutionResult(
+            success=False,
+            target="discord",
+            heard_text=intent.raw_text,
+            control_text="Discord control coming soon",
+            info_text="Discord support is coming in a future Touchless update.",
+        )
+        action = intent.action
+        slots = intent.slots or {}
+        target_name = str(slots.get("target") or "").strip()
+        message_text = str(slots.get("message") or "").strip()
+        success = False
+        info_text = "-"
+
+        # Every Discord action emits a step log so the user can see
+        # exactly which RPC call ran and whether the response was
+        # success / not-found / RPC error. The controller methods
+        # already update their `.message` field with the underlying
+        # reason; we mirror it here so the user sees it via the log
+        # without having to read controller-internal state.
+        self._log_step(f"[discord] action={action} target={target_name!r}")
+
+        if action == "mute":
+            self._log_step("[discord] setting self_mute=True...")
+            success = self.discord_controller.set_self_mute(True)
+            self._log_step(
+                f"[discord] mute → {'ok' if success else 'failed'} "
+                f"({self.discord_controller.message})"
+            )
+        elif action == "unmute":
+            self._log_step("[discord] setting self_mute=False...")
+            success = self.discord_controller.set_self_mute(False)
+            self._log_step(
+                f"[discord] unmute → {'ok' if success else 'failed'} "
+                f"({self.discord_controller.message})"
+            )
+        elif action == "deafen":
+            self._log_step("[discord] setting self_deafen=True...")
+            success = self.discord_controller.set_self_deafen(True)
+            self._log_step(
+                f"[discord] deafen → {'ok' if success else 'failed'} "
+                f"({self.discord_controller.message})"
+            )
+        elif action == "undeafen":
+            self._log_step("[discord] setting self_deafen=False...")
+            success = self.discord_controller.set_self_deafen(False)
+            self._log_step(
+                f"[discord] undeafen → {'ok' if success else 'failed'} "
+                f"({self.discord_controller.message})"
+            )
+        elif action == "leave_call":
+            self._log_step("[discord] leaving current voice channel...")
+            success = self.discord_controller.leave_voice_channel()
+            self._log_step(
+                f"[discord] leave_call → {'ok' if success else 'failed'} "
+                f"({self.discord_controller.message})"
+            )
+        elif action == "join_voice":
+            self._log_step(
+                f"[discord] searching voice channels for {target_name!r}..."
+            )
+            channel = self.discord_controller.find_voice_channel_by_name(target_name)
+            if channel is None:
+                self._log_step(
+                    f"[discord] no voice channel matched {target_name!r} "
+                    f"(searched across all joined guilds)"
+                )
+                info_text = f"voice channel '{target_name}' not found"
+            else:
+                self._log_step(
+                    f"[discord] matched voice #{channel.get('name', '?')} "
+                    f"in {channel.get('_guild_name', '?')} "
+                    f"(id={channel.get('id', '?')})"
+                )
+                self._log_step("[discord] joining voice channel...")
+                success = self.discord_controller.select_voice_channel(channel.get("id", ""))
+                if success:
+                    info_text = (
+                        f"joined #{channel.get('name', '?')} "
+                        f"in {channel.get('_guild_name', '?')}"
+                    )
+                    self._log_step(f"[discord] joined: {info_text}")
+                else:
+                    self._log_step(
+                        f"[discord] join failed: {self.discord_controller.message}"
+                    )
+        elif action == "open_text":
+            self._log_step(
+                f"[discord] searching text channels for {target_name!r}..."
+            )
+            channel = self.discord_controller.find_text_channel_by_name(target_name)
+            if channel is None:
+                self._log_step(
+                    f"[discord] no text channel matched {target_name!r}"
+                )
+                info_text = f"text channel '{target_name}' not found"
+            else:
+                self._log_step(
+                    f"[discord] matched #{channel.get('name', '?')} "
+                    f"in {channel.get('_guild_name', '?')} "
+                    f"(id={channel.get('id', '?')})"
+                )
+                self._log_step("[discord] focusing text channel in UI...")
+                success = self.discord_controller.select_text_channel(
+                    channel.get("id", ""), channel_info=channel
+                )
+                if success:
+                    info_text = (
+                        f"opened #{channel.get('name', '?')} "
+                        f"in {channel.get('_guild_name', '?')}"
+                    )
+                    self._log_step(f"[discord] opened: {info_text}")
+                else:
+                    self._log_step(
+                        f"[discord] open failed: {self.discord_controller.message}"
+                    )
+        elif action == "switch_server":
+            self._log_step(
+                f"[discord] searching guilds for {target_name!r}..."
+            )
+            guild = self.discord_controller.find_guild_by_name(target_name)
+            if guild is None:
+                self._log_step(f"[discord] no guild matched {target_name!r}")
+                info_text = f"server '{target_name}' not found"
+            else:
+                self._log_step(
+                    f"[discord] matched guild {guild.get('name', '?')} "
+                    f"(id={guild.get('id', '?')}); "
+                    "selecting its first text channel..."
+                )
+                success = self.discord_controller.focus_guild_first_text_channel(
+                    guild.get("id", "")
+                )
+                if success:
+                    info_text = f"switched to {guild.get('name', '?')}"
+                    self._log_step(f"[discord] {info_text}")
+                else:
+                    self._log_step(
+                        f"[discord] switch_server failed: "
+                        f"{self.discord_controller.message}"
+                    )
+        elif action == "send":
+            success, info_text = self._execute_discord_send(target_name, message_text)
+        return VoiceExecutionResult(
+            success=success,
+            target="discord",
+            heard_text=intent.raw_text,
+            control_text=self.discord_controller.message,
+            info_text=info_text if info_text != "-" else self.discord_controller.message,
+        )
+
+    def _execute_discord_pending_send(
+        self, spoken_text: str
+    ) -> VoiceExecutionResult | None:
+        """If `_discord_pending_send` is set, treat `spoken_text` as
+        the destination channel name and complete the send.
+
+        Cancel words ("cancel", "nevermind", "stop") clear the pending
+        state without sending. Unrecognised channel names re-prompt
+        (state stays set). 30 s expiry — if the user goes silent for
+        too long, the pending message is dropped.
+        """
+        pending = self._discord_pending_send
+        if pending is None:
+            return None
+        # 30 s timeout — drop stale pending if the user moved on.
+        if time.time() - float(pending.get("started_at", 0)) > 30.0:
+            self._discord_pending_send = None
+            return None
+        normalized = self._normalize_text(spoken_text)
+        if not normalized:
+            return None
+        # Cancel words clear the pending state without firing.
+        if normalized in {
+            "cancel", "nevermind", "never mind", "stop", "forget it",
+            "abort", "scratch that", "no", "nope",
+        }:
+            self._discord_pending_send = None
+            return VoiceExecutionResult(
+                success=False,
+                target="discord",
+                heard_text=spoken_text,
+                control_text="send cancelled",
+                info_text="-",
+                display_text="send cancelled",
+            )
+        # Treat the entire utterance as the channel name and resolve.
+        message_text = str(pending.get("message", "")).strip()
+        target_name = normalized
+        # Strip common filler prefixes the user might say when
+        # responding to the prompt — "in general", "the general
+        # channel", etc.
+        for prefix in ("in the ", "in ", "the ", "to "):
+            if target_name.startswith(prefix):
+                target_name = target_name[len(prefix):].strip()
+                break
+        for suffix in (" channel", " channels"):
+            if target_name.endswith(suffix):
+                target_name = target_name[: -len(suffix)].strip()
+                break
+        # Clear pending state BEFORE the send call — if it fails, we
+        # don't want to leave it dangling for the next utterance to
+        # consume.
+        self._discord_pending_send = None
+        success, info_text = self._execute_discord_send(target_name, message_text)
+        return VoiceExecutionResult(
+            success=success,
+            target="discord",
+            heard_text=spoken_text,
+            control_text=self.discord_controller.message,
+            info_text=info_text if info_text != "-" else self.discord_controller.message,
+            display_text=info_text,
+        )
+
+    def _execute_discord_send(
+        self, target_name: str, message_text: str
+    ) -> tuple[bool, str]:
+        """Resolve the destination, focus the Discord window + the
+        target channel, paste the message, and press Enter.
+
+        Destination resolution (in order):
+          1. Explicit `target_name` from the voice command (fuzzy
+             match against every text channel).
+          2. `default_send_target()` — the controller-side fallback
+             chain: currently-joined voice channel's in-call chat,
+             then the last text channel we focused via Touchless.
+          3. Set `_discord_pending_send` and return a prompt asking
+             the user which channel. The next utterance is consumed
+             as the destination.
+
+        Critical step the v1 build missed: focus the Discord WINDOW
+        before pasting. `SELECT_TEXT_CHANNEL` navigates Discord's
+        internal UI but doesn't raise the window — paste keystrokes
+        would otherwise land in whichever app currently has focus
+        (Touchless's own voice-listener overlay, browser, IDE, etc.).
+        """
+        self._log_step(
+            f"[discord] send: message={message_text[:60]!r} target={target_name!r}"
+        )
+        if not message_text:
+            self._log_step("[discord] send aborted: no message text")
+            return False, "no message text — try 'send <message> in <channel>'"
+        info_prefix = ""
+        channel: dict[str, Any] | None = None
+
+        # Stage 1: explicit destination from the voice command.
+        if target_name:
+            self._log_step(
+                f"[discord] resolving destination by name: {target_name!r}"
+            )
+            channel = self.discord_controller.find_text_channel_by_name(target_name)
+            if channel is None:
+                self._log_step(
+                    f"[discord] no text channel matched {target_name!r}; "
+                    "send aborted"
+                )
+                return False, f"send target '{target_name}' not found"
+            self._log_step(
+                f"[discord] matched #{channel.get('name', '?')} "
+                f"in {channel.get('_guild_name', '?')} "
+                f"(id={channel.get('id', '?')})"
+            )
+        # Stage 2: fall back to the controller's smart default.
+        else:
+            self._log_step(
+                "[discord] no destination given; checking fallback chain "
+                "(voice-channel → last focused)..."
+            )
+            channel = self.discord_controller.default_send_target()
+            if channel is None:
+                # Stage 3: nothing to fall back to — stash the message
+                # and prompt the user for a destination on the next
+                # utterance.
+                self._log_step(
+                    "[discord] fallback chain empty; entering "
+                    "awaiting-destination state"
+                )
+                self._discord_pending_send = {
+                    "message": message_text,
+                    "started_at": time.time(),
+                }
+                prompt = (
+                    f"Which channel for: \"{message_text[:80]}\"?\n"
+                    "Say a channel name (e.g. 'general'), or 'cancel' to abort."
+                )
+                return False, prompt
+            self._log_step(
+                f"[discord] fallback target: #{channel.get('name', '?')} "
+                f"({channel.get('_via', 'unknown')})"
+            )
+
+        # We have a channel — focus the Discord window so the paste
+        # lands in its compose box, then run SELECT_TEXT_CHANNEL.
+        self._log_step("[discord] focusing Discord desktop window...")
+        if not self.discord_controller.focus_discord_window():
+            self._log_step(
+                "[discord] could not focus Discord window — paste may go "
+                "to the wrong app; continuing anyway"
+            )
+        time.sleep(0.20)
+        self._log_step(
+            f"[discord] SELECT_TEXT_CHANNEL id={channel.get('id', '?')}..."
+        )
+        ok = self.discord_controller.select_text_channel(
+            channel.get("id", ""), channel_info=channel
+        )
+        if not ok:
+            self._log_step(
+                f"[discord] SELECT_TEXT_CHANNEL failed: "
+                f"{self.discord_controller.message}"
+            )
+            return False, "couldn't focus destination channel"
+        self._log_step(
+            "[discord] channel focused; settling 150 ms before paste"
+        )
+        time.sleep(0.15)
+        info_prefix = (
+            f"#{channel.get('name', '?')} in {channel.get('_guild_name', '?')}: "
+        )
+        # Step 3: paste the body via clipboard, then synthesize a
+        # separate VK_RETURN keypress.
+        #
+        # Two calls, not one with "\n" baked in. The reason: paste-
+        # mode shoves the entire string onto the clipboard and hits
+        # Ctrl+V, which delivers ALL characters verbatim — including
+        # newlines, which Discord renders as in-message line breaks
+        # instead of treating as "send". For an actual Send we need
+        # the Enter key event, not a newline character. The typed
+        # path (prefer_paste=False) calls _text_to_inputs which
+        # remaps "\n" to VK_RETURN — exactly what we want for the
+        # Enter step. Splitting body and Enter into two calls keeps
+        # the body fast (one clipboard op) while making the send a
+        # real keypress.
+        self._log_step(
+            f"[discord] pasting message body ({len(message_text)} chars) "
+            "via clipboard..."
+        )
+        try:
+            ok_paste = bool(
+                self.text_input_controller.insert_text(message_text, prefer_paste=True)
+            )
+        except Exception as exc:
+            self._log_step(f"[discord] paste raised: {exc}")
+            return False, f"send failed (paste step): {exc}"
+        if not ok_paste:
+            self._log_step(
+                f"[discord] paste returned False: "
+                f"{self.text_input_controller.message}"
+            )
+            return False, "send failed (paste step)"
+        self._log_step("[discord] paste ok; sending Enter keypress...")
+        try:
+            ok_enter = bool(
+                self.text_input_controller.insert_text("\n", prefer_paste=False)
+            )
+        except Exception as exc:
+            self._log_step(f"[discord] enter raised: {exc}")
+            return False, f"send failed (enter step): {exc}"
+        if not ok_enter:
+            self._log_step(
+                f"[discord] enter returned False: "
+                f"{self.text_input_controller.message}"
+            )
+            return False, "send failed (enter step)"
+        self._log_step(
+            f"[discord] sent {message_text[:60]!r} to "
+            f"#{channel.get('name', '?')}"
+        )
+        return True, f"{info_prefix}sent \"{message_text[:80]}\""
+
+    def _parse_discord(
+        self,
+        text: str,
+        *,
+        raw_text: str,
+        context: VoiceCommandContext | None,
+    ) -> ParsedVoiceCommand | None:
+        """Parse Discord voice commands.
+
+        Action coverage:
+          * mute / unmute / deafen / undeafen (require Discord context
+            so "mute me" alone doesn't capture system-mute users)
+          * leave_call / hang up / disconnect (no Discord context
+            required — these phrases are Discord-specific enough)
+          * join_voice — "join <voice channel>"
+          * open_text — "open <channel>" / "switch to <channel>"
+          * switch_server — "open <server>" / "switch to server <name>"
+          * send — "send <message>" / "send <message> in <target>" /
+                   "send <message> to <target>"
+
+        Returns None when the text doesn't look like a Discord command.
+        """
+        matched_alias = self._matched_alias(text, "discord")
+        discord_context = (
+            matched_alias is not None
+            or self._contains_any(text, DISCORD_CONTEXT_PHRASES)
+            or (context is not None and context.preferred_app == "discord")
+        )
+
+        # leave / hang up — high-specificity, no context required
+        if self._contains_any(text, DISCORD_LEAVE_PHRASES):
+            return ParsedVoiceCommand(
+                raw_text=raw_text,
+                normalized_text=text,
+                app_name="discord",
+                action="leave_call",
+                confidence=0.94,
+                matched_alias=matched_alias,
+                slots={},
+            )
+
+        # mute / unmute — require Discord context so they don't grab
+        # generic "mute" intents.
+        if discord_context:
+            if self._contains_any(text, ("unmute", "un-mute")):
+                return ParsedVoiceCommand(
+                    raw_text=raw_text, normalized_text=text, app_name="discord",
+                    action="unmute", confidence=0.94, matched_alias=matched_alias,
+                )
+            if "mute" in text:
+                return ParsedVoiceCommand(
+                    raw_text=raw_text, normalized_text=text, app_name="discord",
+                    action="mute", confidence=0.94, matched_alias=matched_alias,
+                )
+            if self._contains_any(text, ("undeafen", "un-deafen", "un deafen")):
+                return ParsedVoiceCommand(
+                    raw_text=raw_text, normalized_text=text, app_name="discord",
+                    action="undeafen", confidence=0.94, matched_alias=matched_alias,
+                )
+            if "deafen" in text:
+                return ParsedVoiceCommand(
+                    raw_text=raw_text, normalized_text=text, app_name="discord",
+                    action="deafen", confidence=0.94, matched_alias=matched_alias,
+                )
+
+        # send — long-tail; match before "join"/"open" because "send a
+        # message" must not be confused with anything else.
+        for prefix in DISCORD_SEND_PHRASES:
+            if text.startswith(prefix + " "):
+                payload = text[len(prefix) + 1:].strip()
+                if not payload:
+                    return None
+                # Split out the destination if present. Use the LAST
+                # " in " / " to " — the message itself may contain
+                # earlier instances of those words. Prefer "in" over
+                # "to" when both appear; "in" is the canonical phrase.
+                target = ""
+                message = payload
+                for sep in DISCORD_SEND_TARGET_SEPARATORS:
+                    idx = payload.rfind(sep)
+                    if idx > 0:
+                        target = payload[idx + len(sep):].strip()
+                        message = payload[:idx].strip()
+                        break
+                # Confidence: high when destination is given (parser
+                # has more signal); moderate when implicit (just "send
+                # X"). Drop below the 0.56 acceptance floor when there's
+                # no Discord marker AND no destination — otherwise
+                # "send a file" would always be a Discord intent.
+                # Always claim "send <something>". The executor runs
+                # a 3-stage fallback chain (voice channel chat → last-
+                # focused text channel → pending prompt) so any send
+                # shape produces useful behaviour. Confidence ladder:
+                #   target + discord context  → 1.20 (unambiguous)
+                #   target alone              → 1.05 (still beats
+                #     most catalog matches)
+                #   discord context, no target → 1.05 (use fallback)
+                #   nothing                    → 0.60 (just above
+                #     accept floor 0.56 — stronger parsers like
+                #     "send file to printer" → catalog can win)
+                if target and (matched_alias or discord_context):
+                    confidence = 1.20
+                elif target or matched_alias or discord_context:
+                    confidence = 1.05
+                else:
+                    confidence = 0.60
+                return ParsedVoiceCommand(
+                    raw_text=raw_text,
+                    normalized_text=text,
+                    app_name="discord",
+                    action="send",
+                    confidence=confidence,
+                    matched_alias=matched_alias,
+                    slots={"target": target, "message": message},
+                )
+
+        # join — voice channel. Strip the " in <server>" qualifier
+        # from the trailing part so we don't search for a channel
+        # literally called "everyone in garbage". Heuristic: if the
+        # tail contains " in " AND there's at least one word before
+        # it, treat everything before " in " as the channel name and
+        # discard the server hint (we fuzzy-match channels across all
+        # guilds anyway, so server context is informational only).
+        # Same for the singular "channel" filler (e.g. "join voice
+        # channel garbage" → target "garbage", not "channel garbage").
+        for prefix in DISCORD_JOIN_PHRASES:
+            if text.startswith(prefix + " "):
+                rest = text[len(prefix) + 1:].strip()
+                if not rest:
+                    return None
+                target = rest
+                for sep in (" in the ", " in "):
+                    idx = target.rfind(sep)
+                    if idx > 0:
+                        target = target[:idx].strip()
+                        break
+                if target.startswith("channel "):
+                    target = target[len("channel "):].strip()
+                if not target:
+                    return None
+                return ParsedVoiceCommand(
+                    raw_text=raw_text,
+                    normalized_text=text,
+                    app_name="discord",
+                    action="join_voice",
+                    confidence=0.88 if (matched_alias or discord_context) else 0.74,
+                    matched_alias=matched_alias,
+                    slots={"target": target, "message": ""},
+                )
+
+        # open server (check BEFORE channel since "open server X"
+        # would also match "open X"). High confidence because "server"
+        # is an explicit, unambiguous Discord keyword — boosted past
+        # the catalog parser's typical 1.0+ confidence for app-name
+        # matches like "AppAdminServer" that grab the word "server".
+        for prefix in DISCORD_OPEN_SERVER_PHRASES:
+            if text.startswith(prefix + " "):
+                target = text[len(prefix) + 1:].strip()
+                if not target:
+                    return None
+                return ParsedVoiceCommand(
+                    raw_text=raw_text,
+                    normalized_text=text,
+                    app_name="discord",
+                    action="switch_server",
+                    confidence=1.05,
+                    matched_alias=matched_alias,
+                    slots={"target": target, "message": ""},
+                )
+
+        # open / switch text channel — STRONG patterns (explicit
+        # "channel" keyword) fire unconditionally. WEAK patterns
+        # ("switch to X", "go to X") require Discord context to avoid
+        # grabbing "switch to dark mode" / "go to settings".
+        for prefix in DISCORD_OPEN_TEXT_PHRASES_STRONG:
+            if text.startswith(prefix + " "):
+                target = text[len(prefix) + 1:].strip()
+                if not target:
+                    return None
+                return ParsedVoiceCommand(
+                    raw_text=raw_text,
+                    normalized_text=text,
+                    app_name="discord",
+                    action="open_text",
+                    confidence=0.98,
+                    matched_alias=matched_alias,
+                    slots={"target": target, "message": ""},
+                )
+        if discord_context:
+            for prefix in DISCORD_OPEN_TEXT_PHRASES_WEAK:
+                if text.startswith(prefix + " "):
+                    target = text[len(prefix) + 1:].strip()
+                    if not target:
+                        return None
+                    return ParsedVoiceCommand(
+                        raw_text=raw_text,
+                        normalized_text=text,
+                        app_name="discord",
+                        action="open_text",
+                        confidence=0.86,
+                        matched_alias=matched_alias,
+                        slots={"target": target, "message": ""},
+                    )
+
+        return None
 
     def _execute_youtube(self, intent: ParsedVoiceCommand) -> VoiceExecutionResult:
         """Open YouTube search results for the query in Chrome AND
@@ -1071,6 +1942,7 @@ class VoiceCommandProcessor:
         query = (intent.query or "").strip()
         success = False
         message = "youtube search query missing"
+        self._log_step(f"[youtube] action=play query={query[:60]!r}")
         # Helper: telemetry fire-and-forget. Lazy import keeps the
         # voice processor importable in environments / tests where
         # the telemetry module isn't on the path.
@@ -1081,9 +1953,24 @@ class VoiceCommandProcessor:
             except Exception:
                 pass
 
+        if not query:
+            self._log_step("[youtube] aborting: no query")
+
         if query:
+            self._log_step(
+                f"[youtube] stage 1: opening search URL in Chrome..."
+            )
             success = self.chrome_controller.search_youtube(query)
             message = self.chrome_controller.message
+            self._log_step(
+                f"[youtube] search open → {'ok' if success else 'failed'} "
+                f"({message})"
+            )
+            if success:
+                self._log_step(
+                    f"[youtube] stage 2: dispatching auto-play worker for "
+                    f"{query[:40]!r}..."
+                )
             # Stage-1 telemetry: the search-page open is the user's
             # first observable signal that the voice command worked.
             # Fires whether the open succeeded or not so the dashboard
@@ -1158,20 +2045,34 @@ class VoiceCommandProcessor:
 
     def _execute_chrome(self, intent: ParsedVoiceCommand) -> VoiceExecutionResult:
         success = False
+        self._log_step(
+            f"[chrome] action={intent.action} query={(intent.query or '')[:60]!r}"
+        )
         if intent.action == "open" and not intent.query:
+            self._log_step("[chrome] focus_or_open_window...")
             success = self.chrome_controller.focus_or_open_window()
         elif intent.action in {"open", "search"}:
+            self._log_step(f"[chrome] open_or_search {intent.query!r}...")
             success = self.chrome_controller.open_or_search(intent.query or "")
         elif intent.action == "back":
+            self._log_step("[chrome] navigate_back...")
             success = self.chrome_controller.navigate_back()
         elif intent.action == "forward":
+            self._log_step("[chrome] navigate_forward...")
             success = self.chrome_controller.navigate_forward()
         elif intent.action == "refresh":
+            self._log_step("[chrome] refresh_page...")
             success = self.chrome_controller.refresh_page()
         elif intent.action == "new_tab":
+            self._log_step("[chrome] new_tab...")
             success = self.chrome_controller.new_tab()
         elif intent.action == "incognito":
+            self._log_step("[chrome] new_incognito_tab...")
             success = self.chrome_controller.new_incognito_tab()
+        self._log_step(
+            f"[chrome] {intent.action} → {'ok' if success else 'failed'} "
+            f"({self.chrome_controller.message})"
+        )
         return VoiceExecutionResult(
             success=success,
             target="chrome",
@@ -1181,7 +2082,12 @@ class VoiceCommandProcessor:
         )
 
     def _execute_settings(self, intent: ParsedVoiceCommand) -> VoiceExecutionResult:
+        self._log_step(f"[settings] opening settings panel {intent.query!r}...")
         success = self.desktop_controller.open_settings(intent.query)
+        self._log_step(
+            f"[settings] open → {'ok' if success else 'failed'} "
+            f"({self.desktop_controller.message})"
+        )
         return VoiceExecutionResult(
             success=success,
             target="settings",
@@ -1191,8 +2097,19 @@ class VoiceCommandProcessor:
         )
 
     def _execute_file_explorer(self, intent: ParsedVoiceCommand) -> VoiceExecutionResult:
+        self._log_step(
+            f"[file_explorer] action={intent.action} query={(intent.query or '')[:60]!r} "
+            f"folder_hint={intent.slots.get('folder_hint')!r}"
+        )
         if intent.action == "search":
+            self._log_step(
+                f"[file_explorer] searching File Explorer for {intent.query!r}..."
+            )
             success = self.desktop_controller.search_file_explorer(intent.query or "")
+            self._log_step(
+                f"[file_explorer] search → {'ok' if success else 'failed'} "
+                f"({self.desktop_controller.message})"
+            )
             return VoiceExecutionResult(
                 success=success,
                 target="file_explorer",
@@ -1201,12 +2118,20 @@ class VoiceCommandProcessor:
                 info_text=self.desktop_controller.message,
             )
         if intent.query:
+            self._log_step(
+                f"[file_explorer] resolving named file {intent.query!r} "
+                f"(preferred_root={intent.slots.get('preferred_root')!r})..."
+            )
             success = self.desktop_controller.open_named_file(
                 intent.query,
                 preferred_root=intent.slots.get("preferred_root"),
                 folder_hint=intent.slots.get("folder_hint"),
             )
             message = self.desktop_controller.message
+            self._log_step(
+                f"[file_explorer] open_named_file → "
+                f"{'ok' if success else 'no/multi match'} ({message})"
+            )
             if success:
                 return VoiceExecutionResult(
                     success=True,
@@ -1216,6 +2141,9 @@ class VoiceCommandProcessor:
                     info_text=message,
                 )
             if str(message).lower().startswith("multiple matching files found"):
+                self._log_step(
+                    "[file_explorer] multiple matches — prompting user to pick"
+                )
                 resolved, ambiguous = self.desktop_controller.resolve_named_file(
                     intent.query,
                     preferred_root=intent.slots.get("preferred_root"),
@@ -1244,7 +2172,12 @@ class VoiceCommandProcessor:
                 display_text=intent.query,
             )
         else:
+            self._log_step("[file_explorer] opening File Explorer window...")
             success = self.desktop_controller.open_file_explorer(intent.query)
+            self._log_step(
+                f"[file_explorer] open → {'ok' if success else 'failed'} "
+                f"({self.desktop_controller.message})"
+            )
         return VoiceExecutionResult(
             success=success,
             target="file_explorer",
@@ -1254,16 +2187,29 @@ class VoiceCommandProcessor:
         )
 
     def _execute_outlook(self, intent: ParsedVoiceCommand) -> VoiceExecutionResult:
+        self._log_step(f"[outlook] action={intent.action}")
         if intent.action == "compose":
+            self._log_step(
+                f"[outlook] composing email to={intent.slots.get('recipient')!r} "
+                f"subject={intent.slots.get('subject')!r}"
+            )
             success = self.desktop_controller.compose_email(
                 recipient=intent.slots.get("recipient"),
                 subject=intent.slots.get("subject"),
                 body=intent.slots.get("body"),
             )
         elif intent.action == "open_folder":
+            self._log_step(
+                f"[outlook] opening folder {intent.query!r}..."
+            )
             success = self.desktop_controller.open_outlook_folder(intent.query)
         else:
+            self._log_step("[outlook] opening Outlook...")
             success = self.desktop_controller.open_outlook()
+        self._log_step(
+            f"[outlook] {intent.action} → {'ok' if success else 'failed'} "
+            f"({self.desktop_controller.message})"
+        )
         return VoiceExecutionResult(
             success=success,
             target="outlook",
@@ -1273,20 +2219,37 @@ class VoiceCommandProcessor:
         )
 
     def _execute_generic(self, intent: ParsedVoiceCommand) -> VoiceExecutionResult:
+        self._log_step(
+            f"[system] action={intent.action} query={(intent.query or '')[:60]!r}"
+        )
         if intent.action == "close_window":
             if intent.query:
                 parts = [p.strip() for p in re.split(r"[,;]\s*|\s+and\s+", intent.query) if p.strip()]
+                self._log_step(
+                    f"[system] close_window: targeting {parts or [intent.query]}"
+                )
                 results: list[bool] = []
                 messages: list[str] = []
                 for part in (parts if parts else [intent.query]):
+                    self._log_step(f"[system] closing window matching {part!r}...")
                     ok = self.desktop_controller.close_named_window(part)
+                    self._log_step(
+                        f"[system] close_named_window({part!r}) → "
+                        f"{'ok' if ok else 'failed'} "
+                        f"({self.desktop_controller.message})"
+                    )
                     results.append(ok)
                     messages.append(self.desktop_controller.message)
                 success = any(results)
                 msg = "; ".join(m for m in messages if m)
             else:
+                self._log_step("[system] closing active window")
                 success = self.desktop_controller.close_active_window()
                 msg = self.desktop_controller.message
+                self._log_step(
+                    f"[system] close_active_window → {'ok' if success else 'failed'} "
+                    f"({msg})"
+                )
             return VoiceExecutionResult(
                 success=success,
                 target="system",
@@ -1294,8 +2257,16 @@ class VoiceCommandProcessor:
                 control_text=msg,
                 info_text=msg,
             )
+        self._log_step(
+            f"[system] searching app catalog for {intent.query!r}..."
+        )
         best_entry, ambiguous_entries = self.desktop_controller.resolve_named_application_options(intent.query or "")
         if ambiguous_entries:
+            ambig_names = [getattr(e, "name", str(e)) for e in ambiguous_entries[:5]]
+            self._log_step(
+                f"[system] multiple matches; prompting user. Candidates: "
+                f"{ambig_names}"
+            )
             prompt = self._create_pending_selection(
                 kind="app",
                 query=intent.query or "",
@@ -1314,9 +2285,24 @@ class VoiceCommandProcessor:
                 display_text=prompt,
             )
         if best_entry is not None:
+            entry_name = getattr(best_entry, "name", "?")
+            self._log_step(f"[system] matched app {entry_name!r}; launching...")
             success = self.desktop_controller.open_desktop_entry(best_entry)
+            self._log_step(
+                f"[system] open_desktop_entry → {'ok' if success else 'failed'} "
+                f"({self.desktop_controller.message})"
+            )
         else:
+            self._log_step(
+                f"[system] no catalog match; trying open_named_application "
+                f"({intent.query!r})..."
+            )
             success = self.desktop_controller.open_named_application(intent.query or "")
+            self._log_step(
+                f"[system] open_named_application → "
+                f"{'ok' if success else 'failed'} "
+                f"({self.desktop_controller.message})"
+            )
         return VoiceExecutionResult(
             success=success,
             target="system",
@@ -1351,12 +2337,55 @@ class VoiceCommandProcessor:
             return None
         if not self._contains_any(trimmed, APP_LAUNCH_PHRASES):
             return None
+        # File-type disambiguation. "open touchless clip" /
+        # "open touchless drawing" / "open touchless screenshot" /
+        # "open touchless recording" are NOT app-launch commands —
+        # the user wants the corresponding save folder opened in
+        # Explorer (or in a future extension, the most recent
+        # matching file). We route the intent through this same
+        # parser with the file-type stashed in slots so
+        # _execute_touchless_app can branch on it. The plain
+        # "open touchless" / "open touchless settings" path is
+        # unaffected.
+        TOUCHLESS_FILE_KEYWORDS_TO_OUTPUT = {
+            "clip": "clips",
+            "clips": "clips",
+            "drawing": "drawings",
+            "drawings": "drawings",
+            "screenshot": "screenshots",
+            "screenshots": "screenshots",
+            "recording": "screen_recordings",
+            "recordings": "screen_recordings",
+        }
+        # Word-boundary check so "clipboard" / "drawing-tool" / etc.
+        # don't accidentally match; we split on whitespace and check
+        # each token verbatim against the keyword map.
+        tokens = trimmed.split()
+        touchless_file_kind: str | None = None
+        for tok in tokens:
+            if tok in TOUCHLESS_FILE_KEYWORDS_TO_OUTPUT:
+                touchless_file_kind = TOUCHLESS_FILE_KEYWORDS_TO_OUTPUT[tok]
+                break
         # Find the most-specific tab keyword that matches.
         matched_tab: str | None = None
         for phrase, key in TOUCHLESS_TAB_KEYWORDS:
             if phrase in trimmed:
                 matched_tab = key
                 break
+        # File-kind beats tab-keyword (file-kind tokens like "clip"
+        # don't overlap with TOUCHLESS_TAB_KEYWORDS entries, but
+        # being explicit makes the precedence obvious).
+        if touchless_file_kind is not None:
+            return ParsedVoiceCommand(
+                raw_text=raw_text,
+                normalized_text=text,
+                app_name="touchless_app",
+                action="open_save_folder",
+                confidence=1.10,
+                query=touchless_file_kind,
+                matched_alias="touchless",
+                slots={"output_kind": touchless_file_kind},
+            )
         confidence = 1.04 if matched_tab else 0.96
         return ParsedVoiceCommand(
             raw_text=raw_text,

@@ -69,6 +69,8 @@ class PhoneCameraConnectDialog(QDialog):
 
     def __init__(self, config: AppConfig, parent=None, *, existing_server: Optional[PhoneCameraServer] = None) -> None:
         super().__init__(parent)
+        from .window_chrome import apply_touchless_chrome
+        apply_touchless_chrome(self)
         self.config = config
         self._server_status.connect(self._apply_server_status)
         # When the caller already has a running server (auto-started at
