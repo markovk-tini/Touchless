@@ -39,6 +39,7 @@ from .screen_context import ScreenContext
 from .tool_executor import ToolExecutor
 from .tool_registry import ToolRegistry
 from .user_prefs import get_default_email
+from . import cost_policy
 
 
 SYSTEM_INSTRUCTIONS = (
@@ -771,6 +772,9 @@ class LiveApiManager(QObject):
                 action_label = routed.intent_action or "router"
                 self.tool_event.emit("called", {"name": f"router/{action_label}", "info": routed.message, "source": "touchless"})
                 self.tool_event.emit("completed", {"name": f"router/{action_label}", "status": "ok", "source": "touchless"})
+                if self._logger:
+                    self._logger.event("routing_decision", **cost_policy.decision_record(
+                        raw=text, tool=action_label, source="touchless", status="ok"))
                 self.assistant_text.emit(routed.message or "Done.")
                 self._set_state(LiveApiState.LISTENING, "Ready (type a command)")
                 return True
@@ -1386,6 +1390,10 @@ class LiveApiManager(QObject):
                         self._logger.exception("zoom_image_send_failed", exc)
         if self._logger:
             self._logger.event("function_call_completed", tool=name, status=output.get("status"))
+            # Structured routing-decision log: which cost tier handled this.
+            self._logger.event("routing_decision", **cost_policy.decision_record(
+                tool=name, source=source, status=str(output.get("status", "")),
+                call_id=call_id))
         self.tool_event.emit("completed", {"name": name, "call_id": call_id, "status": output.get("status"), "source": source})
 
         # Always submit the tool output (conversation.item.create is allowed

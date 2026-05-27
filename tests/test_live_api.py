@@ -489,6 +489,26 @@ class ConnectorRouterTests(unittest.TestCase):
             self.assertTrue(owner.available())
 
 
+class CostPolicyTests(unittest.TestCase):
+    """The routing-ladder cost classification."""
+
+    def test_levels(self) -> None:
+        from hgr.live_api.cost_policy import classify
+        self.assertEqual(classify("anything", "touchless")[0], 0)
+        self.assertEqual(classify("spotify_play", "connector")[0], 2)
+        self.assertEqual(classify("click_screen", "iris")[0], 4)        # vision
+        self.assertEqual(classify("click_text_on_screen", "iris")[0], 1)  # OCR
+        self.assertEqual(classify("send_to_coding_agent", "iris")[0], 3)  # LLM
+        self.assertEqual(classify("open_app", "iris")[0], 0)            # local
+
+    def test_decision_record_shape(self) -> None:
+        from hgr.live_api.cost_policy import decision_record
+        rec = decision_record(tool="volume_set", source="connector", status="ok")
+        for key in ("tool", "source", "cost_level", "cost_label", "why_short", "status"):
+            self.assertIn(key, rec)
+        self.assertEqual(rec["cost_level"], 2)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
