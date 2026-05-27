@@ -172,7 +172,8 @@ class Microsoft365Connector(Connector):
             flt = "&$filter=isRead eq false" if args.get("unread_only") else ""
             data, err = self._graph(
                 "GET", f"/me/mailFolders/inbox/messages?$top={max_n}{flt}"
-                       "&$select=id,subject,from,receivedDateTime,bodyPreview")
+                       "&$select=id,subject,from,receivedDateTime,bodyPreview"
+                       "&$orderby=receivedDateTime desc")  # newest first
             if err:
                 return connector_result("error", error=err)
             msgs = [{"id": m.get("id"),
