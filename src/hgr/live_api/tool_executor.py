@@ -2118,11 +2118,18 @@ class ToolExecutor:
         """Read on-screen TEXT accurately and cheaply: the active window's
         accessibility names (UIA) + local OCR of the screen. Returns text (no
         image), so the model can read/summarize emails, docs, chats, etc.
-        without vision tokens or any mail-reading API."""
+        without vision tokens or any mail-reading API.
+
+        With scroll_passes > 0 it scrolls the active window down and
+        accumulates unique lines across passes — so a long inbox / document
+        below the fold is fully captured, not just the visible top."""
+        import time as _time
         from ..debug.foreground_window import get_foreground_window_info
         info = get_foreground_window_info()
         title = (info.title if info else "") or ""
         proc = (info.process_name if info else "") or ""
+        scroll_passes = max(0, min(10, int(args.get("scroll_passes") or 0)))
+
         ui_names = []
         uia = self._ensure_uia()
         if uia is not None:
@@ -2133,19 +2140,68 @@ class ToolExecutor:
                                 if e.get("name")]
             except Exception as exc:
                 self._logger.exception("read_screen_uia_failed", exc)
-        text = ""
+
         ocr = self._ensure_ocr()
-        if ocr is not None:
+        lines: list = []
+        seen: set = set()
+
+        def _grab() -> int:
+            if ocr is None:
+                return 0
             try:
-                text = ocr.read_all_text() or ""
+                txt = ocr.read_all_text() or ""
             except Exception as exc:
                 self._logger.exception("read_screen_ocr_failed", exc)
+                return 0
+            added = 0
+            for ln in txt.splitlines():
+                s = ln.strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    lines.append(s)
+                    added += 1
+            return added
+
+        _grab()
+        for _ in range(scroll_passes):
+            if not self._scroll_active_window_down():
+                break
+            _time.sleep(0.45)  # let the list repaint before OCR
+            if _grab() == 0:
+                break  # nothing new -> reached the bottom
+        text = "\n".join(lines)
         if not text and not ui_names:
             return _result(status="error",
                            error="couldn't read screen text (no OCR/UIA result)",
                            active_window=title, process=proc)
+        # Bigger cap when scrolling (a whole inbox); modest otherwise.
+        cap = 16000 if scroll_passes else 6000
         return _result(status="ok", active_window=title, process=proc,
-                       ui_elements=ui_names[:80], text=text[:6000])
+                       scrolled=scroll_passes, ui_elements=ui_names[:80],
+                       text=text[:cap])
+
+    def _scroll_active_window_down(self) -> bool:
+        """Mouse-wheel-scroll down over the active window's left-center (the
+        list/content area). Returns False on failure."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = ctypes.windll.user32
+            hwnd = u.GetForegroundWindow()
+            if not hwnd:
+                return False
+            rect = wintypes.RECT()
+            if not u.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return False
+            cx = rect.left + int((rect.right - rect.left) * 0.30)
+            cy = rect.top + int((rect.bottom - rect.top) * 0.50)
+            u.SetCursorPos(int(cx), int(cy))
+            MOUSEEVENTF_WHEEL = 0x0800
+            u.mouse_event(MOUSEEVENTF_WHEEL, 0, 0, ctypes.c_int(-480), 0)  # down
+            return True
+        except Exception as exc:
+            self._logger.exception("read_screen_scroll_failed", exc)
+            return False
 
     def _ensure_ocr(self):
         if self._ocr is None:

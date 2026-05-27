@@ -177,7 +177,11 @@ def build_system_instructions() -> str:
         "page — call read_screen (accurate OCR text, cheap, no image). Use "
         "get_screen_context (a picture) only to SEE layout or find something "
         "to click. The user's mailbox lives in Outlook; there is no mail-read "
-        "API, so 'summarize my unread emails' = read_screen on Outlook.\n"
+        "API, so 'summarize my unread emails' = read_screen on Outlook. If "
+        "content is cut off below the fold (a long inbox/doc), call read_screen "
+        "with scroll_passes (e.g. 6) so it scrolls and reads ALL of it — don't "
+        "say items may be hidden, just scroll. To read one email's full body, "
+        "click it, then read_screen the reading pane.\n"
         + email_clause +
         "FILES: open files/folders by NAME with open_path (don't ask where) — "
         "status='ambiguous'→list+ask, not_found→retry deep=true; open several "

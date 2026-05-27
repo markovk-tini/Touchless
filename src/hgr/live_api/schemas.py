@@ -47,11 +47,21 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "document, a chat, a web page, etc. Prefer this over "
             "get_screen_context when you need to read words rather than see "
             "layout. (The user's email lives in their open Outlook window — "
-            "read it here; there is no mail-reading API.)"
+            "read it here; there is no mail-reading API.) Set scroll_passes>0 "
+            "(e.g. 6) to auto-scroll the window down and accumulate everything "
+            "below the fold — use this to read a WHOLE inbox or long document, "
+            "not just the visible top. It stops early once nothing new appears."
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "scroll_passes": {
+                    "type": "integer",
+                    "description": "Times to scroll down and re-read (0 = visible "
+                                   "screen only; 6 captures a typical full inbox).",
+                    "default": 0,
+                },
+            },
             "required": [],
             "additionalProperties": False,
         },
