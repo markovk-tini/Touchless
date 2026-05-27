@@ -35,6 +35,7 @@ from typing import List, Optional
 # basic profile. offline_access (refresh token) is added by MSAL.
 SCOPES: List[str] = [
     "Mail.Send",
+    "Mail.ReadWrite",       # read inbox + manage messages (mark read, drafts)
     "Calendars.ReadWrite",
     "Files.ReadWrite",      # OneDrive + Excel workbook read/write
     "Chat.ReadWrite",       # Teams 1:1 chat messages

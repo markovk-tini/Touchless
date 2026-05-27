@@ -73,6 +73,24 @@ class Microsoft365Connector(Connector):
                "confirm intent first. Always include a concise subject.",
                {"to": {"type": "string"}, "subject": {"type": "string"},
                 "body": {"type": "string"}}, ["to", "subject", "body"]),
+            fn("ms_mail_list",
+               "List recent Outlook inbox messages (sender, subject, preview). "
+               "Set unread_only=true for just unread.",
+               {"max": {"type": "integer", "description": "Max messages (default 10)."},
+                "unread_only": {"type": "boolean", "default": False}}),
+            fn("ms_mail_search",
+               "Search Outlook mail for a query; returns matching messages.",
+               {"query": {"type": "string"},
+                "max": {"type": "integer", "description": "Max results (default 10)."}},
+               ["query"]),
+            fn("ms_mail_read",
+               "Read the full body of one Outlook message by its id (from "
+               "ms_mail_list / ms_mail_search).",
+               {"id": {"type": "string"}}, ["id"]),
+            fn("ms_mail_mark_read",
+               "Mark an Outlook message as read (or unread) by id.",
+               {"id": {"type": "string"},
+                "read": {"type": "boolean", "default": True}}, ["id"]),
             fn("ms_calendar_list",
                "List upcoming Microsoft 365 calendar events (soonest first).",
                {"max": {"type": "integer", "description": "Max events (default 10)."}}),
@@ -124,6 +142,64 @@ class Microsoft365Connector(Connector):
             _, err = self._graph("POST", "/me/sendMail", body=msg)
             return connector_result("error" if err else "ok",
                                     error=err, sent=(err is None), to=to)
+
+        if name == "ms_mail_list":
+            max_n = max(1, min(50, int(args.get("max") or 10)))
+            flt = "&$filter=isRead eq false" if args.get("unread_only") else ""
+            data, err = self._graph(
+                "GET", f"/me/mailFolders/inbox/messages?$top={max_n}{flt}"
+                       "&$select=id,subject,from,receivedDateTime,bodyPreview")
+            if err:
+                return connector_result("error", error=err)
+            msgs = [{"id": m.get("id"),
+                     "from": (m.get("from") or {}).get("emailAddress", {}).get("address"),
+                     "subject": m.get("subject"),
+                     "received": m.get("receivedDateTime"),
+                     "preview": m.get("bodyPreview")} for m in (data.get("value") or [])]
+            return connector_result("ok", count=len(msgs), messages=msgs)
+
+        if name == "ms_mail_search":
+            q = str(args.get("query") or "").strip()
+            if not q:
+                return connector_result("error", error="query is required")
+            max_n = max(1, min(50, int(args.get("max") or 10)))
+            sq = urllib.parse.quote(f'"{q}"')
+            data, err = self._graph(
+                "GET", f"/me/messages?$search={sq}&$top={max_n}"
+                       "&$select=id,subject,from,receivedDateTime")
+            if err:
+                return connector_result("error", error=err)
+            msgs = [{"id": m.get("id"),
+                     "from": (m.get("from") or {}).get("emailAddress", {}).get("address"),
+                     "subject": m.get("subject"),
+                     "received": m.get("receivedDateTime")} for m in (data.get("value") or [])]
+            return connector_result("ok", count=len(msgs), messages=msgs)
+
+        if name == "ms_mail_read":
+            mid = str(args.get("id") or "").strip()
+            if not mid:
+                return connector_result("error", error="id is required")
+            data, err = self._graph(
+                "GET", f"/me/messages/{mid}?$select=subject,from,body,receivedDateTime")
+            if err:
+                return connector_result("error", error=err)
+            body = (data.get("body") or {}).get("content") or ""
+            if (data.get("body") or {}).get("contentType", "").lower() == "html":
+                import re
+                body = re.sub(r"<[^>]+>", " ", body)
+                body = re.sub(r"\s+", " ", body).strip()
+            return connector_result(
+                "ok", subject=data.get("subject"),
+                **{"from": (data.get("from") or {}).get("emailAddress", {}).get("address")},
+                body=body[:5000])
+
+        if name == "ms_mail_mark_read":
+            mid = str(args.get("id") or "").strip()
+            if not mid:
+                return connector_result("error", error="id is required")
+            read = bool(args.get("read", True))
+            _, err = self._graph("PATCH", f"/me/messages/{mid}", body={"isRead": read})
+            return connector_result("error" if err else "ok", error=err, id=mid, read=read)
 
         if name == "ms_calendar_list":
             max_n = max(1, min(50, int(args.get("max") or 10)))
