@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List
 
@@ -87,6 +88,24 @@ class Microsoft365Connector(Connector):
             fn("onedrive_list",
                "List recent files in the user's OneDrive root.",
                {"max": {"type": "integer", "description": "Max files (default 20)."}}),
+            fn("teams_send",
+               "Send a 1:1 Microsoft Teams chat message to a person by email. "
+               "Sends immediately — confirm first.",
+               {"to": {"type": "string", "description": "Recipient's email."},
+                "text": {"type": "string"}}, ["to", "text"]),
+            fn("excel_set_cell",
+               "Set a cell value in a OneDrive Excel workbook (found by file name).",
+               {"file": {"type": "string", "description": "Workbook name, e.g. 'Budget.xlsx'."},
+                "cell": {"type": "string", "description": "A1-style cell, e.g. 'B2'."},
+                "value": {"type": "string"},
+                "sheet": {"type": "string", "description": "Worksheet name (default Sheet1)."}},
+               ["file", "cell", "value"]),
+            fn("excel_read_range",
+               "Read a range from a OneDrive Excel workbook (found by file name).",
+               {"file": {"type": "string"},
+                "range": {"type": "string", "description": "A1-style range, e.g. 'A1:C5'."},
+                "sheet": {"type": "string", "description": "Worksheet name (default Sheet1)."}},
+               ["file", "range"]),
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -157,4 +176,72 @@ class Microsoft365Connector(Connector):
                      for f in (data.get("value") or [])]
             return connector_result("ok", count=len(files), files=files)
 
+        if name == "teams_send":
+            to = str(args.get("to") or "").strip()
+            text = str(args.get("text") or "")
+            if not to:
+                return connector_result("error", error="'to' is required")
+            # oneOnOne chats are unique per member pair — POST returns the
+            # existing chat if it already exists, so this is safe to repeat.
+            chat_body = {
+                "chatType": "oneOnOne",
+                "members": [
+                    {"@odata.type": "#microsoft.graph.aadUserConversationMember",
+                     "roles": ["owner"],
+                     "user@odata.bind": "https://graph.microsoft.com/v1.0/me"},
+                    {"@odata.type": "#microsoft.graph.aadUserConversationMember",
+                     "roles": ["owner"],
+                     "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{to}')"},
+                ],
+            }
+            chat, err = self._graph("POST", "/chats", body=chat_body)
+            if err:
+                return connector_result("error", error=err)
+            cid = chat.get("id")
+            _, err = self._graph("POST", f"/chats/{cid}/messages",
+                                 body={"body": {"content": text}})
+            return connector_result("error" if err else "ok", error=err,
+                                    sent=(err is None), to=to)
+
+        if name in ("excel_set_cell", "excel_read_range"):
+            file = str(args.get("file") or "").strip()
+            if not file:
+                return connector_result("error", error="file is required")
+            item_id, err = self._excel_item(file)
+            if err:
+                return connector_result("error", error=err, code="not_found")
+            sheet = str(args.get("sheet") or "Sheet1").strip() or "Sheet1"
+            base = f"/me/drive/items/{item_id}/workbook/worksheets('{sheet}')"
+            if name == "excel_set_cell":
+                cell = str(args.get("cell") or "").strip()
+                if not cell:
+                    return connector_result("error", error="cell is required")
+                _, err = self._graph(
+                    "PATCH", f"{base}/range(address='{cell}')",
+                    body={"values": [[str(args.get("value") or "")]]})
+                return connector_result("error" if err else "ok", error=err,
+                                        file=file, cell=cell)
+            rng = str(args.get("range") or "").strip()
+            if not rng:
+                return connector_result("error", error="range is required")
+            data, err = self._graph("GET", f"{base}/range(address='{rng}')?$select=values")
+            if err:
+                return connector_result("error", error=err)
+            return connector_result("ok", file=file, range=rng,
+                                    values=(data or {}).get("values"))
+
         return connector_result("error", error=f"unknown ms365 tool: {name}", code="no_handler")
+
+    def _excel_item(self, file: str):
+        """Resolve a OneDrive workbook by name → (item_id, None) or (None, err)."""
+        q = urllib.parse.quote(file)
+        res, err = self._graph("GET", f"/me/drive/root/search(q='{q}')?$top=10&$select=id,name")
+        if err:
+            return None, err
+        items = res.get("value") or []
+        for it in items:
+            if str(it.get("name", "")).lower().endswith((".xlsx", ".xlsm")):
+                return it.get("id"), None
+        if items:
+            return items[0].get("id"), None
+        return None, f"no workbook found named '{file}'"

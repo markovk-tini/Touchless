@@ -36,7 +36,8 @@ from typing import List, Optional
 SCOPES: List[str] = [
     "Mail.Send",
     "Calendars.ReadWrite",
-    "Files.ReadWrite",
+    "Files.ReadWrite",      # OneDrive + Excel workbook read/write
+    "Chat.ReadWrite",       # Teams 1:1 chat messages
     "User.Read",
 ]
 
