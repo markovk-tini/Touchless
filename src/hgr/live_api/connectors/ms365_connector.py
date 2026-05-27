@@ -109,9 +109,10 @@ class Microsoft365Connector(Connector):
                "List recent files in the user's OneDrive root.",
                {"max": {"type": "integer", "description": "Max files (default 20)."}}),
             fn("teams_send",
-               "Send a 1:1 Microsoft Teams chat message to a person by email. "
-               "Sends immediately — confirm first.",
-               {"to": {"type": "string", "description": "Recipient's email."},
+               "Send a 1:1 Microsoft Teams chat message. `to` can be the "
+               "person's email OR their name (matched against your existing "
+               "Teams chats). Sends immediately — confirm first.",
+               {"to": {"type": "string", "description": "Recipient email or name."},
                 "text": {"type": "string"}}, ["to", "text"]),
             fn("teams_channel_post",
                "Post a message to a Microsoft Teams channel (resolved by team "
@@ -281,24 +282,10 @@ class Microsoft365Connector(Connector):
             to = str(args.get("to") or "").strip()
             text = str(args.get("text") or "")
             if not to:
-                return connector_result("error", error="'to' is required")
-            # oneOnOne chats are unique per member pair — POST returns the
-            # existing chat if it already exists, so this is safe to repeat.
-            chat_body = {
-                "chatType": "oneOnOne",
-                "members": [
-                    {"@odata.type": "#microsoft.graph.aadUserConversationMember",
-                     "roles": ["owner"],
-                     "user@odata.bind": "https://graph.microsoft.com/v1.0/me"},
-                    {"@odata.type": "#microsoft.graph.aadUserConversationMember",
-                     "roles": ["owner"],
-                     "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{to}')"},
-                ],
-            }
-            chat, err = self._graph("POST", "/chats", body=chat_body)
+                return connector_result("error", error="'to' (email or name) is required")
+            cid, err = self._resolve_chat(to)
             if err:
-                return connector_result("error", error=err)
-            cid = chat.get("id")
+                return connector_result("error", error=err, code="not_found")
             _, err = self._graph("POST", f"/chats/{cid}/messages",
                                  body={"body": {"content": text}})
             return connector_result("error" if err else "ok", error=err,
@@ -407,6 +394,46 @@ class Microsoft365Connector(Connector):
             return connector_result("ok", count=len(out), contacts=out)
 
         return connector_result("error", error=f"unknown ms365 tool: {name}", code="no_handler")
+
+    def _resolve_chat(self, to: str):
+        """Resolve a Teams chat id from an email (create/find a 1:1 chat) OR a
+        person's name (match a member in your existing chats). Returns
+        (chat_id, None) or (None, err)."""
+        if "@" in to:
+            # oneOnOne chats are unique per member pair — POST returns the
+            # existing one if it exists, so this is safe to repeat.
+            body = {
+                "chatType": "oneOnOne",
+                "members": [
+                    {"@odata.type": "#microsoft.graph.aadUserConversationMember",
+                     "roles": ["owner"],
+                     "user@odata.bind": "https://graph.microsoft.com/v1.0/me"},
+                    {"@odata.type": "#microsoft.graph.aadUserConversationMember",
+                     "roles": ["owner"],
+                     "user@odata.bind": f"https://graph.microsoft.com/v1.0/users('{to}')"},
+                ],
+            }
+            chat, err = self._graph("POST", "/chats", body=body)
+            if err:
+                return None, err
+            return chat.get("id"), None
+        # By name: find an existing chat whose members include that name.
+        data, err = self._graph(
+            "GET", "/me/chats?$expand=members&$top=50&$select=id,chatType,topic")
+        if err:
+            return None, err
+        tn = to.lower()
+        fallback = None
+        for chat in (data.get("value") or []):
+            names = [str(m.get("displayName") or "") for m in (chat.get("members") or [])]
+            if any(tn in n.lower() for n in names):
+                if chat.get("chatType") == "oneOnOne":
+                    return chat.get("id"), None  # prefer a direct 1:1
+                fallback = fallback or chat.get("id")
+        if fallback:
+            return fallback, None
+        return None, (f"no existing Teams chat with '{to}'. Provide their email "
+                      f"to start a new chat.")
 
     def _teams_channel(self, team_name: str, channel_name: str):
         """Resolve (team_id, channel_id) by names → (tid, cid, None) or (None, None, err).
