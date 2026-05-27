@@ -39,6 +39,9 @@ SCOPES: List[str] = [
     "Calendars.ReadWrite",
     "Files.ReadWrite",      # OneDrive + Excel workbook read/write
     "Chat.ReadWrite",       # Teams 1:1 chat messages
+    "Team.ReadBasic.All",   # list joined teams (resolve by name)
+    "Channel.ReadBasic.All",# list channels in a team (resolve by name)
+    "ChannelMessage.Send",  # post to a Teams channel
     "Tasks.ReadWrite",      # Microsoft To Do
     "Notes.ReadWrite",      # OneNote
     "Contacts.ReadWrite",   # Outlook contacts

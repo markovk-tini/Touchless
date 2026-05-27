@@ -111,6 +111,14 @@ class Microsoft365Connector(Connector):
                "Sends immediately — confirm first.",
                {"to": {"type": "string", "description": "Recipient's email."},
                 "text": {"type": "string"}}, ["to", "text"]),
+            fn("teams_channel_post",
+               "Post a message to a Microsoft Teams channel (resolved by team "
+               "name; defaults to the team's General channel). Confirm first.",
+               {"team": {"type": "string", "description": "Team name."},
+                "text": {"type": "string"},
+                "channel": {"type": "string",
+                            "description": "Channel name (default: General)."}},
+               ["team", "text"]),
             fn("excel_set_cell",
                "Set a cell value in a OneDrive Excel workbook (found by file name).",
                {"file": {"type": "string", "description": "Workbook name, e.g. 'Budget.xlsx'."},
@@ -293,6 +301,19 @@ class Microsoft365Connector(Connector):
             return connector_result("error" if err else "ok", error=err,
                                     sent=(err is None), to=to)
 
+        if name == "teams_channel_post":
+            team = str(args.get("team") or "").strip()
+            text = str(args.get("text") or "")
+            if not team:
+                return connector_result("error", error="team is required")
+            tid, cid, err = self._teams_channel(team, str(args.get("channel") or "").strip())
+            if err:
+                return connector_result("error", error=err, code="not_found")
+            _, err = self._graph("POST", f"/teams/{tid}/channels/{cid}/messages",
+                                 body={"body": {"content": text}})
+            return connector_result("error" if err else "ok", error=err,
+                                    posted=(err is None), team=team)
+
         if name in ("excel_set_cell", "excel_read_range"):
             file = str(args.get("file") or "").strip()
             if not file:
@@ -383,6 +404,34 @@ class Microsoft365Connector(Connector):
             return connector_result("ok", count=len(out), contacts=out)
 
         return connector_result("error", error=f"unknown ms365 tool: {name}", code="no_handler")
+
+    def _teams_channel(self, team_name: str, channel_name: str):
+        """Resolve (team_id, channel_id) by names → (tid, cid, None) or (None, None, err).
+        Defaults to the team's primary (General) channel."""
+        teams, err = self._graph("GET", "/me/joinedTeams?$select=id,displayName")
+        if err:
+            return None, None, err
+        tn = team_name.lower()
+        tid = None
+        for t in (teams.get("value") or []):
+            if tn in str(t.get("displayName", "")).lower():
+                tid = t.get("id")
+                break
+        if not tid:
+            return None, None, f"no joined team matches '{team_name}'"
+        if channel_name:
+            chans, err = self._graph("GET", f"/teams/{tid}/channels?$select=id,displayName")
+            if err:
+                return None, None, err
+            cn = channel_name.lower()
+            for c in (chans.get("value") or []):
+                if cn in str(c.get("displayName", "")).lower():
+                    return tid, c.get("id"), None
+            return None, None, f"no channel '{channel_name}' in team '{team_name}'"
+        prim, err = self._graph("GET", f"/teams/{tid}/primaryChannel?$select=id")
+        if err:
+            return None, None, err
+        return tid, (prim or {}).get("id"), None
 
     def _todo_default_list(self):
         """Resolve the user's default To Do list id → (id, None) or (None, err)."""

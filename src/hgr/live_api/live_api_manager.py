@@ -1229,7 +1229,8 @@ class LiveApiManager(QObject):
 
     # Outward-facing / irreversible connector actions that must be confirmed
     # by the user before they run (sending email, etc.).
-    _CONFIRM_BEFORE_TOOLS = {"gmail_send", "email_send", "ms_mail_send", "teams_send"}
+    _CONFIRM_BEFORE_TOOLS = {"gmail_send", "email_send", "ms_mail_send", "teams_send",
+                             "teams_channel_post"}
 
     def _confirm_connector_action(self, name: str, args: Dict[str, Any]) -> bool:
         """Ask the user before an irreversible connector action. Returns True
@@ -1246,6 +1247,10 @@ class LiveApiManager(QObject):
         elif name == "teams_send":
             to = str((args or {}).get("to") or "")
             title = f"Send this Teams message to {to}?"
+            detail = str((args or {}).get("text") or "")[:200]
+        elif name == "teams_channel_post":
+            team = str((args or {}).get("team") or "")
+            title = f"Post this to the '{team}' Teams channel?"
             detail = str((args or {}).get("text") or "")[:200]
         else:
             title, detail = f"Run {name}?", ""
