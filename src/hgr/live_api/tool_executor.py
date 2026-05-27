@@ -714,6 +714,20 @@ class ToolExecutor:
                         result["note"] = (f"Opened {name}, but its window didn't appear in time to "
                                           f"move it — it may still be loading; try move_window_to_monitor shortly.")
                 return result
+        # Fallback for Store/UWP apps (new Microsoft Teams, Calculator, Photos,
+        # Settings, etc.) which aren't .exe candidates: DesktopController
+        # launches them from the Start-Apps catalog via shell:AppsFolder.
+        try:
+            desktop = self._ensure_desktop()
+            if desktop is not None and desktop.open_named_application(name):
+                return _result(
+                    status="ok", app=name, via="start_apps",
+                    message=f"launched '{name}' via the Start-Apps catalog "
+                            f"(Store/UWP app)",
+                    tried=tried,
+                )
+        except Exception as exc:
+            self._logger.exception("open_app_start_apps_fallback_failed", exc)
         return _result(
             status="error",
             error=f"could not launch '{name}'",
