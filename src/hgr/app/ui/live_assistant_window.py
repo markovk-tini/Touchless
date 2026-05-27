@@ -72,6 +72,8 @@ class LiveAssistantWindow(QWidget):
 
     # Marshals Gmail-connect results from the OAuth worker thread to the UI.
     _gmail_result = Signal(bool, str)
+    # Marshals Microsoft-365-connect results from its worker thread.
+    _ms_result = Signal(bool, str)
 
     def __init__(self, config=None, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -178,6 +180,14 @@ class LiveAssistantWindow(QWidget):
         controls.addWidget(self._gmail_btn)
         self._gmail_result.connect(self._on_gmail_result)
         self._refresh_gmail_button()
+
+        # One-click Microsoft 365 connect (same pattern as Gmail).
+        self._ms_btn = QPushButton("Connect Microsoft")
+        self._ms_btn.setStyleSheet(self._button_style(subtle=True))
+        self._ms_btn.clicked.connect(self._on_connect_ms)
+        controls.addWidget(self._ms_btn)
+        self._ms_result.connect(self._on_ms_result)
+        self._refresh_ms_button()
 
         controls.addStretch(1)
         clear_btn = QPushButton("Clear")
@@ -340,6 +350,47 @@ class LiveAssistantWindow(QWidget):
     def _on_gmail_result(self, ok: bool, message: str) -> None:
         self._add_system_bubble(("✓ " if ok else "⚠ ") + message)
         self._refresh_gmail_button()
+
+    # ---- Microsoft 365 connect (one-click OAuth, mirrors Gmail) ----
+
+    def _ms_status(self) -> str:
+        try:
+            from ...live_api.connectors.ms_graph_client import status
+            return status()
+        except Exception:
+            return "needs_libs"
+
+    def _refresh_ms_button(self) -> None:
+        st = self._ms_status()
+        if st in ("needs_libs", "needs_client"):
+            self._ms_btn.setVisible(False)
+            return
+        self._ms_btn.setVisible(True)
+        if st == "connected":
+            self._ms_btn.setText("Microsoft ✓")
+            self._ms_btn.setEnabled(False)
+        else:
+            self._ms_btn.setText("Connect Microsoft")
+            self._ms_btn.setEnabled(True)
+
+    def _on_connect_ms(self) -> None:
+        self._ms_btn.setEnabled(False)
+        self._ms_btn.setText("Connecting…")
+        self._add_system_bubble("Opening your browser to connect Microsoft 365 — approve the sign-in.")
+
+        def _worker() -> None:
+            try:
+                from ...live_api.connectors.ms_graph_client import MsGraphClient
+                ok, msg = MsGraphClient.shared().connect()
+            except Exception as exc:
+                ok, msg = False, f"Microsoft connect failed: {exc}"
+            self._ms_result.emit(ok, msg)
+
+        threading.Thread(target=_worker, name="MsGraphConnect", daemon=True).start()
+
+    def _on_ms_result(self, ok: bool, message: str) -> None:
+        self._add_system_bubble(("✓ " if ok else "⚠ ") + message)
+        self._refresh_ms_button()
 
     # ---- confirmation (cross-thread) ----
 

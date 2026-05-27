@@ -86,6 +86,14 @@ google-auth-oauthlib
 #   pip install mcp
 mcp
 
+# Optional — Microsoft 365 connector (src/hgr/live_api/connectors/ms365_*).
+# Microsoft Graph auth via MSAL: Outlook mail send, M365 calendar, OneDrive.
+# Dormant unless installed AND an Azure public-client id is provided
+# (MS_GRAPH_CLIENT_ID env or assets/ms_graph_client.json). No client secret
+# (public client + PKCE). Connect via the "Connect Microsoft" button.
+#   pip install msal
+msal
+
 # Microsoft Store in-app updater (src/hgr/app/updater/store_updater.py). WinRT
 # StoreContext projection — only used by the packaged STORE build to detect and
 # install Store updates from inside the app. Imported lazily, so source runs

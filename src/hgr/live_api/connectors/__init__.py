@@ -64,6 +64,7 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     from .slides_connector import GoogleSlidesConnector
     from .drive_connector import DriveConnector
     from .directions_connector import DirectionsConnector
+    from .ms365_connector import Microsoft365Connector
 
     _add(lambda: VolumeConnector())
     _add(lambda: MediaConnector())
@@ -79,6 +80,7 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     _add(lambda: GoogleSlidesConnector())
     _add(lambda: DriveConnector())
     _add(lambda: DirectionsConnector())
+    _add(lambda: Microsoft365Connector())
 
     # MCP servers (breadth for everything not hand-written). Each configured
     # server becomes a connector whose tools the search router can discover.
@@ -109,6 +111,7 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
         "gslides": "Google Slides presentation slideshow deck create",
         "drive": "Google Drive upload save file list cloud storage",
         "directions": "directions route navigation distance drive travel time map between places",
+        "ms365": "Microsoft 365 Outlook email send Microsoft calendar event OneDrive upload Office Copilot",
     }
     for c in reg._connectors:
         if not getattr(c, "description", ""):

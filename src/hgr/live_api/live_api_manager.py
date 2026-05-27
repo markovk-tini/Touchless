@@ -1225,7 +1225,7 @@ class LiveApiManager(QObject):
 
     # Outward-facing / irreversible connector actions that must be confirmed
     # by the user before they run (sending email, etc.).
-    _CONFIRM_BEFORE_TOOLS = {"gmail_send", "email_send"}
+    _CONFIRM_BEFORE_TOOLS = {"gmail_send", "email_send", "ms_mail_send"}
 
     def _confirm_connector_action(self, name: str, args: Dict[str, Any]) -> bool:
         """Ask the user before an irreversible connector action. Returns True
@@ -1234,7 +1234,7 @@ class LiveApiManager(QObject):
         cb = self._confirm_callback
         if cb is None:
             return True
-        if name in ("gmail_send", "email_send"):
+        if name in ("gmail_send", "email_send", "ms_mail_send"):
             to = str((args or {}).get("to") or (args or {}).get("recipient") or "")
             subject = str((args or {}).get("subject") or "")
             title = f"Send this email now to {to}?"
