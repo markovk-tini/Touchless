@@ -33,6 +33,30 @@ onnxruntime-directml
 # clicking "Test Live API" in the UI shows a friendly install hint.
 websocket-client
 
+# OCR for the Live API agent's click_text_on_screen tool (find a button by
+# its visible text and click its exact pixels — for Chromium/webview UIs
+# UIA can't see, e.g. Valorant's PLAY). Pure ONNX, offline.
+#
+# CRITICAL: rapidocr-onnxruntime DEPENDS ON the CPU-only `onnxruntime`
+# wheel, which shadows onnxruntime-directml above and KILLS the
+# DmlExecutionProvider (GPU mode). Install it WITHOUT pulling that wheel:
+#   pip install --no-deps rapidocr-onnxruntime
+#   pip install pyclipper shapely pyyaml   # rapidocr's other runtime deps
+# (numpy / opencv / pillow are already required above.) If a plain
+# `pip install -r requirements.txt` ever re-adds CPU onnxruntime, restore
+# DirectML with:
+#   pip uninstall -y onnxruntime && pip install --force-reinstall --no-deps onnxruntime-directml
+rapidocr-onnxruntime
+pyclipper
+shapely
+pyyaml
+
+# Read/summarize documents for the Live API agent's read_file tool (summarize
+# a file without opening it). Both are pure-Python, no numpy/onnxruntime
+# conflict. pypdf = PDFs; python-docx = Word .docx.
+pypdf
+python-docx
+
 # Phone camera over WebRTC (Settings -> Camera -> "Connect Phone", the
 # pairing-code flow via touchless-control.com/connect). The WebRTC stream
 # is decoded by a hidden Chromium page (PySide6 QtWebEngine — already a
@@ -41,3 +65,31 @@ websocket-client
 # here explicitly. (No aiortc — QtWebEngine does the WebRTC + hardware
 # decode, which is far smoother than software decoding in Python.)
 aiohttp
+
+# Optional — Google connectors for the Live API agent (Gmail / Calendar /
+# Docs, under src/hgr/live_api/connectors). Pure-Python, no numpy/onnxruntime
+# conflict. The connectors import these lazily and stay dormant
+# (available() == False) when the libs OR the user's OAuth credentials are
+# absent, so the app runs fine without them. To enable:
+#   1. pip install google-api-python-client google-auth google-auth-oauthlib
+#   2. Drop Google Cloud "Desktop app" OAuth credentials at
+#      ~/Documents/Touchless/google/client_secret.json
+#   3. python -m hgr.live_api.connectors.google_client authorize   (once)
+google-api-python-client
+google-auth
+google-auth-oauthlib
+
+# Optional — MCP bridge for the Live API agent (src/hgr/live_api/connectors/
+# mcp_bridge.py). Lets iris consume any MCP server's tools as connectors —
+# the breadth path for apps we don't hand-write. Dormant unless this is
+# installed AND a server list exists at ~/Documents/Touchless/mcp_servers.json.
+#   pip install mcp
+mcp
+
+# Microsoft Store in-app updater (src/hgr/app/updater/store_updater.py). WinRT
+# StoreContext projection — only used by the packaged STORE build to detect and
+# install Store updates from inside the app. Imported lazily, so source runs
+# and website builds never touch it. MUST be bundled into the MSIX build (add
+# 'winsdk' to hiddenimports in hgr_app.spec since it's a lazy/dynamic import).
+#   pip install winsdk
+winsdk

@@ -777,6 +777,14 @@ class LocalBackend:
             self._logger.event("local_send_screen_image_noop", bytes_b64=len(jpeg_b64 or ""))
         return True
 
+    def update_tools(self, tools: List[Dict[str, Any]]) -> bool:
+        """Replace the available tool list (capability-search router loads
+        connector tools on demand). Local backend reads self._tools fresh on
+        every turn, so this just swaps the list — no protocol message needed.
+        """
+        self._tools = _filter_tools_for_local(tools or [])
+        return True
+
     def send_tool_result(self, call_id: str, output: Dict[str, Any]) -> bool:
         tool_name = self._inflight_tool_calls.pop(call_id, "unknown")
         try:

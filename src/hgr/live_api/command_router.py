@@ -124,6 +124,19 @@ _BUILD_WORDS = (
     " a folder ", " a file ", " a window ", " a script ",
 )
 
+# Coding-agent commands ("have claude…", "tell codex…", "watch my claude tab
+# and approve…") need the LLM (send_to_coding_agent / follow_up_coding_agent /
+# auto_approve). The deterministic router can't drive an agent, and would
+# mis-parse these (e.g. open a file named 'claude'). Any mention routes to LLM.
+_CODING_AGENT_MARKERS = ("claude", "codex", "coding agent", "vs code", "vscode")
+
+# Opening File Explorer to specific FOLDERS (esp. several) belongs to the LLM's
+# open_path (which opens each as its own window) — the deterministic processor
+# mishandles it (it opened touchless-control.com/downloads for "downloads").
+_FILE_BROWSE_MARKERS = (
+    "file explorer", " explorer to ", "explorer window",
+)
+
 
 # Phrases that signal CONVERSATIONAL text rather than a command. The
 # voice-pipeline parser is greedy ("I don't see X" can parse as
@@ -146,6 +159,70 @@ _CONVERSATIONAL_LEADS = (
     "i didn't ", "i didnt ", "i won't ", "i wont ",
     "i need ", "i want ", "i would like ",
     "hmm", "umm", "uhh", "actually ",
+)
+
+# Phrases that signal a CONTEXTUAL or web-page action — operating on a
+# page/tab/link that's already open, or referencing prior state. The
+# deterministic router can only launch apps / fire fixed intents; it
+# can't click page elements or reason about "the page you just opened".
+# These belong to the LLM (which has the web_* tools + page context).
+# Without this, "open the block 15 page from there" greedily parses as
+# "open app: block 15" and launches the wrong thing.
+_WEB_CONTEXT_MARKERS = (
+    " page", " tab", " link", " links", " result", " results",
+    " from there", " from that", " from the page", " from chrome",
+    " you just", " just opened", " that page", " this page",
+    " on the page", " on that", " second link", " first link",
+    " third link", " go back",
+)
+
+# Leads that are page/screen actions the router can't perform — always
+# hand to the LLM. (Substring "click" alone would catch app names like
+# "clickup", so we anchor to the start / a word boundary instead.)
+_WEB_ACTION_LEADS = ("click ", "go to ", "scroll ", "go back")
+
+# WINDOW-MANAGEMENT commands (move/resize/arrange a window across monitors).
+# The deterministic router only OPENS apps — it can't move/maximize windows,
+# and the voice parser greedily turns "move my file explorer window..." into
+# "open file" and searches the disk. These belong to the LLM
+# (move_window_to_monitor / drag).
+_WINDOW_MGMT_LEADS = ("move ", "drag ", "resize ", "maximize ", "minimize ", "snap ", "put ")
+_WINDOW_MGMT_MARKERS = (
+    " window", " monitor", " second screen", " other screen", " other monitor",
+    " maximize", " minimize", " to the left screen", " to the right screen",
+)
+
+# Navigation verbs that, ANYWHERE in the command, mean "open a site and do
+# something there" — the deterministic opener can't navigate + act, so these
+# belong to the LLM web_* tools. ("open chrome, GO TO hacker news, ...")
+_WEB_NAV_MARKERS = (" go to ", " navigate to ", " head to ", " pull up ")
+
+# Email composition WITH a recipient/body belongs to the LLM + the Outlook/
+# email connector (outlook_compose), which parses "email X saying Y"
+# reliably and pre-fills the draft. The deterministic processor only
+# understands "email TO x SUBJECT y BODY z" and otherwise opens a BLANK
+# composer, so route content-bearing email requests to the LLM instead.
+# ("open outlook" / "check my email" have no content cue and stay here.)
+_EMAIL_COMPOSE_WORDS = (
+    "email", "e-mail", "compose", "draft an email", "send an email", "mail to",
+)
+_EMAIL_COMPOSE_CUES = (
+    "@", " saying ", " about ", " that says ", " telling ", " tell ",
+    " subject ", " body ", " message ", " re ",
+)
+
+# Phrases that ask Iris to REPORT CONTENT back (read a page, summarize, list
+# results). The deterministic router can only open/search — it can't read a
+# page and tell you what's on it. Anything asking for a spoken/written answer
+# must go to the LLM (which has web_get_text / web_get_links). Without this,
+# "open chrome and tell me the top three stories" parses as a plain Google
+# search and never summarizes anything.
+_REPORT_BACK_MARKERS = (
+    " tell me", " read me", " read it", " summarize", " summary",
+    " what are", " what's on", " whats on", " what does it say",
+    " top three", " top 3", " top five", " top 5", " top ten", " top 10",
+    " headlines", " give me the", " list the", " show me the",
+    " how many", " find out", " look up", " search for and",
 )
 
 # Punctuation / patterns that suggest natural language (questions,
@@ -237,6 +314,35 @@ class CommandRouter:
             return RouterResult(matched=False)
         if any(word in lower for word in _BUILD_WORDS):
             self._logger.event("router_skip_build_word", text_len=len(text))
+            return RouterResult(matched=False)
+        # Coding-agent commands always go to the LLM.
+        if any(m in lower for m in _CODING_AGENT_MARKERS):
+            self._logger.event("router_skip_coding_agent", text_len=len(text))
+            return RouterResult(matched=False)
+        # File Explorer / folder-opening → LLM open_path (opens each folder as
+        # its own window; the local processor mishandles multi-folder opens).
+        if any(m in lower for m in _FILE_BROWSE_MARKERS):
+            self._logger.event("router_skip_file_browse", text_len=len(text))
+            return RouterResult(matched=False)
+        # Contextual / web-page actions belong to the LLM (it has the
+        # web_* tools + the open page), not the deterministic app-opener.
+        if lower.startswith(_WEB_ACTION_LEADS) or any(m in lower for m in _WEB_CONTEXT_MARKERS):
+            self._logger.event("router_skip_web_context", text_len=len(text))
+            return RouterResult(matched=False)
+        # Navigate-and-act ("...go to hacker news...") or report-back
+        # ("...tell me the top three...") commands need the LLM's web tools —
+        # the router can only open/search, not read a page back to the user.
+        if any(m in lower for m in _WEB_NAV_MARKERS) or any(m in lower for m in _REPORT_BACK_MARKERS):
+            self._logger.event("router_skip_web_read", text_len=len(text))
+            return RouterResult(matched=False)
+        # Window-management (move/resize/arrange across monitors) — the router
+        # can only open apps, so these go to the LLM (move_window_to_monitor).
+        if lower.startswith(_WINDOW_MGMT_LEADS) or any(m in lower for m in _WINDOW_MGMT_MARKERS):
+            self._logger.event("router_skip_window_mgmt", text_len=len(text))
+            return RouterResult(matched=False)
+        # Email-with-content → LLM + email connector (fills recipient/body).
+        if any(w in lower for w in _EMAIL_COMPOSE_WORDS) and any(c in lower for c in _EMAIL_COMPOSE_CUES):
+            self._logger.event("router_skip_email_compose", text_len=len(text))
             return RouterResult(matched=False)
 
         processor = self._ensure_processor()

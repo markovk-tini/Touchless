@@ -53,11 +53,14 @@ class RealtimeClient:
         on_connected: Optional[ConnectedCallback] = None,
         on_closed: Optional[ClosedCallback] = None,
         on_error: Optional[ErrorCallback] = None,
+        text_only: bool = False,
     ) -> None:
         self._config = config
         self._logger = logger
         self._tools = tools
         self._system_instructions = system_instructions
+        # Typed-command mode: text in/out, no mic, no audio session config.
+        self._text_only = bool(text_only)
         self._on_event = on_event
         self._on_connected = on_connected
         self._on_closed = on_closed
@@ -127,9 +130,10 @@ class RealtimeClient:
         while not self._stop_requested and attempts <= self._config.reconnect_max_attempts:
             attempts += 1
             url = f"{self._config.realtime_url}?model={self._config.model}"
+            # GA Realtime API: the OpenAI-Beta header is gone (sending it
+            # gets you the retired beta shape -> beta_api_shape_disabled).
             headers = [
                 f"Authorization: Bearer {self._config.api_key}",
-                "OpenAI-Beta: realtime=v1",
             ]
             self._logger.event(
                 "ws_connecting",
@@ -176,9 +180,19 @@ class RealtimeClient:
                 self._logger.exception("on_closed_callback_failed", exc)
 
     def _read_loop(self, ws) -> None:
+        import websocket as _ws_mod  # for the timeout exception type
+
         while not self._stop_requested:
             try:
                 raw = ws.recv()
+            except _ws_mod.WebSocketTimeoutException:
+                # The socket-level read timeout (set on connect) firing is
+                # NOT a disconnect — a realtime session sends nothing for
+                # long idle stretches. Keep waiting; just loop back so we
+                # re-check the stop flag. Previously this fell into the
+                # generic handler below and forced a reconnect every ~10s,
+                # which exhausted the retry budget and dropped the session.
+                continue
             except Exception as exc:
                 self._logger.exception("ws_recv_failed", exc)
                 return
@@ -218,41 +232,68 @@ class RealtimeClient:
         return True
 
     def _send_session_update(self) -> None:
-        """Initial session config — model, voice, tools, system instructions.
+        """Initial session config in the GA Realtime shape.
 
-        VAD tuning notes:
-          * `silence_duration_ms` defaults to 200ms which cuts users off
-            mid-sentence on any natural pause. We use 1500ms so longer
-            multi-step commands ("open vscode, then create a folder...")
-            stay in one turn.
-          * `prefix_padding_ms` includes a bit of audio before speech
-            onset so leading consonants aren't clipped.
+        GA differences from the retired beta:
+          * `session.type` ("realtime") is required and the model lives
+            in the session object.
+          * `modalities` -> `output_modalities`.
+          * audio config moved under `session.audio.input` /
+            `session.audio.output` (format is now an object, not the
+            "pcm16" string).
+
+        Text-only (typed-command) sessions skip the audio block entirely
+        and request text output — no mic, no voice synthesis.
         """
-        payload = {
-            "type": "session.update",
-            "session": {
-                "modalities": ["audio", "text"],
-                "instructions": self._system_instructions,
-                "voice": "alloy",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {"model": "whisper-1"},
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    # 2500ms gives enough room for multi-step commands
-                    # like "open vscode, then create a folder, then..."
-                    # without cutting users off mid-sentence on natural
-                    # between-clause pauses.
-                    "silence_duration_ms": 2500,
-                },
-                "tools": self._tools,
-                "tool_choice": "auto",
-                "temperature": 0.7,
-            },
+        session: Dict[str, Any] = {
+            "type": "realtime",
+            "model": self._config.model,
+            "instructions": self._system_instructions,
+            "tools": self._tools,
+            "tool_choice": "auto",
         }
-        self._send(payload)
+        if self._text_only:
+            session["output_modalities"] = ["text"]
+        else:
+            # Voice path. `silence_duration_ms` is generous so multi-step
+            # spoken commands ("open vscode, then create a folder...")
+            # stay in one turn instead of being cut off on natural pauses.
+            rate = int(self._config.audio_sample_rate)
+            session["output_modalities"] = ["audio"]
+            session["audio"] = {
+                "input": {
+                    "format": {"type": "audio/pcm", "rate": rate},
+                    "transcription": {"model": "whisper-1"},
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 2500,
+                    },
+                },
+                "output": {
+                    "format": {"type": "audio/pcm", "rate": rate},
+                    "voice": "alloy",
+                },
+            }
+        self._send({"type": "session.update", "session": session})
+
+    def update_tools(self, tools: List[Dict[str, Any]]) -> bool:
+        """Replace the session's tool list mid-conversation and re-push it.
+
+        The capability-search router calls this to load a connector's tools
+        on demand (keeping the initial tool list lean). A `session.update`
+        with only `tools` merges into the live session — instructions/audio
+        are untouched. Safe before connect: we just stash the list and the
+        initial session.update sends it.
+        """
+        self._tools = list(tools or [])
+        if not self._connected:
+            return False
+        return self._send({
+            "type": "session.update",
+            "session": {"type": "realtime", "tools": self._tools},
+        })
 
     def send_audio_chunk(self, pcm16_bytes: bytes) -> bool:
         if not pcm16_bytes:

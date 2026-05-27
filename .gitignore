@@ -68,6 +68,11 @@ models/
 !assets/models/*.npy
 !assets/models/*.task
 
+# Google OAuth client (Desktop app) — bundled into the build so users get
+# one-click Gmail connect, but the JSON holds the client secret so it is NOT
+# committed. Place the downloaded JSON here for local testing + builds.
+assets/google_oauth_client.json
+
 # Third-party source + built artifacts (fetched/rebuilt via scripts in builder/)
 whisper.cpp/
 whisper_bundle/

@@ -99,6 +99,17 @@ VENDOR_PREFIXES = {
 }
 
 FILE_SEARCH_ROOT_NAMES = ("Desktop", "Documents", "Downloads", "Music", "Pictures", "Videos", "OneDrive")
+
+# Top-level dirs to skip when shallow-scanning a whole drive root (C:\) —
+# the huge OS/app trees no user means by a folder name. Keeps the
+# drive-root scan fast and the results relevant (so "HGR App v1.0.0" at
+# C:\ is found without descending into Windows/Program Files).
+_DRIVE_SCAN_SKIP_DIRS = frozenset({
+    "windows", "program files", "program files (x86)", "programdata",
+    "$recycle.bin", "$winreagent", "$sysreset", "system volume information",
+    "recovery", "perflogs", "msocache", "config.msi", "intel", "appdata",
+    "windows.old", "onedrivetemp",
+})
 FILE_EXTENSION_ALIASES = {
     "pdf": ".pdf",
     "doc": ".doc",
@@ -589,6 +600,110 @@ class DesktopController:
             self._message = f"could not find file: {' '.join((query or '').split()).strip()}"
             return False
         return self.open_resolved_path(resolved)
+
+    def deep_find(
+        self,
+        query: str,
+        *,
+        kind: str = "any",
+        time_budget: float = 8.0,
+        limit: int = 25,
+    ) -> tuple[Path | None, list[Path]]:
+        """Best-effort DEEP search across all fixed drives + the home tree,
+        name-matching files/folders at any depth. Wall-clock time-budgeted so
+        it can never hang. Returns (best_match, other_matches) like the normal
+        resolvers, so callers handle it the same way. Used as an on-demand
+        fallback when the fast (index + shallow) search finds nothing."""
+        if not self._available:
+            return None, []
+        normalized = self._normalize_file_query(query)
+        if not normalized:
+            return None, []
+        qtokens = [t for t in normalized.split() if t]
+        # Exact-match target uses the SAME normalizer as candidate names
+        # (so the early-exit actually fires; the two normalizers differ).
+        exact_target = self._normalize_file_token_text(query)
+        deadline = time.monotonic() + max(1.0, float(time_budget))
+        want_dirs = kind in ("any", "folder")
+        want_files = kind in ("any", "file")
+
+        def _matches(name_norm: str) -> bool:
+            if not name_norm:
+                return False
+            if normalized in name_norm:
+                return True
+            return bool(qtokens) and all(tok in name_norm for tok in qtokens)
+
+        from collections import deque
+        roots = self._fixed_drive_roots()
+        home = Path.home()
+        if home not in roots:
+            roots.append(home)
+        found: list[Path] = []
+        seen: set[str] = set()
+        visited: set[str] = set()
+        max_deep_depth = 9
+        # Breadth-first: visit shallow directories before deep ones, so a
+        # top-level target (C:\HGR App v1.0.0) is found immediately instead
+        # of the DFS diving into C:\Users first and burning the budget.
+        queue: deque[tuple[Path, int]] = deque((r, 0) for r in roots)
+        while queue:
+            if time.monotonic() > deadline or len(found) >= limit:
+                break
+            current_path, depth = queue.popleft()
+            dkey = str(current_path).lower()
+            if dkey in visited:
+                continue
+            visited.add(dkey)
+            try:
+                entries = list(os.scandir(current_path))
+            except Exception:
+                continue
+            subdirs: list[Path] = []
+            for entry in entries:
+                name = entry.name
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except Exception:
+                    is_dir = False
+                if is_dir:
+                    if name.lower() in _DRIVE_SCAN_SKIP_DIRS or name.startswith("$"):
+                        continue
+                    p = Path(entry.path)
+                    if want_dirs:
+                        cn = self._normalize_file_token_text(name)
+                        if _matches(cn):
+                            if cn == exact_target:  # exact match - stop now
+                                return p, []
+                            key = str(p).lower()
+                            if key not in seen:
+                                seen.add(key)
+                                found.append(p)
+                    subdirs.append(p)
+                elif want_files:
+                    fn = self._normalize_file_token_text(Path(name).stem)
+                    if _matches(fn):
+                        p = Path(entry.path)
+                        if fn == exact_target:  # exact match - stop now
+                            return p, []
+                        key = str(p).lower()
+                        if key not in seen:
+                            seen.add(key)
+                            found.append(p)
+                            if len(found) >= limit:
+                                break
+            if depth < max_deep_depth:
+                subdirs.sort(key=lambda q: (len(q.name), q.name.lower()))
+                for p in subdirs:
+                    queue.append((p, depth + 1))
+        if not found:
+            return None, []
+        # Rank: exact name match first, then shallower path, then shorter name.
+        def _score(p: Path):
+            base = self._normalize_file_token_text(p.stem if p.suffix else p.name)
+            return (base == normalized, -len(p.parts), -len(p.name))
+        found.sort(key=_score, reverse=True)
+        return found[0], found[1:8]
 
     def resolve_named_application_options(
         self,
@@ -1353,7 +1468,12 @@ try {
         results: list[Path] = []
         if not root.exists():
             return results
-        max_depth = 5
+        # A drive root (C:\) is enormous: scan it shallowly (depth 2) and
+        # skip the big OS/app trees, so top-level folders are found fast
+        # without descending into Windows/Program Files. Home folders keep
+        # the full depth-5 walk.
+        is_drive_root = root.parent == root
+        max_depth = 2 if is_drive_root else 5
         try:
             root_depth = len(root.relative_to(root.anchor).parts)
         except Exception:
@@ -1364,11 +1484,26 @@ try {
                 current_depth = len(current_path.relative_to(root).parts)
             except Exception:
                 current_depth = max(0, len(current_path.parts) - root_depth)
+            # Prune giant/system + hidden ($...) dirs from the descent
+            # (cheap everywhere; essential at a drive root).
+            dirnames[:] = [
+                d for d in dirnames
+                if d.lower() not in _DRIVE_SCAN_SKIP_DIRS and not d.startswith("$")
+            ]
             dirnames.sort(key=lambda name: (len(name), name.lower()))
             if current_depth >= max_depth:
                 dirnames[:] = []
             elif len(dirnames) > 40:
                 del dirnames[40:]
+            # At a drive root, capture ALL (pruned) top-level folders up
+            # front so a DFS budget can't exhaust before reaching them
+            # (dedup downstream handles the re-visit). This guarantees e.g.
+            # C:\HGR App v1.0.0 is a candidate.
+            if want_dirs and is_drive_root and current_path == root:
+                for d in dirnames:
+                    results.append(root / d)
+                    if len(results) >= max_items:
+                        break
             if want_dirs and current_path != root:
                 results.append(current_path)
                 if len(results) >= max_items:
@@ -1701,6 +1836,25 @@ try {
         for name in FILE_SEARCH_ROOT_NAMES:
             path = home / name
             add_root(path)
+        # Also include fixed-drive roots (C:\, D:\, ...) so top-level
+        # folders outside the home tree (e.g. C:\HGR App v1.0.0) are
+        # findable. These are scanned shallowly + system-dir-pruned in
+        # _walk_search_candidates, and the index path scopes to them too.
+        for drive in self._fixed_drive_roots():
+            add_root(drive)
+        return roots
+
+    def _fixed_drive_roots(self) -> list[Path]:
+        """Existing drive roots (C:..Z:). Skips A:/B: to avoid floppy stalls."""
+        import string
+        roots: list[Path] = []
+        for letter in string.ascii_uppercase[2:]:  # C..Z
+            p = Path(f"{letter}:\\")
+            try:
+                if p.exists():
+                    roots.append(p)
+            except Exception:
+                continue
         return roots
 
     def _classic_outlook_path(self) -> Path | None:

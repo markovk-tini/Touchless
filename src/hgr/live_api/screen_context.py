@@ -23,6 +23,96 @@ from .live_api_logger import LiveApiLogger
 from ..debug.foreground_window import get_foreground_window_info
 
 
+def describe_monitor_layout() -> str:
+    """Human-readable map of the physical monitors as they appear, left to
+    right, in an all-screens stitched capture — so the model labels
+    'primary'/'secondary' from ground truth instead of guessing by image
+    position. Returns "" for single-monitor / non-Windows / on any failure.
+
+    The stitched image's x-origin is the virtual desktop's min-left, so
+    ordering monitors by their left edge matches their left→right order in
+    the image. The PRIMARY monitor is the one whose top-left is (0,0).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        # Fresh WinDLL — the shared user32 can have argtypes polluted by
+        # other modules, which breaks the WINFUNCTYPE callback (same reason
+        # tool_executor._list_monitors does this).
+        user32 = ctypes.WinDLL("user32")
+        rects: list[tuple[int, int, int, int]] = []
+        MonEnumProc = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(wintypes.RECT), ctypes.c_void_p,
+        )
+
+        def _cb(_hmon, _hdc, lprc, _data):
+            try:
+                r = lprc.contents
+                rects.append((int(r.left), int(r.top), int(r.right), int(r.bottom)))
+            except Exception:
+                pass
+            return True
+
+        user32.EnumDisplayMonitors(0, 0, MonEnumProc(_cb), 0)
+        if len(rects) < 2:
+            return ""
+        ordered = sorted(rects, key=lambda m: m[0])  # left edge = image x
+        labels = []
+        for left, top, right, bottom in ordered:
+            is_primary = (left == 0 and top == 0)
+            labels.append(f"{'PRIMARY' if is_primary else 'secondary'} "
+                          f"({right - left}x{bottom - top})")
+        return (
+            f"This image stitches {len(rects)} monitors side by side. "
+            f"Left to right in the image: {'; '.join(labels)}. "
+            "When the user says 'primary'/'secondary' or 'main'/'second' "
+            "monitor, use THESE labels — do not infer from left/right position."
+        )
+    except Exception:
+        return ""
+
+
+def describe_open_windows(limit: int = 12) -> str:
+    """List the visible top-level windows (title + process) as ground truth
+    so the model identifies apps from their real window titles instead of
+    guessing from the pixels (e.g. calling VS Code 'Jupyter Notebook').
+    Returns "" on non-Windows or any failure."""
+    try:
+        from ..debug.foreground_window import enumerate_visible_windows
+        wins = enumerate_visible_windows()
+    except Exception:
+        return ""
+    if not wins:
+        return ""
+    # Shell/system windows that are visible but meaningless to the user.
+    skip = {
+        "program manager", "windows input experience",
+        "windows shell experience host", "microsoft text input application",
+        "settings", "",
+    }
+    seen: set = set()
+    items: list[str] = []
+    for w in wins:
+        title = (w.title or "").strip()
+        proc = (w.process_name or "").strip()
+        if title.lower() in skip:
+            continue
+        key = (title.lower(), proc)
+        if key in seen:
+            continue
+        seen.add(key)
+        shown = title if len(title) <= 60 else title[:57] + "..."
+        items.append(f"'{shown}'" + (f" [{proc}]" if proc else ""))
+        if len(items) >= limit:
+            break
+    if not items:
+        return ""
+    return ("Open windows (ground truth — name apps from these, not from the "
+            "pixels): " + "; ".join(items) + ".")
+
+
 @dataclass
 class ScreenFrame:
     captured_at: float
@@ -31,6 +121,8 @@ class ScreenFrame:
     jpeg_bytes: bytes
     active_window_title: str
     active_window_process: str
+    monitor_layout: str = ""
+    open_windows: str = ""
 
     @property
     def b64(self) -> str:
@@ -96,6 +188,8 @@ class ScreenContext:
             jpeg_bytes=jpeg_bytes,
             active_window_title=title,
             active_window_process=process,
+            monitor_layout=describe_monitor_layout(),
+            open_windows=describe_open_windows(),
         )
         self._capture_count += 1
         elapsed_ms = round((time.time() - started) * 1000.0, 2)

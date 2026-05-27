@@ -452,6 +452,43 @@ class CommandRouterTests(unittest.TestCase):
             logger.close()
 
 
+class ConnectorRouterTests(unittest.TestCase):
+    """Capability-search router + connector registry hygiene."""
+
+    def setUp(self) -> None:
+        from hgr.live_api.connectors import build_connector_registry
+        self.reg = build_connector_registry()
+
+    def test_connector_tool_names_unique_and_no_builtin_collision(self) -> None:
+        builtin = {s["name"] for s in all_tool_schemas()}
+        seen = set()
+        for c in self.reg._connectors:
+            for s in c.tools():
+                name = s["name"]
+                self.assertNotIn(name, builtin, f"{name} collides with a built-in")
+                self.assertNotIn(name, seen, f"{name} duplicated across connectors")
+                seen.add(name)
+
+    def test_search_ranks_known_intents(self) -> None:
+        # Guard on availability — CI may not have a given app authed/installed.
+        # (Spotify is intentionally NOT a connector — Touchless Layer 0 owns it.)
+        cases = {"turn the volume down": "volume", "mute my discord": "discord"}
+        ids_available = {e["id"] for e in self.reg.catalog()}
+        for query, expected in cases.items():
+            if expected in ids_available:
+                hits = self.reg.search(query, limit=1)
+                self.assertTrue(hits, f"expected a hit for {query!r}")
+                self.assertEqual(hits[0]["id"], expected)
+
+    def test_search_returns_nothing_for_irrelevant_task(self) -> None:
+        self.assertEqual(self.reg.search("defragment the flux capacitor"), [])
+
+    def test_search_only_surfaces_available_connectors(self) -> None:
+        for entry in self.reg.search("send an email", limit=5):
+            owner = next(c for c in self.reg._connectors if c.id == entry["id"])
+            self.assertTrue(owner.available())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

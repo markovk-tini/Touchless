@@ -15,11 +15,9 @@ from typing import Optional
 
 
 # Model name is exposed as a constant so prototypes can swap it without
-# editing dataclass defaults. The official OpenAI Realtime model name
-# at the time of writing is "gpt-realtime"; the user spec asked for
-# "gpt-realtime-1.5" as a placeholder. We honour OPENAI_REALTIME_MODEL
-# at runtime, so this is only a fallback default.
-DEFAULT_REALTIME_MODEL = "gpt-realtime-1.5"
+# editing dataclass defaults. "gpt-realtime" is the GA Realtime model.
+# Overridable at runtime via OPENAI_REALTIME_MODEL.
+DEFAULT_REALTIME_MODEL = "gpt-realtime"
 DEFAULT_REALTIME_URL = "wss://api.openai.com/v1/realtime"
 
 # Audio capture defaults — pcm16 mono is what the Realtime API expects.
@@ -75,8 +73,12 @@ class LiveApiConfig:
     audio_sample_rate: int = DEFAULT_AUDIO_SAMPLE_RATE
     audio_chunk_ms: int = DEFAULT_AUDIO_CHUNK_MS
 
-    # Screen
-    send_screen_always: bool = True
+    # Screen. On-demand by default: the model only receives a screenshot
+    # at session start, after a screen-changing tool, or when it calls
+    # get_screen_context — instead of streaming one every few seconds.
+    # Images are the dominant token cost, so streaming was very wasteful.
+    # Set LIVE_API_SEND_SCREEN_ALWAYS=true to restore continuous capture.
+    send_screen_always: bool = False
     send_screen_interval_sec: float = SCREEN_CAPTURE_INTERVAL_SEC
     screen_max_width: int = SCREEN_CAPTURE_MAX_WIDTH
     screen_jpeg_quality: int = SCREEN_CAPTURE_JPEG_QUALITY
