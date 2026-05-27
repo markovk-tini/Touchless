@@ -39,7 +39,9 @@ class Microsoft365Connector(Connector):
         token = self._client.token()
         if not token:
             return None, "not_connected"
-        url = GRAPH_BASE + path
+        # Encode spaces (OData $filter like "isRead eq false" has them) — a raw
+        # space makes urllib reject the URL as containing control characters.
+        url = (GRAPH_BASE + path).replace(" ", "%20")
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Authorization", f"Bearer {token}")
