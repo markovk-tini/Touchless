@@ -211,6 +211,16 @@ _EMAIL_COMPOSE_CUES = (
     " subject ", " body ", " message ", " re ",
 )
 
+# READING/summarizing mail goes to the LLM (iris opens Outlook + read_screen) —
+# the deterministic voice parser greedily turns any "...email..." into a blank
+# COMPOSE, so "read my latest email" / "summarize my unread emails" must skip
+# the router. (Detected by an email noun + a read/look verb.)
+_EMAIL_NOUNS = ("email", "emails", "inbox", "mailbox")
+_EMAIL_READ_VERBS = (
+    "read", "summar", "unread", "latest", "recent", "check", "show",
+    "what", "any new", "do i have", "go through", "look at",
+)
+
 # Phrases that ask Iris to REPORT CONTENT back (read a page, summarize, list
 # results). The deterministic router can only open/search — it can't read a
 # page and tell you what's on it. Anything asking for a spoken/written answer
@@ -343,6 +353,11 @@ class CommandRouter:
         # Email-with-content → LLM + email connector (fills recipient/body).
         if any(w in lower for w in _EMAIL_COMPOSE_WORDS) and any(c in lower for c in _EMAIL_COMPOSE_CUES):
             self._logger.event("router_skip_email_compose", text_len=len(text))
+            return RouterResult(matched=False)
+        # Read/summarize mail → LLM (iris opens Outlook + read_screen). Without
+        # this the parser mis-fires "read my latest email" as a blank compose.
+        if any(n in lower for n in _EMAIL_NOUNS) and any(v in lower for v in _EMAIL_READ_VERBS):
+            self._logger.event("router_skip_email_read", text_len=len(text))
             return RouterResult(matched=False)
 
         processor = self._ensure_processor()
