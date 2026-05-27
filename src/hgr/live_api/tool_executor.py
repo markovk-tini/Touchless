@@ -154,6 +154,7 @@ class ToolExecutor:
     def _handlers(self) -> Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]]:
         return {
             "get_screen_context": self._t_get_screen_context,
+            "read_screen": self._t_read_screen,
             "click_screen": self._t_click_screen,
             "type_text": self._t_type_text,
             "send_to_coding_agent": self._t_send_to_coding_agent,
@@ -2112,6 +2113,39 @@ class ToolExecutor:
             command=cmd,
             message=(getattr(result, "info_text", "") or "").strip(),
         )
+
+    def _t_read_screen(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Read on-screen TEXT accurately and cheaply: the active window's
+        accessibility names (UIA) + local OCR of the screen. Returns text (no
+        image), so the model can read/summarize emails, docs, chats, etc.
+        without vision tokens or any mail-reading API."""
+        from ..debug.foreground_window import get_foreground_window_info
+        info = get_foreground_window_info()
+        title = (info.title if info else "") or ""
+        proc = (info.process_name if info else "") or ""
+        ui_names = []
+        uia = self._ensure_uia()
+        if uia is not None:
+            try:
+                res = uia.list_elements(limit=80)
+                if isinstance(res, dict) and res.get("status") == "ok":
+                    ui_names = [e.get("name") for e in (res.get("elements") or [])
+                                if e.get("name")]
+            except Exception as exc:
+                self._logger.exception("read_screen_uia_failed", exc)
+        text = ""
+        ocr = self._ensure_ocr()
+        if ocr is not None:
+            try:
+                text = ocr.read_all_text() or ""
+            except Exception as exc:
+                self._logger.exception("read_screen_ocr_failed", exc)
+        if not text and not ui_names:
+            return _result(status="error",
+                           error="couldn't read screen text (no OCR/UIA result)",
+                           active_window=title, process=proc)
+        return _result(status="ok", active_window=title, process=proc,
+                       ui_elements=ui_names[:80], text=text[:6000])
 
     def _ensure_ocr(self):
         if self._ocr is None:

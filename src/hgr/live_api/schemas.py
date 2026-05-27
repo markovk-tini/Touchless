@@ -38,6 +38,26 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "read_screen",
+        "description": (
+            "Read the TEXT currently visible on screen (active window) via local "
+            "OCR + the accessibility tree. Accurate and cheap — returns text, "
+            "not an image, so no vision tokens. Use this to READ or SUMMARIZE "
+            "on-screen content: emails in the open Outlook/Mail window, a "
+            "document, a chat, a web page, etc. Prefer this over "
+            "get_screen_context when you need to read words rather than see "
+            "layout. (The user's email lives in their open Outlook window — "
+            "read it here; there is no mail-reading API.)"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
         "name": "click_screen",
         "description": (
             "Move the mouse and click. ALWAYS use coordinate_space='normalized' "

@@ -172,6 +172,12 @@ def build_system_instructions() -> str:
         "youtube_* (a YouTube tab), chrome_* (browser), and the email/Google "
         "tools below. Only control the app on-screen (click/type) when no such "
         "tool is available for the task.\n"
+        "READING THE SCREEN: to READ or SUMMARIZE on-screen text — the user's "
+        "email in their open Outlook/Mail window, a document, a chat, a web "
+        "page — call read_screen (accurate OCR text, cheap, no image). Use "
+        "get_screen_context (a picture) only to SEE layout or find something "
+        "to click. The user's mailbox lives in Outlook; there is no mail-read "
+        "API, so 'summarize my unread emails' = read_screen on Outlook.\n"
         + email_clause +
         "FILES: open files/folders by NAME with open_path (don't ask where) — "
         "status='ambiguous'→list+ask, not_found→retry deep=true; open several "
