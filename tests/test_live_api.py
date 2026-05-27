@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -507,6 +508,42 @@ class CostPolicyTests(unittest.TestCase):
         for key in ("tool", "source", "cost_level", "cost_label", "why_short", "status"):
             self.assertIn(key, rec)
         self.assertEqual(rec["cost_level"], 2)
+
+
+class ScreenReaderTests(unittest.TestCase):
+    """Unified ScreenContext: match ladder + hash-based cache."""
+
+    def test_match_ranking(self) -> None:
+        from hgr.live_api.screen_reader import ScreenReader, ScreenElement
+        r = ScreenReader()
+        els = [
+            ScreenElement(text="Send", clickable=True),
+            ScreenElement(text="Send email now", clickable=True),
+            ScreenElement(text="Cancel", clickable=True),
+        ]
+        res = r._match("send", els, ocr_fallback=False)
+        self.assertTrue(res)
+        self.assertEqual(res[0].text, "Send")  # exact beats substring
+        self.assertNotIn("Cancel", [e.text for e in res])  # unrelated excluded
+
+    def test_cache_reuse_invalidate_and_window_change(self) -> None:
+        from hgr.live_api.screen_reader import ScreenReader, ScreenContext
+        r = ScreenReader(freshness_sec=60)
+        state = {"win": ("vscode", "Demo - VS Code", "code.exe"), "builds": 0}
+        r._active_window = lambda: state["win"]
+
+        def fake_build(app, title, proc, sig, *, want_text=False):
+            state["builds"] += 1
+            return ScreenContext(timestamp=time.time(), active_app=app,
+                                 active_window_title=title, active_process=proc,
+                                 screen_hash=sig)
+        r._build = fake_build
+
+        r.get_context(); self.assertEqual(state["builds"], 1)
+        r.get_context(); self.assertEqual(state["builds"], 1)   # cached (unchanged + fresh)
+        r.invalidate(); r.get_context(); self.assertEqual(state["builds"], 2)  # dirtied -> rebuild
+        state["win"] = ("chrome", "Google", "chrome.exe")
+        r.get_context(); self.assertEqual(state["builds"], 3)   # window changed -> rebuild
 
 
 if __name__ == "__main__":  # pragma: no cover
