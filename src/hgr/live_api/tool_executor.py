@@ -156,6 +156,7 @@ class ToolExecutor:
             "get_screen_context": self._t_get_screen_context,
             "read_screen": self._t_read_screen,
             "click_screen": self._t_click_screen,
+            "click_type": self._t_click_type,
             "type_text": self._t_type_text,
             "send_to_coding_agent": self._t_send_to_coding_agent,
             "follow_up_coding_agent": self._t_follow_up_coding_agent,
@@ -2212,6 +2213,38 @@ class ToolExecutor:
                        scrolled=scroll_passes,
                        clickable_elements=elements[:120],
                        text=text[:cap])
+
+    def _t_click_type(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Click → type → (optional Enter) in ONE call, so the model fills a
+        field and sends in a single turn instead of three (faster, far fewer
+        round trips / rate-limit pauses)."""
+        import time as _t
+        x = args.get("x")
+        y = args.get("y")
+        if x is None or y is None:
+            return _result(status="error", error="x and y are required", code="invalid_arguments")
+        space = str(args.get("coordinate_space", "screen") or "screen")
+        clicked = self._t_click_screen({"x": x, "y": y, "coordinate_space": space})
+        if clicked.get("status") != "ok":
+            return clicked
+        _t.sleep(0.2)  # let focus land in the field
+        text = str(args.get("text") or "")
+        if text:
+            typed = self._t_type_text({"text": text})
+            if typed.get("status") != "ok":
+                return typed
+        submitted = False
+        if args.get("submit"):
+            _t.sleep(0.15)
+            try:
+                u = ctypes.windll.user32
+                VK_RETURN, KEYUP = 0x0D, 0x0002
+                u.keybd_event(VK_RETURN, 0, 0, 0)
+                u.keybd_event(VK_RETURN, 0, KEYUP, 0)
+                submitted = True
+            except Exception as exc:
+                self._logger.exception("click_type_enter_failed", exc)
+        return _result(status="ok", clicked=[x, y], typed=bool(text), submitted=submitted)
 
     def _scroll_active_window_down(self) -> bool:
         """Mouse-wheel-scroll down over the active window's left-center (the

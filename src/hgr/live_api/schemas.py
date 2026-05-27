@@ -74,6 +74,34 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "click_type",
+        "description": (
+            "Click a location, type text, and optionally press Enter — ALL IN "
+            "ONE call. Use after read_screen to fill a message box or field and "
+            "send it in a single step: click_type(x=<px>, y=<py>, "
+            "coordinate_space='screen', text='...', submit=true). This replaces "
+            "doing separate click + type + send turns (faster, fewer round "
+            "trips, avoids rate limits). Confirm with the user before "
+            "submit=true on an outward message."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "text": {"type": "string", "description": "Text to type after clicking."},
+                "coordinate_space": {"type": "string", "enum": ["screen", "normalized"],
+                                     "default": "screen"},
+                "submit": {"type": "boolean",
+                           "description": "Press Enter after typing (e.g. to send).",
+                           "default": False},
+            },
+            "required": ["x", "y", "text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
         "name": "click_screen",
         "description": (
             "Move the mouse and click. ALWAYS use coordinate_space='normalized' "
