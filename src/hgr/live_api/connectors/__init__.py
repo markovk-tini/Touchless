@@ -111,7 +111,7 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
         "gslides": "Google Slides presentation slideshow deck create",
         "drive": "Google Drive upload save file list cloud storage",
         "directions": "directions route navigation distance drive travel time map between places",
-        "ms365": "Microsoft 365 Outlook email send Microsoft calendar event OneDrive upload Teams message chat Excel spreadsheet cell read write Office Copilot",
+        "ms365": "Microsoft 365 Outlook email send read search Microsoft calendar event OneDrive upload Teams message chat Excel spreadsheet cell To Do task reminder OneNote note Contacts Office Copilot",
     }
     for c in reg._connectors:
         if not getattr(c, "description", ""):

@@ -39,6 +39,9 @@ SCOPES: List[str] = [
     "Calendars.ReadWrite",
     "Files.ReadWrite",      # OneDrive + Excel workbook read/write
     "Chat.ReadWrite",       # Teams 1:1 chat messages
+    "Tasks.ReadWrite",      # Microsoft To Do
+    "Notes.ReadWrite",      # OneNote
+    "Contacts.ReadWrite",   # Outlook contacts
     "User.Read",
 ]
 

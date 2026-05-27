@@ -124,6 +124,20 @@ class Microsoft365Connector(Connector):
                 "range": {"type": "string", "description": "A1-style range, e.g. 'A1:C5'."},
                 "sheet": {"type": "string", "description": "Worksheet name (default Sheet1)."}},
                ["file", "range"]),
+            fn("todo_add",
+               "Add a task to Microsoft To Do (the user's default task list).",
+               {"title": {"type": "string"}, "note": {"type": "string"}}, ["title"]),
+            fn("todo_list",
+               "List tasks from Microsoft To Do (default list).",
+               {"max": {"type": "integer", "description": "Max tasks (default 20)."}}),
+            fn("onenote_create",
+               "Create a OneNote page with a title and text in the default section.",
+               {"title": {"type": "string"}, "text": {"type": "string"}}, ["title"]),
+            fn("contacts_search",
+               "Search the user's Outlook contacts; returns names + emails.",
+               {"query": {"type": "string"},
+                "max": {"type": "integer", "description": "Max results (default 10)."}},
+               ["query"]),
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -306,7 +320,80 @@ class Microsoft365Connector(Connector):
             return connector_result("ok", file=file, range=rng,
                                     values=(data or {}).get("values"))
 
+        if name in ("todo_add", "todo_list"):
+            list_id, err = self._todo_default_list()
+            if err:
+                return connector_result("error", error=err)
+            if name == "todo_add":
+                title = str(args.get("title") or "").strip()
+                if not title:
+                    return connector_result("error", error="title is required")
+                body = {"title": title}
+                note = str(args.get("note") or "").strip()
+                if note:
+                    body["body"] = {"content": note, "contentType": "text"}
+                data, err = self._graph("POST", f"/me/todo/lists/{list_id}/tasks", body=body)
+                return connector_result("error" if err else "ok", error=err,
+                                        added=(err is None), title=title, id=(data or {}).get("id"))
+            max_n = max(1, min(50, int(args.get("max") or 20)))
+            data, err = self._graph(
+                "GET", f"/me/todo/lists/{list_id}/tasks?$top={max_n}&$select=title,status,id")
+            if err:
+                return connector_result("error", error=err)
+            tasks = [{"title": t.get("title"), "status": t.get("status"), "id": t.get("id")}
+                     for t in (data.get("value") or [])]
+            return connector_result("ok", count=len(tasks), tasks=tasks)
+
+        if name == "onenote_create":
+            title = str(args.get("title") or "").strip()
+            if not title:
+                return connector_result("error", error="title is required")
+            text = str(args.get("text") or "")
+            html = (f"<!DOCTYPE html><html><head><title>{title}</title></head>"
+                    f"<body><p>{text}</p></body></html>")
+            data, err = self._graph("POST", "/me/onenote/pages",
+                                    raw=html.encode("utf-8"), content_type="text/html")
+            if err:
+                return connector_result("error", error=err)
+            links = (data or {}).get("links", {}) or {}
+            return connector_result("ok", created=True, title=title,
+                                    link=(links.get("oneNoteWebUrl") or {}).get("href"))
+
+        if name == "contacts_search":
+            q = str(args.get("query") or "").strip()
+            if not q:
+                return connector_result("error", error="query is required")
+            max_n = max(1, min(50, int(args.get("max") or 10)))
+            sq = urllib.parse.quote(f'"{q}"')
+            data, err = self._graph(
+                "GET", f"/me/contacts?$search={sq}&$top={max_n}"
+                       "&$select=displayName,emailAddresses")
+            if err:
+                # $search on contacts can 400 on some mailboxes; fall back to filter.
+                fq = urllib.parse.quote(q)
+                data, err = self._graph(
+                    "GET", f"/me/contacts?$top={max_n}&$select=displayName,emailAddresses"
+                           f"&$filter=startswith(displayName,'{fq}')")
+                if err:
+                    return connector_result("error", error=err)
+            out = []
+            for c in (data.get("value") or []):
+                emails = [e.get("address") for e in (c.get("emailAddresses") or []) if e.get("address")]
+                out.append({"name": c.get("displayName"), "emails": emails})
+            return connector_result("ok", count=len(out), contacts=out)
+
         return connector_result("error", error=f"unknown ms365 tool: {name}", code="no_handler")
+
+    def _todo_default_list(self):
+        """Resolve the user's default To Do list id → (id, None) or (None, err)."""
+        data, err = self._graph("GET", "/me/todo/lists?$select=id,wellknownListName,displayName")
+        if err:
+            return None, err
+        lists = data.get("value") or []
+        for lst in lists:
+            if lst.get("wellknownListName") == "defaultList":
+                return lst.get("id"), None
+        return (lists[0].get("id"), None) if lists else (None, "no To Do lists found")
 
     def _excel_item(self, file: str):
         """Resolve a OneDrive workbook by name → (item_id, None) or (None, err)."""
