@@ -278,6 +278,10 @@ class UiaController:
                     "name": name[:80],
                     "type": _INTERACTIVE_TYPES.get(int(e.CurrentControlType), "control"),
                     "enabled": bool(e.CurrentIsEnabled),
+                    # Absolute-pixel center, so read_screen can hand the model a
+                    # click target without OCR or guessing on a downscaled image.
+                    "cx": int((r.left + r.right) / 2),
+                    "cy": int((r.top + r.bottom) / 2),
                 })
             except Exception:
                 continue

@@ -2144,14 +2144,30 @@ class ToolExecutor:
         proc = (info.process_name if info else "") or ""
         scroll_passes = max(0, min(10, int(args.get("scroll_passes") or 0)))
 
-        ui_names = []
+        # Clickable elements WITH absolute-pixel centers — so the model can
+        # click directly via click_screen(coordinate_space='screen', x, y)
+        # instead of OCR-guessing or re-screenshotting (that retry loop is what
+        # was blowing the rate limit).
+        elements: list = []
+        elem_seen: set = set()
+
+        def _add_elem(text_val: str, x, y, source: str):
+            t = (text_val or "").strip()
+            if not t or x is None or y is None:
+                return
+            key = (t.lower(), int(x) // 8, int(y) // 8)
+            if key in elem_seen:
+                return
+            elem_seen.add(key)
+            elements.append({"text": t[:60], "x": int(x), "y": int(y), "source": source})
+
         uia = self._ensure_uia()
         if uia is not None:
             try:
                 res = uia.list_elements(limit=80)
                 if isinstance(res, dict) and res.get("status") == "ok":
-                    ui_names = [e.get("name") for e in (res.get("elements") or [])
-                                if e.get("name")]
+                    for e in (res.get("elements") or []):
+                        _add_elem(e.get("name"), e.get("cx"), e.get("cy"), "uia")
             except Exception as exc:
                 self._logger.exception("read_screen_uia_failed", exc)
 
@@ -2163,16 +2179,19 @@ class ToolExecutor:
             if ocr is None:
                 return 0
             try:
-                txt = ocr.read_all_text() or ""
+                res = ocr.read_text_boxes()
             except Exception as exc:
                 self._logger.exception("read_screen_ocr_failed", exc)
                 return 0
+            if not isinstance(res, dict) or res.get("status") != "ok":
+                return 0
             added = 0
-            for ln in txt.splitlines():
-                s = ln.strip()
+            for it in (res.get("items") or []):
+                s = str(it.get("text") or "").strip()
                 if s and s not in seen:
                     seen.add(s)
                     lines.append(s)
+                    _add_elem(s, it.get("x"), it.get("y"), "ocr")
                     added += 1
             return added
 
@@ -2184,14 +2203,14 @@ class ToolExecutor:
             if _grab() == 0:
                 break  # nothing new -> reached the bottom
         text = "\n".join(lines)
-        if not text and not ui_names:
+        if not text and not elements:
             return _result(status="error",
                            error="couldn't read screen text (no OCR/UIA result)",
                            active_window=title, process=proc)
-        # Bigger cap when scrolling (a whole inbox); modest otherwise.
         cap = 16000 if scroll_passes else 6000
         return _result(status="ok", active_window=title, process=proc,
-                       scrolled=scroll_passes, ui_elements=ui_names[:80],
+                       scrolled=scroll_passes,
+                       clickable_elements=elements[:120],
                        text=text[:cap])
 
     def _scroll_active_window_down(self) -> bool:

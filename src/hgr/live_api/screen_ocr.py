@@ -160,6 +160,41 @@ class ScreenOcr:
         matches.sort(key=lambda m: (m["y"] // 20, m["x"]))
         return {"status": "ok", "query": needle, "matches": matches, "count": len(matches)}
 
+    def read_text_boxes(self) -> Dict[str, Any]:
+        """OCR the screen and return EVERY text item with its absolute-pixel
+        center, in reading order — a clickable text map for read_screen."""
+        if not self._ensure():
+            return {"status": "error", "error": "OCR unavailable", "code": "no_ocr"}
+        try:
+            arr, (ox, oy) = self._capture()
+        except Exception as exc:
+            self._logger.exception("screen_ocr_capture_failed", exc)
+            return {"status": "error", "error": f"capture failed: {exc}", "code": "capture_failed"}
+        try:
+            result, _elapse = self._engine(arr)
+        except Exception as exc:
+            self._logger.exception("screen_ocr_run_failed", exc)
+            return {"status": "error", "error": f"ocr failed: {exc}", "code": "ocr_failed"}
+        items: List[Dict[str, Any]] = []
+        for entry in (result or []):
+            try:
+                box, text, score = entry
+                t = str(text).strip()
+                if not t:
+                    continue
+                xs = [float(p[0]) for p in box]
+                ys = [float(p[1]) for p in box]
+                items.append({
+                    "text": t,
+                    "x": int(sum(xs) / len(xs)) + ox,
+                    "y": int(sum(ys) / len(ys)) + oy,
+                    "score": round(float(score), 3),
+                })
+            except Exception:
+                continue
+        items.sort(key=lambda m: (m["y"] // 20, m["x"]))
+        return {"status": "ok", "items": items, "count": len(items)}
+
     def capture_crop(self, cx: float, cy: float, size: float = 0.25):
         """Capture a FULL-RESOLUTION crop centered at normalized (cx,cy) of the
         virtual desktop, spanning `size` fraction of it. Returns

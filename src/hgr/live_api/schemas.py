@@ -50,7 +50,13 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "read it here; there is no mail-reading API.) Set scroll_passes>0 "
             "(e.g. 6) to auto-scroll the window down and accumulate everything "
             "below the fold — use this to read a WHOLE inbox or long document, "
-            "not just the visible top. It stops early once nothing new appears."
+            "not just the visible top. It stops early once nothing new appears.) "
+            "Returns clickable_elements: each visible control/text with its "
+            "SCREEN-PIXEL center x,y. To click one, call click_screen with "
+            "coordinate_space='screen' and that x,y — exact, no guessing. After "
+            "one read_screen you have everything; click and type from it "
+            "WITHOUT screenshotting or reading again (re-read only if the UI "
+            "actually changed)."
         ),
         "parameters": {
             "type": "object",

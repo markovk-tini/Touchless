@@ -190,6 +190,12 @@ def build_system_instructions() -> str:
         "their chat, click the message box, type_text the message, then press "
         "Enter (or click Send). Confirm with the user before sending. Never say "
         "you can't message someone — fall back to this GUI path.\n"
+        "GUI CLICKING — BE EFFICIENT: call read_screen ONCE; it returns "
+        "clickable_elements with screen-pixel x,y. Click them with "
+        "click_screen(coordinate_space='screen', x=<px>, y=<py>) — exact, no "
+        "guessing, no OCR retries. Do NOT call get_screen_context (a costly "
+        "image) or re-read between each click/type; reuse the one read_screen "
+        "result and only re-read if the screen actually changed.\n"
         + email_clause +
         "FILES: open files/folders by NAME with open_path (don't ask where) — "
         "status='ambiguous'→list+ask, not_found→retry deep=true; open several "
