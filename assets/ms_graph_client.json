@@ -1,0 +1,4 @@
+{
+  "client_id": "e0e96f23-bfad-4754-a74b-2364fa96f6c6",
+  "_note": "Microsoft Entra public-client (Desktop) app ID for the Microsoft 365 connector. This is NOT a secret (public client + PKCE), so it ships bundled for all users. Requires 'pip install msal' and Graph delegated scopes Mail.Send, Calendars.ReadWrite, Files.ReadWrite, User.Read."
+}
