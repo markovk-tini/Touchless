@@ -78,6 +78,21 @@ class LLMPlanner:
             "calls a cheap-LLM at the end automatically. Do NOT add a step "
             'named \"synthesize\" or \"summarize\" — those don\'t exist as '
             "tools.\n\n"
+            "PROVIDER CONSISTENCY: stay inside ONE provider per chain. If "
+            "you used contacts_search (Microsoft Graph), send via "
+            "ms_mail_send (Microsoft) — NOT gmail_send. The two services "
+            "have separate auth and contact lists. Same for Google: if you "
+            "looked something up in google_contacts, send via gmail_send. "
+            "Picking the wrong pair will silently fail because the lookup "
+            "result won't be valid in the other provider's API.\n\n"
+            "OUTPUT SHAPES of common lookup tools (so you reference fields "
+            "correctly with {step:N.field...}):\n"
+            "  contacts_search → {contacts: [{name, emails: [str, ...]}, "
+            "...]}  → use {step:N.contacts[0].emails[0]}\n"
+            "  ms_mail_list / ms_mail_search → {messages: [{id, subject, "
+            "from, ...}, ...]}\n"
+            "  web_search → {results: [{title, url, snippet}, ...]} → "
+            "use {step:N.results[0].url}\n\n"
             "WEB CHAIN: to 'read and summarize an article from a search', the "
             "correct chain is: (1) web_search, (2) web_navigate the chosen "
             "result's URL, (3) web_get_text, then set final='synthesize'. "
@@ -92,6 +107,15 @@ class LLMPlanner:
             '{"id":3,"tool":"web_get_text","args":{"max_chars":4000},'
             '"depends_on":[2]}'
             '],"final":"synthesize"}\n\n'
+            "Example for 'find Dani's email and send him a quick hi' (note: "
+            "contacts_search → ms_mail_send, NOT gmail_send):\n"
+            '{"goal":"find Dani\'s email and send him a quick hi",'
+            '"steps":['
+            '{"id":1,"tool":"contacts_search","args":{"query":"Dani"}},'
+            '{"id":2,"tool":"ms_mail_send","args":{"to":'
+            '"{step:1.contacts[0].emails[0]}","subject":"Hi",'
+            '"body":"Hi Dani!"},"depends_on":[1]}'
+            '],"final":"return"}\n\n'
             "Available tools:\n" + catalog + "\n\n"
             "Output STRICT JSON, no commentary:\n"
             '{"goal": <string>, "steps": [{"id": <int starting at 1>, '

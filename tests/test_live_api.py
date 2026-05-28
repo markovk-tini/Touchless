@@ -2052,6 +2052,23 @@ class LLMPlannerPromptTests(unittest.TestCase):
         # And the {step:N.results[0].url} ref pattern is documented.
         self.assertIn("results[0]", system)
 
+    def test_prompt_documents_provider_consistency_and_shapes(self) -> None:
+        """The prompt must explicitly warn against contacts_search + gmail_send
+        and document the contacts_search output shape so refs resolve."""
+        from hgr.live_api.planner.planner_llm import LLMPlanner
+        reg = _StubRegistry({})
+        lp = LLMPlanner(reg)
+        msgs = lp._build_messages("find x's email and send")
+        system = next(m["content"] for m in msgs if m["role"] == "system")
+        # Provider rule named and the wrong pair explicitly called out.
+        self.assertIn("provider consistency", system.lower())
+        self.assertIn("gmail_send", system.lower())
+        self.assertIn("ms_mail_send", system.lower())
+        # contacts_search output shape documented with the exact ref.
+        self.assertIn("contacts[0].emails[0]", system)
+        # Worked example for find-email-and-send chain.
+        self.assertIn("contacts_search", system)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
