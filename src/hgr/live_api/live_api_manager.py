@@ -22,6 +22,7 @@ from __future__ import annotations
 import enum
 import getpass
 import json
+import os
 import re
 import threading
 import time
@@ -361,6 +362,9 @@ class LiveApiManager(QObject):
         self._screen: Optional[ScreenContext] = None
         self._executor: Optional[ToolExecutor] = None
         self._registry: Optional[ToolRegistry] = None
+        # Iris planner (Phase 1: deterministic classifier → connector, no model).
+        # Lazily built when the registry exists; reset at session start.
+        self._iris_planner: Optional[Any] = None
         # Connector tool schemas loaded on demand by find_capability this
         # session (deduped by tool name). Added on top of the built-in tools.
         self._loaded_connector_schemas: List[Dict[str, Any]] = []
@@ -487,6 +491,7 @@ class LiveApiManager(QObject):
             self._registry = ToolRegistry(self._executor, connectors)
             # Fresh session: nothing loaded on demand yet.
             self._loaded_connector_schemas = []
+            self._iris_planner = None
             # Layer 0 router. Lazy-import keeps the manager loadable on
             # systems where Touchless's voice modules can't initialize
             # (e.g. headless CI without sounddevice).
@@ -824,7 +829,40 @@ class LiveApiManager(QObject):
                     info=getattr(routed, "message", ""),
                 )
 
-        # ---- Layer 1: LLM agent (router didn't match) ----
+        # ---- Layer 1: iris planner (deterministic classifier → connector,
+        # 0 model tokens). Phase 1 of the JARVIS-level decision engine — see
+        # docs/IRIS_PLANNER_DESIGN.md. Default on; disable with
+        # TOUCHLESS_IRIS_PLANNER=0 to force the old LLM path for debugging.
+        if os.environ.get("TOUCHLESS_IRIS_PLANNER", "1") != "0" and self._registry is not None:
+            try:
+                if self._iris_planner is None:
+                    from .planner.orchestrator import IrisPlanner
+                    self._iris_planner = IrisPlanner(self._registry, self._logger,
+                                                     confirm=self._confirm_callback)
+                handled = self._iris_planner.try_handle(text)
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception("iris_planner_unhandled", exc)
+                handled = None
+            if handled is not None:
+                step = handled["step"]
+                result = handled["result"]
+                source = handled["source"]
+                pid = f"planner/{step.tool}"
+                self.tool_event.emit("called", {"name": step.tool, "call_id": pid, "source": source})
+                self.tool_event.emit("completed", {
+                    "name": step.tool, "call_id": pid,
+                    "status": result.get("status", "ok"), "source": source,
+                })
+                if self._logger:
+                    self._logger.event("routing_decision", **cost_policy.decision_record(
+                        raw=text, tool=step.tool, source=source,
+                        status=str(result.get("status", ""))))
+                self.assistant_text.emit(handled["message"])
+                self._set_state(LiveApiState.LISTENING, "Ready (type a command)")
+                return True
+
+        # ---- Layer 2: LLM agent (planner didn't classify either) ----
         # Reset task state for this new user turn.
         self._multistep_active = False
         self._in_queue = False

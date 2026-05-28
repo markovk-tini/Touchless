@@ -546,6 +546,69 @@ class ScreenReaderTests(unittest.TestCase):
         r.get_context(); self.assertEqual(state["builds"], 3)   # window changed -> rebuild
 
 
+class IrisPlannerClassifierTests(unittest.TestCase):
+    """Phase 1 of the planner: deterministic intent -> Step, no LLM."""
+
+    def setUp(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        self.c = Classifier()
+
+    def _expect(self, text: str, tool: str, **expected_args) -> None:
+        step = self.c.classify(text)
+        self.assertIsNotNone(step, f"classifier missed: {text!r}")
+        self.assertEqual(step.tool, tool, f"wrong tool for {text!r}: {step.tool}")
+        for k, v in expected_args.items():
+            self.assertEqual(step.args.get(k), v, f"{text!r} args[{k}]={step.args.get(k)} (expected {v})")
+
+    def _miss(self, text: str) -> None:
+        self.assertIsNone(self.c.classify(text), f"classifier should have missed: {text!r}")
+
+    def test_volume(self) -> None:
+        self._expect("set volume to 30", "volume_set", percent=30)
+        self._expect("volume 75", "volume_set", percent=75)
+        self._expect("what's the volume", "volume_get")
+        self._expect("mute", "volume_mute", muted=True)
+        self._expect("unmute", "volume_mute", muted=False)
+        self._expect("toggle mute", "volume_toggle_mute")
+        # "mute discord" must NOT become system mute — it routes to discord:
+        step = self.c.classify("mute discord")
+        self.assertIsNotNone(step)
+        self.assertEqual(step.tool, "discord_mute")
+
+    def test_discord(self) -> None:
+        self._expect("mute discord", "discord_mute", muted=True)
+        self._expect("unmute discord", "discord_mute", muted=False)
+        self._expect("toggle mute on discord", "discord_toggle_mute")
+        self._expect("deafen on discord", "discord_deafen", deafened=True)
+
+    def test_todo(self) -> None:
+        self._expect("add a task: buy milk", "todo_add", title="buy milk")
+        self._expect("remind me to call mom", "todo_add", title="call mom")
+
+    def test_google_create(self) -> None:
+        self._expect("make a google doc titled Demo", "gdocs_create", title="demo")
+        self._expect("create a spreadsheet called Budget", "sheets_create", title="budget")
+        self._expect("new slideshow titled Pitch", "slides_create", title="pitch")
+
+    def test_drive_upload(self) -> None:
+        self._expect("upload C:/tmp/file.png to my google drive", "drive_upload",
+                     path="C:/tmp/file.png")
+
+    def test_email_compose_with_recipient_and_body(self) -> None:
+        step = self.c.classify("email dani@mangollc.org saying hi from iris")
+        self.assertIsNotNone(step)
+        self.assertEqual(step.tool, "outlook_compose")
+        self.assertEqual(step.args.get("recipient"), "dani@mangollc.org")
+        self.assertEqual(step.args.get("body"), "hi from iris")
+
+    def test_misses_safely(self) -> None:
+        # Things that must NOT classify (they need the LLM / fall through):
+        self._miss("what's the weather")
+        self._miss("read my latest email")
+        self._miss("summarize my unread emails")
+        self._miss("can you help me figure out what to do today")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
