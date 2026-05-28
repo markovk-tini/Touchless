@@ -55,9 +55,54 @@ def main() -> None:
             print(f"    ! 'Contacts.ReadWrite' is NOT in this token. "
                   f"Disconnect Microsoft and reconnect to upgrade scopes.")
 
-    print()
-    print(f"Running contacts_search query={args.query!r} account={args.account!r}...")
+    # Raw diagnostic calls so we can see what Microsoft Graph ACTUALLY says.
+    # Bypass the connector's strategy stack and hit the endpoints directly.
     conn = Microsoft365Connector(client)
+    for acct in accts:
+        tok = client.token_for(acct)
+        if not tok:
+            continue
+        print()
+        print(f"=== Raw Graph calls for {acct.get('username')} ===")
+        for label, path, headers in [
+            ("/me (sanity — auth works?)", "/me", None),
+            ("/me/contacts?$top=5 (any contacts at all?)",
+             "/me/contacts?$top=5&$select=displayName,emailAddresses", None),
+            (f"/me/contacts?$search=\"{args.query}\" (search)",
+             f"/me/contacts?$search=\"{args.query}\"&$top=10"
+             "&$select=displayName,emailAddresses",
+             {"ConsistencyLevel": "eventual"}),
+            (f"/me/contacts?$filter=startswith(displayName,'{args.query}')",
+             f"/me/contacts?$top=10&$select=displayName,emailAddresses"
+             f"&$filter=startswith(displayName,'{args.query}')", None),
+            ("/me/people?$top=5 (correspondents)",
+             "/me/people?$top=5", None),
+        ]:
+            data, err = conn._graph("GET", path, token=tok,
+                                    extra_headers=headers)
+            print(f"\n  {label}")
+            if err:
+                print(f"    ERR: {err[:300]}")
+                continue
+            if not isinstance(data, dict):
+                print(f"    (non-dict response: {type(data).__name__})")
+                continue
+            keys = list(data.keys())
+            print(f"    keys: {keys}")
+            value = data.get("value") if "value" in keys else None
+            if isinstance(value, list):
+                print(f"    value count: {len(value)}")
+                for entry in value[:5]:
+                    dn = entry.get("displayName") or entry.get("userPrincipalName") or "?"
+                    em = entry.get("emailAddresses") or entry.get("scoredEmailAddresses") or []
+                    em_str = ", ".join(e.get("address") or "" for e in em)
+                    print(f"      - {dn}  [{em_str}]")
+            else:
+                # /me just returns user info, no value array.
+                print(f"    sample: {json.dumps({k: data[k] for k in keys[:6]}, default=str)[:200]}")
+
+    print()
+    print("=== contacts_search aggregate ===")
     result = conn.execute("contacts_search",
                           {"query": args.query, "account": args.account})
     print(json.dumps(result, indent=2, default=str)[:2000])
