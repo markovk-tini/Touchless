@@ -35,27 +35,56 @@ from hgr.live_api.planner.triggers import (  # noqa: E402
 )
 
 
+# ---- Synthetic catalog matching what a fully-connected user sees ----------
+# In production the planner asks the real ToolRegistry for connector_catalog()
+# (Microsoft Graph, Google, Discord, etc.). The probe doesn't run with those
+# connectors authenticated, so we hand-mirror what the LLM would see in the
+# live app — otherwise it falls back to GUI computer-use because no API tools
+# show up.
+_SYNTHETIC_CATALOG = [
+    {"id": "ms_graph", "description": "Microsoft 365 (Outlook/Calendar/OneDrive/Teams/To Do/OneNote/Contacts)",
+     "tools": ["ms_mail_send", "ms_mail_list", "ms_mail_search", "ms_mail_read",
+               "ms_mail_mark_read", "ms_calendar_list", "ms_calendar_create",
+               "onedrive_upload", "onedrive_list", "teams_send",
+               "teams_channel_post", "excel_create", "excel_set_cell",
+               "todo_add", "onenote_create", "contacts_search",
+               "ms_list_accounts", "ms_use_account"]},
+    {"id": "outlook", "description": "Outlook desktop quick-actions",
+     "tools": ["outlook_compose", "email_send", "outlook_open"]},
+    {"id": "gmail", "description": "Gmail send-only API",
+     "tools": ["gmail_send"]},
+    {"id": "drive", "description": "Google Drive / Docs / Sheets / Slides",
+     "tools": ["drive_upload", "drive_list", "gdocs_create", "sheets_create",
+               "slides_create"]},
+    {"id": "google_calendar", "description": "Google Calendar",
+     "tools": ["calendar_list_events", "calendar_create_event"]},
+    {"id": "discord", "description": "Discord voice/system controls",
+     "tools": ["discord_voice_status", "discord_mute", "discord_toggle_mute",
+               "discord_deafen", "discord_toggle_deafen",
+               "discord_join_voice", "discord_leave_voice"]},
+    {"id": "volume", "description": "System audio (Windows Core Audio)",
+     "tools": ["volume_set", "volume_get", "volume_mute", "volume_toggle_mute"]},
+    {"id": "media", "description": "Media playback (play/pause/skip)",
+     "tools": ["media_play_pause"]},
+]
+_SYNTHETIC_CONNECTOR_TOOLS = {t for c in _SYNTHETIC_CATALOG for t in c["tools"]}
+
+
 # ---- A tiny fake registry that just records calls --------------------------
 class _ProbeRegistry:
     """Pretends to be a ToolRegistry. Returns canned 'ok' outputs and
     records every call so we can show the trail."""
 
-    # The Phase 1 classifier checks handles_connector before firing —
-    # accept the full known set so the probe doesn't drop matches.
-    _KNOWN_CONNECTOR_TOOLS = frozenset({
-        "volume_set", "volume_get", "volume_mute", "volume_toggle_mute",
-        "discord_mute", "discord_toggle_mute", "discord_deafen",
-        "discord_toggle_deafen",
-        "todo_add",
-        "gdocs_create", "sheets_create", "slides_create", "drive_upload",
-        "outlook_compose", "ms_mail_send",
-    })
-
     def __init__(self) -> None:
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
 
     def handles_connector(self, tool: str) -> bool:
-        return tool in self._KNOWN_CONNECTOR_TOOLS
+        return tool in _SYNTHETIC_CONNECTOR_TOOLS
+
+    def connector_catalog(self) -> List[Dict[str, Any]]:
+        """What LLMPlanner._tool_catalog uses to render the prompt's
+        'Available tools:' section. Mirrors the live app's connector list."""
+        return _SYNTHETIC_CATALOG
 
     def call(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
         self.calls.append((tool, dict(args or {})))
