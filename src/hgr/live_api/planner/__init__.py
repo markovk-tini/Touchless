@@ -16,13 +16,17 @@ etc. never touch a model.
 Author: Konstantin Markov
 """
 from .plan import Step, StepResult, Plan
+from .plan_cache import PlanCache
 from .classifier import Classifier
 from .executor import Executor
 from .planner_llm import LLMPlanner
 from .scheduler import RateScheduler, scheduler
 from .synthesizer import Synthesizer
+from .triggers import looks_multi_action, plan_needs_confirm, RISKY_TOOLS
 from .orchestrator import IrisPlanner
 
-__all__ = ["Step", "StepResult", "Plan", "Classifier",
+__all__ = ["Step", "StepResult", "Plan", "PlanCache", "Classifier",
            "Executor", "LLMPlanner", "Synthesizer",
-           "RateScheduler", "scheduler", "IrisPlanner"]
+           "RateScheduler", "scheduler",
+           "looks_multi_action", "plan_needs_confirm", "RISKY_TOOLS",
+           "IrisPlanner"]

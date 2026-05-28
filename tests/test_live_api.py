@@ -873,6 +873,140 @@ class IrisPlannerSynthesisRoutingTests(unittest.TestCase):
         self.assertTrue(out["message"])
 
 
+class IrisPlannerTriggersTests(unittest.TestCase):
+    """Phase 4 heuristic: pick out requests that look multi-step."""
+
+    def test_chain_words_trigger(self) -> None:
+        from hgr.live_api.planner.triggers import looks_multi_action
+        self.assertTrue(looks_multi_action("open Outlook and then read the latest email"))
+        self.assertTrue(looks_multi_action("find Dani's email then send him hi"))
+        self.assertTrue(looks_multi_action("search for AI news, after that summarize the top result"))
+
+    def test_and_verb_triggers(self) -> None:
+        from hgr.live_api.planner.triggers import looks_multi_action
+        self.assertTrue(looks_multi_action("find Dani's email and send him hi"))
+        self.assertTrue(looks_multi_action("create a doc and share it with the team"))
+
+    def test_two_distinct_verbs_trigger(self) -> None:
+        from hgr.live_api.planner.triggers import looks_multi_action
+        # "open chrome to search for X" — two action verbs.
+        self.assertTrue(looks_multi_action("open chrome and search for the latest news"))
+
+    def test_single_step_does_not_trigger(self) -> None:
+        from hgr.live_api.planner.triggers import looks_multi_action
+        self.assertFalse(looks_multi_action("what's the volume"))
+        self.assertFalse(looks_multi_action("mute"))
+        self.assertFalse(looks_multi_action("open YouTube"))
+        self.assertFalse(looks_multi_action("hi"))
+
+    def test_plan_needs_confirm(self) -> None:
+        from hgr.live_api.planner.triggers import plan_needs_confirm
+        self.assertTrue(plan_needs_confirm(["cal_freebusy", "outlook_compose"]))
+        self.assertTrue(plan_needs_confirm(["drive_upload"]))
+        self.assertFalse(plan_needs_confirm(["cal_freebusy", "ms_mail_list"]))
+        self.assertFalse(plan_needs_confirm([]))
+
+
+class IrisPlannerCacheTests(unittest.TestCase):
+    """Phase 4 plan cache: skip the LLM call when the same goal recurs."""
+
+    def test_hits_within_ttl(self) -> None:
+        from hgr.live_api.planner.plan_cache import PlanCache
+        from hgr.live_api.planner.plan import Plan, Step
+        t = [0.0]
+        cache = PlanCache(ttl=60.0, clock=lambda: t[0])
+        plan = Plan(goal="g", steps=[Step(id=1, tool="a")])
+        cache.put("Do The Thing", plan)
+        # Case + whitespace normalization.
+        self.assertIs(cache.get("  do the thing  "), plan)
+
+    def test_expires_after_ttl(self) -> None:
+        from hgr.live_api.planner.plan_cache import PlanCache
+        from hgr.live_api.planner.plan import Plan, Step
+        t = [0.0]
+        cache = PlanCache(ttl=10.0, clock=lambda: t[0])
+        cache.put("do it", Plan(goal="g", steps=[Step(id=1, tool="a")]))
+        t[0] = 20.0
+        self.assertIsNone(cache.get("do it"))
+
+    def test_lru_eviction(self) -> None:
+        from hgr.live_api.planner.plan_cache import PlanCache
+        from hgr.live_api.planner.plan import Plan, Step
+        t = [0.0]
+        cache = PlanCache(ttl=60.0, max_entries=2, clock=lambda: t[0])
+        cache.put("a", Plan(goal="g", steps=[Step(id=1, tool="x")]))
+        t[0] = 1.0
+        cache.put("b", Plan(goal="g", steps=[Step(id=1, tool="x")]))
+        t[0] = 2.0
+        cache.put("c", Plan(goal="g", steps=[Step(id=1, tool="x")]))  # evicts "a"
+        self.assertIsNone(cache.get("a"))
+        self.assertIsNotNone(cache.get("b"))
+        self.assertIsNotNone(cache.get("c"))
+
+
+class IrisPlannerPhase4WiringTests(unittest.TestCase):
+    """Phase 4: heuristic opens Phase 2, plan cache skips repeat LLM calls,
+    risky plans surface a single confirm dialog."""
+
+    def _build(self):
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        from hgr.live_api.planner.plan import Plan, Step
+        from hgr.live_api.planner.scheduler import scheduler
+        reg = _StubRegistry({
+            "lookup": {"status": "ok", "email": "x@y"},
+            "outlook_compose": {"status": "ok"},
+        })
+        forged = Plan(goal="find x and email", steps=[
+            Step(id=1, tool="lookup", args={}),
+            Step(id=2, tool="outlook_compose",
+                 args={"recipient": "{step:1.email}"}, depends_on=[1]),
+        ])
+        calls = {"plan": 0}
+        confirms = {"prompts": []}
+        def confirm(title, body):
+            confirms["prompts"].append((title, body))
+            return confirms.get("answer", True)
+        planner = IrisPlanner(reg, confirm=confirm)
+        scheduler()._events.clear()  # type: ignore[attr-defined]
+        def fake_plan(_g):
+            calls["plan"] += 1
+            return forged
+        planner._llm_planner.plan = fake_plan  # type: ignore[assignment]
+        import hgr.live_api.planner.orchestrator as orch
+        orch.llm_planner_configured = lambda: True
+        return planner, reg, calls, confirms
+
+    def test_heuristic_opens_phase2_without_flag(self) -> None:
+        planner, reg, calls, confirms = self._build()
+        confirms["answer"] = True
+        out = planner.try_handle("find Dani's email and send him hi")
+        self.assertIsNotNone(out)
+        self.assertEqual(calls["plan"], 1)
+        self.assertEqual([s.tool for s in out["steps"]],
+                         ["lookup", "outlook_compose"])
+        # outlook_compose is risky → confirm must have been requested.
+        self.assertEqual(len(confirms["prompts"]), 1)
+        self.assertIn("outlook_compose", confirms["prompts"][0][1])
+
+    def test_confirm_cancel_skips_execution(self) -> None:
+        planner, reg, calls, confirms = self._build()
+        confirms["answer"] = False  # user clicks "no"
+        out = planner.try_handle("find Dani's email and send him hi")
+        self.assertEqual(out["message"], "Cancelled.")
+        self.assertEqual([r.status for r in out["results"]],
+                         ["cancelled", "cancelled"])
+        # Plan was generated but neither step actually ran.
+        self.assertEqual(reg.calls, [])
+
+    def test_cache_skips_second_llm_call(self) -> None:
+        planner, reg, calls, confirms = self._build()
+        confirms["answer"] = True
+        planner.try_handle("find Dani's email and send him hi")
+        planner.try_handle("find Dani's email and send him hi")
+        # Second call reused the cached Plan.
+        self.assertEqual(calls["plan"], 1)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

@@ -18,10 +18,12 @@ import os
 
 from .classifier import Classifier
 from .executor import Executor
-from .plan import Plan, Step
+from .plan import Plan, Step, StepResult
+from .plan_cache import PlanCache
 from .planner_llm import LLMPlanner, configured as llm_planner_configured
 from .scheduler import scheduler
 from .synthesizer import Synthesizer, configured as synth_configured
+from .triggers import looks_multi_action, plan_needs_confirm
 
 
 class IrisPlanner:
@@ -38,6 +40,7 @@ class IrisPlanner:
         self._llm_planner = LLMPlanner(registry, logger) if registry is not None else None
         self._executor = Executor(registry, logger) if registry is not None else None
         self._synthesizer = Synthesizer(logger=logger)
+        self._plan_cache = PlanCache()
 
     def try_handle(self, text: str) -> Optional[Dict[str, Any]]:
         """Try to fully handle a request without the realtime model.
@@ -56,7 +59,6 @@ class IrisPlanner:
         if single is not None and self._registry.handles_connector(single.tool):
             if single.needs_confirm and self._confirm is not None and \
                     not self._confirm(f"Run {single.tool}?", single.description):
-                from .plan import StepResult
                 return {
                     "steps": [single],
                     "results": [StepResult(step_id=0, tool=single.tool,
@@ -69,7 +71,6 @@ class IrisPlanner:
                 if self._logger:
                     self._logger.exception("iris_planner_call_failed", exc, tool=single.tool)
                 return None
-            from .plan import StepResult
             sr = StepResult(step_id=0, tool=single.tool,
                             status=str((out or {}).get("status") or "ok"),
                             output=out or {}, error=(out or {}).get("error"))
@@ -77,18 +78,46 @@ class IrisPlanner:
                     "message": self._format_message(single, out or {})}
 
         # --- Phase 2: cheap-LLM JSON plan -> Executor ---
-        # Fires when (a) the explicit flag is on, OR (b) realtime is currently
-        # rate-limited and cheap-LLM is healthy (back-pressure: prefer the
-        # lane that can actually serve the request).
+        # Fires when ANY of:
+        #   (a) explicit opt-in flag (TOUCHLESS_IRIS_PLAN_LLM=1)
+        #   (b) the request looks multi-step (heuristic)
+        #   (c) realtime is rate-limited and cheap-LLM is healthy
+        # — and OPENAI_API_KEY is available. Phase 2 stays disabled when none
+        # of those apply, so single-step questions never burn a planner call.
         flag_on = os.environ.get("TOUCHLESS_IRIS_PLAN_LLM", "0") == "1"
         sched = scheduler()
         scheduler_prefers_cheap = sched.prefer_cheap_planner()
-        if ((flag_on or scheduler_prefers_cheap)
+        heuristic_open = looks_multi_action(text)
+        if ((flag_on or heuristic_open or scheduler_prefers_cheap)
                 and llm_planner_configured()
                 and self._llm_planner is not None
                 and self._executor is not None):
-            plan = self._llm_planner.plan(text)
+            # Cache: same goal twice in ~10 min reuses the prior Plan and
+            # skips the LLM call entirely.
+            plan = self._plan_cache.get(text)
+            if plan is None:
+                plan = self._llm_planner.plan(text)
+                self._plan_cache.put(text, plan)
             if plan is not None and plan.steps:
+                # Whole-plan confirm-gate: if any step is "risky" (sends email,
+                # uploads files, types into focused window, etc.), surface one
+                # summary dialog before running.
+                step_tools = [s.tool for s in plan.steps]
+                if (plan_needs_confirm(step_tools)
+                        and self._confirm is not None
+                        and not self._confirm("Run this plan?",
+                                              self._plan_confirm_summary(plan))):
+                    return {
+                        "steps": plan.steps,
+                        "results": [
+                            StepResult(step_id=s.id, tool=s.tool,
+                                       status="cancelled",
+                                       output={"status": "cancelled"})
+                            for s in plan.steps
+                        ],
+                        "plan": plan,
+                        "message": "Cancelled.",
+                    }
                 results = self._executor.run(plan)
                 message = self._summarize(plan, results)
                 return {
@@ -98,6 +127,15 @@ class IrisPlanner:
                     "message": message,
                 }
         return None
+
+    @staticmethod
+    def _plan_confirm_summary(plan: "Plan") -> str:
+        """Compact human-readable summary of a Plan for the confirm dialog."""
+        bullets = []
+        for s in plan.steps:
+            desc = (s.description or s.tool).strip()
+            bullets.append(f"  • {desc}")
+        return f"Goal: {plan.goal}\nSteps:\n" + "\n".join(bullets)
 
     # ---- summarize a multi-step plan --------------------------------------
     def _summarize(self, plan: "Plan", results: list) -> str:
