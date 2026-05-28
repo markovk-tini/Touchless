@@ -3421,6 +3421,134 @@ class MemoryObserveConversationTests(unittest.TestCase):
             self.assertEqual(ext.call_count, 0)
 
 
+class MemoryPreferenceUniquenessTests(unittest.TestCase):
+    """Preferences are last-write-wins on (kind, key) — never two
+    simultaneous values for the same preference key."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="iris-prefdupes-")
+        from hgr.live_api.memory import MemoryStore
+        self._store = MemoryStore(Path(self._tmp) / "m.db")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_preference_overwritten_on_set(self) -> None:
+        self._store.add_semantic("preference", "default_send_via", "gmail_send")
+        self._store.add_semantic("preference", "default_send_via", "ms_mail_send")
+        rows = self._store.find_facts(kind="preference",
+                                      key="default_send_via")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].value, "ms_mail_send")
+
+    def test_alias_overwritten_on_set(self) -> None:
+        self._store.add_semantic("alias", "preferred_name", "Kosta")
+        self._store.add_semantic("alias", "preferred_name", "Konstantin")
+        rows = self._store.find_facts(kind="alias", key="preferred_name")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].value, "Konstantin")
+
+    def test_person_can_have_multiple_values(self) -> None:
+        # Multi-value kinds are unchanged: one person can have multiple
+        # known email addresses.
+        self._store.add_semantic("person", "dani", "dani@home.com")
+        self._store.add_semantic("person", "dani", "dani@work.com")
+        rows = self._store.find_facts(kind="person", key="dani")
+        emails = {r.value for r in rows}
+        self.assertEqual(emails, {"dani@home.com", "dani@work.com"})
+
+
+class MemoryDeleteFactsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="iris-del-")
+        from hgr.live_api.memory import MemoryStore
+        self._store = MemoryStore(Path(self._tmp) / "m.db")
+        for kind, key, val in [
+            ("person", "dani", "dani@x.io"),
+            ("person", "vesko", "vesko@y.com"),
+            ("artifact", "iris debrief", "https://x/1"),
+            ("artifact", "iris debrief main", "https://x/2"),
+        ]:
+            self._store.add_semantic(kind, key, val)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_delete_by_kind_and_key(self) -> None:
+        n = self._store.delete_facts(kind="person", key="dani")
+        self.assertEqual(n, 1)
+        self.assertEqual(
+            [r.value for r in self._store.find_facts(kind="person", key="dani")],
+            [])
+        self.assertEqual(
+            [r.value for r in self._store.find_facts(kind="person", key="vesko")],
+            ["vesko@y.com"])
+
+    def test_delete_all_of_kind(self) -> None:
+        n = self._store.delete_facts(kind="artifact")
+        self.assertEqual(n, 2)
+        self.assertEqual(self._store.find_facts(kind="artifact"), [])
+
+    def test_delete_requires_filter(self) -> None:
+        # Empty filter must NOT wipe everything — use clear() for that.
+        n = self._store.delete_facts()
+        self.assertEqual(n, 0)
+        self.assertEqual(self._store.count()["semantic"], 4)
+
+
+class ForgetIntentTests(unittest.TestCase):
+    """'forget Dani' / 'delete Vesko from memory' Tier 1 pseudo-tool."""
+
+    def test_classifier_matches_forget_phrasings(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        for text in [
+            "forget Dani",
+            "forget Dani's email",
+            "forget about Vesko",
+            "delete Vesko from memory",
+            "remove Mariya from your memory",
+            "wipe Mariya",
+        ]:
+            step = c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "iris_forget_contact",
+                             f"tool wrong for {text!r}: {step.tool}")
+
+    def test_classifier_skips_stopword_pronouns(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        # 'forget it' / 'forget that' shouldn't match — those are
+        # conversational, not memory operations.
+        for text in ["forget it", "forget that", "delete everything"]:
+            step = c.classify(text)
+            # Either no match, or NOT a forget intent.
+            if step is not None:
+                self.assertNotEqual(step.tool, "iris_forget_contact",
+                                    f"text={text!r}")
+
+    def test_orchestrator_removes_facts_from_memory(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        removed_calls: List[tuple] = []
+        class _FakeMem:
+            class _S:
+                def find_facts(self, **k): return []
+            def __init__(self): self._store = self._S()
+            def forget_fact(self, kind=None, key=None, value=None):
+                removed_calls.append((kind, key, value))
+                return 1
+            def set_fact(self, *a, **k): pass
+            def record(self, *a, **k): pass
+            def recall(self, *a, **k):
+                return {"context": "", "episodes": [], "facts": []}
+        planner = IrisPlanner(_StubRegistry({}), memory=_FakeMem())
+        out = planner.try_handle("forget Dani")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["results"][0].status, "ok")
+        self.assertIn("Forgotten", out["message"])
+        self.assertEqual(removed_calls, [("person", "dani", None)])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

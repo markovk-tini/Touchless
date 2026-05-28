@@ -119,7 +119,7 @@ class IrisPlanner:
         # rare, and they answer cheaper than Tier 2 ever could.
         single = self._classifier.classify(text)
         _BYPASS_MULTI = {"iris_lookup_contact", "iris_set_preference",
-                         "iris_remember_contact"}
+                         "iris_remember_contact", "iris_forget_contact"}
         if multi and single is not None and single.tool not in _BYPASS_MULTI:
             single = None
 
@@ -144,6 +144,35 @@ class IrisPlanner:
             else:
                 message = (f"Got it — {', '.join(names[:-1])} and "
                            f"{names[-1]} all share {email}.")
+            self._record_turn(text, None, [single], [sr], message)
+            return {"steps": [single], "results": [sr], "message": message}
+
+        # --- Pseudo-tool: forget a contact (delete person/<name> from memory).
+        if single is not None and single.tool == "iris_forget_contact":
+            name = str((single.args or {}).get("name") or "").strip()
+            removed = 0
+            if self._memory is not None and name:
+                try:
+                    removed = self._memory.forget_fact(
+                        kind="person", key=name.lower())
+                    # Also try the trailing-s variant ("Veskos") so users
+                    # don't have to know the exact stored form.
+                    if removed == 0 and len(name) > 3 and name.lower().endswith("s"):
+                        removed = self._memory.forget_fact(
+                            kind="person", key=name[:-1].lower())
+                except Exception as exc:
+                    if self._logger:
+                        self._logger.exception("forget_fact_failed", exc)
+            sr = StepResult(step_id=0, tool=single.tool,
+                            status="ok" if removed else "not_found",
+                            output={"status": "ok" if removed else "not_found",
+                                    "name": name, "removed": removed})
+            if removed:
+                message = (f"Forgotten — removed {removed} fact"
+                           f"{'s' if removed != 1 else ''} about {name}.")
+            else:
+                message = (f"I didn't have anything stored for {name}, "
+                           f"so nothing to forget.")
             self._record_turn(text, None, [single], [sr], message)
             return {"steps": [single], "results": [sr], "message": message}
 

@@ -39,6 +39,10 @@ def main() -> None:
     ap.add_argument("--source", default="user-seeded")
     ap.add_argument("--list", action="store_true", help="show all facts")
     ap.add_argument("--clear", action="store_true", help="WIPE ALL MEMORY")
+    ap.add_argument("--forget", action="store_true",
+                    help="DELETE rows matching kind/key/value (use as many "
+                         "filters as you need: --forget person dani  OR  "
+                         "--forget artifact 'iris debrief' ...)")
     args = ap.parse_args()
 
     store = MemoryStore(default_memory_path())
@@ -46,6 +50,16 @@ def main() -> None:
     if args.clear:
         store.clear()
         print(f"Cleared memory at {default_memory_path()}")
+        return
+
+    if args.forget:
+        if not (args.kind or args.key or args.value):
+            ap.error("--forget needs at least one of kind/key/value (use "
+                     "--clear to wipe everything)")
+        removed = store.delete_facts(kind=args.kind, key=args.key,
+                                     value=args.value)
+        print(f"Forgot {removed} row{'s' if removed != 1 else ''} from "
+              f"{default_memory_path()}")
         return
 
     if args.list or not args.kind:

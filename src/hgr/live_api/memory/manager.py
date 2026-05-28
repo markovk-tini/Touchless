@@ -128,6 +128,17 @@ class MemoryManager:
             )
 
     # ---- write -----------------------------------------------------------
+    def forget_fact(self, kind: Optional[str] = None,
+                    key: Optional[str] = None,
+                    value: Optional[str] = None) -> int:
+        """Delete semantic rows matching the filters. Returns the count."""
+        try:
+            return self._store.delete_facts(kind=kind, key=key, value=value)
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("memory_forget_fact_failed", exc)
+            return 0
+
     def set_fact(self, kind: str, key: str, value: str,
                  source: str = "user said") -> None:
         """Persist a single semantic fact. Used by Tier 1 preference-setting

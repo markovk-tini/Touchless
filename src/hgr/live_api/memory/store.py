@@ -131,16 +131,51 @@ class MemoryStore:
             )
             return new_id
 
+    # Kinds for which (kind, key) is unique — last value written wins.
+    # Preferences are the obvious case ('default_send_via' should never have
+    # two simultaneous values). Aliases too ('preferred_name' is a single
+    # value at a time). Other kinds keep the existing UNIQUE(kind,key,value)
+    # semantics so e.g. one person can have multiple email addresses.
+    _SINGLE_VALUE_KINDS = frozenset({"preference", "alias"})
+
     def add_semantic(self, kind: str, key: str, value: str,
                      source: Optional[str] = None) -> None:
         if not (kind and key and value):
             return
         with self._lock, self._conn() as c:
+            if kind in self._SINGLE_VALUE_KINDS:
+                # Last-write-wins: delete any prior value for this key
+                # before inserting the new one.
+                c.execute("DELETE FROM semantic WHERE kind = ? AND key = ?",
+                          (kind, key.lower()))
             c.execute(
                 "INSERT OR REPLACE INTO semantic (ts, kind, key, value, source) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (time.time(), kind, key.lower(), value, source),
             )
+
+    def delete_facts(self, kind: Optional[str] = None,
+                     key: Optional[str] = None,
+                     value: Optional[str] = None) -> int:
+        """Delete semantic rows matching the given filters. Returns the
+        number of rows removed. At least one filter must be non-None to
+        avoid wiping the whole table by accident — use clear() for that."""
+        if kind is None and key is None and value is None:
+            return 0
+        sql = "DELETE FROM semantic WHERE 1=1"
+        args: List[Any] = []
+        if kind is not None:
+            sql += " AND kind = ?"
+            args.append(kind)
+        if key is not None:
+            sql += " AND key = ?"
+            args.append(key.lower())
+        if value is not None:
+            sql += " AND value = ?"
+            args.append(value)
+        with self._lock, self._conn() as c:
+            cur = c.execute(sql, args)
+            return cur.rowcount or 0
 
     def add_facts(self, facts: List[Tuple[str, str, str, Optional[str]]]) -> None:
         """Bulk semantic insert. `facts` is [(kind, key, value, source), ...]."""

@@ -187,6 +187,29 @@ class Classifier:
                 description="local weather",
             )
 
+        # ---- contact forget ("forget Dani", "forget Dani's email",
+        # "delete Vesko from memory", "you can forget about Mariya") ----
+        # Lets the user purge memory facts without the CLI.
+        m = re.search(
+            r"\b(?:forget|delete|remove|wipe)\b"
+            r"(?:\s+about|\s+everything\s+about)?\s+"
+            r"(?P<name>[A-Za-z][A-Za-z0-9._\-]*)"
+            r"(?:'s|s)?\s*(?:email|address|info|details|number|"
+            r"from\s+(?:memory|your\s+memory)|address\s+book)?",
+            t, flags=re.IGNORECASE,
+        )
+        if m:
+            name = m.group("name")
+            _STOP = {"my", "me", "your", "the", "a", "an", "his", "her",
+                     "their", "our", "all", "everything", "it", "that"}
+            if name.lower() not in _STOP:
+                return Step(
+                    tool="iris_forget_contact",
+                    args={"name": name},
+                    layer="touchless",
+                    description=f"forget {name} in memory",
+                )
+
         # ---- contact remember ("X is for Vesko and Mariya", "Vesko at X") --
         # Lets the user TEACH Iris facts via Tier 1, no realtime/LLM needed.
         # Supports one or many names per email so 'shared address' patterns
