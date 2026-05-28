@@ -113,7 +113,14 @@ class IrisPlanner:
         # intent. Skip Phase 1 in that case so the request can be decomposed
         # properly by Phase 2 (or fall through to realtime).
         multi = looks_multi_action(text)
-        single = None if multi else self._classifier.classify(text)
+        # Always run the classifier so high-confidence pseudo-tool patterns
+        # (lookup / preference-set) can fire even when looks_multi_action
+        # triggers — their regexes are very specific so false positives are
+        # rare, and they answer cheaper than Tier 2 ever could.
+        single = self._classifier.classify(text)
+        _BYPASS_MULTI = {"iris_lookup_contact", "iris_set_preference"}
+        if multi and single is not None and single.tool not in _BYPASS_MULTI:
+            single = None
 
         # --- Pseudo-tool: contact lookup. Reads person/<name> from memory
         # and returns the email as the user-facing message.

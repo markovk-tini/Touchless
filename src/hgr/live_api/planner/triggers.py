@@ -46,6 +46,20 @@ _VERB_PATTERNS = [re.compile(r"\b" + v + r"\b", re.IGNORECASE) for v in _ACTION_
 
 _CONNECTOR_RE = re.compile(r"[,;]| \band\b ", re.IGNORECASE)
 
+# Strip noun-form occurrences of action-shaped words so the two-verb branch
+# doesn't false-positive on "Dani's email" / "the message" / "this post"
+# (the word follows a possessive or determiner — it's a noun, not a verb).
+_NOUN_FORM_RE = re.compile(
+    r"\b(?:'s|s)?\s*(?:'s|the|a|an|this|that|my|your|his|her|their|our)\s+"
+    r"(?:email|message|post|search|share|copy|move|read|write|draft)\b",
+    re.IGNORECASE,
+)
+_POSSESSIVE_NOUN_RE = re.compile(
+    r"\b[a-z]+'s\s+(?:email|message|post|address|number|name|file|"
+    r"document|note|task|calendar)\b",
+    re.IGNORECASE,
+)
+
 
 def looks_multi_action(text: str) -> bool:
     """True if `text` looks like a multi-step request worth planning."""
@@ -61,9 +75,13 @@ def looks_multi_action(text: str) -> bool:
     # would be a false positive.
     if not _CONNECTOR_RE.search(t):
         return False
+    # Strip noun-form occurrences so we don't mis-count "Dani's email" /
+    # "the message" as the verb "email"/"message".
+    stripped = _POSSESSIVE_NOUN_RE.sub(" ", t)
+    stripped = _NOUN_FORM_RE.sub(" ", stripped)
     found = 0
     for pat in _VERB_PATTERNS:
-        if pat.search(t):
+        if pat.search(stripped):
             found += 1
             if found >= 2:
                 return True

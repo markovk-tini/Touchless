@@ -155,12 +155,19 @@ class Classifier:
             # Reject ambiguous "names".
             if name.lower() not in {"my", "me", "your", "the", "a", "an", "his",
                                     "her", "their", "our"}:
-                return Step(
-                    tool="iris_lookup_contact",
-                    args={"name": name},
-                    layer="touchless",
-                    description=f"look up {name}'s email in memory",
-                )
+                # Only a PURE lookup. If the request also wants to send/
+                # email/compose something, this is a chain — fall through
+                # to Tier 2 so the full intent is planned together.
+                tail = t[m.end():].lower()
+                _SEND_WORDS = (" send ", " email ", " message ", " write ",
+                               " draft ", " compose ", " reply ", " text ")
+                if not any(w in tail for w in _SEND_WORDS):
+                    return Step(
+                        tool="iris_lookup_contact",
+                        args={"name": name},
+                        layer="touchless",
+                        description=f"look up {name}'s email in memory",
+                    )
 
         # ---- sticky user preferences (saved to memory, 0 tokens) ----------
         # "always send from gmail", "use outlook by default", "set my default

@@ -2556,6 +2556,37 @@ class ContactLookupIntentTests(unittest.TestCase):
         step = c.classify("email dani@x.io saying hi")
         self.assertEqual(step.tool, "outlook_compose")
 
+    def test_heuristic_does_not_falsefire_on_possessive_email(self) -> None:
+        """'Dani's email' is a noun, not the action verb 'email'. Without
+        this fix, looks_multi_action returned True (find + email = 2 verbs)
+        and the lookup intent never fired."""
+        from hgr.live_api.planner.triggers import looks_multi_action
+        self.assertFalse(looks_multi_action("find Dani's email and give it to me"))
+        self.assertFalse(looks_multi_action("what's Dani's email address"))
+        self.assertFalse(looks_multi_action("look up Sarah's email and tell me"))
+
+    def test_lookup_intent_fires_even_when_multi_action(self) -> None:
+        """Even if the heuristic DID return True, iris_lookup_contact is a
+        high-confidence pseudo-tool that bypasses the gate."""
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+
+        class _Store:
+            def find_facts(self_, kind=None, key=None, limit=50):
+                if kind == "person" and key == "dani":
+                    return [type("F", (), {"kind": "person", "key": "dani",
+                                            "value": "dani@x.io"})()]
+                return []
+        class _FakeMem:
+            def __init__(self_): self_._store = _Store()
+            def set_fact(self_, *a, **k): pass
+            def record(self_, *a, **k): pass
+            def recall(self_, *a, **k):
+                return {"context": "", "episodes": [], "facts": []}
+        planner = IrisPlanner(_StubRegistry({}), memory=_FakeMem())
+        # Even with multi-action phrasing, the lookup pseudo-tool runs.
+        out = planner.try_handle("find Dani's email then tell me")
+        self.assertIn("dani@x.io", out["message"])
+
     def test_orchestrator_returns_memory_email(self) -> None:
         from hgr.live_api.planner.orchestrator import IrisPlanner
 
