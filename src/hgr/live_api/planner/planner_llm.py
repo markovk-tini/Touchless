@@ -46,7 +46,7 @@ class LLMPlanner:
         try:
             messages = self._build_messages(goal, memory_context=memory_context)
             data = self._call(messages)
-            return self._parse(goal, data)
+            return self._parse(goal, data, self._known_tool_names())
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
                 scheduler().record_rate_limit("cheap-llm")
@@ -70,8 +70,28 @@ class LLMPlanner:
             "multi-step tasks, decompose into the smallest set of steps; mark "
             "ordering with depends_on (list of earlier step ids). Pass "
             "earlier outputs forward via {step:N.field} string refs in args "
-            "(e.g. \"to\":\"{step:1.email}\"). End with final='synthesize' if "
-            "a natural-language answer over gathered data is needed.\n\n"
+            "(e.g. \"to\":\"{step:1.email}\"). List indexing works too: "
+            "{step:N.results[0].url}.\n\n"
+            "IMPORTANT: 'synthesize' is NOT a tool — it's the plan-level "
+            '"final" flag. Set "final":"synthesize" when the user wants a '
+            "natural-language answer over what was gathered; the framework "
+            "calls a cheap-LLM at the end automatically. Do NOT add a step "
+            'named \"synthesize\" or \"summarize\" — those don\'t exist as '
+            "tools.\n\n"
+            "WEB CHAIN: to 'read and summarize an article from a search', the "
+            "correct chain is: (1) web_search, (2) web_navigate the chosen "
+            "result's URL, (3) web_get_text, then set final='synthesize'. "
+            "Snippets from web_search alone are too short to summarize from.\n\n"
+            "Example for 'search for AI news and summarize the top result':\n"
+            '{"goal":"search for AI news and summarize the top result",'
+            '"steps":['
+            '{"id":1,"tool":"web_search","args":{"query":"latest AI news",'
+            '"count":5,"recent_days":7}},'
+            '{"id":2,"tool":"web_navigate","args":{"url_or_query":'
+            '"{step:1.results[0].url}"},"depends_on":[1]},'
+            '{"id":3,"tool":"web_get_text","args":{"max_chars":4000},'
+            '"depends_on":[2]}'
+            '],"final":"synthesize"}\n\n'
             "Available tools:\n" + catalog + "\n\n"
             "Output STRICT JSON, no commentary:\n"
             '{"goal": <string>, "steps": [{"id": <int starting at 1>, '
@@ -85,6 +105,18 @@ class LLMPlanner:
             messages.append({"role": "system", "content": memory_context})
         messages.append({"role": "user", "content": goal})
         return messages
+
+    def _known_tool_names(self) -> Optional[set]:
+        """Set of tool names the registry actually exposes. Used by _parse
+        to drop steps the LLM hallucinated. Returns None on failure so the
+        parser falls back to its old non-validating behaviour rather than
+        rejecting everything when introspection breaks."""
+        try:
+            names = {s.get("name") for s in self._registry.openai_tools()
+                     if isinstance(s, dict) and s.get("name")}
+            return names or None
+        except Exception:
+            return None
 
     def _tool_catalog(self) -> str:
         """Compact tool catalog for the planner — connector tools available
@@ -153,7 +185,8 @@ class LLMPlanner:
 
     # ---- parse + validate --------------------------------------------------
     @staticmethod
-    def _parse(goal: str, data: Dict[str, Any]) -> Optional[Plan]:
+    def _parse(goal: str, data: Dict[str, Any],
+               known_tools: Optional[set] = None) -> Optional[Plan]:
         raw_steps = data.get("steps") or []
         if not isinstance(raw_steps, list) or not raw_steps:
             return None
@@ -164,6 +197,12 @@ class LLMPlanner:
                 continue
             tool = str(s.get("tool") or "").strip()
             if not tool:
+                continue
+            # Defensive: drop steps whose tool isn't actually exposed by the
+            # registry (e.g. the LLM emitting 'synthesize' as a step name
+            # when it should have set final='synthesize'). When known_tools
+            # is None we couldn't introspect, so we keep the old behaviour.
+            if known_tools is not None and tool not in known_tools:
                 continue
             try:
                 step_id = int(s.get("id") or (len(steps) + 1))

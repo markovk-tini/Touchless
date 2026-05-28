@@ -1996,6 +1996,63 @@ class ExecutorArrayRefTests(unittest.TestCase):
         self.assertEqual(use_args["t"], "B")
 
 
+class LLMPlannerHallucinationGuardTests(unittest.TestCase):
+    """The LLM occasionally emits non-existent tools (e.g. 'synthesize' as a
+    step instead of as plan.final). When the registry tells us the known
+    tool names, _parse drops those steps defensively."""
+
+    def test_unknown_tool_dropped(self) -> None:
+        from hgr.live_api.planner.planner_llm import LLMPlanner
+        data = {
+            "goal": "x",
+            "steps": [
+                {"id": 1, "tool": "web_search", "args": {"query": "ai"}},
+                {"id": 2, "tool": "synthesize",
+                 "args": {"text": "{step:1.results[0].snippet}"},
+                 "depends_on": [1]},  # <- hallucinated tool name
+                {"id": 3, "tool": "web_navigate",
+                 "args": {"url_or_query": "{step:1.results[0].url}"},
+                 "depends_on": [1]},
+            ],
+            "final": "synthesize",
+        }
+        known = {"web_search", "web_navigate", "web_get_text"}
+        plan = LLMPlanner._parse("x", data, known_tools=known)
+        self.assertIsNotNone(plan)
+        self.assertEqual([s.tool for s in plan.steps],
+                         ["web_search", "web_navigate"])
+
+    def test_none_known_tools_keeps_old_behaviour(self) -> None:
+        from hgr.live_api.planner.planner_llm import LLMPlanner
+        data = {"goal": "x", "steps": [{"id": 1, "tool": "anything"}]}
+        # known_tools=None means "couldn't introspect" — keep the step.
+        plan = LLMPlanner._parse("x", data, known_tools=None)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.steps[0].tool, "anything")
+
+
+class LLMPlannerPromptTests(unittest.TestCase):
+    """System prompt must give the model the right web chain pattern and
+    explicitly forbid emitting 'synthesize' as a step."""
+
+    def test_prompt_mentions_synthesize_is_not_a_tool(self) -> None:
+        from hgr.live_api.planner.planner_llm import LLMPlanner
+        from hgr.live_api.planner import IrisPlanner
+        # Build a planner with a stub registry just to render the prompt.
+        reg = _StubRegistry({})
+        lp = LLMPlanner(reg)
+        msgs = lp._build_messages("any goal")
+        system = next(m["content"] for m in msgs if m["role"] == "system")
+        self.assertIn("not a tool", system.lower())
+        self.assertIn("synthesize", system.lower())
+        # Worked example shows the correct web chain.
+        self.assertIn("web_search", system)
+        self.assertIn("web_navigate", system)
+        self.assertIn("web_get_text", system)
+        # And the {step:N.results[0].url} ref pattern is documented.
+        self.assertIn("results[0]", system)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
