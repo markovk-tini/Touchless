@@ -31,11 +31,15 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-# SEND-only mail (no gmail.readonly), full calendar, create docs, per-file
-# Drive. gmail.send / calendar / documents / drive.file are all "sensitive"
-# scopes — free public verification, NO paid CASA security assessment.
-# gmail.readonly is deliberately omitted because it is "restricted" (would
-# require the annual paid CASA assessment for public release).
+# SEND-only mail (gmail.send), full calendar, create docs, per-file Drive.
+# gmail.send / calendar / documents / drive.file are all "sensitive" scopes
+# — free public verification, NO paid CASA assessment.
+#
+# gmail.readonly is "restricted" and would require CASA for PUBLIC release,
+# but it's fine for PERSONAL / DEV use (the OAuth consent screen just shows
+# an "unverified app" warning you can click through). It unlocks 'read my
+# emails' / morning-briefing flows where Microsoft Graph for personal MSA
+# accounts is incomplete. Disable by setting TOUCHLESS_GMAIL_READONLY=0.
 SCOPES: List[str] = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar",
@@ -44,6 +48,8 @@ SCOPES: List[str] = [
     "https://www.googleapis.com/auth/presentations",
     "https://www.googleapis.com/auth/drive.file",
 ]
+if os.environ.get("TOUCHLESS_GMAIL_READONLY", "1") != "0":
+    SCOPES.append("https://www.googleapis.com/auth/gmail.readonly")
 
 
 def _config_dir() -> Path:

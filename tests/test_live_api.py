@@ -7,6 +7,7 @@ not exercised here.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
@@ -3001,6 +3002,167 @@ class MailListIncludeBodyTests(unittest.TestCase):
             select = p.split("$select=", 1)[1].split("&", 1)[0]
             fields = select.split(",")
             self.assertNotIn("body", fields, f"unexpected body in {p}")
+
+
+class GmailReadTests(unittest.TestCase):
+    """gmail_list / gmail_read against a mocked Gmail service."""
+
+    def _conn(self, list_response=None, get_responses=None):
+        from hgr.live_api.connectors.gmail_connector import GmailConnector
+        list_response = list_response or {"messages": []}
+        get_responses = get_responses or {}
+
+        class _Get:
+            def __init__(self_, doc): self_._doc = doc
+            def execute(self_): return self_._doc
+
+        class _Messages:
+            calls: List[Dict[str, Any]] = []
+            def list(self_, **kw):
+                self_.calls.append({"op": "list", **kw})
+                return _Get(list_response)
+            def get(self_, **kw):
+                self_.calls.append({"op": "get", **kw})
+                return _Get(get_responses.get(kw["id"]) or {})
+            def send(self_, **kw):
+                self_.calls.append({"op": "send", **kw})
+                return _Get({"id": "sent-1"})
+
+        class _Users:
+            def __init__(self_): self_._m = _Messages()
+            def messages(self_): return self_._m
+
+        class _Svc:
+            def __init__(self_): self_._u = _Users()
+            def users(self_): return self_._u
+
+        svc = _Svc()
+        class _FakeClient:
+            def ready(self_): return True
+            def service(self_, *a, **k): return svc
+        conn = GmailConnector(_FakeClient())  # type: ignore[arg-type]
+        return conn, svc
+
+    def test_split_from_header(self) -> None:
+        from hgr.live_api.connectors.gmail_connector import _split_from
+        self.assertEqual(_split_from('Dani Markov <dani@x.io>'),
+                         ("Dani Markov", "dani@x.io"))
+        self.assertEqual(_split_from('"Dani M." <dani@x>'),
+                         ("Dani M.", "dani@x"))
+        self.assertEqual(_split_from("dani@x.io"), ("", "dani@x.io"))
+
+    def test_walk_for_body_prefers_plain(self) -> None:
+        from hgr.live_api.connectors.gmail_connector import _walk_for_body
+        payload = {
+            "mimeType": "multipart/alternative",
+            "parts": [
+                {"mimeType": "text/plain",
+                 "body": {"data": base64.urlsafe_b64encode(
+                     b"plain version").decode()}},
+                {"mimeType": "text/html",
+                 "body": {"data": base64.urlsafe_b64encode(
+                     b"<p>html version</p>").decode()}},
+            ],
+        }
+        body = _walk_for_body(payload)
+        self.assertEqual(body, "plain version")
+
+    def test_walk_for_body_falls_back_to_stripped_html(self) -> None:
+        from hgr.live_api.connectors.gmail_connector import _walk_for_body
+        payload = {
+            "mimeType": "text/html",
+            "body": {"data": base64.urlsafe_b64encode(
+                b"<html><p>hello <b>world</b></p></html>").decode()},
+        }
+        body = _walk_for_body(payload)
+        self.assertIn("hello", body)
+        self.assertIn("world", body)
+        self.assertNotIn("<", body)
+
+    def test_gmail_list_unread_only_default_query(self) -> None:
+        conn, svc = self._conn(
+            list_response={"messages": [{"id": "m1"}, {"id": "m2"}]},
+            get_responses={
+                "m1": {"id": "m1", "snippet": "msg1 preview",
+                       "payload": {"headers": [
+                           {"name": "From", "value": "Dani <dani@x.io>"},
+                           {"name": "Subject", "value": "Hi"},
+                           {"name": "Date", "value": "Wed, 28 May 2026"},
+                       ]}},
+                "m2": {"id": "m2", "snippet": "msg2 preview",
+                       "payload": {"headers": [
+                           {"name": "From", "value": "Spam <s@y>"},
+                           {"name": "Subject", "value": "Sale!"},
+                           {"name": "Date", "value": "Wed, 28 May 2026"},
+                       ]}},
+            },
+        )
+        out = conn.execute("gmail_list",
+                           {"unread_only": True, "max": 5})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(out["messages"][0]["from_name"], "Dani")
+        self.assertEqual(out["messages"][0]["from"], "dani@x.io")
+        self.assertEqual(out["messages"][0]["subject"], "Hi")
+        # List call used the unread-only query.
+        list_call = next(c for c in svc._u._m.calls if c["op"] == "list")
+        self.assertEqual(list_call["q"], "in:inbox is:unread")
+        self.assertEqual(list_call["maxResults"], 5)
+        # No bodies in default mode.
+        self.assertNotIn("body_text", out["messages"][0])
+
+    def test_gmail_list_include_body_uses_full_format(self) -> None:
+        plain_b64 = base64.urlsafe_b64encode(
+            b"real email body content").decode()
+        conn, svc = self._conn(
+            list_response={"messages": [{"id": "m1"}]},
+            get_responses={
+                "m1": {"id": "m1", "snippet": "snip",
+                       "payload": {"mimeType": "multipart/alternative",
+                                   "headers": [
+                                       {"name": "From", "value": "Dani <d@x>"},
+                                       {"name": "Subject", "value": "hi"},
+                                   ],
+                                   "parts": [
+                                       {"mimeType": "text/plain",
+                                        "body": {"data": plain_b64}},
+                                   ]}},
+            },
+        )
+        out = conn.execute("gmail_list",
+                           {"unread_only": True, "include_body": True})
+        self.assertEqual(out["messages"][0]["body_text"],
+                         "real email body content")
+        # get() was called with format=full.
+        get_call = next(c for c in svc._u._m.calls if c["op"] == "get")
+        self.assertEqual(get_call["format"], "full")
+
+    def test_gmail_list_custom_query_wins(self) -> None:
+        conn, svc = self._conn(
+            list_response={"messages": []},
+        )
+        conn.execute("gmail_list",
+                     {"query": "from:dani@x.io newer_than:7d", "max": 3})
+        list_call = next(c for c in svc._u._m.calls if c["op"] == "list")
+        self.assertEqual(list_call["q"], "from:dani@x.io newer_than:7d")
+
+    def test_gmail_read_returns_full_body(self) -> None:
+        body_b64 = base64.urlsafe_b64encode(b"full body text").decode()
+        conn, _ = self._conn(get_responses={
+            "abc": {"id": "abc", "snippet": "snip",
+                    "payload": {"headers": [
+                        {"name": "From", "value": "Dani <d@x>"},
+                        {"name": "To", "value": "me@x"},
+                        {"name": "Subject", "value": "hi"},
+                        {"name": "Date", "value": "Wed, 28 May 2026"},
+                    ], "mimeType": "text/plain",
+                        "body": {"data": body_b64}}}
+        })
+        out = conn.execute("gmail_read", {"id": "abc"})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["subject"], "hi")
+        self.assertEqual(out["body_text"], "full body text")
+        self.assertEqual(out["from_"], "d@x")
 
 
 if __name__ == "__main__":  # pragma: no cover
