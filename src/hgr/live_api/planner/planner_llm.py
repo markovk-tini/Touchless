@@ -144,6 +144,7 @@ class LLMPlanner:
         if not isinstance(raw_steps, list) or not raw_steps:
             return None
         steps: List[Step] = []
+        seen_ids: set = set()
         for s in raw_steps:
             if not isinstance(s, dict):
                 continue
@@ -151,8 +152,15 @@ class LLMPlanner:
             if not tool:
                 continue
             try:
+                step_id = int(s.get("id") or (len(steps) + 1))
+                # The LLM occasionally repeats an id; if it does we'd silently
+                # overwrite the earlier step's result in the executor. Renumber
+                # duplicates to the next free id so both steps actually run.
+                while step_id in seen_ids:
+                    step_id += 1
+                seen_ids.add(step_id)
                 steps.append(Step(
-                    id=int(s.get("id") or (len(steps) + 1)),
+                    id=step_id,
                     tool=tool,
                     args=s.get("args") if isinstance(s.get("args"), dict) else {},
                     depends_on=[int(x) for x in (s.get("depends_on") or [])],

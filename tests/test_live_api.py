@@ -899,6 +899,19 @@ class IrisPlannerTriggersTests(unittest.TestCase):
         self.assertFalse(looks_multi_action("open YouTube"))
         self.assertFalse(looks_multi_action("hi"))
 
+    def test_noun_form_verbs_do_not_falsely_trigger(self) -> None:
+        """Two verb-words in ONE action ('send dani an email', 'post a
+        message') must not trip the heuristic. The two-verb branch now
+        requires a connector (and/comma/chain) to count."""
+        from hgr.live_api.planner.triggers import looks_multi_action
+        self.assertFalse(looks_multi_action("send dani an email saying hi"))
+        self.assertFalse(looks_multi_action("post a message to the channel"))
+        self.assertFalse(looks_multi_action("email dani saying I will send the post tomorrow"))
+
+    def test_comma_chains_trigger(self) -> None:
+        from hgr.live_api.planner.triggers import looks_multi_action
+        self.assertTrue(looks_multi_action("open chrome, search for AI news, summarize the top result"))
+
     def test_plan_needs_confirm(self) -> None:
         from hgr.live_api.planner.triggers import plan_needs_confirm
         self.assertTrue(plan_needs_confirm(["cal_freebusy", "outlook_compose"]))
@@ -1146,6 +1159,192 @@ class WebSearchToolWiringTests(unittest.TestCase):
                                           {"query": "test", "count": 3})
         self.assertTrue(ok)
         self.assertEqual(normalised["query"], "test")
+
+
+class IrisPlannerEdgeCaseTests(unittest.TestCase):
+    """Edge cases that exercise the planner under hostile / weird input."""
+
+    def test_classifier_skipped_when_input_is_multi_action(self) -> None:
+        """The classic data-loss bug: 'set volume to 30 AND email dani' must
+        NOT fire volume_set and drop the email half. Phase 1 must yield to
+        Phase 2 (or realtime) when looks_multi_action is True."""
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({"volume_set": {"status": "ok"}})
+        # No LLM planner configured → Phase 2 won't fire either, so we expect
+        # None (fall through to realtime), NOT a silent volume_set call.
+        planner = IrisPlanner(reg)
+        out = planner.try_handle("set volume to 30 and email dani saying hi")
+        self.assertIsNone(out)
+        self.assertEqual(reg.calls, [])
+
+    def test_classifier_still_fires_for_pure_single_intent(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({"volume_set": {"status": "ok"}})
+        planner = IrisPlanner(reg)
+        out = planner.try_handle("set volume to 30")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["steps"][0].tool, "volume_set")
+
+    def test_plan_cache_is_thread_safe(self) -> None:
+        """Concurrent put/get across threads must not crash or lose data."""
+        import threading as _t
+        from hgr.live_api.planner.plan_cache import PlanCache
+        from hgr.live_api.planner.plan import Plan, Step
+        cache = PlanCache(max_entries=16)
+        errors: List[BaseException] = []
+
+        def worker(seed: int) -> None:
+            try:
+                for i in range(100):
+                    key = f"goal {seed} {i % 4}"
+                    cache.put(key, Plan(goal=key,
+                                        steps=[Step(id=1, tool="a")]))
+                    cache.get(key)
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [_t.Thread(target=worker, args=(s,)) for s in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+        self.assertEqual(errors, [])
+
+    def test_web_search_clamps_recent_days(self) -> None:
+        from hgr.live_api import web_search as ws
+        os.environ["GOOGLE_CSE_API_KEY"] = "k"
+        os.environ["GOOGLE_CSE_ID"] = "cx"
+        seen: Dict[str, Any] = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return b'{"items": []}'
+
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            return _Resp()
+
+        try:
+            with patch.object(ws.urllib.request, "urlopen", side_effect=fake_urlopen):
+                ws.web_search("x", recent_days=-5)
+            # Negative clamped to 0 → no dateRestrict in URL.
+            self.assertNotIn("dateRestrict", seen["url"])
+            with patch.object(ws.urllib.request, "urlopen", side_effect=fake_urlopen):
+                ws.web_search("x", recent_days=99999)
+            # Over-large clamped to 365.
+            self.assertIn("dateRestrict=d365", seen["url"])
+        finally:
+            os.environ.pop("GOOGLE_CSE_API_KEY", None)
+            os.environ.pop("GOOGLE_CSE_ID", None)
+
+    def test_web_search_caps_query_length(self) -> None:
+        from hgr.live_api import web_search as ws
+        seen: Dict[str, Any] = {}
+
+        class _Resp:
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return b''
+
+        def fake_urlopen(req, timeout=None):
+            seen["req"] = req
+            return _Resp()
+
+        with patch.object(ws.urllib.request, "urlopen", side_effect=fake_urlopen):
+            out = ws.web_search("x" * 5000)
+        # No keys → DDG path; query in the POST body.
+        body = seen["req"].data.decode("utf-8")
+        # 5000-char query was capped to 500 (so encoded length is bounded).
+        self.assertLess(len(body), 1500)
+        # Tool still returned a structured response (empty results).
+        self.assertEqual(out["status"], "ok")
+
+    def test_llm_planner_renumbers_duplicate_step_ids(self) -> None:
+        """Two Step(id=1, ...) would silently overwrite each other in the
+        executor's results dict. The parser must renumber duplicates."""
+        from hgr.live_api.planner.planner_llm import LLMPlanner
+        data = {
+            "goal": "x",
+            "steps": [
+                {"id": 1, "tool": "a"},
+                {"id": 1, "tool": "b"},
+                {"id": 1, "tool": "c"},
+            ],
+            "final": "return",
+        }
+        plan = LLMPlanner._parse("x", data)
+        self.assertIsNotNone(plan)
+        ids = sorted(s.id for s in plan.steps)
+        self.assertEqual(len(set(ids)), len(ids), f"duplicate ids: {ids}")
+        self.assertEqual([s.tool for s in plan.steps], ["a", "b", "c"])
+
+    def test_executor_marks_dependent_failed_when_upstream_errors(self) -> None:
+        """Already covered, but a regression-pin: an arg ref like
+        {step:1.id} into an errored step doesn't silently substitute ''.
+        The dependent step must be marked error before it ever runs."""
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="broken", args={}),
+            Step(id=2, tool="follow",
+                 args={"x": "{step:1.id}"}, depends_on=[1]),
+        ])
+        reg = _StubRegistry({
+            "broken": {"status": "error", "error": "boom"},
+            "follow": {"status": "ok"},  # should NEVER be called
+        })
+        results = Executor(reg).run(plan)
+        # "follow" must not have actually run.
+        self.assertNotIn("follow", [t for t, _ in reg.calls])
+        # Both results are errors.
+        statuses = {r.step_id: r.status for r in results}
+        self.assertEqual(statuses, {1: "error", 2: "error"})
+
+    def test_synthesizer_handles_nonjsonable_output(self) -> None:
+        """If a tool returns objects json.dumps can't natively serialize
+        (datetime, set, custom class), the synthesizer must not crash."""
+        from datetime import datetime
+        from hgr.live_api.planner.synthesizer import Synthesizer
+        from hgr.live_api.planner.plan import Plan, StepResult
+        os.environ["OPENAI_API_KEY"] = "fake-for-test"
+        try:
+            synth = Synthesizer()
+            synth._call = lambda _m: "summary text"  # type: ignore[assignment]
+            plan = Plan(goal="g", steps=[], final="synthesize")
+            results = [StepResult(step_id=1, tool="t", status="ok",
+                                  output={"when": datetime(2026, 5, 27),
+                                          "set_field": {1, 2, 3},
+                                          "list_field": list(range(50))})]
+            out = synth.summarize(plan, results)
+            self.assertEqual(out, "summary text")
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+
+    def test_orchestrator_no_confirm_callback_still_runs(self) -> None:
+        """When the UI hasn't wired a confirm callback, risky plans should
+        still run (dev/headless mode). The Phase 1 path already does this
+        for needs_confirm — verify the Phase 2 path matches."""
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        from hgr.live_api.planner.plan import Plan, Step
+        import hgr.live_api.planner.orchestrator as orch
+        reg = _StubRegistry({"outlook_compose": {"status": "ok"}})
+        planner = IrisPlanner(reg, confirm=None)  # explicit no-callback
+        planner._llm_planner.plan = lambda _g: Plan(  # type: ignore[assignment]
+            goal="g",
+            steps=[Step(id=1, tool="outlook_compose",
+                        args={"recipient": "x@y", "body": "hi"})])
+        os.environ["TOUCHLESS_IRIS_PLAN_LLM"] = "1"
+        old_cfg = orch.llm_planner_configured
+        orch.llm_planner_configured = lambda: True
+        try:
+            out = planner.try_handle("send dani an email")
+        finally:
+            os.environ.pop("TOUCHLESS_IRIS_PLAN_LLM", None)
+            orch.llm_planner_configured = old_cfg
+        self.assertIsNotNone(out)
+        self.assertEqual(out["results"][0].status, "ok")
+        self.assertEqual(reg.calls, [("outlook_compose",
+                                      {"recipient": "x@y", "body": "hi"})])
 
 
 if __name__ == "__main__":  # pragma: no cover

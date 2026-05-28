@@ -55,7 +55,12 @@ class IrisPlanner:
             return None
 
         # --- Phase 1: deterministic classifier -> single connector step ---
-        single = self._classifier.classify(text)
+        # IMPORTANT: when the input looks multi-action ("set volume to 30 AND
+        # email dani"), the classifier would silently swallow only the first
+        # intent. Skip Phase 1 in that case so the request can be decomposed
+        # properly by Phase 2 (or fall through to realtime).
+        multi = looks_multi_action(text)
+        single = None if multi else self._classifier.classify(text)
         if single is not None and self._registry.handles_connector(single.tool):
             if single.needs_confirm and self._confirm is not None and \
                     not self._confirm(f"Run {single.tool}?", single.description):
@@ -87,8 +92,7 @@ class IrisPlanner:
         flag_on = os.environ.get("TOUCHLESS_IRIS_PLAN_LLM", "0") == "1"
         sched = scheduler()
         scheduler_prefers_cheap = sched.prefer_cheap_planner()
-        heuristic_open = looks_multi_action(text)
-        if ((flag_on or heuristic_open or scheduler_prefers_cheap)
+        if ((flag_on or multi or scheduler_prefers_cheap)
                 and llm_planner_configured()
                 and self._llm_planner is not None
                 and self._executor is not None):

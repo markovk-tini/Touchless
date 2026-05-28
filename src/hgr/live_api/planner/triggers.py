@@ -44,6 +44,9 @@ _ACTION_VERBS = (
 _VERB_PATTERNS = [re.compile(r"\b" + v + r"\b", re.IGNORECASE) for v in _ACTION_VERBS]
 
 
+_CONNECTOR_RE = re.compile(r"[,;]| \band\b ", re.IGNORECASE)
+
+
 def looks_multi_action(text: str) -> bool:
     """True if `text` looks like a multi-step request worth planning."""
     t = (text or "").strip()
@@ -53,7 +56,11 @@ def looks_multi_action(text: str) -> bool:
         return True
     if _AND_VERB_RE.search(t):
         return True
-    # Two distinct action verbs in the same sentence.
+    # Two distinct action verbs ONLY counts when something actually joins
+    # them — otherwise "send dani an email" (one action, two verb words)
+    # would be a false positive.
+    if not _CONNECTOR_RE.search(t):
+        return False
     found = 0
     for pat in _VERB_PATTERNS:
         if pat.search(t):

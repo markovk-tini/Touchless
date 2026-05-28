@@ -34,6 +34,8 @@ _DDG_HTML_URL = "https://html.duckduckgo.com/html/"
 _TIMEOUT = 8.0
 _DEFAULT_COUNT = 5
 _MAX_COUNT = 10
+_MAX_QUERY_CHARS = 500   # CSE accepts ~2K; cap so we never send arbitrary text.
+_MAX_RECENT_DAYS = 365
 
 
 def web_search(query: str, count: int = _DEFAULT_COUNT,
@@ -44,7 +46,14 @@ def web_search(query: str, count: int = _DEFAULT_COUNT,
     q = (query or "").strip()
     if not q:
         return {"status": "error", "error": "empty query", "code": "invalid_arguments"}
+    # Sanitize: cap the query so a runaway prompt doesn't end up in a URL,
+    # and clamp recent_days so we never produce malformed 'dateRestrict=d-7'.
+    q = q[:_MAX_QUERY_CHARS]
     count = max(1, min(int(count or _DEFAULT_COUNT), _MAX_COUNT))
+    try:
+        recent_days = max(0, min(int(recent_days or 0), _MAX_RECENT_DAYS))
+    except (TypeError, ValueError):
+        recent_days = 0
     if site:
         q = f"{q} site:{site}"
 

@@ -8,6 +8,7 @@ Author: Konstantin Markov
 from __future__ import annotations
 
 import re
+import threading
 import time
 from typing import Callable, Dict, Optional, Tuple
 
@@ -25,6 +26,7 @@ class PlanCache:
         self._ttl = ttl
         self._max = max_entries
         self._clock = clock
+        self._lock = threading.Lock()
         self._d: Dict[str, Tuple[float, Plan]] = {}
 
     @classmethod
@@ -33,20 +35,25 @@ class PlanCache:
 
     def get(self, text: str) -> Optional[Plan]:
         key = self._norm(text)
-        entry = self._d.get(key)
-        if entry is None:
-            return None
-        ts, plan = entry
-        if self._clock() - ts > self._ttl:
-            self._d.pop(key, None)
-            return None
-        return plan
+        with self._lock:
+            entry = self._d.get(key)
+            if entry is None:
+                return None
+            ts, plan = entry
+            if self._clock() - ts > self._ttl:
+                self._d.pop(key, None)
+                return None
+            return plan
 
     def put(self, text: str, plan: Optional[Plan]) -> None:
         if plan is None or not plan.steps:
             return
-        # Evict the oldest if we've outgrown the cap.
-        if len(self._d) >= self._max:
-            oldest = min(self._d.items(), key=lambda kv: kv[1][0])[0]
-            self._d.pop(oldest, None)
-        self._d[self._norm(text)] = (self._clock(), plan)
+        key = self._norm(text)
+        with self._lock:
+            # Evict the oldest if we've outgrown the cap (oldest by insertion
+            # timestamp, not last-access — this is a near-LRU; good enough at
+            # 32 entries).
+            if len(self._d) >= self._max and key not in self._d:
+                oldest = min(self._d.items(), key=lambda kv: kv[1][0])[0]
+                self._d.pop(oldest, None)
+            self._d[key] = (self._clock(), plan)
