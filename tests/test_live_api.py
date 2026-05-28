@@ -1083,10 +1083,11 @@ class WebSearchTests(unittest.TestCase):
     def test_ddg_fallback_when_no_keys(self) -> None:
         from hgr.live_api import web_search as ws
         html = (
-            '<a class="result__a" href="https://news.example.com/x">First Result</a>'
+            '<a class="result__a" href="https://news.example.com/2026/05/'
+            'first-article-slug-goes-here-yes">First Result</a>'
             '<a class="result__snippet">snippet about first</a>'
             '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2F'
-            'two.example.com">Second</a>'
+            'two.example.com%2F2026%2F05%2Fsecond-article-slug-here">Second</a>'
             '<a class="result__snippet">snippet about second</a>'
         ).encode("utf-8")
 
@@ -1105,9 +1106,13 @@ class WebSearchTests(unittest.TestCase):
         self.assertEqual(out["provider"], "duckduckgo")
         self.assertEqual(len(out["results"]), 2)
         self.assertEqual(out["results"][0]["title"], "First Result")
-        self.assertEqual(out["results"][0]["url"], "https://news.example.com/x")
+        self.assertEqual(
+            out["results"][0]["url"],
+            "https://news.example.com/2026/05/first-article-slug-goes-here-yes")
         # Redirect-wrapped URLs get unwrapped.
-        self.assertEqual(out["results"][1]["url"], "https://two.example.com")
+        self.assertEqual(
+            out["results"][1]["url"],
+            "https://two.example.com/2026/05/second-article-slug-here")
 
     def test_cse_quota_error_falls_through_to_ddg(self) -> None:
         from hgr.live_api import web_search as ws
@@ -2718,6 +2723,49 @@ class ContactRememberIntentTests(unittest.TestCase):
         self.assertIn("markovi@msn.com", out["message"])
         # Reply uses the resolved form (without trailing s).
         self.assertIn("Vesko", out["message"])
+
+
+class WebSearchArticleRankingTests(unittest.TestCase):
+    """Article-shaped URLs should land above category landing pages so
+    {step:N.results[0].url} picks a real article."""
+
+    def test_article_score_signals(self) -> None:
+        from hgr.live_api.web_search import _article_score
+        # Strong article signal: date in path.
+        self.assertGreater(
+            _article_score("https://example.com/2026/05/openai-launches-thing"),
+            _article_score("https://example.com/technology/ai/"))
+        # Section/category demoted.
+        self.assertLess(
+            _article_score("https://reuters.com/topic/artificial-intelligence/"),
+            _article_score("https://reuters.com/world/europe/uk-passes-bill-x/"))
+        # Long slug at the end (article-shaped).
+        self.assertGreater(
+            _article_score(
+                "https://nytimes.com/article/a-very-long-article-slug-here-yes"),
+            _article_score("https://nytimes.com/section/tech/"))
+
+    def test_ranking_promotes_article_over_section(self) -> None:
+        from hgr.live_api.web_search import _rank_articles_first
+        results = [
+            {"title": "AI section", "url": "https://reuters.com/technology/artificial-intelligence/", "snippet": ""},
+            {"title": "Specific story", "url": "https://reuters.com/2026/05/openai-launches-new-model/", "snippet": ""},
+            {"title": "Another section", "url": "https://nytimes.com/section/tech/", "snippet": ""},
+        ]
+        ranked = _rank_articles_first(results)
+        # The article URL is now first.
+        self.assertEqual(ranked[0]["url"],
+                         "https://reuters.com/2026/05/openai-launches-new-model/")
+
+    def test_ranking_is_stable_when_scores_tie(self) -> None:
+        """No score advantage between two articles -> original order kept."""
+        from hgr.live_api.web_search import _rank_articles_first
+        results = [
+            {"title": "A", "url": "https://x.com/2026/05/aaa-bbb-ccc-ddd-eee-fff", "snippet": ""},
+            {"title": "B", "url": "https://y.com/2026/04/ggg-hhh-iii-jjj-kkk-lll", "snippet": ""},
+        ]
+        ranked = _rank_articles_first(results)
+        self.assertEqual([r["title"] for r in ranked], ["A", "B"])
 
 
 if __name__ == "__main__":  # pragma: no cover

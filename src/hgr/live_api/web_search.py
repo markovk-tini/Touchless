@@ -37,6 +37,63 @@ _MAX_COUNT = 10
 _MAX_QUERY_CHARS = 500   # CSE accepts ~2K; cap so we never send arbitrary text.
 _MAX_RECENT_DAYS = 365
 
+# Path tokens that strongly suggest a category/section landing page rather
+# than a specific article. Used to demote those results so the planner's
+# default {step:N.results[0].url} picks a real article.
+_SECTION_TOKENS = frozenset({
+    "category", "categories", "section", "sections", "topic", "topics",
+    "tag", "tags", "subject", "subjects", "channel", "channels",
+    "hub", "feed", "feeds", "archive", "archives", "index",
+    "browse", "all", "latest",
+})
+
+
+def _article_score(url: str) -> int:
+    """Heuristic: how 'article-like' is this URL? Higher = more likely to be
+    a specific story rather than a category landing page.
+
+    Cues:
+      +3  A YYYY/MM/DD date segment in the path (very strong article signal).
+      +2  A long slug at the end (>30 chars, dashes/underscores — typical
+          article URL shape: '/2026/05/anthropic-launches-next-gen-model').
+      -3  A path segment is a known section/category token ('category',
+          'topic', 'tag', etc.).
+      -2  Path has 2 or fewer segments AND the last is short with no
+          dashes (e.g. '/technology/' or '/ai' — typical category roots).
+    """
+    try:
+        path = urllib.parse.urlparse(url).path or ""
+    except Exception:
+        return 0
+    parts = [p for p in path.split("/") if p]
+    score = 0
+    # Date in path = strong article signal.
+    if any(
+        len(p) == 4 and p.isdigit() and 1900 <= int(p) <= 2100
+        for p in parts
+    ):
+        # And the next segment is a month-shaped number.
+        for i, p in enumerate(parts):
+            if (len(p) == 4 and p.isdigit() and i + 1 < len(parts)
+                    and parts[i + 1].isdigit()
+                    and 1 <= int(parts[i + 1]) <= 12):
+                score += 3
+                break
+    # Long slug at the end (the article title encoded as a URL slug).
+    if parts:
+        last = parts[-1].split("?")[0].split("#")[0]
+        if len(last) > 30 and ("-" in last or "_" in last):
+            score += 2
+    # Section/category tokens demote.
+    if any(p.lower() in _SECTION_TOKENS for p in parts):
+        score -= 3
+    # Short, dash-less last segment with a shallow path = likely a hub.
+    if 0 < len(parts) <= 2:
+        last = parts[-1]
+        if len(last) < 25 and "-" not in last and "_" not in last:
+            score -= 2
+    return score
+
 
 def web_search(query: str, count: int = _DEFAULT_COUNT,
                site: str = "", recent_days: int = 0) -> Dict[str, Any]:
@@ -101,7 +158,8 @@ def _search_google_cse(query: str, api_key: str, cse_id: str,
             "url": str(item.get("link") or ""),
             "snippet": str(item.get("snippet") or "")[:400],
         })
-    return {"status": "ok", "provider": "google_cse", "results": results}
+    return {"status": "ok", "provider": "google_cse",
+            "results": _rank_articles_first(results)}
 
 
 # ---- DuckDuckGo HTML fallback --------------------------------------------
@@ -166,4 +224,17 @@ def _search_duckduckgo(query: str, count: int) -> Dict[str, Any]:
         })
         if len(results) >= count:
             break
-    return {"status": "ok", "provider": "duckduckgo", "results": results}
+    return {"status": "ok", "provider": "duckduckgo",
+            "results": _rank_articles_first(results)}
+
+
+def _rank_articles_first(results: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Stable-sort results so article-shaped URLs land at the top, keeping
+    the search engine's original ordering as the tiebreaker. The planner's
+    default {step:N.results[0].url} pick then lands on a real article
+    instead of a category landing page."""
+    scored = [(idx, _article_score(r.get("url", "")), r)
+              for idx, r in enumerate(results)]
+    # Sort by score desc, then by original index asc (Python sorts are stable).
+    scored.sort(key=lambda t: (-t[1], t[0]))
+    return [r for _idx, _s, r in scored]
