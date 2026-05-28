@@ -2170,6 +2170,17 @@ class PlannerPromptPrefsTests(unittest.TestCase):
         # Per-request override wins for THIS request.
         self.assertIn("one-shot", system.lower())
 
+    def test_prompt_teaches_memory_resolved_contacts(self) -> None:
+        """When memory has 'person dani = dani@x', the planner should use
+        that email directly and skip contacts_search."""
+        from hgr.live_api.planner.planner_llm import LLMPlanner
+        reg = _StubRegistry({})
+        lp = LLMPlanner(reg)
+        msgs = lp._build_messages("any goal")
+        system = next(m["content"] for m in msgs if m["role"] == "system")
+        self.assertIn("memory-resolved", system.lower())
+        self.assertIn("skip contacts_search", system.lower())
+
 
 class MultiAccountContactsSearchTests(unittest.TestCase):
     """contacts_search fans out across every connected Microsoft account by
