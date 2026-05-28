@@ -433,50 +433,101 @@ class Microsoft365Connector(Connector):
                     return connector_result(
                         "error",
                         error=f"no connected Microsoft account matches {account_q!r}")
-            # Fan out: hit each account's /me/contacts, merge by email so the
-            # same person in multiple address books doesn't show up twice.
+            # Fan out: hit each account's /me/contacts (formal contacts),
+            # then ALSO /me/people (anyone you've recently emailed or are in
+            # an org with — much broader recall). Merge by email so the same
+            # person in multiple address books doesn't show up twice.
             seen_keys: set = set()
             out: List[Dict[str, Any]] = []
             errors: List[str] = []
             sq = urllib.parse.quote(f'"{q}"')
             fq = urllib.parse.quote(q)
+            pq = urllib.parse.quote(q)
+
+            def _add(name: Optional[str], emails: List[str],
+                     account: Optional[str], source: str) -> None:
+                emails = [e for e in emails if e]
+                primary = (emails[0].lower() if emails
+                           else f"{(name or '?')}@{account or '?'}").lower()
+                if primary in seen_keys:
+                    return
+                seen_keys.add(primary)
+                out.append({
+                    "name": name, "emails": emails,
+                    "source_account": account, "source": source,
+                })
+
             for acct in all_accounts:
                 token = self._client.token_for(acct)
                 if not token:
                     errors.append(f"{acct.get('username')}: token refresh failed")
                     continue
+                # Pass 1: /me/contacts (formal address book).
                 data, err = self._graph(
                     "GET",
                     f"/me/contacts?$search={sq}&$top={max_n}"
                     "&$select=displayName,emailAddresses",
                     token=token)
                 if err:
-                    # Some mailboxes 400 on $search; fall back to startswith filter.
                     data, err = self._graph(
                         "GET",
                         f"/me/contacts?$top={max_n}&$select=displayName,emailAddresses"
                         f"&$filter=startswith(displayName,'{fq}')",
                         token=token)
-                    if err:
-                        errors.append(f"{acct.get('username')}: {err}")
-                        continue
-                for c in (data.get("value") or []):
-                    emails = [e.get("address")
-                              for e in (c.get("emailAddresses") or [])
-                              if e.get("address")]
-                    # Dedup key: first email (lowercased) or name+account if no email.
-                    primary = (emails[0].lower() if emails
-                               else f"{c.get('displayName')}@{acct.get('username')}")
-                    if primary in seen_keys:
-                        continue
-                    seen_keys.add(primary)
-                    out.append({
-                        "name": c.get("displayName"),
-                        "emails": emails,
-                        "source_account": acct.get("username"),
-                    })
-            if not out and errors:
-                return connector_result("error", error="; ".join(errors[:3]))
+                if not err and data:
+                    for c in (data.get("value") or []):
+                        emails = [e.get("address")
+                                  for e in (c.get("emailAddresses") or [])
+                                  if e.get("address")]
+                        _add(c.get("displayName"), emails,
+                             acct.get("username"), "contacts")
+
+                # Pass 2: /me/people (anyone you've corresponded with). This
+                # rescues "added to Outlook desktop's local address book"
+                # cases that don't sync to /me/contacts, and finds people you
+                # email regularly without having added them formally.
+                p_data, p_err = self._graph(
+                    "GET", f"/me/people?$search=\"{pq}\"&$top={max_n}",
+                    token=token)
+                if p_err and "$search" in p_err:
+                    # Some mailboxes don't support $search on /me/people; the
+                    # default ranked list still works without it.
+                    p_data, p_err = self._graph(
+                        "GET", f"/me/people?$top={max_n}", token=token)
+                if not p_err and p_data:
+                    qlow = q.lower()
+                    for p in (p_data.get("value") or []):
+                        name = p.get("displayName") or ""
+                        # Filter by query substring since /me/people without
+                        # $search returns the full ranked list.
+                        if qlow and qlow not in name.lower():
+                            # Also try the username (some entries have only
+                            # an email-ish handle, no real displayName).
+                            handles = [
+                                e.get("address", "")
+                                for e in (p.get("scoredEmailAddresses") or [])
+                            ]
+                            if not any(qlow in h.lower() for h in handles):
+                                continue
+                        emails = [e.get("address")
+                                  for e in (p.get("scoredEmailAddresses") or [])
+                                  if e.get("address")]
+                        _add(name, emails, acct.get("username"), "people")
+
+                if err and p_err:
+                    errors.append(
+                        f"{acct.get('username')}: contacts={err}; people={p_err}")
+
+            if not out:
+                if errors:
+                    return connector_result("error", error="; ".join(errors[:3]))
+                # No errors but no results either — graceful "not found" so
+                # the executor can surface a clean message instead of a
+                # downstream 'to is required' from the next step.
+                return connector_result(
+                    "ok", count=0, contacts=[],
+                    searched_accounts=[a.get("username") for a in all_accounts],
+                    message=f"No one matching {q!r} in contacts or recent correspondents.")
             return connector_result("ok", count=len(out), contacts=out,
                                     searched_accounts=[a.get("username")
                                                        for a in all_accounts],

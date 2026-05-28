@@ -1964,7 +1964,10 @@ class ExecutorArrayRefTests(unittest.TestCase):
         nav_args = next(a for t, a in reg.calls if t == "web_navigate")
         self.assertEqual(nav_args["url_or_query"], "https://a.example/")
 
-    def test_out_of_range_index_returns_empty(self) -> None:
+    def test_out_of_range_index_fails_step_clearly(self) -> None:
+        """Previously: out-of-range index silently substituted ''. Now: the
+        step fails with a 'ref_unresolved' error that names the bad ref —
+        otherwise the downstream tool errors with a cryptic 'X is required'."""
         from hgr.live_api.planner import Executor, Plan, Step
         plan = Plan(goal="g", steps=[
             Step(id=1, tool="src", args={}),
@@ -1975,9 +1978,11 @@ class ExecutorArrayRefTests(unittest.TestCase):
             "src": {"status": "ok", "results": [{"url": "https://a/"}]},
             "use": {"status": "ok"},
         })
-        Executor(reg).run(plan)
-        use_args = next(a for t, a in reg.calls if t == "use")
-        self.assertEqual(use_args["x"], "")  # graceful empty, no crash
+        results = Executor(reg).run(plan)
+        self.assertEqual(results[1].status, "error")
+        self.assertIn("{step:1.results[5].url}", results[1].error)
+        # "use" was never actually invoked.
+        self.assertNotIn("use", [t for t, _ in reg.calls])
 
     def test_dotted_after_index(self) -> None:
         from hgr.live_api.planner import Executor, Plan, Step
@@ -2186,15 +2191,21 @@ class MultiAccountContactsSearchTests(unittest.TestCase):
         def fake_graph(self_, method, path, body=None, raw=None,
                        content_type=None, token=None):
             seen_paths.append((token, path))
-            # Pull the account name out of the token to look up canned data.
             acct_name = (token or "").replace("token-", "")
             contacts = account_contacts.get(acct_name, [])
             value = []
-            for c in contacts:
-                value.append({
-                    "displayName": c["name"],
-                    "emailAddresses": [{"address": e} for e in c["emails"]],
-                })
+            # contacts_search now hits both /me/contacts (formal) AND
+            # /me/people (correspondents). Mirror the real field shapes.
+            if "/me/contacts" in path:
+                for c in contacts:
+                    value.append({
+                        "displayName": c["name"],
+                        "emailAddresses": [{"address": e} for e in c["emails"]],
+                    })
+            elif "/me/people" in path:
+                # Empty for the multi-account tests — we're only exercising
+                # the contacts pathway here.
+                pass
             return {"value": value}, None
 
         conn = Microsoft365Connector(_FakeClient())  # type: ignore[arg-type]
@@ -2251,6 +2262,132 @@ class MultiAccountContactsSearchTests(unittest.TestCase):
         out = conn.execute("contacts_search", {"query": "dani"})
         self.assertEqual(out["status"], "error")
         self.assertIn("no Microsoft accounts connected", out["error"])
+
+
+class ExecutorRefFailureTests(unittest.TestCase):
+    """When a {step:N.field} ref points at nothing (empty list, missing key),
+    the executor must fail the step with a CLEAR error instead of silently
+    substituting '' and letting the downstream tool error cryptically."""
+
+    def test_empty_list_index_fails_step_with_clear_error(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="contacts_search", args={"query": "ghost"}),
+            Step(id=2, tool="gmail_send",
+                 args={"to": "{step:1.contacts[0].emails[0]}",
+                       "subject": "hi", "body": "hi"},
+                 depends_on=[1]),
+        ])
+        reg = _StubRegistry({
+            "contacts_search": {"status": "ok", "contacts": []},
+            "gmail_send": {"status": "ok"},
+        })
+        results = Executor(reg).run(plan)
+        # Step 1 ok, step 2 errors with the specific ref that failed.
+        self.assertEqual(results[0].status, "ok")
+        self.assertEqual(results[1].status, "error")
+        self.assertIn("{step:1.contacts[0].emails[0]}", results[1].error)
+        self.assertIn("no matching data", results[1].error)
+        # gmail_send was NEVER actually invoked.
+        self.assertNotIn("gmail_send", [t for t, _ in reg.calls])
+
+    def test_resolves_when_data_is_present(self) -> None:
+        """Sanity: when the ref DOES resolve, the step still runs normally."""
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="contacts_search", args={"query": "dani"}),
+            Step(id=2, tool="gmail_send",
+                 args={"to": "{step:1.contacts[0].emails[0]}",
+                       "subject": "hi", "body": "hi"},
+                 depends_on=[1]),
+        ])
+        reg = _StubRegistry({
+            "contacts_search": {"status": "ok",
+                                "contacts": [{"name": "Dani",
+                                              "emails": ["dani@x.io"]}]},
+            "gmail_send": {"status": "ok"},
+        })
+        results = Executor(reg).run(plan)
+        self.assertEqual([r.status for r in results], ["ok", "ok"])
+        send = next(a for t, a in reg.calls if t == "gmail_send")
+        self.assertEqual(send["to"], "dani@x.io")
+
+
+class ContactsSearchFallbackTests(unittest.TestCase):
+    """contacts_search now also queries /me/people (broader recall — anyone
+    you've recently emailed, not just formal contacts)."""
+
+    def _make_connector(self, contacts_by_account, people_by_account):
+        from hgr.live_api.connectors.ms365_connector import Microsoft365Connector
+
+        class _FakeClient:
+            def all_accounts(self_):
+                return [{"username": "u@gmail.com"}]
+            def token_for(self_, account): return "tok"
+            def token(self_): return "tok"
+
+        paths_hit: List[str] = []
+        def fake_graph(self_, method, path, body=None, raw=None,
+                       content_type=None, token=None):
+            paths_hit.append(path)
+            if "/me/contacts" in path:
+                return ({"value": [
+                    {"displayName": c["name"],
+                     "emailAddresses": [{"address": e} for e in c["emails"]]}
+                    for c in contacts_by_account.get("u@gmail.com", [])
+                ]}, None)
+            if "/me/people" in path:
+                return ({"value": [
+                    {"displayName": p["name"],
+                     "scoredEmailAddresses": [{"address": e} for e in p["emails"]]}
+                    for p in people_by_account.get("u@gmail.com", [])
+                ]}, None)
+            return None, "unknown path"
+
+        conn = Microsoft365Connector(_FakeClient())  # type: ignore[arg-type]
+        conn._graph = fake_graph.__get__(conn, Microsoft365Connector)  # type: ignore[method-assign]
+        return conn, paths_hit
+
+    def test_falls_back_to_people_when_contacts_empty(self) -> None:
+        conn, paths = self._make_connector(
+            contacts_by_account={"u@gmail.com": []},  # nothing in formal contacts
+            people_by_account={"u@gmail.com": [
+                {"name": "Dani M", "emails": ["dani@school.edu"]},
+            ]},
+        )
+        out = conn.execute("contacts_search", {"query": "Dani"})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(len(out["contacts"]), 1)
+        self.assertEqual(out["contacts"][0]["emails"], ["dani@school.edu"])
+        # Both endpoints were hit.
+        self.assertTrue(any("/me/contacts" in p for p in paths))
+        self.assertTrue(any("/me/people" in p for p in paths))
+
+    def test_merges_contacts_and_people_dedup(self) -> None:
+        conn, _ = self._make_connector(
+            contacts_by_account={"u@gmail.com": [
+                {"name": "Dani Formal", "emails": ["dani@x.io"]},
+            ]},
+            people_by_account={"u@gmail.com": [
+                # Same email — should dedup.
+                {"name": "Dani M", "emails": ["dani@x.io"]},
+                # Different email — should add.
+                {"name": "Dani Other", "emails": ["dani2@x.io"]},
+            ]},
+        )
+        out = conn.execute("contacts_search", {"query": "Dani"})
+        emails = sorted(e for c in out["contacts"] for e in c["emails"])
+        self.assertEqual(emails, ["dani2@x.io", "dani@x.io"])
+
+    def test_no_results_returns_helpful_message(self) -> None:
+        conn, _ = self._make_connector(
+            contacts_by_account={"u@gmail.com": []},
+            people_by_account={"u@gmail.com": []},
+        )
+        out = conn.execute("contacts_search", {"query": "ghost"})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["count"], 0)
+        self.assertIn("No one matching 'ghost'", out["message"])
 
 
 if __name__ == "__main__":  # pragma: no cover

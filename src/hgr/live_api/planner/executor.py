@@ -49,7 +49,41 @@ class Executor:
                     order.append(r)
                 break
             remaining.remove(ready)
-            args = self._resolve(ready.args, results)
+            args, unresolved = self._resolve_tracked(ready.args, results)
+            # Ref-resolution failure: a {step:N.field} pointed at nothing
+            # (e.g. step 1 returned 0 contacts; downstream {step:1.contacts
+            # [0].emails[0]} → ""). Fail the step here with the SPECIFIC
+            # ref that didn't resolve, instead of letting the connector
+            # error out with a cryptic '"to" is required' message.
+            if unresolved:
+                out = {"status": "error",
+                       "error": f"unresolved reference {unresolved[0]} "
+                                f"(prior step returned no matching data)",
+                       "code": "ref_unresolved"}
+                r = StepResult(step_id=ready.id, tool=ready.tool,
+                               status="error", output=out,
+                               error=out["error"])
+                results[ready.id] = r
+                order.append(r)
+                # Fail dependents too (same logic as below).
+                failed = {ready.id}
+                changed = True
+                while changed:
+                    changed = False
+                    still: List = []
+                    for s in remaining:
+                        if any(d in failed for d in s.depends_on):
+                            er = StepResult(step_id=s.id, tool=s.tool,
+                                            status="error",
+                                            error="upstream step failed")
+                            results[s.id] = er
+                            order.append(er)
+                            failed.add(s.id)
+                            changed = True
+                        else:
+                            still.append(s)
+                    remaining = still
+                continue
             # Precondition check (Phase 6): short-circuit unavailable tools
             # with a clear reason instead of letting the connector fail mid-
             # call. Registries that don't implement is_available are skipped.
@@ -100,37 +134,52 @@ class Executor:
                     remaining = still
         return order
 
+    @classmethod
+    def _resolve_tracked(cls, args: Any,
+                         results: Dict[int, StepResult]) -> tuple:
+        """Same as _resolve but ALSO returns a list of refs that didn't
+        resolve. Used by run() to fail a step with a clear error instead
+        of letting the downstream tool see a silently-empty arg."""
+        unresolved: List[str] = []
+        resolved = cls._resolve(args, results, unresolved)
+        return resolved, unresolved
+
     # ---- {step:N.field} reference resolution ------------------------------
     @classmethod
-    def _resolve(cls, args: Any, results: Dict[int, StepResult]) -> Any:
+    def _resolve(cls, args: Any, results: Dict[int, StepResult],
+                 unresolved: Optional[List[str]] = None) -> Any:
         if isinstance(args, dict):
-            return {k: cls._resolve(v, results) for k, v in args.items()}
+            return {k: cls._resolve(v, results, unresolved) for k, v in args.items()}
         if isinstance(args, list):
-            return [cls._resolve(v, results) for v in args]
+            return [cls._resolve(v, results, unresolved) for v in args]
         if isinstance(args, str):
             def sub(m):
+                ref_text = m.group(0)
                 step_id = int(m.group(1))
                 path = m.group(2)
+                def fail() -> str:
+                    if unresolved is not None and ref_text not in unresolved:
+                        unresolved.append(ref_text)
+                    return ""
                 r = results.get(step_id)
                 if r is None:
-                    return ""
+                    return fail()
                 val: Any = r.output
                 for segment in path.split("."):
                     sm = _SEG_RE.match(segment)
                     if sm is None:
-                        return ""
+                        return fail()
                     key, idx = sm.group(1), sm.group(2)
                     if isinstance(val, dict):
                         val = val.get(key)
                     else:
-                        return ""
+                        return fail()
                     if val is None:
-                        return ""
+                        return fail()
                     if idx is not None:
-                        # Array index, e.g. results[0].
                         i = int(idx)
                         if not isinstance(val, list) or not (0 <= i < len(val)):
-                            return ""
+                            return fail()
                         val = val[i]
                 return str(val)
             return _REF_RE.sub(sub, args)
