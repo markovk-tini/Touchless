@@ -14,8 +14,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional
 
+import os
+
 from .classifier import Classifier
-from .plan import Step
+from .executor import Executor
+from .plan import Plan, Step
+from .planner_llm import LLMPlanner, configured as llm_planner_configured
 
 
 class IrisPlanner:
@@ -29,42 +33,78 @@ class IrisPlanner:
         self._logger = logger
         self._confirm = confirm
         self._classifier = Classifier()
+        self._llm_planner = LLMPlanner(registry, logger) if registry is not None else None
+        self._executor = Executor(registry, logger) if registry is not None else None
 
     def try_handle(self, text: str) -> Optional[Dict[str, Any]]:
-        """Return {'step', 'result', 'source', 'message'} if handled, else None."""
-        step = self._classifier.classify(text)
-        if step is None:
-            return None
+        """Try to fully handle a request without the realtime model.
+
+        Returns a uniform dict on success (single step OR multi-step plan):
+            {steps: [Step], results: [StepResult], message: str, plan: Plan?}
+        and None to fall through to the LLM. Both Phase 1 (classifier) and
+        Phase 2 (LLM plan + executor) produce the same shape so the manager
+        can iterate steps and emit per-step badges either way.
+        """
         if self._registry is None:
             return None
-        # Only fire when the tool is actually owned by an *available* connector
-        # (or is a built-in). If a connector isn't ready, fall through to the
-        # LLM rather than throwing a confusing error.
-        if not self._registry.handles_connector(step.tool):
-            # Don't try built-in tools at this stage — they often need richer
-            # arg shapes the regex parser doesn't produce. Phase 2 covers them.
-            return None
-        # Confirmation hook for sends/destructive — not needed in Phase 1's
-        # current intent set, but kept for forward-compat.
-        if step.needs_confirm and self._confirm is not None:
-            if not self._confirm(f"Run {step.tool}?", step.description):
+
+        # --- Phase 1: deterministic classifier -> single connector step ---
+        single = self._classifier.classify(text)
+        if single is not None and self._registry.handles_connector(single.tool):
+            if single.needs_confirm and self._confirm is not None and \
+                    not self._confirm(f"Run {single.tool}?", single.description):
+                from .plan import StepResult
                 return {
-                    "step": step, "source": "connector",
-                    "result": {"status": "cancelled", "code": "user_declined"},
+                    "steps": [single],
+                    "results": [StepResult(step_id=0, tool=single.tool,
+                                           status="cancelled",
+                                           output={"status": "cancelled"})],
                     "message": "Cancelled."}
-        try:
-            result = self._registry.call(step.tool, step.args)
-        except Exception as exc:
-            if self._logger:
-                self._logger.exception("iris_planner_call_failed", exc, tool=step.tool)
-            return None  # let the LLM try
-        source = "connector" if self._registry.handles_connector(step.tool) else "iris"
-        return {
-            "step": step,
-            "result": result or {"status": "error", "error": "no result"},
-            "source": source,
-            "message": self._format_message(step, result or {}),
-        }
+            try:
+                out = self._registry.call(single.tool, single.args)
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception("iris_planner_call_failed", exc, tool=single.tool)
+                return None
+            from .plan import StepResult
+            sr = StepResult(step_id=0, tool=single.tool,
+                            status=str((out or {}).get("status") or "ok"),
+                            output=out or {}, error=(out or {}).get("error"))
+            return {"steps": [single], "results": [sr],
+                    "message": self._format_message(single, out or {})}
+
+        # --- Phase 2: cheap-LLM JSON plan -> Executor (opt-in flag) ---
+        if (os.environ.get("TOUCHLESS_IRIS_PLAN_LLM", "0") == "1"
+                and llm_planner_configured()
+                and self._llm_planner is not None
+                and self._executor is not None):
+            plan = self._llm_planner.plan(text)
+            if plan is not None and plan.steps:
+                results = self._executor.run(plan)
+                return {
+                    "steps": plan.steps,
+                    "results": results,
+                    "plan": plan,
+                    "message": self._format_plan_message(plan, results),
+                }
+        return None
+
+    def _format_plan_message(self, plan: "Plan", results: list) -> str:
+        ok = sum(1 for r in results if r.status == "ok")
+        if ok == len(results) and results:
+            # If a "useful" final result exists, surface its message.
+            last = results[-1].output if results else {}
+            if isinstance(last, dict):
+                for key in ("link", "message", "result", "summary"):
+                    val = last.get(key)
+                    if val:
+                        return str(val)[:600]
+            tools = ", ".join(r.tool for r in results)
+            return f"Done ({ok}/{len(results)} steps: {tools})."
+        errs = [r for r in results if r.status != "ok"]
+        first = errs[0] if errs else None
+        return f"Plan ran {ok}/{len(results)} steps" + (
+            f"; {first.tool} failed: {first.error}" if first else ".")
 
     # ---- friendly result text ----
     @staticmethod

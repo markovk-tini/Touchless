@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any, Dict, List, Tuple
 from unittest.mock import MagicMock, patch
 
 from hgr.live_api.config import LiveApiConfig
@@ -607,6 +608,137 @@ class IrisPlannerClassifierTests(unittest.TestCase):
         self._miss("read my latest email")
         self._miss("summarize my unread emails")
         self._miss("can you help me figure out what to do today")
+
+
+class _StubRegistry:
+    """Minimal registry stand-in: records calls and returns canned outputs."""
+
+    def __init__(self, outputs: Dict[str, Any]) -> None:
+        self.outputs = outputs  # tool -> dict (or callable(args) -> dict)
+        self.calls: List[Tuple[str, Dict[str, Any]]] = []
+
+    def call(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        self.calls.append((tool, dict(args or {})))
+        out = self.outputs.get(tool)
+        if callable(out):
+            return out(args)
+        if out is None:
+            return {"status": "error", "error": "no stub"}
+        return dict(out)
+
+    def handles_connector(self, _tool: str) -> bool:
+        return True
+
+
+class IrisPlannerExecutorTests(unittest.TestCase):
+    """Phase 2 executor: dep order, {step:N.field} refs, error short-circuit."""
+
+    def test_runs_in_dependency_order(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=2, tool="b", args={"x": 1}, depends_on=[1]),
+            Step(id=1, tool="a", args={}, depends_on=[]),
+            Step(id=3, tool="c", args={}, depends_on=[2]),
+        ])
+        reg = _StubRegistry({"a": {"status": "ok"}, "b": {"status": "ok"},
+                             "c": {"status": "ok"}})
+        results = Executor(reg).run(plan)
+        self.assertEqual([r.tool for r in results], ["a", "b", "c"])
+        self.assertTrue(all(r.status == "ok" for r in results))
+
+    def test_resolves_step_refs(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="lookup", args={"q": "dani"}),
+            Step(id=2, tool="send",
+                 args={"to": "{step:1.email}",
+                       "msg": "hi {step:1.profile.name}"},
+                 depends_on=[1]),
+        ])
+        reg = _StubRegistry({
+            "lookup": {"status": "ok", "email": "x@y.z",
+                       "profile": {"name": "Dani"}},
+            "send": {"status": "ok"},
+        })
+        Executor(reg).run(plan)
+        # The send step's args should have been substituted from step 1's output.
+        send_args = next(a for t, a in reg.calls if t == "send")
+        self.assertEqual(send_args["to"], "x@y.z")
+        self.assertEqual(send_args["msg"], "hi Dani")
+
+    def test_error_short_circuits_dependents(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="boom", args={}),
+            Step(id=2, tool="later", args={}, depends_on=[1]),
+            Step(id=3, tool="independent", args={}),
+        ])
+        reg = _StubRegistry({
+            "boom": {"status": "error", "error": "nope"},
+            "later": {"status": "ok"},
+            "independent": {"status": "ok"},
+        })
+        results = Executor(reg).run(plan)
+        by_id = {r.step_id: r for r in results}
+        self.assertEqual(by_id[1].status, "error")
+        # Dependent gets unresolved-dep error, not actually called.
+        self.assertEqual(by_id[2].status, "error")
+        self.assertNotIn("later", [t for t, _ in reg.calls])
+        # Independent step still runs.
+        self.assertEqual(by_id[3].status, "ok")
+
+
+class IrisPlannerOrchestratorTests(unittest.TestCase):
+    """Phase 2 wiring: orchestrator returns the unified {steps, results} shape."""
+
+    def test_phase1_returns_single_step_list(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({"volume_set": {"status": "ok"}})
+        planner = IrisPlanner(reg)
+        out = planner.try_handle("set volume to 40")
+        self.assertIsNotNone(out)
+        self.assertEqual(len(out["steps"]), 1)
+        self.assertEqual(out["steps"][0].tool, "volume_set")
+        self.assertEqual(out["results"][0].status, "ok")
+        self.assertIn("40", out["message"])
+
+    def test_phase2_uses_executor_when_flag_on(self) -> None:
+        # Forge a Plan and stub the LLMPlanner so we don't hit the network.
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        from hgr.live_api.planner.plan import Plan, Step
+        reg = _StubRegistry({
+            "lookup": {"status": "ok", "id": "abc"},
+            "send": {"status": "ok", "link": "https://x"},
+        })
+        planner = IrisPlanner(reg)
+        forged = Plan(goal="g", steps=[
+            Step(id=1, tool="lookup", args={}),
+            Step(id=2, tool="send", args={"ref": "{step:1.id}"}, depends_on=[1]),
+        ])
+        # Patch the LLMPlanner so it returns our forged plan.
+        planner._llm_planner.plan = lambda _goal: forged  # type: ignore[assignment]
+        # Also patch configured() so the flag-check passes even w/o API key.
+        import hgr.live_api.planner.orchestrator as orch
+        import hgr.live_api.planner.planner_llm as pl
+        old_flag = os.environ.get("TOUCHLESS_IRIS_PLAN_LLM")
+        old_cfg = pl.configured
+        os.environ["TOUCHLESS_IRIS_PLAN_LLM"] = "1"
+        orch.llm_planner_configured = lambda: True
+        try:
+            out = planner.try_handle("do something tricky")
+        finally:
+            if old_flag is None:
+                os.environ.pop("TOUCHLESS_IRIS_PLAN_LLM", None)
+            else:
+                os.environ["TOUCHLESS_IRIS_PLAN_LLM"] = old_flag
+            orch.llm_planner_configured = pl.configured  # restore
+            pl.configured = old_cfg
+        self.assertIsNotNone(out)
+        self.assertEqual([s.tool for s in out["steps"]], ["lookup", "send"])
+        self.assertEqual([r.status for r in out["results"]], ["ok", "ok"])
+        # send step args were resolved from lookup's output:
+        send_args = next(a for t, a in reg.calls if t == "send")
+        self.assertEqual(send_args["ref"], "abc")
 
 
 if __name__ == "__main__":  # pragma: no cover

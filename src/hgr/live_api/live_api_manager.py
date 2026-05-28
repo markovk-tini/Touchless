@@ -845,19 +845,27 @@ class LiveApiManager(QObject):
                     self._logger.exception("iris_planner_unhandled", exc)
                 handled = None
             if handled is not None:
-                step = handled["step"]
-                result = handled["result"]
-                source = handled["source"]
-                pid = f"planner/{step.tool}"
-                self.tool_event.emit("called", {"name": step.tool, "call_id": pid, "source": source})
-                self.tool_event.emit("completed", {
-                    "name": step.tool, "call_id": pid,
-                    "status": result.get("status", "ok"), "source": source,
-                })
-                if self._logger:
-                    self._logger.event("routing_decision", **cost_policy.decision_record(
-                        raw=text, tool=step.tool, source=source,
-                        status=str(result.get("status", ""))))
+                # Unified shape: Phase 1 (classifier) returns a 1-step list,
+                # Phase 2 (LLM plan + Executor) returns N steps. Either way we
+                # iterate steps/results so the UI gets a per-step badge trail.
+                steps = handled.get("steps") or []
+                results = handled.get("results") or []
+                for step, sr in zip(steps, results):
+                    out = sr.output if isinstance(sr.output, dict) else {}
+                    source = ("connector"
+                              if self._registry.handles_connector(step.tool)
+                              else "touchless")
+                    pid = f"planner/{step.tool}/{getattr(step, 'id', 0)}"
+                    self.tool_event.emit("called", {"name": step.tool, "call_id": pid, "source": source})
+                    self.tool_event.emit("completed", {
+                        "name": step.tool, "call_id": pid,
+                        "status": out.get("status", sr.status or "ok"),
+                        "source": source,
+                    })
+                    if self._logger:
+                        self._logger.event("routing_decision", **cost_policy.decision_record(
+                            raw=text, tool=step.tool, source=source,
+                            status=str(out.get("status", sr.status or ""))))
                 self.assistant_text.emit(handled["message"])
                 self._set_state(LiveApiState.LISTENING, "Ready (type a command)")
                 return True
