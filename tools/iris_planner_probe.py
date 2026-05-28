@@ -117,13 +117,15 @@ def _probe(text: str, live: bool) -> None:
     planner = LLMPlanner(reg)
     # Bypass the silent error swallow in LLMPlanner.plan so we can SEE what
     # actually went wrong (wrong model id, 401, JSON shape mismatch, etc.).
+    # Also pass known_tools=None so the probe doesn't drop steps just because
+    # the probe registry is a stub — we want to see the LLM's raw plan shape.
     try:
         messages = planner._build_messages(text)
         data = planner._call(messages)
         print(f"  Raw response keys : {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
         if isinstance(data, dict) and "steps" not in data:
             print(f"  Raw response     : {data}")
-        plan = planner._parse(text, data)
+        plan = planner._parse(text, data, known_tools=None)
     except Exception as exc:
         print(f"  LLM call FAILED  : {type(exc).__name__}: {exc}")
         # HTTPError carries the response body — surface it.
