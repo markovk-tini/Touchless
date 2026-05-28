@@ -173,6 +173,33 @@ class MsGraphClient:
             return None
         return None
 
+    def all_accounts(self) -> list:
+        """Raw MSAL account objects for every connected account. Used by
+        tools that need to fan out across all accounts (e.g. contact search
+        looks in both school and personal contact folders)."""
+        app = self._get_app()
+        if app is None:
+            return []
+        try:
+            return list(app.get_accounts())
+        except Exception:
+            return []
+
+    def token_for(self, account: dict) -> Optional[str]:
+        """Silent access token for a SPECIFIC account (not just the active
+        one). Returns None when refresh fails."""
+        app = self._get_app()
+        if app is None or account is None:
+            return None
+        try:
+            result = app.acquire_token_silent(SCOPES, account=account)
+            self._save_cache()
+            if result and "access_token" in result:
+                return result["access_token"]
+        except Exception:
+            return None
+        return None
+
     def ready(self) -> bool:
         return self.token() is not None
 

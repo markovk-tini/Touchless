@@ -15,7 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .base import Connector, connector_result
 from .ms_graph_client import MsGraphClient, GRAPH_BASE
@@ -37,8 +37,13 @@ class Microsoft365Connector(Connector):
 
     # ---- Graph REST helper ----
     def _graph(self, method: str, path: str, body: Dict[str, Any] | None = None,
-               raw: bytes | None = None, content_type: str | None = None):
-        token = self._client.token()
+               raw: bytes | None = None, content_type: str | None = None,
+               token: Optional[str] = None):
+        """Default behavior: use the active account's token. Pass token=... to
+        target a specific account (used by fan-out tools like multi-account
+        contacts_search)."""
+        if token is None:
+            token = self._client.token()
         if not token:
             return None, "not_connected"
         # Encode spaces (OData $filter like "isRead eq false" has them) — a raw
@@ -152,9 +157,19 @@ class Microsoft365Connector(Connector):
                "Create a OneNote page with a title and text in the default section.",
                {"title": {"type": "string"}, "text": {"type": "string"}}, ["title"]),
             fn("contacts_search",
-               "Search the user's Outlook contacts; returns names + emails.",
+               "Search Outlook contacts ACROSS ALL connected Microsoft "
+               "accounts (school + personal etc.) and merge results, deduped "
+               "by email. Pass account='edu' (or any substring of the "
+               "username) to restrict to one account; omit or 'all' for "
+               "every account. Returns {contacts: [{name, emails:[str], "
+               "source_account}], searched_accounts: [str]}.",
                {"query": {"type": "string"},
-                "max": {"type": "integer", "description": "Max results (default 10)."}},
+                "account": {"type": "string",
+                            "description": "Substring of an account username "
+                                           "(e.g. 'edu', 'gmail') to restrict "
+                                           "the search; omit or 'all' to "
+                                           "search every connected account."},
+                "max": {"type": "integer", "description": "Max results per account (default 10)."}},
                ["query"]),
             fn("ms_list_accounts",
                "List the connected Microsoft accounts and which one is active "
@@ -401,23 +416,71 @@ class Microsoft365Connector(Connector):
             if not q:
                 return connector_result("error", error="query is required")
             max_n = max(1, min(50, int(args.get("max") or 10)))
+            # `account` arg: explicit substring (e.g. "edu") narrows the search
+            # to that one account; omit (or set "all") to fan out across every
+            # connected Microsoft account. Default IS all-accounts now —
+            # contacts live in different folders per account and the user
+            # almost always wants the union.
+            account_q = str(args.get("account") or "").strip().lower()
+            all_accounts = self._client.all_accounts()
+            if not all_accounts:
+                return connector_result("error", error="no Microsoft accounts connected")
+            if account_q and account_q != "all":
+                # Restrict to accounts whose username contains the query.
+                all_accounts = [a for a in all_accounts
+                                if account_q in (a.get("username") or "").lower()]
+                if not all_accounts:
+                    return connector_result(
+                        "error",
+                        error=f"no connected Microsoft account matches {account_q!r}")
+            # Fan out: hit each account's /me/contacts, merge by email so the
+            # same person in multiple address books doesn't show up twice.
+            seen_keys: set = set()
+            out: List[Dict[str, Any]] = []
+            errors: List[str] = []
             sq = urllib.parse.quote(f'"{q}"')
-            data, err = self._graph(
-                "GET", f"/me/contacts?$search={sq}&$top={max_n}"
-                       "&$select=displayName,emailAddresses")
-            if err:
-                # $search on contacts can 400 on some mailboxes; fall back to filter.
-                fq = urllib.parse.quote(q)
+            fq = urllib.parse.quote(q)
+            for acct in all_accounts:
+                token = self._client.token_for(acct)
+                if not token:
+                    errors.append(f"{acct.get('username')}: token refresh failed")
+                    continue
                 data, err = self._graph(
-                    "GET", f"/me/contacts?$top={max_n}&$select=displayName,emailAddresses"
-                           f"&$filter=startswith(displayName,'{fq}')")
+                    "GET",
+                    f"/me/contacts?$search={sq}&$top={max_n}"
+                    "&$select=displayName,emailAddresses",
+                    token=token)
                 if err:
-                    return connector_result("error", error=err)
-            out = []
-            for c in (data.get("value") or []):
-                emails = [e.get("address") for e in (c.get("emailAddresses") or []) if e.get("address")]
-                out.append({"name": c.get("displayName"), "emails": emails})
-            return connector_result("ok", count=len(out), contacts=out)
+                    # Some mailboxes 400 on $search; fall back to startswith filter.
+                    data, err = self._graph(
+                        "GET",
+                        f"/me/contacts?$top={max_n}&$select=displayName,emailAddresses"
+                        f"&$filter=startswith(displayName,'{fq}')",
+                        token=token)
+                    if err:
+                        errors.append(f"{acct.get('username')}: {err}")
+                        continue
+                for c in (data.get("value") or []):
+                    emails = [e.get("address")
+                              for e in (c.get("emailAddresses") or [])
+                              if e.get("address")]
+                    # Dedup key: first email (lowercased) or name+account if no email.
+                    primary = (emails[0].lower() if emails
+                               else f"{c.get('displayName')}@{acct.get('username')}")
+                    if primary in seen_keys:
+                        continue
+                    seen_keys.add(primary)
+                    out.append({
+                        "name": c.get("displayName"),
+                        "emails": emails,
+                        "source_account": acct.get("username"),
+                    })
+            if not out and errors:
+                return connector_result("error", error="; ".join(errors[:3]))
+            return connector_result("ok", count=len(out), contacts=out,
+                                    searched_accounts=[a.get("username")
+                                                       for a in all_accounts],
+                                    errors=errors or None)
 
         if name == "ms_list_accounts":
             return connector_result("ok", accounts=self._client.list_accounts())

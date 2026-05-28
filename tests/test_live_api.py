@@ -2166,6 +2166,93 @@ class PlannerPromptPrefsTests(unittest.TestCase):
         self.assertIn("one-shot", system.lower())
 
 
+class MultiAccountContactsSearchTests(unittest.TestCase):
+    """contacts_search fans out across every connected Microsoft account by
+    default, dedupes by email, and supports account=<substring> to restrict."""
+
+    def _make_connector(self, account_contacts: Dict[str, List[Dict[str, Any]]]):
+        """Build an Microsoft365Connector wired to a fake graph client that returns
+        per-account canned contact lists."""
+        from hgr.live_api.connectors.ms365_connector import Microsoft365Connector
+
+        class _FakeClient:
+            def all_accounts(self_):
+                return [{"username": u} for u in account_contacts]
+            def token_for(self_, account):
+                return f"token-{account.get('username')}"
+            def token(self_): return "active-token"
+
+        seen_paths: List[tuple] = []
+        def fake_graph(self_, method, path, body=None, raw=None,
+                       content_type=None, token=None):
+            seen_paths.append((token, path))
+            # Pull the account name out of the token to look up canned data.
+            acct_name = (token or "").replace("token-", "")
+            contacts = account_contacts.get(acct_name, [])
+            value = []
+            for c in contacts:
+                value.append({
+                    "displayName": c["name"],
+                    "emailAddresses": [{"address": e} for e in c["emails"]],
+                })
+            return {"value": value}, None
+
+        conn = Microsoft365Connector(_FakeClient())  # type: ignore[arg-type]
+        conn._graph = fake_graph.__get__(conn, Microsoft365Connector)  # type: ignore[method-assign]
+        return conn, seen_paths
+
+    def test_fans_out_across_accounts_and_dedupes(self) -> None:
+        conn, paths = self._make_connector({
+            "school@edu": [
+                {"name": "Dani Markov", "emails": ["dani@school.edu"]},
+                {"name": "Vesko", "emails": ["vesko@school.edu"]},
+            ],
+            "personal@gmail.com": [
+                # Same email as school (dedup target).
+                {"name": "Dani M", "emails": ["dani@school.edu"]},
+                {"name": "Dani Personal", "emails": ["dani@personal.com"]},
+            ],
+        })
+        out = conn.execute("contacts_search", {"query": "dani"})
+        self.assertEqual(out["status"], "ok")
+        # Hit both accounts.
+        tokens_used = sorted({tok for tok, _ in paths})
+        self.assertEqual(tokens_used, ["token-personal@gmail.com", "token-school@edu"])
+        # Dedup: dani@school.edu should appear ONCE across both accounts.
+        emails = [e for c in out["contacts"] for e in c["emails"]]
+        self.assertEqual(emails.count("dani@school.edu"), 1)
+        # source_account is recorded.
+        sources = {c["source_account"] for c in out["contacts"]}
+        self.assertEqual(sources, {"school@edu", "personal@gmail.com"})
+
+    def test_account_substring_restricts(self) -> None:
+        conn, paths = self._make_connector({
+            "school@edu": [{"name": "Dani", "emails": ["dani@school.edu"]}],
+            "personal@gmail.com": [{"name": "Dani G", "emails": ["dani@gmail.com"]}],
+        })
+        out = conn.execute("contacts_search",
+                           {"query": "dani", "account": "edu"})
+        self.assertEqual(out["status"], "ok")
+        # Only the .edu account was queried.
+        tokens_used = {tok for tok, _ in paths}
+        self.assertEqual(tokens_used, {"token-school@edu"})
+        self.assertEqual([c["source_account"] for c in out["contacts"]],
+                         ["school@edu"])
+
+    def test_unknown_account_substring_errors(self) -> None:
+        conn, _ = self._make_connector({"school@edu": []})
+        out = conn.execute("contacts_search",
+                           {"query": "dani", "account": "yahoo"})
+        self.assertEqual(out["status"], "error")
+        self.assertIn("yahoo", out["error"])
+
+    def test_no_accounts_returns_error(self) -> None:
+        conn, _ = self._make_connector({})
+        out = conn.execute("contacts_search", {"query": "dani"})
+        self.assertEqual(out["status"], "error")
+        self.assertIn("no Microsoft accounts connected", out["error"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
