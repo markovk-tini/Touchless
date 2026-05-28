@@ -769,6 +769,18 @@ class LocalBackend:
         self._turn_ready.set()
         return True
 
+    def send_session_note(self, text: str) -> bool:
+        """Background note injected after a planner-handled turn so the model
+        has context for follow-ups. Local backend stores it but never triggers
+        a fresh turn (mirrors realtime semantics)."""
+        text = (text or "").strip()
+        if not text:
+            return True
+        self._messages.append({"role": "system", "content": text})
+        if self._logger:
+            self._logger.text("local_session_note", text)
+        return True
+
     def send_screen_image(self, jpeg_b64: str, *, caption: str = "") -> bool:
         # Phase 1: no vision. Quietly accept so the manager's screen
         # worker can run without errors. Logged so the dev knows why it

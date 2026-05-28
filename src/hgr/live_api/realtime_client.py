@@ -313,6 +313,25 @@ class RealtimeClient:
             }
         )
 
+    def send_session_note(self, text: str) -> bool:
+        """Inject a system-role note into the conversation WITHOUT triggering
+        a response. Used by the iris planner to tell realtime what was just
+        handled outside the model, so follow-ups like 'send him a thank you
+        too' have the prior context to resolve."""
+        text = (text or "").strip()
+        if not text:
+            return True
+        return self._send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+        )
+
     def send_screen_image(self, jpeg_b64: str, *, caption: str = "") -> bool:
         """Send a screenshot as an image content part on a user message."""
         text_part = {"type": "input_text", "text": caption or "Current screen context."}

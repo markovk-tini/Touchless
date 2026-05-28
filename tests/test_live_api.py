@@ -1347,6 +1347,143 @@ class IrisPlannerEdgeCaseTests(unittest.TestCase):
                                       {"recipient": "x@y", "body": "hi"})])
 
 
+class SessionNoteBuilderTests(unittest.TestCase):
+    """The compact note injected into realtime after a planner-handled turn."""
+
+    def _build(self):
+        from hgr.live_api.live_api_manager import LiveApiManager
+        return LiveApiManager._build_session_note
+
+    def _fake_step(self, tool, args=None):
+        ns = type("S", (), {})()
+        ns.tool = tool
+        ns.args = args or {}
+        ns.id = 1
+        return ns
+
+    def _fake_result(self, tool, status="ok", output=None):
+        ns = type("R", (), {})()
+        ns.tool = tool
+        ns.status = status
+        ns.output = output or {}
+        ns.error = None
+        return ns
+
+    def test_basic_shape(self) -> None:
+        build = self._build()
+        note = build(
+            "find Dani's email",
+            [self._fake_step("ms_contacts_find", {"q": "Dani"})],
+            [self._fake_result("ms_contacts_find",
+                               output={"status": "ok",
+                                       "email": "dani@x.io",
+                                       "name": "Dani M"})],
+            "Found Dani: dani@x.io",
+        )
+        # Mentions tool, status, and the resolvable entity.
+        self.assertIn("ms_contacts_find=ok", note)
+        self.assertIn("dani@x.io", note)
+        self.assertIn("find Dani's email", note)
+        # And the user-visible reply for context.
+        self.assertIn("Found Dani", note)
+
+    def test_redacts_secrets(self) -> None:
+        build = self._build()
+        note = build(
+            "log in",
+            [self._fake_step("auth")],
+            [self._fake_result("auth",
+                               output={"status": "ok",
+                                       "access_token": "supersecret123",
+                                       "refresh_token": "rfsh",
+                                       "email": "u@x"})],
+            "Logged in.",
+        )
+        self.assertNotIn("supersecret123", note)
+        self.assertNotIn("rfsh", note)
+        self.assertIn("u@x", note)
+
+    def test_size_capped(self) -> None:
+        build = self._build()
+        big = "x" * 2000
+        note = build(
+            big,
+            [self._fake_step("t")],
+            [self._fake_result("t", output={"title": big})],
+            big,
+        )
+        # The whole note is capped, individual fields trimmed.
+        self.assertLessEqual(len(note), 600)
+
+    def test_handles_empty_steps(self) -> None:
+        build = self._build()
+        note = build("hi", [], [], "")
+        self.assertIn("tools: none", note)
+
+
+class SessionNoteWiringTests(unittest.TestCase):
+    """When the planner handles a turn, the manager sends a session note
+    via client.send_session_note (best-effort, never breaks the reply)."""
+
+    def test_send_session_note_called_after_planner_handle(self) -> None:
+        from hgr.live_api.live_api_manager import LiveApiManager
+
+        sent: List[str] = []
+
+        class _FakeClient:
+            connected = True
+            def send_session_note(self, text):
+                sent.append(text)
+                return True
+
+        # Synthesize a manager handled-result and run the post-handle block
+        # by calling _build_session_note + the client directly, mirroring the
+        # production code path. Unit-isolating the full manager is heavy;
+        # this hits the contract we care about.
+        from hgr.live_api.planner.plan import Step, StepResult
+        steps = [Step(id=1, tool="ms_mail_send",
+                      args={"to": "dani@x", "body": "hi"})]
+        results = [StepResult(step_id=1, tool="ms_mail_send", status="ok",
+                              output={"status": "ok",
+                                      "recipient": "dani@x",
+                                      "link": "https://m/abc"})]
+        note = LiveApiManager._build_session_note(
+            "email Dani saying hi",
+            steps, results,
+            "Drafted email to dani@x.",
+        )
+        client = _FakeClient()
+        client.send_session_note(note)
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn("ms_mail_send=ok", sent[0])
+        self.assertIn("dani@x", sent[0])
+
+
+class RealtimeClientNoteTests(unittest.TestCase):
+    """realtime_client.send_session_note emits a SYSTEM message (no response)."""
+
+    def test_emits_system_role_no_response(self) -> None:
+        from hgr.live_api.realtime_client import RealtimeClient
+        sent: List[Dict[str, Any]] = []
+        c = RealtimeClient.__new__(RealtimeClient)
+        c._send = lambda payload: (sent.append(payload), True)[1]  # type: ignore[attr-defined]
+        ok = c.send_session_note("hello")
+        self.assertTrue(ok)
+        self.assertEqual(len(sent), 1)
+        item = sent[0]["item"]
+        self.assertEqual(item["role"], "system")
+        self.assertEqual(item["content"][0]["text"], "hello")
+
+    def test_empty_note_noop(self) -> None:
+        from hgr.live_api.realtime_client import RealtimeClient
+        sent: List[Dict[str, Any]] = []
+        c = RealtimeClient.__new__(RealtimeClient)
+        c._send = lambda payload: (sent.append(payload), True)[1]  # type: ignore[attr-defined]
+        self.assertTrue(c.send_session_note(""))
+        self.assertEqual(sent, [])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

@@ -666,6 +666,56 @@ class LiveApiManager(QObject):
             self._response_active = False
             return False
 
+    # -- planner -> realtime session note ----------------------------------
+    @staticmethod
+    def _build_session_note(user_text: str, steps: List[Any],
+                            results: List[Any], reply: str) -> str:
+        """Compact natural-language note describing what the iris planner
+        just handled outside the model. Injected into realtime as a system
+        message so the model can resolve follow-ups ("send him a thank you
+        too") that reference the prior turn.
+
+        Designed to stay small (< ~400 chars) so it doesn't bloat context.
+        Surfaces the user's request, which tools ran, and a few "interesting"
+        outputs (emails, links, titles, recipients) for entity resolution.
+        """
+        REDACT = {"password", "token", "access_token", "refresh_token",
+                  "client_secret", "api_key", "secret"}
+        INTERESTING = ("email", "recipient", "link", "url", "title", "subject",
+                       "id", "name", "path", "filename", "query", "phone")
+        ut = (user_text or "").strip()
+        if len(ut) > 200:
+            ut = ut[:200] + "..."
+        tool_parts: List[str] = []
+        facts: List[str] = []
+        for step, sr in zip(steps or [], results or []):
+            tool = getattr(step, "tool", "?")
+            status = getattr(sr, "status", "?")
+            tool_parts.append(f"{tool}={status}")
+            out = getattr(sr, "output", None)
+            if not isinstance(out, dict):
+                continue
+            for k, v in out.items():
+                kl = str(k).lower()
+                if kl in REDACT or any(r in kl for r in REDACT):
+                    continue
+                if kl in INTERESTING and v is not None:
+                    sv = str(v)
+                    if len(sv) > 120:
+                        sv = sv[:120] + "..."
+                    facts.append(f"{k}={sv}")
+        note = f'(iris planner handled: "{ut}". tools: {", ".join(tool_parts) or "none"}.'
+        if facts:
+            # Cap fact list so the note stays small.
+            note += f" facts: {'; '.join(facts[:6])}."
+        rep = (reply or "").strip()
+        if rep:
+            if len(rep) > 200:
+                rep = rep[:200] + "..."
+            note += f" reply to user: {rep}"
+        note += ")"
+        return note[:600]
+
     def _push_assistant_note(self, text: str) -> None:
         """Inject a proactive note into the live session from a BACKGROUND
         thread (e.g. auto-approve concluding) so the assistant relays it to
@@ -867,6 +917,19 @@ class LiveApiManager(QObject):
                             raw=text, tool=step.tool, source=source,
                             status=str(out.get("status", sr.status or ""))))
                 self.assistant_text.emit(handled["message"])
+                # Realtime-session sync: tell the model what just happened so
+                # follow-ups like "send him a thank you too" can resolve the
+                # prior turn. Best-effort — never fail the user-visible reply.
+                try:
+                    client = self._client
+                    if client is not None and hasattr(client, "send_session_note"):
+                        note = self._build_session_note(text, steps, results,
+                                                        handled.get("message") or "")
+                        if note:
+                            client.send_session_note(note)
+                except Exception as exc:  # pragma: no cover - defensive
+                    if self._logger:
+                        self._logger.exception("session_note_send_failed", exc)
                 self._set_state(LiveApiState.LISTENING, "Ready (type a command)")
                 return True
 
