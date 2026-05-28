@@ -25,15 +25,20 @@ from typing import Any, Dict
 
 DEFAULT_MODEL = "gpt-5-mini"
 API_URL = "https://api.openai.com/v1/chat/completions"
-_MAX_INPUT_CHARS = 6000   # cap to keep prompt small
-_MAX_TOKENS = 500          # cap output length
+# Sized for 'write a debrief about every unread email' patterns: a typical
+# inbox of 30-50 emails with 2KB bodies each fits inside 32K input chars
+# (~8K tokens), and the LLM can render that into a full bulleted list
+# within 2500 output tokens (~10 lines per email at most). gpt-5-mini's
+# context is large; we can afford the headroom.
+_MAX_INPUT_CHARS = 32000
+_MAX_TOKENS = 2500
 
 
 def configured() -> bool:
     return bool((os.environ.get("OPENAI_API_KEY") or "").strip())
 
 
-def compose_text(prompt: str, inputs: Any, max_tokens: int = _MAX_TOKENS,
+def compose_text(prompt: str, inputs: Any, max_tokens: int = 0,
                  model: str = "") -> Dict[str, Any]:
     """Synthesize text from a prompt + inputs.
 
@@ -67,9 +72,13 @@ def compose_text(prompt: str, inputs: Any, max_tokens: int = _MAX_TOKENS,
         "input data, produce ONLY the final text. No preamble, no "
         "explanation, no JSON wrapping — just the text the user wants. "
         "Adapt length and structure to the instruction (a 'short summary' "
-        "should be concise; a 'detailed brief' should expand). Enumerate "
-        "every relevant item in lists when the user asked for a complete "
-        "listing; don't truncate."
+        "should be concise; a 'detailed brief' should expand).\n\n"
+        "COMPLETENESS: when the instruction or input data implies a list "
+        "(emails, events, items, results), include EVERY entry from the "
+        "input — never silently skip or cap them. If the input has 7 "
+        "messages, the output must mention all 7. If the user later wants "
+        "fewer, they'll ask. Count items in the input before writing and "
+        "verify the output matches that count."
     )
     user = f"Instruction:\n{prompt}\n\nInput data:\n{inputs_str}"
 
@@ -80,7 +89,8 @@ def compose_text(prompt: str, inputs: Any, max_tokens: int = _MAX_TOKENS,
             {"role": "user", "content": user},
         ],
         "temperature": 0.3,
-        "max_tokens": int(max(64, min(int(max_tokens or _MAX_TOKENS), 2000))),
+        # max_tokens=0 means 'use default'; clamp to a sensible upper bound.
+        "max_tokens": int(max(64, min(int(max_tokens or _MAX_TOKENS), 8000))),
     }
     key = os.environ["OPENAI_API_KEY"]
     req = urllib.request.Request(
