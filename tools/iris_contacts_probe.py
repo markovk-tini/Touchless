@@ -77,6 +77,10 @@ def main() -> None:
              f"&$filter=startswith(displayName,'{args.query}')", None),
             ("/me/people?$top=5 (correspondents)",
              "/me/people?$top=5", None),
+            (f"/me/messages?$search=\"{args.query}\" (mail-search fallback)",
+             f"/me/messages?$search=\"{args.query}\"&$top=10"
+             "&$select=from,toRecipients,subject",
+             {"ConsistencyLevel": "eventual"}),
         ]:
             data, err = conn._graph("GET", path, token=tok,
                                     extra_headers=headers)

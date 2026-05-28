@@ -161,12 +161,14 @@ class Microsoft365Connector(Connector):
                "Create a OneNote page with a title and text in the default section.",
                {"title": {"type": "string"}, "text": {"type": "string"}}, ["title"]),
             fn("contacts_search",
-               "Search Outlook contacts ACROSS ALL connected Microsoft "
-               "accounts (school + personal etc.) and merge results, deduped "
-               "by email. Pass account='edu' (or any substring of the "
-               "username) to restrict to one account; omit or 'all' for "
-               "every account. Returns {contacts: [{name, emails:[str], "
-               "source_account}], searched_accounts: [str]}.",
+               "Find someone's email across ALL connected Microsoft accounts. "
+               "Searches three pathways per account: (1) /me/contacts formal "
+               "address book, (2) /me/people correspondents (work/school "
+               "only), (3) /me/messages mail headers — so anyone you've "
+               "EVER emailed gets found, even if not formally added as a "
+               "contact. Merged + deduped by email. Pass account='edu' to "
+               "restrict to one account. Returns {contacts: [{name, emails: "
+               "[str], source_account, source}], searched_accounts: [str]}.",
                {"query": {"type": "string"},
                 "account": {"type": "string",
                             "description": "Substring of an account username "
@@ -525,27 +527,20 @@ class Microsoft365Connector(Connector):
                              acct.get("username"), "contacts")
                         contacts_hits += 1
 
-                # Pass 2: /me/people (anyone you've corresponded with). This
-                # rescues "added to Outlook desktop's local address book"
-                # cases that don't sync to /me/contacts, and finds people you
-                # email regularly without having added them formally.
+                # Pass 2: /me/people (correspondents — work/school only).
+                # Returns 403 on personal MSA accounts; that's expected and
+                # NOT a real error, so don't record it.
                 p_data, p_err = self._graph(
                     "GET", f"/me/people?$search=\"{pq}\"&$top={max_n}",
                     token=token)
                 if p_err and "$search" in p_err:
-                    # Some mailboxes don't support $search on /me/people; the
-                    # default ranked list still works without it.
                     p_data, p_err = self._graph(
                         "GET", f"/me/people?$top={max_n}", token=token)
+                people_supported = not (p_err and "403" in p_err)
                 if not p_err and p_data:
-                    qlow = q.lower()
                     for p in (p_data.get("value") or []):
                         name = p.get("displayName") or ""
-                        # Filter by query substring since /me/people without
-                        # $search returns the full ranked list.
                         if qlow and qlow not in name.lower():
-                            # Also try the username (some entries have only
-                            # an email-ish handle, no real displayName).
                             handles = [
                                 e.get("address", "")
                                 for e in (p.get("scoredEmailAddresses") or [])
@@ -557,9 +552,53 @@ class Microsoft365Connector(Connector):
                                   if e.get("address")]
                         _add(name, emails, acct.get("username"), "people")
 
-                if err and p_err:
+                # Pass 3: /me/messages search. Critical for personal Microsoft
+                # accounts where /me/contacts is incomplete (Outlook's UI sees
+                # more contacts than Graph does — Outlook.com People service
+                # is a separate store) and /me/people is 403. If you've ever
+                # exchanged mail with Dani, their address is in a message
+                # header — extract it from there.
+                m_data, m_err = self._graph(
+                    "GET",
+                    f"/me/messages?$search=\"{pq}\"&$top=25"
+                    "&$select=from,sender,toRecipients,ccRecipients,subject",
+                    token=token,
+                    extra_headers={"ConsistencyLevel": "eventual"})
+                if not m_err and m_data:
+                    for msg in (m_data.get("value") or []):
+                        parties = []
+                        for field in ("from", "sender"):
+                            ea = ((msg.get(field) or {}).get("emailAddress")
+                                  or {})
+                            parties.append((ea.get("name"), ea.get("address")))
+                        for field in ("toRecipients", "ccRecipients"):
+                            for entry in (msg.get(field) or []):
+                                ea = (entry.get("emailAddress") or {})
+                                parties.append((ea.get("name"),
+                                                ea.get("address")))
+                        for name, addr in parties:
+                            if not addr:
+                                continue
+                            name_l = (name or "").lower()
+                            addr_l = addr.lower()
+                            if qlow and qlow not in name_l and qlow not in addr_l:
+                                continue
+                            _add(name, [addr], acct.get("username"),
+                                 "mail-search")
+
+                # Only record a per-account error if NOTHING was found AND
+                # there was a real error. A 403 on /me/people for MSA isn't
+                # surfaced as an error here.
+                pathway_errs = []
+                if err:
+                    pathway_errs.append(f"contacts={err}")
+                if p_err and people_supported:
+                    pathway_errs.append(f"people={p_err}")
+                if m_err:
+                    pathway_errs.append(f"messages={m_err}")
+                if pathway_errs and contacts_hits == 0:
                     errors.append(
-                        f"{acct.get('username')}: contacts={err}; people={p_err}")
+                        f"{acct.get('username')}: " + "; ".join(pathway_errs))
 
             if not out:
                 if errors:

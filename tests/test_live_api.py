@@ -2203,8 +2203,11 @@ class MultiAccountContactsSearchTests(unittest.TestCase):
                         "emailAddresses": [{"address": e} for e in c["emails"]],
                     })
             elif "/me/people" in path:
-                # Empty for the multi-account tests — we're only exercising
-                # the contacts pathway here.
+                # Empty for the multi-account tests.
+                pass
+            elif "/me/messages" in path:
+                # Empty for multi-account tests — mail-search exercised
+                # separately below.
                 pass
             return {"value": value}, None
 
@@ -2317,8 +2320,10 @@ class ContactsSearchFallbackTests(unittest.TestCase):
     """contacts_search now also queries /me/people (broader recall — anyone
     you've recently emailed, not just formal contacts)."""
 
-    def _make_connector(self, contacts_by_account, people_by_account):
+    def _make_connector(self, contacts_by_account, people_by_account,
+                        messages_by_account=None):
         from hgr.live_api.connectors.ms365_connector import Microsoft365Connector
+        messages_by_account = messages_by_account or {}
 
         class _FakeClient:
             def all_accounts(self_):
@@ -2341,6 +2346,17 @@ class ContactsSearchFallbackTests(unittest.TestCase):
                     {"displayName": p["name"],
                      "scoredEmailAddresses": [{"address": e} for e in p["emails"]]}
                     for p in people_by_account.get("u@gmail.com", [])
+                ]}, None)
+            if "/me/messages" in path:
+                return ({"value": [
+                    {"from": {"emailAddress":
+                              {"name": m["from_name"], "address": m["from_addr"]}},
+                     "toRecipients": [{"emailAddress":
+                                       {"name": m.get("to_name"),
+                                        "address": m.get("to_addr")}}]
+                                      if m.get("to_addr") else [],
+                     "subject": m.get("subject", "")}
+                    for m in messages_by_account.get("u@gmail.com", [])
                 ]}, None)
             return None, "unknown path"
 
@@ -2388,6 +2404,31 @@ class ContactsSearchFallbackTests(unittest.TestCase):
         self.assertEqual(out["status"], "ok")
         self.assertEqual(out["count"], 0)
         self.assertIn("No one matching 'ghost'", out["message"])
+
+    def test_mail_search_finds_someone_youve_emailed(self) -> None:
+        """The real fix for MSA accounts: /me/contacts is incomplete and
+        /me/people is 403, but /me/messages search finds anyone whose
+        address appears in a mail header."""
+        conn, paths = self._make_connector(
+            # /me/contacts and /me/people both empty for this user.
+            contacts_by_account={"u@gmail.com": []},
+            people_by_account={"u@gmail.com": []},
+            # But there's a message FROM Dani in the mailbox.
+            messages_by_account={"u@gmail.com": [
+                {"from_name": "Dani Markov",
+                 "from_addr": "dani@mangollc.org",
+                 "to_addr": "u@gmail.com",
+                 "to_name": "Me",
+                 "subject": "hello"},
+            ]},
+        )
+        out = conn.execute("contacts_search", {"query": "Dani"})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(len(out["contacts"]), 1)
+        self.assertEqual(out["contacts"][0]["emails"], ["dani@mangollc.org"])
+        self.assertEqual(out["contacts"][0]["source"], "mail-search")
+        # /me/messages was actually hit.
+        self.assertTrue(any("/me/messages" in p for p in paths))
 
 
 if __name__ == "__main__":  # pragma: no cover
