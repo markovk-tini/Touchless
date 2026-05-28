@@ -12,7 +12,7 @@ Author: Konstantin Markov
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .plan import Plan, StepResult
 
@@ -44,14 +44,28 @@ class Executor:
                 break
             remaining.remove(ready)
             args = self._resolve(ready.args, results)
-            try:
-                out = self._registry.call(ready.tool, args)
-                if not isinstance(out, dict):
-                    out = {"status": "error", "error": "tool returned non-dict"}
-            except Exception as exc:
-                if self._logger:
-                    self._logger.exception("planner_exec_failed", exc, tool=ready.tool)
-                out = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            # Precondition check (Phase 6): short-circuit unavailable tools
+            # with a clear reason instead of letting the connector fail mid-
+            # call. Registries that don't implement is_available are skipped.
+            unavail_reason: Optional[str] = None
+            checker = getattr(self._registry, "is_available", None)
+            if callable(checker):
+                try:
+                    unavail_reason = checker(ready.tool)
+                except Exception:
+                    unavail_reason = None
+            if unavail_reason:
+                out = {"status": "error", "error": unavail_reason,
+                       "code": "precondition_not_met"}
+            else:
+                try:
+                    out = self._registry.call(ready.tool, args)
+                    if not isinstance(out, dict):
+                        out = {"status": "error", "error": "tool returned non-dict"}
+                except Exception as exc:
+                    if self._logger:
+                        self._logger.exception("planner_exec_failed", exc, tool=ready.tool)
+                    out = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
             r = StepResult(step_id=ready.id, tool=ready.tool,
                            status=str(out.get("status") or "ok"),
                            output=out, error=out.get("error"))

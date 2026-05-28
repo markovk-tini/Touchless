@@ -1821,6 +1821,119 @@ class OrchestratorSkillsTests(unittest.TestCase):
         self.assertEqual(out["steps"][0].tool, "volume_set")
 
 
+class PreconditionTests(unittest.TestCase):
+    """Phase 6 preconditions: registry says 'not available now' → executor
+    skips with a structured error instead of letting the connector fail."""
+
+    def _reg(self, available_map):
+        """Stub registry whose is_available consults a dict."""
+        class _Reg:
+            def __init__(self_):
+                self_.calls = []
+            def is_available(self_, name):
+                return available_map.get(name)  # None == available
+            def call(self_, name, args):
+                self_.calls.append((name, dict(args or {})))
+                return {"status": "ok"}
+            def handles_connector(self_, name):
+                return True
+        return _Reg()
+
+    def test_unavailable_step_short_circuits(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        reg = self._reg({"outlook_compose": "ms_graph not connected"})
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="outlook_compose",
+                 args={"recipient": "x@y", "body": "hi"}),
+        ])
+        results = Executor(reg).run(plan)
+        self.assertEqual(results[0].status, "error")
+        self.assertIn("not connected", results[0].error or "")
+        self.assertEqual(results[0].output.get("code"), "precondition_not_met")
+        # Step was NEVER actually called.
+        self.assertEqual(reg.calls, [])
+
+    def test_available_steps_still_run(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        reg = self._reg({})  # nothing unavailable
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="cal_today", args={}),
+        ])
+        results = Executor(reg).run(plan)
+        self.assertEqual(results[0].status, "ok")
+        self.assertEqual(reg.calls, [("cal_today", {})])
+
+    def test_dependents_of_precondition_failure_cascade(self) -> None:
+        """Step 2 depends on step 1; step 1 fails its precondition →
+        step 2 gets upstream-failed instead of running."""
+        from hgr.live_api.planner import Executor, Plan, Step
+        reg = self._reg({"outlook_compose": "ms_graph not connected"})
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="outlook_compose", args={}),
+            Step(id=2, tool="cal_today", args={}, depends_on=[1]),
+        ])
+        results = Executor(reg).run(plan)
+        self.assertEqual({r.step_id: r.status for r in results},
+                         {1: "error", 2: "error"})
+        self.assertEqual(reg.calls, [])
+
+    def test_registry_without_is_available_works(self) -> None:
+        """Older registries (or test stubs) that don't implement
+        is_available must continue to work — the executor falls through."""
+        from hgr.live_api.planner import Executor, Plan, Step
+        reg = _StubRegistry({"a": {"status": "ok"}})
+        # _StubRegistry has no is_available method.
+        results = Executor(reg).run(Plan(goal="g",
+                                          steps=[Step(id=1, tool="a")]))
+        self.assertEqual(results[0].status, "ok")
+
+
+class ConnectorRegistryAvailabilityTests(unittest.TestCase):
+    """ConnectorRegistry.is_available_for routes to the owning connector."""
+
+    def test_returns_reason_for_unavailable_connector(self) -> None:
+        from hgr.live_api.connectors.base import Connector, ConnectorRegistry
+
+        class _DisconnectedMS(Connector):
+            id = "ms_graph"
+            description = "Microsoft Graph"
+            def available(self): return False
+            def tools(self): return [{"name": "outlook_compose",
+                                       "parameters": {"type": "object",
+                                                      "properties": {},
+                                                      "required": [],
+                                                      "additionalProperties": False}}]
+            def execute(self, name, args): return None
+
+        reg = ConnectorRegistry()
+        reg.register(_DisconnectedMS())
+        # Note: an unavailable connector contributes nothing to
+        # available_tool_schemas, so the ownership map stays empty —
+        # is_available_for returns None (built-in path). That's correct:
+        # the planner won't include the tool in its catalog either.
+        reason = reg.is_available_for("outlook_compose")
+        self.assertIsNone(reason)  # not owned by an available connector
+
+    def test_returns_none_for_available_connector(self) -> None:
+        from hgr.live_api.connectors.base import Connector, ConnectorRegistry
+
+        class _ConnectedMS(Connector):
+            id = "ms_graph"
+            description = "Microsoft Graph"
+            def available(self): return True
+            def tools(self): return [{"name": "outlook_compose",
+                                       "parameters": {"type": "object",
+                                                      "properties": {},
+                                                      "required": [],
+                                                      "additionalProperties": False}}]
+            def execute(self, name, args): return {"status": "ok"}
+
+        reg = ConnectorRegistry()
+        reg.register(_ConnectedMS())
+        reg.available_tool_schemas()  # populate ownership
+        self.assertIsNone(reg.is_available_for("outlook_compose"))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

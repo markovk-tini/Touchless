@@ -63,6 +63,17 @@ class ToolRegistry:
         executor). Used to label which layer executed a command."""
         return self._connectors.handles(name)
 
+    def is_available(self, name: str) -> Optional[str]:
+        """Precondition check: None when the tool is runnable now, else a
+        short human-readable reason (e.g. 'ms_graph not connected'). Used by
+        the planner Executor to short-circuit a step before calling — gives
+        clean errors like 'Outlook not connected for the active account'
+        instead of cryptic auth failures from inside the connector."""
+        if self._connectors.handles(name):
+            return self._connectors.is_available_for(name)
+        # Built-in / GUI tools — we trust the executor's own runtime checks.
+        return None
+
     def call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         # API-first: a connector that owns this tool handles it directly.
         if self._connectors.handles(name):

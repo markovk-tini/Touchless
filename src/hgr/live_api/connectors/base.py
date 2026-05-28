@@ -59,6 +59,25 @@ class ConnectorRegistry:
     def register(self, connector: Connector) -> None:
         self._connectors.append(connector)
 
+    def is_available_for(self, name: str) -> Optional[str]:
+        """None when the connector owning `name` is runnable right now,
+        else a short human-readable reason ('outlook not connected', etc.).
+        Forces an ownership-map rebuild on miss so callers don't have to
+        pre-query schemas to get a meaningful answer."""
+        owner = self._owner.get(name)
+        if owner is None:
+            self.available_tool_schemas()
+            owner = self._owner.get(name)
+        if owner is None:
+            return None  # no connector owns it — built-in path, not our call
+        try:
+            if not owner.available():
+                cid = getattr(owner, "id", "connector")
+                return f"{cid} not connected"
+        except Exception as exc:
+            return f"availability check failed: {type(exc).__name__}"
+        return None
+
     def available_tool_schemas(self) -> List[Dict[str, Any]]:
         """Schemas for all currently-available connectors. Also (re)builds
         the name->connector ownership map used for routing."""
