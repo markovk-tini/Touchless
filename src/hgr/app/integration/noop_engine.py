@@ -565,7 +565,10 @@ class GestureWorker(QObject):
     # to the RAW normalized fingertip (before the control-box remap) so
     # tuning is independent of box gain. Lower min_cutoff => steadier
     # when holding still; higher beta => less lag on fast strokes.
-    _DRAWING_OEF_MIN_CUTOFF = 1.2
+    # min_cutoff lowered 1.2 -> 0.6: at rest the cursor was still drifting
+    # / shaking (hand tremor leaking through); 0.6 Hz holds it much steadier
+    # when the hand is held still. beta keeps fast strokes responsive.
+    _DRAWING_OEF_MIN_CUTOFF = 0.6
     _DRAWING_OEF_BETA = 0.6
     # Suggestion overlay: triggered when measured FPS stays below 15 for
     # longer than 10 seconds. After the user dismisses (X, left-fist, or
@@ -1902,7 +1905,13 @@ class GestureWorker(QObject):
         moves within a forearm-sized patch. Square in normalized coords
         keeps motion undistorted on a 16:9 frame/canvas.
         """
-        size = float(getattr(self.config, "drawing_control_box_size", 0.45))
+        # Default enlarged 0.45 -> 0.72: a small patch mapped to the whole
+        # canvas meant high gain, so the cursor flew (0.45=~2.2x, 0.60=~1.7x
+        # still felt too fast). 0.72 (~1.4x gain) makes the cursor noticeably
+        # slower/steadier; the tradeoff is a bit more hand travel to reach the
+        # canvas edges. Not user-configurable today, so this default is the
+        # effective value (a Settings slider can expose it if finer tuning helps).
+        size = float(getattr(self.config, "drawing_control_box_size", 0.72))
         size = max(0.15, min(1.0, size))
         cx = float(getattr(self.config, "drawing_control_box_center_x", 0.82))
         cy = float(getattr(self.config, "drawing_control_box_center_y", 0.55))
@@ -1963,7 +1972,20 @@ class GestureWorker(QObject):
             self._drawing_oef_y.reset()
         smooth_x = self._drawing_oef_x.update(raw_x, now)
         smooth_y = self._drawing_oef_y.update(raw_y, now)
-        self._drawing_cursor_norm = self._map_drawing_control_box(smooth_x, smooth_y)
+        # CAMERA ("switch view") draws on the camera feed the user is looking
+        # at, so the ink must land exactly under the fingertip: map the
+        # (smoothed) raw fingertip 1:1 to the canvas, with NO control-box gain.
+        # This also removes the "moves too fast" feel in that view — the cursor
+        # now tracks the finger one-to-one. SCREEN view is an air-mouse onto the
+        # whole desktop (the camera isn't visible), so it keeps the control-box
+        # remap that lets a forearm-sized patch cover the screen.
+        if self._drawing_render_target == "camera":
+            self._drawing_cursor_norm = (
+                max(0.0, min(1.0, smooth_x)),
+                max(0.0, min(1.0, smooth_y)),
+            )
+        else:
+            self._drawing_cursor_norm = self._map_drawing_control_box(smooth_x, smooth_y)
         if self._drawing_lift_pose_active(hand_reading):
             self._drawing_tool = "hover"
             self._drawing_control_text = f"drawing hover ({self._drawing_render_target})"
@@ -4933,8 +4955,21 @@ class GestureWorker(QObject):
                             int(raw_active) if isinstance(raw_active, int) else None
                         ),
                     }
-            if mouse_overlay is not None:
-                payload = {"hands": hands_info, "mouse_overlay": mouse_overlay}
+            # In switch-view (camera-target) drawing mode, hide the hand
+            # skeleton / bbox / gesture-label overlay the live-view widget
+            # paints on top — the user wants their DRAWING (baked into the
+            # frame, with the fingertip cursor) to be the top layer, not the
+            # "camera reading my hand" graphics. The drawing + cursor still
+            # show because they're in the frame, not in this overlay.
+            hide_hand_overlay = bool(
+                self._drawing_mode_enabled and self._drawing_render_target == "camera"
+            )
+            if mouse_overlay is not None or hide_hand_overlay:
+                payload = {
+                    "hands": hands_info,
+                    "mouse_overlay": mouse_overlay,
+                    "hide_hand_overlay": hide_hand_overlay,
+                }
             else:
                 payload = hands_info
             self.engine_landmarks_ready.emit(payload)

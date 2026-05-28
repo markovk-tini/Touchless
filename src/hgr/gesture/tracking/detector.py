@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 
 from ..models import TrackedHand
+from .face_filter import FaceExclusionFilter
 from .runtime import HandRuntime, load_hand_runtime
 from .smoothing import AdaptiveLandmarkSmoother
 from .types import build_bounds
@@ -53,6 +54,10 @@ class HandDetector:
         )
         self.smoother = smoother or AdaptiveLandmarkSmoother()
         self.secondary_smoother = secondary_smoother or AdaptiveLandmarkSmoother()
+        # Conservative, fail-safe filter that drops "hands" the model
+        # latched onto a face. No-op on any error so detection is never
+        # degraded; disable with env TOUCHLESS_FACE_FILTER=0.
+        self._face_filter = FaceExclusionFilter()
         self._last_primary_hand: TrackedHand | None = None
         self._last_primary_seen_at = 0.0
         self._last_secondary_hand: TrackedHand | None = None
@@ -60,6 +65,7 @@ class HandDetector:
 
     def close(self) -> None:
         self.hands.close()
+        self._face_filter.close()
 
     def reset(self) -> None:
         self.smoother.reset()
@@ -68,6 +74,31 @@ class HandDetector:
         self._last_primary_seen_at = 0.0
         self._last_secondary_hand = None
         self._last_secondary_seen_at = 0.0
+
+    def _no_detection_result(self, frame: np.ndarray) -> DetectionResult:
+        """Result for a frame with no usable hand — honours the existing
+        miss-tolerance bridge (return the last hand briefly) or resets.
+        Shared by the raw no-hands case and the case where the face
+        filter removes every candidate."""
+        now = time.monotonic()
+        primary_recent = (
+            self._last_primary_hand is not None
+            and self.miss_tolerance_seconds > 0.0
+            and (now - self._last_primary_seen_at) <= self.miss_tolerance_seconds
+        )
+        secondary_recent = (
+            self._last_secondary_hand is not None
+            and self.miss_tolerance_seconds > 0.0
+            and (now - self._last_secondary_seen_at) <= self.miss_tolerance_seconds
+        )
+        if primary_recent:
+            return DetectionResult(
+                tracked_hand=self._last_primary_hand,
+                frame_bgr=frame,
+                secondary_hand=self._last_secondary_hand if secondary_recent else None,
+            )
+        self.reset()
+        return DetectionResult(tracked_hand=None, frame_bgr=frame, secondary_hand=None)
 
     def process(self, frame_bgr: np.ndarray) -> DetectionResult:
         frame = frame_bgr.copy()
@@ -86,25 +117,7 @@ class HandDetector:
         rgb = cv2.cvtColor(processing_frame, cv2.COLOR_BGR2RGB)
         result = self.hands.process(rgb)
         if not getattr(result, "multi_hand_landmarks", None):
-            now = time.monotonic()
-            primary_recent = (
-                self._last_primary_hand is not None
-                and self.miss_tolerance_seconds > 0.0
-                and (now - self._last_primary_seen_at) <= self.miss_tolerance_seconds
-            )
-            secondary_recent = (
-                self._last_secondary_hand is not None
-                and self.miss_tolerance_seconds > 0.0
-                and (now - self._last_secondary_seen_at) <= self.miss_tolerance_seconds
-            )
-            if primary_recent:
-                return DetectionResult(
-                    tracked_hand=self._last_primary_hand,
-                    frame_bgr=frame,
-                    secondary_hand=self._last_secondary_hand if secondary_recent else None,
-                )
-            self.reset()
-            return DetectionResult(tracked_hand=None, frame_bgr=frame, secondary_hand=None)
+            return self._no_detection_result(frame)
 
         hand_entries: list[tuple[np.ndarray, str, float]] = []
         multi_landmarks = result.multi_hand_landmarks
@@ -122,6 +135,15 @@ class HandDetector:
                     label = "Unknown"
                     score = 0.0
             hand_entries.append((raw, label, score))
+
+        # Drop any "hand" the model latched onto a face. Runs on the same
+        # RGB frame the hand model saw, so landmark and face boxes share
+        # one normalized coordinate space. Fail-safe: returns the list
+        # unchanged on any error. If it removes the only candidate, treat
+        # the frame as a no-detection so nothing downstream acts on a face.
+        hand_entries = self._face_filter.filter(rgb, hand_entries)
+        if not hand_entries:
+            return self._no_detection_result(frame)
 
         if len(hand_entries) >= 2:
             centers = [(float(raw[:, 0].mean()), float(raw[:, 1].mean())) for raw, _, _ in hand_entries]

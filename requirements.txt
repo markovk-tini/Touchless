@@ -93,11 +93,3 @@ mcp
 # (public client + PKCE). Connect via the "Connect Microsoft" button.
 #   pip install msal
 msal
-
-# Microsoft Store in-app updater (src/hgr/app/updater/store_updater.py). WinRT
-# StoreContext projection — only used by the packaged STORE build to detect and
-# install Store updates from inside the app. Imported lazily, so source runs
-# and website builds never touch it. MUST be bundled into the MSIX build (add
-# 'winsdk' to hiddenimports in hgr_app.spec since it's a lazy/dynamic import).
-#   pip install winsdk
-winsdk

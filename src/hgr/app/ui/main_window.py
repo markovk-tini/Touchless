@@ -5792,6 +5792,11 @@ class MainWindow(QMainWindow):
         # Stays empty until the phone actually loads the page or sends
         # a frame; updated via the phone-server status callback.
         self._phone_connected_label: str = ""
+        # A phone-camera server that's been STARTED (code shown) but not yet
+        # adopted — we wait for a real connection before adopting it (which is
+        # what reveals the dropdown entry + Disconnect button + switches the
+        # camera). Adopted in _on_phone_server_status_event on connect.
+        self._pending_phone_server = None
         # Connect cross-thread signal up front so it's wired before the
         # server fires its first callback — prevents a race where the
         # phone announces itself between server.start() and the connect
@@ -6046,6 +6051,15 @@ class MainWindow(QMainWindow):
         try:
             from ...utils.runtime_paths import build_channel
             if build_channel() == "store":
+                # Store build: ask the STORE (not GitHub) whether an update is
+                # pending, and surface it through the same UpdateDialog.
+                try:
+                    from ..updater.store_updater import StoreUpdateChecker
+                    self._store_checker = StoreUpdateChecker(parent=self)
+                    self._store_checker.update_available.connect(self._on_update_available)
+                    self._store_checker.start()
+                except Exception:
+                    pass
                 return
         except Exception:
             pass
@@ -6087,6 +6101,29 @@ class MainWindow(QMainWindow):
             pass
 
         from ..updater.update_dialog import UpdateDialog
+
+        # Store update with no self-applicable installer URL (rare fallback):
+        # an unpackaged app can't trigger a Store install itself, so just open
+        # the Store product page on "Download Update". The common Store case has
+        # an installer URL and update_kind='full-exe', which flows through the
+        # normal Updater below (downloads the Store's own installer + runs it).
+        if getattr(info, "update_kind", "") == "store":
+            self._update_dialog = UpdateDialog(info, parent=self)
+            def _open_store(*_a, _url=getattr(info, "html_url", "") or ""):
+                try:
+                    import os as _os
+                    _os.startfile(_url)  # ms-windows-store://pdp/?productid=...
+                except Exception:
+                    pass
+            self._update_dialog.download_requested.connect(_open_store)
+            self._update_dialog.dismissed.connect(
+                lambda v=info.version: self._on_update_dismissed(v)
+            )
+            self._update_dialog.show()
+            self._update_dialog.raise_()
+            self._update_dialog.activateWindow()
+            return
+
         from ..updater import Updater
         self._update_dialog = UpdateDialog(info, parent=self)
         self._updater = Updater(parent=self)
@@ -6396,9 +6433,30 @@ class MainWindow(QMainWindow):
         debug_row.addStretch(1)
         body_layout.addLayout(debug_row)
 
-        # Local Agent UI removed (paused). The underlying live_api/
-        # package code is intact — re-enable by restoring the home-page
-        # card + handlers from git history when ready.
+        # Touchless Assistant (Live API agent / "Iris"). Still in development —
+        # NOT shipped to users yet. It shows ONLY in source/dev runs
+        # (python run_app.py, where sys.frozen is False), so you can keep
+        # working on it, and is HIDDEN in the frozen public build. The build
+        # also EXCLUDES the live_api code (hgr_app.spec), so it can't ship even
+        # by accident. TOUCHLESS_ENABLE_ASSISTANT=1 can force it on for a custom
+        # build that intentionally includes the assistant. The live_api import
+        # is lazy (only when the button is clicked), so a hidden button never
+        # loads it.
+        import os as _os_assistant
+        import sys as _sys_assistant
+        _show_assistant = (
+            not getattr(_sys_assistant, "frozen", False)
+            or _os_assistant.environ.get("TOUCHLESS_ENABLE_ASSISTANT") == "1"
+        )
+        if _show_assistant:
+            assistant_row = QHBoxLayout()
+            assistant_row.addStretch(1)
+            self.assistant_button = QPushButton("ASSISTANT")
+            self.assistant_button.setObjectName("debuggerButton")
+            self.assistant_button.clicked.connect(self.open_assistant)
+            assistant_row.addWidget(self.assistant_button)
+            assistant_row.addStretch(1)
+            body_layout.addLayout(assistant_row)
 
         body_layout.addStretch(1)
         return page
@@ -12377,7 +12435,11 @@ class MainWindow(QMainWindow):
         # Already connected (e.g. from the Camera tab)? Reuse the running
         # receiver — starting a second one would collide on the local port.
         # Just re-show its code (and its connected state).
-        existing = getattr(self, "_phone_camera_qr_server", None)
+        # Reuse a server that's already running — whether fully adopted
+        # (_phone_camera_qr_server) OR still pending a first connection
+        # (_pending_phone_server). Starting a second would collide on the port.
+        existing = (getattr(self, "_phone_camera_qr_server", None)
+                    or getattr(self, "_pending_phone_server", None))
         if isinstance(existing, WebEnginePhoneServer) and existing.is_running and existing.info is not None:
             dialog = PhoneConnectDialog(existing.info.code, parent=self,
                                         connect_url=existing.info.connect_url, config=self.config)
@@ -12403,7 +12465,11 @@ class MainWindow(QMainWindow):
         self._phone_connect_dialog = dialog
         dialog.closed.connect(lambda: setattr(self, "_phone_connect_dialog", None))
         dialog.show()
-        self._adopt_webrtc_phone_server(server)
+        # DON'T adopt yet: keep the server running and wait for the phone to
+        # actually connect. _on_phone_server_status_event adopts it on the
+        # client_connected/streaming event — only THEN do the dropdown entry,
+        # the Disconnect button, and the camera switch appear.
+        self._pending_phone_server = server
         if hasattr(self, "last_action_label"):
             self.last_action_label.setText("Last action: phone connection started")
 
@@ -12571,6 +12637,19 @@ class MainWindow(QMainWindow):
                     dlg.set_status("Waiting for your phone…")
             except Exception:
                 pass
+        # Phone ACTUALLY connected now → adopt the pending server. This is what
+        # reveals the camera dropdown entry + Disconnect button and switches the
+        # camera to the phone — deferred from the Connect click so none of it
+        # appears until there's a real connection. (Never on phone_page_loaded,
+        # which only means the page opened, not that a stream exists.)
+        if event in ("client_connected", "streaming"):
+            pending = getattr(self, "_pending_phone_server", None)
+            if pending is not None and getattr(self, "_phone_camera_qr_server", None) is not pending:
+                self._pending_phone_server = None
+                try:
+                    self._adopt_webrtc_phone_server(pending)
+                except Exception:
+                    pass
         label = str(data.get("label") or "").strip()
         if event == "phone_identified" and label:
             self._phone_connected_label = label
@@ -14098,18 +14177,19 @@ class MainWindow(QMainWindow):
         self._mark_settings_panel_button(self._updates_check_button)
         self._updates_check_button.clicked.connect(self._on_updates_panel_check_clicked)
         if _is_store_build:
-            self._updates_check_button.setEnabled(False)
+            # Store builds CAN now check manually — the button runs the
+            # StoreUpdateChecker (winget manifest) and offers an in-app install,
+            # in addition to the Store's own automatic updates. Keep it enabled.
             self._updates_check_button.setToolTip(
-                "Updates for the Microsoft Store version are delivered "
-                "automatically by the Store."
+                "Check the Microsoft Store for a newer version."
             )
         version_row.addWidget(self._updates_check_button)
         current_layout.addLayout(version_row)
 
         if _is_store_build:
             initial_updates_status = (
-                "This is the Microsoft Store version — updates are "
-                "installed automatically through the Store."
+                "Click 'Check for Updates' to check the Microsoft Store for a "
+                "newer version (the Store also updates automatically)."
             )
         else:
             initial_updates_status = "Click 'Check for Updates' to look for a newer version."
@@ -14167,17 +14247,30 @@ class MainWindow(QMainWindow):
 
     def _on_updates_panel_check_clicked(self) -> None:
         """Manual update check from the Updates settings panel."""
-        # Belt-and-suspenders: Store builds never check GitHub. The
-        # button is already disabled at build time for store channel,
-        # but guard here too in case it's reached programmatically.
+        # Store builds check the STORE (winget manifest), not GitHub. Run the
+        # StoreUpdateChecker and reuse the same dialog flow; manual=True makes
+        # _on_update_available bypass the dismissed-version short-circuit, so a
+        # prior "Later" doesn't hide the result of an explicit re-check.
         try:
             from ...utils.runtime_paths import build_channel
             if build_channel() == "store":
+                from ..updater.store_updater import StoreUpdateChecker
+                if hasattr(self, "_updates_check_button"):
+                    self._updates_check_button.setEnabled(False)
+                    self._updates_check_button.setText("Checking...")
                 if hasattr(self, "_updates_status_label"):
-                    self._updates_status_label.setText(
-                        "This is the Microsoft Store version — updates "
-                        "are installed automatically through the Store."
-                    )
+                    self._updates_status_label.setText("Checking the Microsoft Store for the latest version...")
+                self._in_manual_update_check = True
+                checker = StoreUpdateChecker(parent=self)
+                checker.update_available.connect(self._on_update_available)
+                checker.update_available.connect(self._on_manual_update_found)
+                checker.no_update.connect(self._on_manual_no_update)
+                checker.check_failed.connect(self._on_manual_check_failed)
+                checker.update_available.connect(lambda *_: setattr(self, "_in_manual_update_check", False))
+                checker.no_update.connect(lambda *_: setattr(self, "_in_manual_update_check", False))
+                checker.check_failed.connect(lambda *_: setattr(self, "_in_manual_update_check", False))
+                checker.start()
+                self._update_checker = checker  # keep alive
                 return
         except Exception:
             pass
@@ -14571,6 +14664,31 @@ Admin elevation
         as the parameter only so the lambda site can stay readable
         — its fields aren't used here.
         """
+        # Store builds update from the STORE, not a GitHub entry — route the
+        # download through the StoreUpdateChecker (current Store version + its
+        # installer) instead of fetching the GitHub release.
+        try:
+            from ...utils.runtime_paths import build_channel
+            if build_channel() == "store":
+                from ..updater.store_updater import StoreUpdateChecker
+                self._in_manual_update_check = True
+                try:
+                    self._updates_status_label.setText("Fetching the latest version from the Microsoft Store…")
+                except Exception:
+                    pass
+                checker = StoreUpdateChecker(parent=self)
+                checker.update_available.connect(self._on_update_available)
+                checker.update_available.connect(self._on_manual_update_found)
+                checker.no_update.connect(self._on_manual_no_update)
+                checker.check_failed.connect(self._on_manual_check_failed)
+                checker.update_available.connect(lambda *_: setattr(self, "_in_manual_update_check", False))
+                checker.no_update.connect(lambda *_: setattr(self, "_in_manual_update_check", False))
+                checker.check_failed.connect(lambda *_: setattr(self, "_in_manual_update_check", False))
+                checker.start()
+                self._update_checker = checker
+                return
+        except Exception:
+            pass
         try:
             from ..updater.release_checker import ReleaseChecker
         except Exception as exc:
@@ -17278,13 +17396,13 @@ Admin elevation
     # local camera, "phone_qr" = phone QR source, None = auto-select.
     _PHONE_CAMERA_DROPDOWN_VALUE = "phone_qr"
     _PHONE_MICROPHONE_DROPDOWN_VALUE = "phone_qr_mic"
-    # Sentinel for "Connect Phone (QR)" — only injected into HOME
+    # Sentinel for "Connect Phone" — only injected into HOME
     # combos so the user can pair a phone straight from the start
     # screen without diving into Settings. Selecting this entry opens
-    # the QR pair dialog and reverts the dropdown to its previous
-    # selection (the entry is an action, not a saveable preference).
-    # Settings panels keep their own dedicated "Connect Phone (QR)"
-    # button and intentionally do NOT carry this sentinel.
+    # the pairing-code (touchless-control.com) dialog and reverts the
+    # dropdown to its previous selection (the entry is an action, not a
+    # saveable preference). Settings panels keep their own dedicated
+    # "Connect Phone" button and intentionally do NOT carry this sentinel.
     _CONNECT_PHONE_QR_CAMERA_VALUE = "connect_phone_qr_camera"
     _CONNECT_PHONE_QR_MIC_VALUE = "connect_phone_qr_mic"
 
@@ -17357,7 +17475,7 @@ Admin elevation
             # of the list so the existing Auto-select / local-device
             # ordering doesn't shift around.
             if is_home:
-                combo.addItem("Connect Phone (QR)", self._CONNECT_PHONE_QR_CAMERA_VALUE)
+                combo.addItem("Connect Phone", self._CONNECT_PHONE_QR_CAMERA_VALUE)
             self._set_combo_selection_by_data(combo, selected_value)
             combo.blockSignals(False)
         self._refresh_camera_labels()
@@ -17793,14 +17911,14 @@ Admin elevation
         if combo is None:
             return
         selected_data = combo.currentData()
-        # "Connect Phone (QR)" sentinel: open the pair dialog instead
-        # of saving a preference, and revert the combo to whatever
-        # was previously chosen so it doesn't stick on the action
+        # "Connect Phone" sentinel: open the pairing-code (website) pair
+        # dialog instead of saving a preference, and revert the combo to
+        # whatever was previously chosen so it doesn't stick on the action
         # entry. The pair flow itself rebuilds the combo on success.
         if isinstance(selected_data, str) and selected_data == self._CONNECT_PHONE_QR_CAMERA_VALUE:
             previous = self._saved_camera_settings_combo_value()
             self._refresh_camera_combo_selection(previous)
-            self._on_phone_camera_qr_clicked()
+            self._on_connect_phone_clicked()
             return
         self._save_camera_preference_from_combo(combo, show_notice=False)
 
@@ -18006,7 +18124,7 @@ Admin elevation
             # the phone mic straight from the start screen. Routes
             # through the same QR pair dialog as the camera option.
             if is_home:
-                combo.addItem("Connect Phone (QR)", self._CONNECT_PHONE_QR_MIC_VALUE)
+                combo.addItem("Connect Phone", self._CONNECT_PHONE_QR_MIC_VALUE)
             self._set_combo_selection_by_data(combo, selected_value)
             combo.blockSignals(False)
         self._refresh_microphone_label()
@@ -18065,15 +18183,15 @@ Admin elevation
         if combo is None:
             return
         selected_data = combo.currentData()
-        # "Connect Phone (QR)" sentinel: open the pair dialog instead
-        # of saving a preference, and revert the combo to whatever
-        # was previously chosen so it doesn't stick on the action
-        # entry. Reuses the camera QR pair flow because phone audio
-        # rides over the same WebSocket once paired.
+        # "Connect Phone" sentinel: open the pairing-code (website) pair
+        # dialog instead of saving a preference, and revert the combo to
+        # whatever was previously chosen so it doesn't stick on the action
+        # entry. Reuses the camera pairing-code flow because phone audio
+        # rides over the same connection once paired.
         if isinstance(selected_data, str) and selected_data == self._CONNECT_PHONE_QR_MIC_VALUE:
             previous = self._saved_microphone_settings_combo_value()
             self._refresh_microphone_combo_selection(previous)
-            self._on_phone_camera_qr_clicked()
+            self._on_connect_phone_clicked()
             return
         self._save_microphone_preference_from_combo(combo, show_notice=False)
 
@@ -19358,6 +19476,24 @@ Admin elevation
                 pass
             self.live_view_window.show_window()
             self.last_action_label.setText("Last action: opened live view")
+
+    def open_assistant(self) -> None:
+        self._ensure_assistant_window()
+        if getattr(self, "live_assistant_window", None) is None:
+            return
+        self.live_assistant_window.show_window()
+        self.last_action_label.setText("Last action: opened assistant")
+
+    def _clear_assistant_window_reference(self, *args) -> None:
+        self.live_assistant_window = None
+
+    def _ensure_assistant_window(self) -> None:
+        if getattr(self, "live_assistant_window", None) is None:
+            from .live_assistant_window import LiveAssistantWindow
+            self.live_assistant_window = LiveAssistantWindow(self.config)
+            self.live_assistant_window.destroyed.connect(
+                self._clear_assistant_window_reference
+            )
 
     def _clear_debugger_reference(self, *args) -> None:
         self.debugger_window = None

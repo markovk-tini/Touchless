@@ -166,6 +166,17 @@ class PhoneConnectDialog(QDialog):
         color = self._accent if connected else self._waiting
         self._status.setStyleSheet(f"color: {color}; font-size: 13px; font-weight: 700;")
 
+    def showEvent(self, event):  # noqa: N802 (Qt API)
+        super().showEvent(event)
+        # Paint the OS title bar Touchless indigo to match the main window
+        # and the other app dialogs (no-ops on Win 10 / non-Windows). Must
+        # run after the native window exists, hence here rather than __init__.
+        try:
+            from .custom_gestures_chrome import apply_touchless_titlebar
+            apply_touchless_titlebar(self)
+        except Exception:
+            pass
+
     def closeEvent(self, event):  # noqa: N802 (Qt API)
         self.closed.emit()
         super().closeEvent(event)

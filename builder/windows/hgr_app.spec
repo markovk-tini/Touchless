@@ -1,6 +1,7 @@
 # Touchless PyInstaller spec for Windows
 # Place this file at builder/windows/hgr_app.spec and run from the repo root.
 
+import os
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
@@ -38,6 +39,7 @@ for package_name in ("PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineCore"):
         hiddenimports += pkg_hiddenimports
     except Exception:
         pass
+
 
 # onnxruntime-directml: ships native DLLs (DirectML.dll, the DML
 # execution provider, the providers_shared shim, plus a few
@@ -270,7 +272,17 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["PyQt5", "PyQt6", "PySide2"],
+    # Touchless Assistant ("Iris" / Live API agent) is NOT shipped yet — keep it
+    # OUT of the bundle entirely (the source tree keeps it for dev; the UI entry
+    # point is also dev-gated). Excluding the package means its code AND its
+    # exclusive deps (rapidocr, websocket-client, etc.) are pruned, since
+    # nothing else in the app reaches them. The only importer is a lazy,
+    # env-gated import in main_window, so excluding these can't break startup.
+    excludes=[
+        "PyQt5", "PyQt6", "PySide2",
+        "hgr.live_api",
+        "hgr.app.ui.live_assistant_window",
+    ],
     noarchive=False,
 )
 

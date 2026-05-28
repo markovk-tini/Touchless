@@ -130,6 +130,11 @@ class GpuVideoWidget(QWidget):
         # is unaffected because it runs on the worker thread off
         # raw frames, not off this widget's paint.
         self._lite_paint_mode = False
+        # Switch-view (camera-target) drawing: hide the hand skeleton / bbox /
+        # gesture-label overlay so the user's drawing (baked into the frame,
+        # with its fingertip cursor) is the top layer and the camera doesn't
+        # visibly "read the hand". Set per-frame from the engine payload.
+        self._hide_hand_overlay = False
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(220, 140)
         # Disable Qt's automatic background fill — we paint the
@@ -194,9 +199,11 @@ class GpuVideoWidget(QWidget):
         if payload is None:
             self._hands_info = []
             self._mouse_overlay = None
+            self._hide_hand_overlay = False
             return
         if isinstance(payload, dict):
             hands_info = payload.get("hands") or []
+            self._hide_hand_overlay = bool(payload.get("hide_hand_overlay"))
             mouse_overlay_raw = payload.get("mouse_overlay")
             if isinstance(mouse_overlay_raw, dict):
                 bounds = mouse_overlay_raw.get("bounds")
@@ -226,6 +233,7 @@ class GpuVideoWidget(QWidget):
         else:
             hands_info = payload
             self._mouse_overlay = None
+            self._hide_hand_overlay = False
         normalised: List[dict] = []
         for entry in hands_info:
             if entry is None:
@@ -295,7 +303,12 @@ class GpuVideoWidget(QWidget):
             # OK to drop. _draw_landmarks now honours
             # _lite_paint_mode internally and gates its own heavy
             # sections.
-            self._draw_landmarks(painter, target)
+            # In switch-view drawing mode, skip the hand overlay ENTIRELY
+            # (skeleton/bbox/label) so only the camera + the user's drawing
+            # (baked into the frame, with its fingertip cursor) show — the
+            # drawing is the top layer and the hand-reading graphics vanish.
+            if not self._hide_hand_overlay:
+                self._draw_landmarks(painter, target)
         elif self._idle_text:
             painter.setPen(QPen(self._idle_color, 1))
             painter.setFont(self._idle_font)
