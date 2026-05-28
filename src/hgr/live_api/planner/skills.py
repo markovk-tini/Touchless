@@ -74,9 +74,18 @@ class SkillStore:
 
     # ---- writes ---------------------------------------------------------
     def save(self, name: str, trigger: str, plan: Plan) -> int:
+        # Multi-step skills almost always want a natural-language summary
+        # rather than the deterministic 'Done (N/N steps: a, b).' fallback.
+        # If the caller left final at the default 'return' AND there's more
+        # than one step, promote to 'synthesize'. Single-step action skills
+        # (e.g. a 'leave discord call' macro) keep 'return' — there's
+        # nothing to summarize.
+        final = plan.final or "return"
+        if final == "return" and len(plan.steps or []) > 1:
+            final = "synthesize"
         plan_json = json.dumps({
             "goal": plan.goal,
-            "final": plan.final,
+            "final": final,
             "steps": [
                 {"id": s.id, "tool": s.tool, "args": s.args,
                  "depends_on": s.depends_on, "description": s.description}
