@@ -727,10 +727,20 @@ class LiveApiManager(QObject):
         planner = self._iris_planner
         memory = getattr(planner, "_memory", None) if planner is not None else None
         if memory is None or not hasattr(memory, "observe_conversation"):
+            if self._logger:
+                self._logger.event("observe_realtime_skip_no_memory",
+                                   has_planner=bool(planner),
+                                   has_memory=bool(memory))
             return
         ut = (self._last_user_text or "").strip()
         if not ut:
+            if self._logger:
+                self._logger.event("observe_realtime_skip_no_user_text")
             return
+        if self._logger:
+            self._logger.event("observe_realtime_dispatch",
+                               user_text_len=len(ut),
+                               assistant_text_len=len((self._turn_text or "").strip()))
         try:
             memory.observe_conversation(ut, (self._turn_text or "").strip())
         finally:

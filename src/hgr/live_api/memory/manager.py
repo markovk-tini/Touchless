@@ -79,14 +79,24 @@ class MemoryManager:
         Skips short / question-only turns where extraction would be pure
         noise (no factual content can plausibly be in 'what's the weather')."""
         if not _llm_extraction_enabled():
+            if self._logger:
+                self._logger.event("memory_llm_skip_disabled")
             return
         ut = (user_text or "").strip()
         if len(ut) < 8:
+            if self._logger:
+                self._logger.event("memory_llm_skip_too_short", length=len(ut))
             return
         # Question-only turns rarely contain durable facts. Cheap guard
         # before paying for the LLM round-trip.
         if ut.endswith("?") and len(ut) < 50:
+            if self._logger:
+                self._logger.event("memory_llm_skip_short_question",
+                                   length=len(ut))
             return
+        if self._logger:
+            self._logger.event("memory_llm_thread_starting",
+                               user_text_len=len(ut))
         threading.Thread(
             target=self._observe_safe,
             args=(ut, (assistant_text or "").strip()),
@@ -96,12 +106,18 @@ class MemoryManager:
 
     def _observe_safe(self, user_text: str, assistant_text: str) -> None:
         try:
-            facts = extract_facts_from_conversation(user_text, assistant_text)
+            facts = extract_facts_from_conversation(
+                user_text, assistant_text, logger=self._logger)
         except Exception as exc:  # pragma: no cover - defensive
             if self._logger:
                 self._logger.exception("memory_llm_extract_failed", exc)
             return
         if not facts:
+            if self._logger:
+                # Distinguish 'API returned but parsed to zero' from earlier
+                # silent-fail paths inside the extractor.
+                self._logger.event("memory_llm_extract_empty",
+                                   user_text_len=len(user_text))
             return
         threshold = _llm_confidence_threshold()
         kept = [(kind, key, value) for (kind, key, value, conf) in facts

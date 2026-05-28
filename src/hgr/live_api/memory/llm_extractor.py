@@ -23,7 +23,7 @@ import json
 import os
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Tuple
 
 DEFAULT_MODEL = "gpt-5-mini"
 API_URL = "https://api.openai.com/v1/chat/completions"
@@ -98,13 +98,22 @@ def confidence_threshold() -> float:
 def extract_facts_from_conversation(
         user_text: str, assistant_text: str = "",
         model: str = "", timeout: float = 20.0,
+        logger: Any = None,
 ) -> List[Tuple[str, str, str, float]]:
     """Run one cheap-LLM extraction pass. Returns a list of
     (kind, key, value, confidence) tuples, filtered to the allowed
     kinds vocabulary. Confidence filtering is the caller's job so they
     can audit raw output if they want."""
     user_text = (user_text or "").strip()
-    if not user_text or not configured() or not enabled():
+    if not user_text:
+        return []
+    if not configured():
+        if logger:
+            logger.event("memory_llm_extract_no_api_key")
+        return []
+    if not enabled():
+        if logger:
+            logger.event("memory_llm_extract_disabled_by_env")
         return []
 
     chosen_model = (model
@@ -137,14 +146,30 @@ def extract_facts_from_conversation(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError:
+    except urllib.error.HTTPError as exc:
+        if logger:
+            body = ""
+            try:
+                body = exc.read().decode("utf-8", errors="ignore")[:400]
+            except Exception:
+                pass
+            logger.event("memory_llm_extract_http_error",
+                         code=exc.code, model=chosen_model, body=body)
         return []
-    except Exception:
+    except Exception as exc:
+        if logger:
+            logger.event("memory_llm_extract_network_error",
+                         error=f"{type(exc).__name__}: {exc}")
         return []
 
     raw = ((payload.get("choices") or [{}])[0]
            .get("message", {}).get("content") or "").strip()
-    return _parse_facts(raw)
+    facts = _parse_facts(raw)
+    if logger:
+        logger.event("memory_llm_extract_api_returned",
+                     raw_chars=len(raw), parsed_count=len(facts),
+                     model=chosen_model)
+    return facts
 
 
 def _parse_facts(raw: str) -> List[Tuple[str, str, str, float]]:
