@@ -8,11 +8,13 @@ Author: Konstantin Markov
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from typing import Any, Dict, List
 
 from .base import Connector, connector_result
@@ -122,8 +124,13 @@ class Microsoft365Connector(Connector):
                 "channel": {"type": "string",
                             "description": "Channel name (default: General)."}},
                ["team", "text"]),
+            fn("excel_create",
+               "Create a new blank Excel workbook (.xlsx) in OneDrive by name.",
+               {"file": {"type": "string", "description": "Workbook name, e.g. 'Budget'."}},
+               ["file"]),
             fn("excel_set_cell",
-               "Set a cell value in a OneDrive Excel workbook (found by file name).",
+               "Set a cell in a OneDrive Excel workbook (found by name; created "
+               "automatically if it doesn't exist yet).",
                {"file": {"type": "string", "description": "Workbook name, e.g. 'Budget.xlsx'."},
                 "cell": {"type": "string", "description": "A1-style cell, e.g. 'B2'."},
                 "value": {"type": "string"},
@@ -304,11 +311,23 @@ class Microsoft365Connector(Connector):
             return connector_result("error" if err else "ok", error=err,
                                     posted=(err is None), team=team)
 
+        if name == "excel_create":
+            file = str(args.get("file") or "").strip()
+            if not file:
+                return connector_result("error", error="file is required")
+            item_id, err = self._excel_item(file, create=True)
+            if err:
+                return connector_result("error", error=err)
+            data, _ = self._graph("GET", f"/me/drive/items/{item_id}?$select=name,webUrl")
+            return connector_result("ok", created=True, name=(data or {}).get("name", file),
+                                    link=(data or {}).get("webUrl"))
+
         if name in ("excel_set_cell", "excel_read_range"):
             file = str(args.get("file") or "").strip()
             if not file:
                 return connector_result("error", error="file is required")
-            item_id, err = self._excel_item(file)
+            # set_cell auto-creates the workbook if it's missing; read does not.
+            item_id, err = self._excel_item(file, create=(name == "excel_set_cell"))
             if err:
                 return connector_result("error", error=err, code="not_found")
             sheet = str(args.get("sheet") or "Sheet1").strip() or "Sheet1"
@@ -348,7 +367,7 @@ class Microsoft365Connector(Connector):
                                         added=(err is None), title=title, id=(data or {}).get("id"))
             max_n = max(1, min(50, int(args.get("max") or 20)))
             data, err = self._graph(
-                "GET", f"/me/todo/lists/{list_id}/tasks?$top={max_n}&$select=title,status,id")
+                "GET", f"/me/todo/lists/{list_id}/tasks?$top={max_n}")
             if err:
                 return connector_result("error", error=err)
             tasks = [{"title": t.get("title"), "status": t.get("status"), "id": t.get("id")}
@@ -464,8 +483,10 @@ class Microsoft365Connector(Connector):
         return tid, (prim or {}).get("id"), None
 
     def _todo_default_list(self):
-        """Resolve the user's default To Do list id → (id, None) or (None, err)."""
-        data, err = self._graph("GET", "/me/todo/lists?$select=id,wellknownListName,displayName")
+        """Resolve the user's default To Do list id → (id, None) or (None, err).
+        NOTE: $select 400s on personal accounts (RequestBroker--ParseUri), so
+        request the lists plainly."""
+        data, err = self._graph("GET", "/me/todo/lists")
         if err:
             return None, err
         lists = data.get("value") or []
@@ -474,16 +495,73 @@ class Microsoft365Connector(Connector):
                 return lst.get("id"), None
         return (lists[0].get("id"), None) if lists else (None, "no To Do lists found")
 
-    def _excel_item(self, file: str):
-        """Resolve a OneDrive workbook by name → (item_id, None) or (None, err)."""
-        q = urllib.parse.quote(file)
-        res, err = self._graph("GET", f"/me/drive/root/search(q='{q}')?$top=10&$select=id,name")
-        if err:
-            return None, err
-        items = res.get("value") or []
-        for it in items:
-            if str(it.get("name", "")).lower().endswith((".xlsx", ".xlsm")):
-                return it.get("id"), None
-        if items:
-            return items[0].get("id"), None
-        return None, f"no workbook found named '{file}'"
+    def _excel_item(self, file: str, create: bool = False):
+        """Resolve a OneDrive workbook by name → (item_id, None) or (None, err).
+        Tries a direct PATH lookup first (immediate — search doesn't index new
+        files right away), then search; if create=True and still none, uploads
+        a new blank .xlsx at the root."""
+        name = file if file.lower().endswith((".xlsx", ".xlsm")) else f"{file}.xlsx"
+        enc_name = urllib.parse.quote(name)
+        # 1. Direct path lookup at the OneDrive root (no search-index lag).
+        item, _ = self._graph("GET", f"/me/drive/root:/{enc_name}")
+        if item and item.get("id"):
+            return item.get("id"), None
+        # 2. Search (catches files in subfolders / slightly different names).
+        res, err = self._graph(
+            "GET", f"/me/drive/root/search(q='{urllib.parse.quote(file)}')?$top=10&$select=id,name")
+        if not err and isinstance(res, dict):
+            items = res.get("value") or []
+            for it in items:
+                if str(it.get("name", "")).lower().endswith((".xlsx", ".xlsm")):
+                    return it.get("id"), None
+            if items and not create:
+                return items[0].get("id"), None
+        if not create:
+            return None, f"no workbook found named '{file}'"
+        # 3. Create a fresh blank workbook (Sheet1) at the root.
+        created, cerr = self._graph(
+            "PUT", f"/me/drive/root:/{enc_name}:/content",
+            raw=self._minimal_xlsx_bytes(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if cerr:
+            return None, f"could not create workbook: {cerr}"
+        return (created or {}).get("id"), None
+
+    @staticmethod
+    def _minimal_xlsx_bytes() -> bytes:
+        """A valid blank .xlsx (one sheet 'Sheet1') built in-memory — no
+        third-party library — so iris can create Excel workbooks in OneDrive."""
+        parts = {
+            "[Content_Types].xml":
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                '</Types>',
+            "_rels/.rels":
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                '</Relationships>',
+            "xl/workbook.xml":
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>',
+            "xl/_rels/workbook.xml.rels":
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+                '</Relationships>',
+            "xl/worksheets/sheet1.xml":
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<sheetData/></worksheet>',
+        }
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for path, content in parts.items():
+                z.writestr(path, content)
+        return buf.getvalue()
