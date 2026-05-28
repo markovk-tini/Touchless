@@ -12,6 +12,7 @@ import io
 import json
 import os
 import urllib.error
+import re
 import urllib.parse
 import urllib.request
 import zipfile
@@ -19,6 +20,23 @@ from typing import Any, Dict, List, Optional
 
 from .base import Connector, connector_result
 from .ms_graph_client import MsGraphClient, GRAPH_BASE
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_ENTITY_RE = re.compile(r"&(?:nbsp|amp|lt|gt|quot|apos|#\d+);")
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
+
+def _strip_html(html: str) -> str:
+    """Turn an HTML email body into plain text. Not a full parser; just
+    enough that the synthesizer prompt sees readable content instead of
+    DOM noise. Decodes the common entities + collapses whitespace."""
+    text = _HTML_TAG_RE.sub(" ", html or "")
+    text = _HTML_ENTITY_RE.sub(lambda m: {
+        "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+        "&quot;": '"', "&apos;": "'",
+    }.get(m.group(0), " "), text)
+    return _WS_COLLAPSE_RE.sub(" ", text).strip()
 
 
 class Microsoft365Connector(Connector):
@@ -87,10 +105,15 @@ class Microsoft365Connector(Connector):
                {"to": {"type": "string"}, "subject": {"type": "string"},
                 "body": {"type": "string"}}, ["to", "subject", "body"]),
             fn("ms_mail_list",
-               "List recent Outlook inbox messages (sender, subject, preview). "
-               "Set unread_only=true for just unread.",
+               "List recent Outlook inbox messages (id, from, from_name, "
+               "subject, received, preview). Set unread_only=true for just "
+               "unread; set include_body=true to ALSO fetch the full body "
+               "(HTML stripped, capped at 2 KB per message) inline as "
+               "body_text — pair with final='synthesize' for a real "
+               "'read my emails' briefing instead of just headers.",
                {"max": {"type": "integer", "description": "Max messages (default 10)."},
-                "unread_only": {"type": "boolean", "default": False}}),
+                "unread_only": {"type": "boolean", "default": False},
+                "include_body": {"type": "boolean", "default": False}}),
             fn("ms_mail_search",
                "Search Outlook mail for a query; returns matching messages.",
                {"query": {"type": "string"},
@@ -206,17 +229,34 @@ class Microsoft365Connector(Connector):
         if name == "ms_mail_list":
             max_n = max(1, min(50, int(args.get("max") or 10)))
             flt = "&$filter=isRead eq false" if args.get("unread_only") else ""
+            include_body = bool(args.get("include_body"))
+            fields = "id,subject,from,receivedDateTime,bodyPreview"
+            if include_body:
+                fields += ",body"
             data, err = self._graph(
                 "GET", f"/me/mailFolders/inbox/messages?$top={max_n}{flt}"
-                       "&$select=id,subject,from,receivedDateTime,bodyPreview"
+                       f"&$select={fields}"
                        "&$orderby=receivedDateTime desc")  # newest first
             if err:
                 return connector_result("error", error=err)
-            msgs = [{"id": m.get("id"),
-                     "from": (m.get("from") or {}).get("emailAddress", {}).get("address"),
-                     "subject": m.get("subject"),
-                     "received": m.get("receivedDateTime"),
-                     "preview": m.get("bodyPreview")} for m in (data.get("value") or [])]
+            msgs = []
+            for m in (data.get("value") or []):
+                ea = (m.get("from") or {}).get("emailAddress", {})
+                msg = {
+                    "id": m.get("id"),
+                    "from": ea.get("address"),
+                    "from_name": ea.get("name"),
+                    "subject": m.get("subject"),
+                    "received": m.get("receivedDateTime"),
+                    "preview": m.get("bodyPreview"),
+                }
+                if include_body:
+                    body = m.get("body") or {}
+                    text = str(body.get("content") or "")
+                    if (body.get("contentType") or "").lower() == "html":
+                        text = _strip_html(text)
+                    msg["body_text"] = text[:2000]
+                msgs.append(msg)
             return connector_result("ok", count=len(msgs), messages=msgs)
 
         if name == "ms_mail_search":

@@ -2938,6 +2938,71 @@ class ClarifyingFollowupGuardTests(unittest.TestCase):
         self.assertEqual(reg.calls, [])
 
 
+class MailListIncludeBodyTests(unittest.TestCase):
+    """ms_mail_list with include_body=True returns the HTML-stripped body
+    inline so the synthesizer can write a real morning briefing."""
+
+    def _conn(self, msgs_payload):
+        from hgr.live_api.connectors.ms365_connector import Microsoft365Connector
+        class _FakeClient:
+            def all_accounts(self_): return [{"username": "u@x"}]
+            def token_for(self_, a): return "tok"
+            def token(self_): return "tok"
+        seen_paths: List[str] = []
+        def fake_graph(self_, method, path, body=None, raw=None,
+                       content_type=None, token=None, extra_headers=None):
+            seen_paths.append(path)
+            return {"value": msgs_payload}, None
+        conn = Microsoft365Connector(_FakeClient())  # type: ignore[arg-type]
+        conn._graph = fake_graph.__get__(conn, Microsoft365Connector)  # type: ignore[method-assign]
+        return conn, seen_paths
+
+    def test_html_stripped_into_body_text(self) -> None:
+        conn, paths = self._conn([
+            {"id": "1", "subject": "Sign-in alert",
+             "from": {"emailAddress": {"address": "noreply@x.com",
+                                       "name": "Member Services"}},
+             "receivedDateTime": "2026-05-28T08:00:00Z",
+             "bodyPreview": "We noticed a sign-in attempt...",
+             "body": {"contentType": "html",
+                      "content": "<html><body><p>We noticed a "
+                                 "<b>sign-in attempt</b> from a new "
+                                 "device.&nbsp;Click <a href='x'>here</a> "
+                                 "if it wasn't you.</p></body></html>"}},
+        ])
+        out = conn.execute("ms_mail_list",
+                           {"unread_only": True, "include_body": True, "max": 5})
+        self.assertEqual(out["status"], "ok")
+        msg = out["messages"][0]
+        self.assertEqual(msg["from_name"], "Member Services")
+        self.assertIn("sign-in attempt", msg["body_text"])
+        # HTML tags + entities gone, text readable.
+        self.assertNotIn("<b>", msg["body_text"])
+        self.assertNotIn("&nbsp;", msg["body_text"])
+        self.assertNotIn("<a ", msg["body_text"])
+        # Graph URL asked for the body field.
+        self.assertTrue(any("body" in p for p in paths))
+
+    def test_default_does_not_fetch_body(self) -> None:
+        conn, paths = self._conn([
+            {"id": "1", "subject": "x",
+             "from": {"emailAddress": {"address": "a@b"}},
+             "receivedDateTime": "2026-05-28T08:00:00Z",
+             "bodyPreview": "preview"},
+        ])
+        out = conn.execute("ms_mail_list", {"unread_only": True, "max": 5})
+        self.assertNotIn("body_text", out["messages"][0])
+        # `body` as its own field (not `bodyPreview`) must NOT appear in
+        # $select — the body field would either end the select list or
+        # be followed by ',' / '&'.
+        for p in paths:
+            if "$select=" not in p:
+                continue
+            select = p.split("$select=", 1)[1].split("&", 1)[0]
+            fields = select.split(",")
+            self.assertNotIn("body", fields, f"unexpected body in {p}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
