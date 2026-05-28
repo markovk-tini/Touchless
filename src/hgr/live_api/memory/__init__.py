@@ -14,12 +14,13 @@ Author: Konstantin Markov
 """
 from .embedder import Embedder, FakeEmbedder, OpenAIEmbedder, default_embedder
 from .extractor import extract_facts
+from .llm_extractor import extract_facts_from_conversation
 from .manager import MemoryManager, default_memory_path
 from .store import EpisodicRow, MemoryStore, SemanticRow
 
 __all__ = [
     "Embedder", "FakeEmbedder", "OpenAIEmbedder", "default_embedder",
-    "extract_facts",
+    "extract_facts", "extract_facts_from_conversation",
     "MemoryManager", "default_memory_path",
     "MemoryStore", "EpisodicRow", "SemanticRow",
 ]

@@ -31,6 +31,11 @@ from typing import Any, Dict, List, Optional
 
 from .embedder import Embedder, cosine_sim, default_embedder
 from .extractor import extract_facts
+from .llm_extractor import (
+    confidence_threshold as _llm_confidence_threshold,
+    enabled as _llm_extraction_enabled,
+    extract_facts_from_conversation,
+)
 from .store import EpisodicRow, MemoryStore, SemanticRow
 
 
@@ -63,6 +68,64 @@ class MemoryManager:
         self._embedder = embedder or default_embedder()
         self._async = async_writes
         self._logger = logger
+
+    # ---- realtime conversation observation -------------------------------
+    def observe_conversation(self, user_text: str,
+                             assistant_text: str = "") -> None:
+        """Background fact extraction from a realtime turn that DIDN'T hit
+        the planner. Spins a worker so the user-visible response isn't
+        blocked. No-ops cleanly when extraction is disabled or unconfigured.
+
+        Skips short / question-only turns where extraction would be pure
+        noise (no factual content can plausibly be in 'what's the weather')."""
+        if not _llm_extraction_enabled():
+            return
+        ut = (user_text or "").strip()
+        if len(ut) < 8:
+            return
+        # Question-only turns rarely contain durable facts. Cheap guard
+        # before paying for the LLM round-trip.
+        if ut.endswith("?") and len(ut) < 50:
+            return
+        threading.Thread(
+            target=self._observe_safe,
+            args=(ut, (assistant_text or "").strip()),
+            name="iris-fact-observe",
+            daemon=True,
+        ).start()
+
+    def _observe_safe(self, user_text: str, assistant_text: str) -> None:
+        try:
+            facts = extract_facts_from_conversation(user_text, assistant_text)
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("memory_llm_extract_failed", exc)
+            return
+        if not facts:
+            return
+        threshold = _llm_confidence_threshold()
+        kept = [(kind, key, value) for (kind, key, value, conf) in facts
+                if conf >= threshold]
+        if not kept:
+            if self._logger:
+                self._logger.event("memory_llm_extract_below_threshold",
+                                   raw_count=len(facts),
+                                   threshold=threshold)
+            return
+        for kind, key, value in kept:
+            try:
+                self._store.add_semantic(kind, key, value,
+                                          source="realtime conversation")
+            except Exception as exc:  # pragma: no cover
+                if self._logger:
+                    self._logger.exception("memory_llm_extract_save_failed", exc)
+        if self._logger:
+            self._logger.event(
+                "memory_llm_extract_saved",
+                count=len(kept),
+                facts=[{"kind": k, "key": ky, "value": v[:80]}
+                        for k, ky, v in kept],
+            )
 
     # ---- write -----------------------------------------------------------
     def set_fact(self, kind: str, key: str, value: str,

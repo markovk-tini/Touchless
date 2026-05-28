@@ -3303,6 +3303,124 @@ class ExecutorRefJsonStringifyTests(unittest.TestCase):
         self.assertEqual(use["to"], "dani@x.io")
 
 
+class LLMExtractorTests(unittest.TestCase):
+    """Realtime fact extraction parses model JSON output into validated
+    (kind, key, value, confidence) tuples."""
+
+    def test_parse_array_of_facts(self) -> None:
+        from hgr.live_api.memory.llm_extractor import _parse_facts
+        raw = '[{"kind":"place","key":"office","value":"Kearney 204","confidence":0.95}]'
+        facts = _parse_facts(raw)
+        self.assertEqual(facts, [("place", "office", "Kearney 204", 0.95)])
+
+    def test_parse_wrapped_in_object(self) -> None:
+        from hgr.live_api.memory.llm_extractor import _parse_facts
+        # response_format=json_object returns an object, model wraps array.
+        raw = '{"facts":[{"kind":"person","key":"vesko","value":"my brother","confidence":0.9}]}'
+        facts = _parse_facts(raw)
+        self.assertEqual(facts,
+                         [("person", "vesko", "my brother", 0.9)])
+
+    def test_disallowed_kind_dropped(self) -> None:
+        from hgr.live_api.memory.llm_extractor import _parse_facts
+        raw = '[{"kind":"emotion","key":"tired","value":"yes","confidence":0.9}]'
+        self.assertEqual(_parse_facts(raw), [])
+
+    def test_missing_key_or_value_dropped(self) -> None:
+        from hgr.live_api.memory.llm_extractor import _parse_facts
+        raw = ('[{"kind":"person","value":"x","confidence":0.9},'
+               '{"kind":"person","key":"y","confidence":0.9},'
+               '{"kind":"person","key":"valid","value":"x","confidence":0.9}]')
+        facts = _parse_facts(raw)
+        self.assertEqual([f[1] for f in facts], ["valid"])
+
+    def test_malformed_json_returns_empty(self) -> None:
+        from hgr.live_api.memory.llm_extractor import _parse_facts
+        self.assertEqual(_parse_facts("not json"), [])
+        self.assertEqual(_parse_facts(""), [])
+        self.assertEqual(_parse_facts("null"), [])
+
+    def test_extract_disabled_by_env(self) -> None:
+        from hgr.live_api.memory.llm_extractor import extract_facts_from_conversation
+        os.environ["OPENAI_API_KEY"] = "fake"
+        os.environ["TOUCHLESS_REALTIME_FACT_EXTRACT"] = "0"
+        try:
+            facts = extract_facts_from_conversation("my office is Kearney 204", "ok")
+            self.assertEqual(facts, [])
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+            os.environ.pop("TOUCHLESS_REALTIME_FACT_EXTRACT", None)
+
+    def test_extract_calls_llm_and_returns_facts(self) -> None:
+        from hgr.live_api.memory import llm_extractor
+        os.environ["OPENAI_API_KEY"] = "fake-for-test"
+        try:
+            fake_resp = json.dumps({"choices": [{"message": {
+                "content": '{"facts":[{"kind":"place","key":"office",'
+                           '"value":"Kearney 204","confidence":0.95}]}'
+            }}]}).encode()
+
+            class _Resp:
+                def __enter__(self): return self
+                def __exit__(self, *a): pass
+                def read(self): return fake_resp
+
+            with patch.object(llm_extractor.urllib.request, "urlopen",
+                              return_value=_Resp()):
+                facts = llm_extractor.extract_facts_from_conversation(
+                    "my office is Kearney 204", "noted")
+            self.assertEqual(facts,
+                             [("place", "office", "Kearney 204", 0.95)])
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+
+
+class MemoryObserveConversationTests(unittest.TestCase):
+    """MemoryManager.observe_conversation runs the extractor on a worker
+    thread, filters by confidence, and writes accepted facts."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="iris-obs-")
+        from hgr.live_api.memory import MemoryManager, MemoryStore
+        from hgr.live_api.memory.embedder import FakeEmbedder
+        self._mgr = MemoryManager(
+            store=MemoryStore(Path(self._tmp) / "m.db"),
+            embedder=FakeEmbedder(),
+            async_writes=False,
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_high_confidence_facts_saved(self) -> None:
+        from hgr.live_api.memory import manager as mgr_mod
+        with patch.object(mgr_mod, "extract_facts_from_conversation",
+                          return_value=[
+                              ("place", "office", "Kearney 204", 0.95),
+                              ("person", "vesko", "my brother", 0.85),
+                          ]):
+            self._mgr._observe_safe("my office is Kearney 204 and Vesko is my brother", "noted")
+        facts = self._mgr._store.find_facts()
+        kinds_keys = sorted((f.kind, f.key) for f in facts)
+        self.assertEqual(kinds_keys, [("person", "vesko"), ("place", "office")])
+
+    def test_below_threshold_dropped(self) -> None:
+        from hgr.live_api.memory import manager as mgr_mod
+        with patch.object(mgr_mod, "extract_facts_from_conversation",
+                          return_value=[("fact", "guess", "maybe", 0.4)]):
+            self._mgr._observe_safe("hmm", "ok")
+        self.assertEqual(self._mgr._store.find_facts(), [])
+
+    def test_observe_skips_short_or_question_only(self) -> None:
+        from hgr.live_api.memory import manager as mgr_mod
+        with patch.object(mgr_mod, "extract_facts_from_conversation") as ext:
+            self._mgr.observe_conversation("hi", "hello")
+            self._mgr.observe_conversation("what's the weather?", "sunny")
+            # Neither should have triggered the LLM call (background
+            # thread is never spawned for these inputs).
+            self.assertEqual(ext.call_count, 0)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

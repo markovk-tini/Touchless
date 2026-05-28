@@ -397,6 +397,7 @@ class LiveApiManager(QObject):
         self._nudge_count = 0
         self._nudge_max = 6
         self._turn_text = ""          # assistant text accumulated this response
+        self._last_user_text = ""     # for realtime fact-extraction observation
         self._failed_retries = 0      # retries used for a failed response turn
         self._last_nudge_ts = 0.0     # min-interval guard against nudge bursts
         # Task QUEUE — a multi-action command is split into atomic sub-tasks and
@@ -716,6 +717,27 @@ class LiveApiManager(QObject):
         note += ")"
         return note[:600]
 
+    def _observe_realtime_turn(self) -> None:
+        """Hand the just-completed realtime turn to the memory layer for
+        background fact extraction. Skips when the planner already handled
+        the turn (no last user text), when realtime returned mostly tool
+        calls (assistant text empty), or when the user spoke nothing of
+        substance. The actual extraction runs on a worker thread inside
+        MemoryManager.observe_conversation — never blocks here."""
+        planner = self._iris_planner
+        memory = getattr(planner, "_memory", None) if planner is not None else None
+        if memory is None or not hasattr(memory, "observe_conversation"):
+            return
+        ut = (self._last_user_text or "").strip()
+        if not ut:
+            return
+        try:
+            memory.observe_conversation(ut, (self._turn_text or "").strip())
+        finally:
+            # Consume the user text — don't observe the same turn twice if
+            # multiple response.done events fire (e.g. a retry path).
+            self._last_user_text = ""
+
     def _push_assistant_note(self, text: str) -> None:
         """Inject a proactive note into the live session from a BACKGROUND
         thread (e.g. auto-approve concluding) so the assistant relays it to
@@ -978,6 +1000,10 @@ class LiveApiManager(QObject):
             return ok
         ok = bool(client.send_text_message(text))
         if ok:
+            # Track for fact-extraction on response.done. Only capture turns
+            # that ACTUALLY went to realtime — planner-handled requests
+            # already record themselves via the orchestrator's _record_turn.
+            self._last_user_text = text
             self._request_model_response()
         return ok
 
@@ -1324,6 +1350,14 @@ class LiveApiManager(QObject):
                 self._drain_pending()
                 return
             self._failed_retries = 0
+            # Realtime fact extraction: this turn went to realtime (not the
+            # planner) and completed. Hand it to the memory layer to extract
+            # any durable user-revealed facts. Async — never blocks the UI.
+            try:
+                self._observe_realtime_turn()
+            except Exception as exc:  # pragma: no cover - defensive
+                if self._logger:
+                    self._logger.exception("observe_realtime_failed", exc)
             had_toolcall = "function_call" in output_kinds
             # PLANNING: the model just returned the task list. Parse it and
             # start running the tasks one at a time. If it ignored planning and
