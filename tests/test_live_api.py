@@ -2442,6 +2442,92 @@ class ContactsSearchFallbackTests(unittest.TestCase):
         self.assertTrue(any("/me/messages" in p for p in paths))
 
 
+class ComposeRewriteTests(unittest.TestCase):
+    """Tier 1 outlook_compose is rewritten to gmail_send / ms_mail_send when
+    the user has expressed default_send_via, AND a recipient name is
+    resolved from memory when it isn't an @ address."""
+
+    def _make_planner(self, person_facts=None, pref=None):
+        """Build an IrisPlanner with a fake memory backing the rewrite."""
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+
+        class _Store:
+            def find_facts(self_, kind=None, key=None, limit=50):
+                rows: List[Any] = []
+                if kind == "person":
+                    for name, email in (person_facts or {}).items():
+                        if key is None or key.lower() == name.lower():
+                            rows.append(type("F", (), {
+                                "kind": "person", "key": name.lower(),
+                                "value": email})())
+                if kind == "preference" and pref and (key == "default_send_via"
+                                                       or key is None):
+                    rows.append(type("F", (), {
+                        "kind": "preference", "key": "default_send_via",
+                        "value": pref})())
+                return rows
+
+        class _FakeMem:
+            def __init__(self_): self_._store = _Store()
+            def set_fact(self_, *a, **k): pass
+            def record(self_, *a, **k): pass
+            def recall(self_, *a, **k):
+                return {"context": "", "episodes": [], "facts": []}
+
+        reg = _StubRegistry({
+            "outlook_compose": {"status": "ok"},
+            "gmail_send": {"status": "ok"},
+            "ms_mail_send": {"status": "ok"},
+        })
+        return IrisPlanner(reg, memory=_FakeMem()), reg
+
+    def test_preference_swaps_outlook_to_gmail(self) -> None:
+        planner, reg = self._make_planner(pref="gmail_send")
+        out = planner.try_handle("email dani@x.io saying hi from iris")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["steps"][0].tool, "gmail_send")
+        # Args adapted to gmail_send's {to, subject, body} shape.
+        sent_args = next(a for t, a in reg.calls if t == "gmail_send")
+        self.assertEqual(sent_args["to"], "dani@x.io")
+        self.assertEqual(sent_args["body"], "hi from iris")
+        # Subject defaults to first line of body.
+        self.assertEqual(sent_args["subject"], "hi from iris")
+
+    def test_preference_swaps_outlook_to_ms_mail_send(self) -> None:
+        planner, reg = self._make_planner(pref="ms_mail_send")
+        out = planner.try_handle("email dani@x.io saying hi")
+        self.assertEqual(out["steps"][0].tool, "ms_mail_send")
+
+    def test_name_resolved_from_memory_then_swapped(self) -> None:
+        """The big end-to-end: 'email Dani saying hi' with memory having
+        Dani's email AND a gmail_send preference -> direct gmail_send."""
+        planner, reg = self._make_planner(
+            person_facts={"dani": "dani@mangollc.org"},
+            pref="gmail_send",
+        )
+        out = planner.try_handle("email Dani saying hi from iris")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["steps"][0].tool, "gmail_send")
+        sent = next(a for t, a in reg.calls if t == "gmail_send")
+        self.assertEqual(sent["to"], "dani@mangollc.org")
+        self.assertEqual(sent["body"], "hi from iris")
+
+    def test_no_preference_keeps_outlook_compose(self) -> None:
+        planner, reg = self._make_planner(pref=None)
+        out = planner.try_handle("email dani@x.io saying hi")
+        # No preference -> behavior unchanged from before.
+        self.assertEqual(out["steps"][0].tool, "outlook_compose")
+        self.assertEqual(reg.calls[0][0], "outlook_compose")
+
+    def test_unknown_name_no_memory_falls_through(self) -> None:
+        """If recipient isn't an @ AND memory doesn't have the name, we
+        leave outlook_compose alone (connector will surface the error)."""
+        planner, reg = self._make_planner(pref="gmail_send")
+        out = planner.try_handle("email Unknown saying hi")
+        # Tool stayed outlook_compose; recipient remained "Unknown".
+        self.assertEqual(out["steps"][0].tool, "outlook_compose")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

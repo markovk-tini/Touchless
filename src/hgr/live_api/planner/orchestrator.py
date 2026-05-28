@@ -133,6 +133,14 @@ class IrisPlanner:
             self._record_turn(text, None, [single], [sr], message)
             return {"steps": [single], "results": [sr], "message": message}
 
+        # Email-compose rewrite: respect default_send_via preference and
+        # resolve recipient names via memory. Turns "email Dani saying hi"
+        # into a direct gmail_send (or ms_mail_send) call when the user
+        # has expressed a preference, instead of always opening the
+        # Outlook draft window.
+        if single is not None and single.tool == "outlook_compose":
+            single = self._maybe_rewrite_compose(single)
+
         if single is not None and self._registry.handles_connector(single.tool):
             if single.needs_confirm and self._confirm is not None and \
                     not self._confirm(f"Run {single.tool}?", single.description):
@@ -206,6 +214,83 @@ class IrisPlanner:
                     "message": message,
                 }
         return None
+
+    # ---- preference-aware compose rewrite --------------------------------
+    def _maybe_rewrite_compose(self, step: "Step") -> "Step":
+        """Apply two memory-driven transforms to an outlook_compose Step:
+
+        1. Resolve recipient name → email via memory. If the user said
+           'email Dani saying hi', recipient='Dani' isn't a valid address;
+           look up person/dani in memory and substitute the email.
+        2. Respect default_send_via preference. If memory says the user
+           prefers gmail_send / ms_mail_send, rewrite the tool + adapt
+           the args shape (those tools need {to, subject, body} vs
+           outlook_compose's {recipient, body}). Default subject is the
+           first line of the body or 'Hello'.
+
+        Best-effort: failures fall through and the original outlook_compose
+        Step runs unchanged."""
+        if self._memory is None:
+            return step
+        args = dict(step.args or {})
+        recipient = str(args.get("recipient", "")).strip()
+
+        # 1. Name → email lookup if recipient isn't already an address.
+        if "@" not in recipient and recipient:
+            try:
+                facts = self._memory._store.find_facts(  # type: ignore[attr-defined]
+                    kind="person", key=recipient.lower())
+            except Exception:
+                facts = []
+            if facts:
+                recipient = facts[0].value
+                args["recipient"] = recipient
+                if self._logger:
+                    self._logger.event("compose_recipient_resolved",
+                                       name=step.args.get("recipient"),
+                                       email=recipient)
+
+        # If we still don't have a valid email, leave the step alone — the
+        # connector will fail with a clear error rather than us silently
+        # producing the wrong thing.
+        if "@" not in recipient:
+            return step
+
+        # 2. Sender preference.
+        try:
+            prefs = self._memory._store.find_facts(  # type: ignore[attr-defined]
+                kind="preference", key="default_send_via")
+        except Exception:
+            prefs = []
+        if not prefs:
+            args["recipient"] = recipient
+            return Step(tool=step.tool, args=args, layer=step.layer,
+                        description=step.description,
+                        needs_confirm=step.needs_confirm)
+        preferred = prefs[0].value
+        if preferred not in ("gmail_send", "ms_mail_send"):
+            args["recipient"] = recipient
+            return Step(tool=step.tool, args=args, layer=step.layer,
+                        description=step.description,
+                        needs_confirm=step.needs_confirm)
+
+        # Rewrite to the API send tool. Adapt args shape — outlook_compose
+        # uses {recipient, body} but gmail_send / ms_mail_send require
+        # {to, subject, body}. Default subject = first line of body, or
+        # "Hello" if the body is empty.
+        body = str(args.get("body") or "").strip()
+        subject_default = body.split("\n", 1)[0][:60] if body else "Hello"
+        new_args = {
+            "to": recipient,
+            "subject": str(args.get("subject") or subject_default),
+            "body": body,
+        }
+        if self._logger:
+            self._logger.event("compose_rewritten_to_api_send",
+                               from_tool=step.tool, to_tool=preferred,
+                               recipient=recipient)
+        return Step(tool=preferred, args=new_args, layer="connector",
+                    description=f"send email via {preferred}")
 
     # ---- memory bridge ----------------------------------------------------
     def _recall_context(self, text: str) -> str:

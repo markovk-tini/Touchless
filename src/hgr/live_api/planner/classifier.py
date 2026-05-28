@@ -114,19 +114,33 @@ class Classifier:
                         description=f"upload to Drive: {path}")
 
         # ---- Email compose (recipient + body, simple phrasing) -----------
-        # "email <addr> saying <body>" — strict to avoid mis-firing on read intents.
+        # Two forms, both produce an outlook_compose Step that the
+        # orchestrator MAY rewrite to gmail_send/ms_mail_send based on the
+        # user's default_send_via preference (and resolve a name → email
+        # from memory if recipient isn't an @ address):
+        #
+        #   "email <addr> saying <body>"  — explicit address
+        #   "email <Name> saying <body>"  — a named recipient (the
+        #     orchestrator looks up Name in memory)
+        # Excluded: pronouns/articles ("me", "him", "the boss" — too
+        # ambiguous; let those fall through to higher tiers).
         m = re.search(
-            r"\bemail\s+(?P<to>\S+@\S+\.\S+)\s+(?:saying|with message|that says)\s+(?P<body>.+)$",
+            r"\bemail\s+(?P<to>\S+@\S+\.\S+|[A-Za-z][A-Za-z0-9._\-]*)"
+            r"\s+(?:saying|with message|that says)\s+(?P<body>.+)$",
             t, flags=re.IGNORECASE,
         )
         if m:
-            return Step(
-                tool="outlook_compose",
-                args={"recipient": m.group("to").strip(",.;"),
-                      "body": m.group("body").strip()},
-                layer="connector",
-                description="compose email draft",
-            )
+            recipient = m.group("to").strip(",.;")
+            # Reject ambiguous "recipients" so we don't grab the wrong word.
+            _STOP_NAMES = {"me", "him", "her", "them", "us", "the", "a", "an"}
+            if "@" in recipient or recipient.lower() not in _STOP_NAMES:
+                return Step(
+                    tool="outlook_compose",
+                    args={"recipient": recipient,
+                          "body": m.group("body").strip()},
+                    layer="connector",
+                    description="compose email draft",
+                )
 
         # ---- sticky user preferences (saved to memory, 0 tokens) ----------
         # "always send from gmail", "use outlook by default", "set my default
