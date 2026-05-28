@@ -27,6 +27,7 @@ Author: Konstantin Markov
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import List, Optional
@@ -165,15 +166,24 @@ class GoogleClient:
             from google.oauth2.credentials import Credentials
             from google.auth.transport.requests import Request
 
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-            # If SCOPES grew since this token was minted (e.g. we added Sheets/
-            # Slides), the saved token lacks them — force a reconnect so the
-            # new scopes are granted instead of 403-ing at call time.
+            # IMPORTANT: Credentials.from_authorized_user_file(path, SCOPES)
+            # sets creds.scopes to whatever scopes we pass in, NOT what the
+            # token was actually granted. So creds.has_scopes(SCOPES) is
+            # tautologically True. To detect a stale token (e.g. we added
+            # gmail.readonly after the user authorized just gmail.send),
+            # parse the JSON ourselves and check the granted-scopes list.
             try:
-                if creds and not creds.has_scopes(SCOPES):
+                token_doc = json.loads(token_path.read_text(encoding="utf-8"))
+                granted = set(token_doc.get("scopes") or [])
+                missing = [s for s in SCOPES if s not in granted]
+                if missing:
+                    # Stale: clear cache and force the caller to reconnect.
+                    self._creds = None
                     return None
             except Exception:
                 pass
+
+            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
                 token_path.write_text(creds.to_json(), encoding="utf-8")

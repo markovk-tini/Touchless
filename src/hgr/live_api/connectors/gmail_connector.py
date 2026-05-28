@@ -155,7 +155,17 @@ class GmailConnector(Connector):
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         svc = self._svc()
         if svc is None:
-            return connector_result("error", error="Gmail not authorized", code="not_ready")
+            # available()==False before we got here usually, but if a stale
+            # token slipped through the scope check, the read tools will hit
+            # this branch. Phrase it so the user knows the fix is in their UI.
+            need_readonly = name in ("gmail_list", "gmail_read")
+            extra = (" Reading email needs gmail.readonly — disconnect "
+                     "Google in the app and reconnect to grant the new "
+                     "scope.") if need_readonly else ""
+            return connector_result(
+                "error",
+                error=f"Gmail not authorized.{extra}",
+                code="not_ready")
         try:
             if name == "gmail_send":
                 to = str(args.get("to") or "").strip()
