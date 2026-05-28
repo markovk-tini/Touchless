@@ -135,6 +135,24 @@ class LLMPlanner:
             '"{step:1.contacts[0].emails[0]}","subject":"Hi",'
             '"body":"Hi Dani!"},"depends_on":[1]}'
             '],"final":"return"}\n\n'
+            "Example for 'create google doc called Iris Debrief and write a "
+            "debrief about weather and emails' (gather data FIRST in earlier "
+            "steps, then create the doc with text that REFERENCES the "
+            "gathered data via {step:N.field}; do NOT try to write 'real' "
+            "content inline — it'll be empty placeholder. Refs resolve at "
+            "execution time to actual values.):\n"
+            '{"goal":"create google doc with weather + email debrief",'
+            '"steps":['
+            '{"id":1,"tool":"weather_get","args":{}},'
+            '{"id":2,"tool":"gmail_list","args":{"unread_only":true,'
+            '"max":5,"include_body":true}},'
+            '{"id":3,"tool":"gdocs_create","args":{"title":"Iris Debrief",'
+            '"text":"Weather: {step:1.summary}\\n\\nUnread emails '
+            '({step:2.count}):\\n- {step:2.messages[0].from_name}: '
+            '{step:2.messages[0].subject}\\n- {step:2.messages[1].from_name}: '
+            '{step:2.messages[1].subject}"},'
+            '"depends_on":[1,2]}'
+            '],"final":"return"}\n\n'
             "Available tools:\n" + catalog + "\n\n"
             "Output STRICT JSON, no commentary:\n"
             '{"goal": <string>, "steps": [{"id": <int starting at 1>, '

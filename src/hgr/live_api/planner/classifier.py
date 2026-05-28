@@ -85,10 +85,18 @@ class Classifier:
                         description=f"add task: {title}")
 
         # ---- Google Docs / Sheets / Slides create -------------------------
+        # Title capture stops at common chain words ("and write/include/add/
+        # fill/put/...", "then", commas) so requests like 'create doc called
+        # X AND write Y' don't grab the whole tail as the title — those
+        # chain forms should yield to multi-action / Tier 2.
+        _TITLE_STOP = (r"\s+(?:and|then|,|;|"
+                       r"with\s+(?:the\s+)?(?:weather|email|content|text|body|"
+                       r"morning|debrief|summary|briefing|brief))\b")
         m = re.search(
             r"\b(?:make|create|new)\s+(?:a\s+)?(?:new\s+)?(?:google\s+)?"
             r"(doc(?:ument)?|sheet|spreadsheet|slide(?:show)?|presentation|deck)\b"
-            r"(?:\s+(?:titled|called|named)\s+(.+?))?(?:\s+with\s+|\s*$)",
+            r"(?:\s+(?:titled|called|named)\s+(.+?))?"
+            rf"(?:{_TITLE_STOP}|\s*$)",
             lower,
         )
         if m:

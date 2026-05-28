@@ -40,6 +40,11 @@ _ACTION_VERBS = (
     "press", "create", "make", "delete", "summarize", "summarise",
     "upload", "download", "navigate", "copy", "move", "email", "message",
     "draft", "compose", "schedule", "post", "share",
+    # Added after live test 'create doc and write debrief': clearly action-
+    # shaped second-action verbs. Common verbs ('get', 'show', 'tell', 'list')
+    # are deliberately excluded to avoid false-positive multi-action on
+    # ordinary single-intent requests like 'tell me Dani's email'.
+    "write", "save", "store", "append", "include", "fill", "insert", "record",
 )
 _VERB_PATTERNS = [re.compile(r"\b" + v + r"\b", re.IGNORECASE) for v in _ACTION_VERBS]
 

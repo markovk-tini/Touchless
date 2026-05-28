@@ -3165,6 +3165,51 @@ class GmailReadTests(unittest.TestCase):
         self.assertEqual(out["from_"], "d@x")
 
 
+class CreateDocAndWriteTests(unittest.TestCase):
+    """'create doc called X and write Y' should NOT match the classifier
+    (it's multi-action, belongs in Tier 2). Previously the title regex
+    greedily captured the whole tail as the doc title."""
+
+    def test_classifier_does_not_grab_tail_as_title(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        # The bug: this used to classify gdocs_create with title=
+        # 'iris debrief main and write debrief about weather and emails'.
+        # Now: multi-action heuristic fires first (write is in verbs),
+        # which suppresses the classifier in the orchestrator anyway —
+        # but also defensively the classifier's title capture stops at
+        # ' and '.
+        step = c.classify(
+            "create google doc called Iris Debrief Main and write debrief "
+            "about weather and emails")
+        if step is not None:
+            self.assertEqual(step.tool, "gdocs_create")
+            self.assertEqual(step.args["title"], "iris debrief main",
+                             f"title was {step.args['title']!r}")
+
+    def test_clean_create_doc_still_matches(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        step = c.classify("create a google doc titled Quarterly Plan")
+        self.assertIsNotNone(step)
+        self.assertEqual(step.tool, "gdocs_create")
+        self.assertEqual(step.args["title"], "quarterly plan")
+
+    def test_write_is_an_action_verb(self) -> None:
+        from hgr.live_api.planner.triggers import looks_multi_action
+        # The exact failing prompt now correctly registers as multi-action
+        # because 'write' is now in the verb list, and the request has both
+        # 'create' and 'write' joined by 'and'.
+        self.assertTrue(looks_multi_action(
+            "create google doc called Iris Debrief Main and write debrief "
+            "about weather and emails"))
+        # And the safer additions don't break normal single-action input.
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        self.assertIsNotNone(c.classify("what's Dani's email"))
+        self.assertIsNotNone(c.classify("tell me Dani's email"))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
