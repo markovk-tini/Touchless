@@ -190,6 +190,7 @@ class ToolExecutor:
             "run_python_script": self._t_run_python_script,
             "skip_youtube_ad": self._t_skip_youtube_ad,
             "ask_user_confirmation": self._t_ask_user_confirmation,
+            "web_search": self._t_web_search,
             "web_navigate": self._t_web_navigate,
             "web_get_links": self._t_web_get_links,
             "web_get_text": self._t_web_get_text,
@@ -1535,6 +1536,20 @@ class ToolExecutor:
                 self._logger.exception("web_controller_init_failed", exc)
                 self._web = None
         return self._web
+
+    def _t_web_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        # Structured search results (Google CSE preferred, DuckDuckGo
+        # fallback). The planner uses this + web_navigate to read a
+        # specific result without spinning up the Chrome controller for
+        # the SERP itself — much cheaper than navigate-then-scrape.
+        from .web_search import web_search
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return _result(status="error", error="empty query", code="invalid_arguments")
+        count = int(args.get("count", 5) or 5)
+        site = str(args.get("site", "")).strip()
+        recent_days = int(args.get("recent_days", 0) or 0)
+        return web_search(query, count=count, site=site, recent_days=recent_days)
 
     def _t_web_navigate(self, args: Dict[str, Any]) -> Dict[str, Any]:
         web = self._ensure_web()

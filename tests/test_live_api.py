@@ -1007,6 +1007,147 @@ class IrisPlannerPhase4WiringTests(unittest.TestCase):
         self.assertEqual(calls["plan"], 1)
 
 
+class WebSearchTests(unittest.TestCase):
+    """Phase 5 web_search: Google CSE preferred, DDG HTML fallback."""
+
+    def setUp(self) -> None:
+        # Snapshot env so we can restore between tests.
+        self._env_snapshot = {
+            k: os.environ.get(k) for k in
+            ("GOOGLE_CSE_API_KEY", "GOOGLE_CSE_ID")
+        }
+        for k in self._env_snapshot:
+            os.environ.pop(k, None)
+
+    def tearDown(self) -> None:
+        for k, v in self._env_snapshot.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_empty_query_rejected(self) -> None:
+        from hgr.live_api.web_search import web_search
+        out = web_search("")
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["code"], "invalid_arguments")
+
+    def test_google_cse_when_configured(self) -> None:
+        from hgr.live_api import web_search as ws
+        os.environ["GOOGLE_CSE_API_KEY"] = "k"
+        os.environ["GOOGLE_CSE_ID"] = "cx"
+        fake_payload = json.dumps({
+            "items": [
+                {"title": "AI News Today",
+                 "link": "https://example.com/a",
+                 "snippet": "blurb a"},
+                {"title": "More AI",
+                 "link": "https://example.com/b",
+                 "snippet": "blurb b"},
+            ]
+        }).encode("utf-8")
+
+        class _FakeResp:
+            def __init__(self, body): self._b = body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return self._b
+
+        seen: Dict[str, Any] = {}
+        def fake_urlopen(req, timeout=None):
+            seen["url"] = req.full_url
+            return _FakeResp(fake_payload)
+
+        with patch.object(ws.urllib.request, "urlopen", side_effect=fake_urlopen):
+            out = ws.web_search("latest AI news", count=2, recent_days=7)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["provider"], "google_cse")
+        self.assertEqual(len(out["results"]), 2)
+        self.assertEqual(out["results"][0]["url"], "https://example.com/a")
+        # Recent-days propagated into the CSE URL.
+        self.assertIn("dateRestrict=d7", seen["url"])
+
+    def test_ddg_fallback_when_no_keys(self) -> None:
+        from hgr.live_api import web_search as ws
+        html = (
+            '<a class="result__a" href="https://news.example.com/x">First Result</a>'
+            '<a class="result__snippet">snippet about first</a>'
+            '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2F'
+            'two.example.com">Second</a>'
+            '<a class="result__snippet">snippet about second</a>'
+        ).encode("utf-8")
+
+        class _FakeResp:
+            def __init__(self, body): self._b = body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return self._b
+
+        def fake_urlopen(req, timeout=None):
+            return _FakeResp(html)
+
+        with patch.object(ws.urllib.request, "urlopen", side_effect=fake_urlopen):
+            out = ws.web_search("python tutorials", count=2)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["provider"], "duckduckgo")
+        self.assertEqual(len(out["results"]), 2)
+        self.assertEqual(out["results"][0]["title"], "First Result")
+        self.assertEqual(out["results"][0]["url"], "https://news.example.com/x")
+        # Redirect-wrapped URLs get unwrapped.
+        self.assertEqual(out["results"][1]["url"], "https://two.example.com")
+
+    def test_cse_quota_error_falls_through_to_ddg(self) -> None:
+        from hgr.live_api import web_search as ws
+        os.environ["GOOGLE_CSE_API_KEY"] = "k"
+        os.environ["GOOGLE_CSE_ID"] = "cx"
+        ddg_html = (
+            '<a class="result__a" href="https://fallback.example.com/x">Fallback</a>'
+            '<a class="result__snippet">from ddg</a>'
+        ).encode("utf-8")
+
+        class _FakeResp:
+            def __init__(self, body): self._b = body
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self): return self._b
+
+        calls = {"n": 0}
+        def fake_urlopen(req, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # CSE quota exceeded → fall through.
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "quota", {}, None)
+            return _FakeResp(ddg_html)
+
+        import urllib.error  # local import so the closure can raise it
+        with patch.object(ws.urllib.request, "urlopen", side_effect=fake_urlopen):
+            out = ws.web_search("ai news")
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["provider"], "duckduckgo")
+        self.assertEqual(out["results"][0]["url"], "https://fallback.example.com/x")
+
+
+class WebSearchToolWiringTests(unittest.TestCase):
+    """The tool executor routes 'web_search' calls to web_search.web_search,
+    and the schema is exposed in all_tool_schemas()."""
+
+    def test_schema_registered(self) -> None:
+        from hgr.live_api.schemas import all_tool_schemas
+        names = [s["name"] for s in all_tool_schemas()]
+        self.assertIn("web_search", names)
+
+    def test_schema_validates_required_query(self) -> None:
+        from hgr.live_api.schemas import validate_args
+        ok, msg, _ = validate_args("web_search", {})
+        self.assertFalse(ok)
+        self.assertIn("query", msg)
+        ok, _, normalised = validate_args("web_search",
+                                          {"query": "test", "count": 3})
+        self.assertTrue(ok)
+        self.assertEqual(normalised["query"], "test")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

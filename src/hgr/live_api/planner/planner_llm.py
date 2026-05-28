@@ -105,6 +105,12 @@ class LLMPlanner:
             "- press_hotkey [iris]  Press a key combination.",
             "- open_app [iris]  Launch any app by name (Outlook, Teams, etc.).",
             "- open_url [iris]  Open a URL in the default browser.",
+            "- web_search [iris]  Structured search results "
+            "(title/url/snippet) WITHOUT spinning up Chrome — Google CSE if "
+            "configured, else DuckDuckGo. Use first for any 'search the web' "
+            "/ 'latest news' request; chain with web_navigate + web_get_text "
+            "to read a chosen result. Args: query, count (default 5), "
+            "site (optional domain), recent_days (e.g. 7 for news).",
             "- web_navigate / web_get_text / web_get_links [iris]  Drive the "
             "controllable Chrome (fresh, not the user's signed-in one).",
         ])

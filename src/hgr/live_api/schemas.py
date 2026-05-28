@@ -1258,6 +1258,32 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "web_search",
+        "description": (
+            "Run a web search and return up to N structured "
+            "{title, url, snippet} results — NO Chrome needed. Uses Google "
+            "Custom Search if GOOGLE_CSE_API_KEY + GOOGLE_CSE_ID env vars are "
+            "set; otherwise falls back to DuckDuckGo HTML. Prefer this over "
+            "navigating a search engine and scraping the results page: it's "
+            "faster, cheaper, and gives clean URLs. Pair with web_navigate "
+            "+ web_get_text to actually read a chosen result. Use "
+            "`recent_days` to bias toward fresh news; use `site` to restrict "
+            "to one domain (e.g. site=\"nytimes.com\")."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "count": {"type": "integer", "default": 5},
+                "site": {"type": "string"},
+                "recent_days": {"type": "integer", "default": 0},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
         "name": "web_navigate",
         "description": (
             "Open a URL (or run a Google search for a plain query) in the "
