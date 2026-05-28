@@ -38,10 +38,12 @@ class Microsoft365Connector(Connector):
     # ---- Graph REST helper ----
     def _graph(self, method: str, path: str, body: Dict[str, Any] | None = None,
                raw: bytes | None = None, content_type: str | None = None,
-               token: Optional[str] = None):
+               token: Optional[str] = None,
+               extra_headers: Optional[Dict[str, str]] = None):
         """Default behavior: use the active account's token. Pass token=... to
         target a specific account (used by fan-out tools like multi-account
-        contacts_search)."""
+        contacts_search). extra_headers lets callers add e.g. ConsistencyLevel
+        which $search on /me/contacts requires."""
         if token is None:
             token = self._client.token()
         if not token:
@@ -56,6 +58,8 @@ class Microsoft365Connector(Connector):
             req.add_header("Content-Type", content_type)
         elif body is not None:
             req.add_header("Content-Type", "application/json")
+        for k, v in (extra_headers or {}).items():
+            req.add_header(k, v)
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
                 text = resp.read().decode("utf-8") if resp.length != 0 else ""
@@ -462,25 +466,64 @@ class Microsoft365Connector(Connector):
                 if not token:
                     errors.append(f"{acct.get('username')}: token refresh failed")
                     continue
-                # Pass 1: /me/contacts (formal address book).
+                # Pass 1: /me/contacts (formal address book). Three strategies,
+                # walking from most-targeted to least, so we hit Dani whether
+                # the tenant supports $search, $filter, or only raw listing.
+                qlow = q.lower()
+                contacts_hits = 0
+                contacts_err: Optional[str] = None
+                # 1a) $search — broadest match, but Graph needs the
+                # ConsistencyLevel header. Personal MSA accounts sometimes
+                # don't support $search on /me/contacts; the next two
+                # strategies cover that.
                 data, err = self._graph(
                     "GET",
                     f"/me/contacts?$search={sq}&$top={max_n}"
                     "&$select=displayName,emailAddresses",
-                    token=token)
+                    token=token,
+                    extra_headers={"ConsistencyLevel": "eventual"})
                 if err:
+                    contacts_err = err
+                    # 1b) $filter startswith — works on every tenant; matches
+                    # displayName beginning.
                     data, err = self._graph(
                         "GET",
                         f"/me/contacts?$top={max_n}&$select=displayName,emailAddresses"
                         f"&$filter=startswith(displayName,'{fq}')",
                         token=token)
-                if not err and data:
+                if err:
+                    if contacts_err is None:
+                        contacts_err = err
+                    # 1c) Last resort: list and client-side filter on
+                    # substring match across name + emails. We pull up to 200
+                    # contacts which is plenty for a typical user.
+                    data, err = self._graph(
+                        "GET",
+                        f"/me/contacts?$top=200"
+                        "&$select=displayName,emailAddresses",
+                        token=token)
+                    if not err and data:
+                        filtered = []
+                        for c in (data.get("value") or []):
+                            name = (c.get("displayName") or "").lower()
+                            emails_low = " ".join(
+                                (e.get("address") or "").lower()
+                                for e in (c.get("emailAddresses") or []))
+                            if qlow in name or qlow in emails_low:
+                                filtered.append(c)
+                        data = {"value": filtered[:max_n]}
+                if err:
+                    errors.append(
+                        f"{acct.get('username')} contacts: "
+                        f"{contacts_err or err}")
+                elif data:
                     for c in (data.get("value") or []):
                         emails = [e.get("address")
                                   for e in (c.get("emailAddresses") or [])
                                   if e.get("address")]
                         _add(c.get("displayName"), emails,
                              acct.get("username"), "contacts")
+                        contacts_hits += 1
 
                 # Pass 2: /me/people (anyone you've corresponded with). This
                 # rescues "added to Outlook desktop's local address book"

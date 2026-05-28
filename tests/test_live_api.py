@@ -2189,7 +2189,7 @@ class MultiAccountContactsSearchTests(unittest.TestCase):
 
         seen_paths: List[tuple] = []
         def fake_graph(self_, method, path, body=None, raw=None,
-                       content_type=None, token=None):
+                       content_type=None, token=None, extra_headers=None):
             seen_paths.append((token, path))
             acct_name = (token or "").replace("token-", "")
             contacts = account_contacts.get(acct_name, [])
@@ -2328,7 +2328,7 @@ class ContactsSearchFallbackTests(unittest.TestCase):
 
         paths_hit: List[str] = []
         def fake_graph(self_, method, path, body=None, raw=None,
-                       content_type=None, token=None):
+                       content_type=None, token=None, extra_headers=None):
             paths_hit.append(path)
             if "/me/contacts" in path:
                 return ({"value": [
