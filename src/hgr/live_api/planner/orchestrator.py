@@ -114,6 +114,25 @@ class IrisPlanner:
         # properly by Phase 2 (or fall through to realtime).
         multi = looks_multi_action(text)
         single = None if multi else self._classifier.classify(text)
+
+        # --- Pseudo-tool: preference-setting commands. Not a registry tool —
+        # writes directly to memory so the planner's recall layer injects the
+        # preference into every future Phase-2 prompt.
+        if single is not None and single.tool == "iris_set_preference":
+            args = single.args or {}
+            kind = str(args.get("kind") or "preference")
+            key = str(args.get("key") or "")
+            value = str(args.get("value") or "")
+            if self._memory is not None and key and value:
+                self._memory.set_fact(kind, key, value)
+            sr = StepResult(step_id=0, tool=single.tool,
+                            status="ok",
+                            output={"status": "ok", "kind": kind,
+                                    "key": key, "value": value})
+            message = f"Got it — I'll remember {key} = {value}."
+            self._record_turn(text, None, [single], [sr], message)
+            return {"steps": [single], "results": [sr], "message": message}
+
         if single is not None and self._registry.handles_connector(single.tool):
             if single.needs_confirm and self._confirm is not None and \
                     not self._confirm(f"Run {single.tool}?", single.description):

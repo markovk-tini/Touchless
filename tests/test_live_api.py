@@ -2072,6 +2072,100 @@ class LLMPlannerPromptTests(unittest.TestCase):
         self.assertIn("contacts_search", system)
 
 
+class PreferenceClassifierTests(unittest.TestCase):
+    """'always send from X' / 'set default sender to X' / etc. — must map
+    deterministically to an iris_set_preference Step."""
+
+    def setUp(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        self.c = Classifier()
+
+    def _expect(self, text, key, value):
+        step = self.c.classify(text)
+        self.assertIsNotNone(step, f"missed: {text!r}")
+        self.assertEqual(step.tool, "iris_set_preference")
+        self.assertEqual(step.args.get("key"), key)
+        self.assertEqual(step.args.get("value"), value)
+
+    def test_send_from_gmail_variants(self) -> None:
+        self._expect("always send from gmail", "default_send_via", "gmail_send")
+        self._expect("always send via my gmail account", "default_send_via", "gmail_send")
+        self._expect("use outlook by default", "default_send_via", "ms_mail_send")
+        self._expect("set my default sender to gmail", "default_send_via", "gmail_send")
+        self._expect("only send email from outlook", "default_send_via", "ms_mail_send")
+
+    def test_contacts_account_variants(self) -> None:
+        self._expect("always search contacts in my .edu",
+                     "default_contact_account", ".edu")
+        self._expect("only look up contacts in gmail",
+                     "default_contact_account", "gmail")
+        self._expect("always find contacts from my work account",
+                     "default_contact_account", "work")
+
+    def test_non_preference_unaffected(self) -> None:
+        # Things that must NOT classify as preference-setting.
+        self.assertIsNone(self.c.classify("send dani an email"))
+        # "what's the weather" doesn't classify at all — neither preference
+        # nor a known intent.
+        self.assertIsNone(self.c.classify("what's the weather"))
+
+
+class PreferencePseudoToolTests(unittest.TestCase):
+    """The iris_set_preference Step is intercepted by the orchestrator
+    BEFORE the registry call — it writes to memory and returns ok."""
+
+    def test_writes_to_memory_without_registry_call(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({})
+        writes: List[tuple] = []
+        class _FakeMem:
+            def set_fact(self_, kind, key, value, source="user said"):
+                writes.append((kind, key, value, source))
+            def record(self_, *a, **k): pass
+            def recall(self_, *a, **k):
+                return {"context": "", "episodes": [], "facts": []}
+        planner = IrisPlanner(reg, memory=_FakeMem())
+        out = planner.try_handle("always send from gmail")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["steps"][0].tool, "iris_set_preference")
+        self.assertEqual(out["results"][0].status, "ok")
+        # The pseudo-tool didn't touch the registry.
+        self.assertEqual(reg.calls, [])
+        # But it DID write to memory.
+        self.assertEqual(writes,
+                         [("preference", "default_send_via", "gmail_send",
+                           "user said")])
+        # User-visible message confirms the new preference.
+        self.assertIn("default_send_via", out["message"])
+        self.assertIn("gmail_send", out["message"])
+
+    def test_no_memory_still_replies_gracefully(self) -> None:
+        """When memory isn't wired, the preference command shouldn't crash —
+        it just acknowledges (and forgets, no place to persist)."""
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({})
+        planner = IrisPlanner(reg, memory=None)
+        out = planner.try_handle("always send from gmail")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["results"][0].status, "ok")
+
+
+class PlannerPromptPrefsTests(unittest.TestCase):
+    """The planner prompt instructs the LLM to read preferences from the
+    memory context and honor per-request overrides."""
+
+    def test_prompt_mentions_preferences(self) -> None:
+        from hgr.live_api.planner.planner_llm import LLMPlanner
+        reg = _StubRegistry({})
+        lp = LLMPlanner(reg)
+        msgs = lp._build_messages("any goal")
+        system = next(m["content"] for m in msgs if m["role"] == "system")
+        self.assertIn("default_send_via", system)
+        self.assertIn("preference", system.lower())
+        # Per-request override wins for THIS request.
+        self.assertIn("one-shot", system.lower())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

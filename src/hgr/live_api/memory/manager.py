@@ -65,6 +65,17 @@ class MemoryManager:
         self._logger = logger
 
     # ---- write -----------------------------------------------------------
+    def set_fact(self, kind: str, key: str, value: str,
+                 source: str = "user said") -> None:
+        """Persist a single semantic fact. Used by Tier 1 preference-setting
+        commands ('always send from gmail') to write through to the store
+        without going via the executor."""
+        try:
+            self._store.add_semantic(kind, key, value, source)
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("memory_set_fact_failed", exc)
+
     def record(self, user_text: str, plan: Any, steps: List[Any],
                results: List[Any], message: str) -> None:
         """Persist a planner-handled turn. Fact extraction is sync (fast);

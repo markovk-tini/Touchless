@@ -128,4 +128,65 @@ class Classifier:
                 description="compose email draft",
             )
 
+        # ---- sticky user preferences (saved to memory, 0 tokens) ----------
+        # "always send from gmail", "use outlook by default", "set my default
+        # sender to gmail" — saved as preference(default_send_via=...). The
+        # planner's recall layer injects it on every future Phase-2 prompt.
+        m = re.search(
+            r"\b(?:always|only|by\s+default|set\s+(?:my\s+)?default)\b.*?\b"
+            r"(?:send|email)\b.*?\b(?:from|via|using|with)\s+"
+            r"(?:my\s+)?(?P<sender>gmail|google|outlook|microsoft|ms|m365|hotmail|exchange)\b",
+            lower,
+        )
+        if m is None:
+            m = re.search(
+                r"\bset\s+(?:my\s+)?default\s+sender\s+to\s+"
+                r"(?P<sender>gmail|google|outlook|microsoft|ms|m365|hotmail|exchange)\b",
+                lower,
+            )
+        if m is None:
+            # "use outlook by default" / "always use gmail" — sender named
+            # without an explicit 'send' verb. We assume "use" + sender =
+            # use as default email sender (the most common interpretation).
+            m = re.search(
+                r"\b(?:always\s+use|use)\s+(?:my\s+)?"
+                r"(?P<sender>gmail|google|outlook|microsoft|ms|m365|hotmail|exchange)"
+                r"\b(?:\s+by\s+default)?",
+                lower,
+            )
+        if m is not None:
+            tool_for = {
+                "gmail": "gmail_send", "google": "gmail_send",
+                "outlook": "ms_mail_send", "microsoft": "ms_mail_send",
+                "ms": "ms_mail_send", "m365": "ms_mail_send",
+                "hotmail": "ms_mail_send", "exchange": "ms_mail_send",
+            }
+            sender = tool_for.get(m.group("sender"))
+            if sender:
+                return Step(
+                    tool="iris_set_preference",
+                    args={"kind": "preference", "key": "default_send_via",
+                          "value": sender},
+                    layer="touchless",
+                    description=f"remember to send via {sender} by default",
+                )
+
+        # "always search contacts in my .edu" / "only look up contacts in
+        # gmail / outlook / school". Saved as default_contact_account.
+        m = re.search(
+            r"\b(?:always|only|by\s+default)\b.*?\b"
+            r"(?:search|look\s*up|find)\b.*?\bcontacts?\b.*?\b(?:in|from|via|using)\s+"
+            r"(?:my\s+)?(?P<acct>gmail|google|outlook|microsoft|ms|m365|hotmail|exchange|"
+            r"school|work|personal|\.?edu|university)\b",
+            lower,
+        )
+        if m is not None:
+            return Step(
+                tool="iris_set_preference",
+                args={"kind": "preference", "key": "default_contact_account",
+                      "value": m.group("acct")},
+                layer="touchless",
+                description=f"remember to search contacts in {m.group('acct')}",
+            )
+
         return None
