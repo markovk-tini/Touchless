@@ -190,6 +190,7 @@ class ToolExecutor:
             "run_python_script": self._t_run_python_script,
             "skip_youtube_ad": self._t_skip_youtube_ad,
             "ask_user_confirmation": self._t_ask_user_confirmation,
+            "compose_text": self._t_compose_text,
             "weather_get": self._t_weather_get,
             "web_search": self._t_web_search,
             "web_navigate": self._t_web_navigate,
@@ -1537,6 +1538,18 @@ class ToolExecutor:
                 self._logger.exception("web_controller_init_failed", exc)
                 self._web = None
         return self._web
+
+    def _t_compose_text(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        # Mid-plan natural-language synthesis. Used by Tier 2 plans like
+        # 'create doc and write a debrief about my weather + emails' —
+        # gather data in earlier steps, compose the prose with this tool,
+        # then feed {step:N.text} into gdocs_create's `text` arg.
+        from .compose import compose_text
+        return compose_text(
+            prompt=str(args.get("prompt") or ""),
+            inputs=args.get("inputs"),
+            max_tokens=int(args.get("max_tokens") or 500),
+        )
 
     def _t_weather_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         # Free, no-key weather via wttr.in. Auto-detects user location

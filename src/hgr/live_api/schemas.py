@@ -1264,6 +1264,38 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "compose_text",
+        "description": (
+            "Synthesize natural-language prose mid-plan via cheap-LLM. The "
+            "{step:N.field} ref system only does direct string substitution — "
+            "use compose_text when a plan needs to TURN structured step "
+            "outputs (a weather dict, a list of emails) INTO prose for the "
+            "next step (e.g. as `text` for gdocs_create). Returns "
+            "{text: <string>}; the next step references it as "
+            "{step:N.text}. `inputs` accepts any string built from refs — "
+            "e.g. 'weather: {step:1.summary}\\nemails: {step:2.messages}'. "
+            "Enumerates EVERY item by default — say 'short summary' if "
+            "you want it terser."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string",
+                           "description": "The composition instruction "
+                                          "(e.g. 'write a morning briefing "
+                                          "covering weather and a bulleted "
+                                          "list of every unread email')."},
+                "inputs": {"type": "string",
+                           "description": "The input data, built up from "
+                                          "{step:N.field} refs."},
+                "max_tokens": {"type": "integer", "default": 500},
+            },
+            "required": ["prompt", "inputs"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
         "name": "weather_get",
         "description": (
             "Current weather + 1-3 day forecast via wttr.in (free, no API "

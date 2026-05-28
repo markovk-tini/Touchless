@@ -11,6 +11,7 @@ Author: Konstantin Markov
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, List, Optional
 
@@ -181,6 +182,14 @@ class Executor:
                         if not isinstance(val, list) or not (0 <= i < len(val)):
                             return fail()
                         val = val[i]
+                # Lists / dicts get JSON-stringified so downstream tools (esp.
+                # compose_text) receive a parseable structure instead of
+                # Python's repr ('[{'id': ...}]' with single quotes).
+                if isinstance(val, (list, dict)):
+                    try:
+                        return json.dumps(val, default=str)
+                    except Exception:
+                        pass
                 return str(val)
             return _REF_RE.sub(sub, args)
         return args

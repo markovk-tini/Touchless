@@ -3210,6 +3210,99 @@ class CreateDocAndWriteTests(unittest.TestCase):
         self.assertIsNotNone(c.classify("tell me Dani's email"))
 
 
+class ComposeTextTests(unittest.TestCase):
+    """compose_text turns step outputs into synthesized prose mid-plan."""
+
+    def test_empty_prompt_rejected(self) -> None:
+        from hgr.live_api.compose import compose_text
+        os.environ["OPENAI_API_KEY"] = "fake"
+        try:
+            out = compose_text("", {"foo": "bar"})
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["code"], "invalid_arguments")
+
+    def test_not_configured_returns_clean_error(self) -> None:
+        from hgr.live_api.compose import compose_text
+        os.environ.pop("OPENAI_API_KEY", None)
+        out = compose_text("write something", {"data": 1})
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["code"], "not_configured")
+
+    def test_happy_path_returns_text(self) -> None:
+        from hgr.live_api import compose as cmod
+        os.environ["OPENAI_API_KEY"] = "fake-for-test"
+        try:
+            fake_resp = json.dumps({"choices": [{"message": {
+                "content": "Sunny, 72°F. 3 unread: ..."}}]}).encode()
+
+            class _Resp:
+                def __enter__(self): return self
+                def __exit__(self, *a): pass
+                def read(self): return fake_resp
+
+            seen: Dict[str, Any] = {}
+            def fake_urlopen(req, timeout=None):
+                seen["body"] = req.data.decode()
+                return _Resp()
+
+            with patch.object(cmod.urllib.request, "urlopen",
+                              side_effect=fake_urlopen):
+                out = cmod.compose_text(
+                    "write a debrief",
+                    {"weather": "sunny", "emails": ["a", "b", "c"]})
+            self.assertEqual(out["status"], "ok")
+            self.assertIn("Sunny", out["text"])
+            # Inputs serialized into the prompt.
+            self.assertIn("emails", seen["body"])
+            self.assertIn("sunny", seen["body"])
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+
+
+class ExecutorRefJsonStringifyTests(unittest.TestCase):
+    """When {step:N.field} resolves to a list/dict, the executor now
+    JSON-stringifies it so downstream tools (especially compose_text)
+    receive parseable data instead of Python repr."""
+
+    def test_list_resolved_as_json(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="src", args={}),
+            Step(id=2, tool="use", args={"data": "{step:1.messages}"},
+                 depends_on=[1]),
+        ])
+        reg = _StubRegistry({
+            "src": {"status": "ok",
+                    "messages": [{"id": "a", "from": "x@y"},
+                                 {"id": "b", "from": "z@w"}]},
+            "use": {"status": "ok"},
+        })
+        Executor(reg).run(plan)
+        use = next(a for t, a in reg.calls if t == "use")
+        # JSON, not Python repr — double quotes, no single quotes.
+        self.assertIn('"id"', use["data"])
+        self.assertNotIn("'id'", use["data"])
+        self.assertIn('"x@y"', use["data"])
+
+    def test_scalar_still_resolved_as_string(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="src", args={}),
+            Step(id=2, tool="use", args={"to": "{step:1.email}"},
+                 depends_on=[1]),
+        ])
+        reg = _StubRegistry({
+            "src": {"status": "ok", "email": "dani@x.io"},
+            "use": {"status": "ok"},
+        })
+        Executor(reg).run(plan)
+        use = next(a for t, a in reg.calls if t == "use")
+        # Scalar values stay as plain strings (no JSON quoting).
+        self.assertEqual(use["to"], "dani@x.io")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
