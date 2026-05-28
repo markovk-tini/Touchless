@@ -603,6 +603,29 @@ class IrisPlannerClassifierTests(unittest.TestCase):
         self.assertEqual(step.args.get("recipient"), "dani@mangollc.org")
         self.assertEqual(step.args.get("body"), "hi from iris")
 
+    def test_email_compose_send_an_email_to_form(self) -> None:
+        """Live-bug fix: 'can you send an email to X saying Y' used to miss
+        the classifier and fall to realtime, which got stuck on
+        ask_user_confirmation. Now Tier 1 catches it."""
+        for text in [
+            "send an email to vesselin.markov@gmail.com saying iris says Hi!",
+            "can you send an email to vesselin.markov@gmail.com saying iris says Hi!",
+            "send email to dani@x.io saying hi",
+            "email to dani@x.io saying hi from iris",
+            "send a message to vesselin.markov@gmail.com saying hello",
+            "send me an email to dani@x.io saying test",
+        ]:
+            step = self.c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "outlook_compose",
+                             f"text={text!r}: tool={step.tool}")
+            recipient = step.args.get("recipient", "")
+            self.assertTrue("@" in recipient or recipient.lower() in
+                            ("dani", "vesselin"),
+                            f"text={text!r}: recipient={recipient!r}")
+            self.assertTrue(step.args.get("body"),
+                            f"text={text!r}: empty body")
+
     def test_misses_safely(self) -> None:
         # Things that must NOT classify (they need the LLM / fall through):
         self._miss("read my latest email")

@@ -122,19 +122,24 @@ class Classifier:
                         description=f"upload to Drive: {path}")
 
         # ---- Email compose (recipient + body, simple phrasing) -----------
-        # Two forms, both produce an outlook_compose Step that the
+        # Recognized forms, all producing an outlook_compose Step that the
         # orchestrator MAY rewrite to gmail_send/ms_mail_send based on the
         # user's default_send_via preference (and resolve a name → email
         # from memory if recipient isn't an @ address):
         #
-        #   "email <addr> saying <body>"  — explicit address
-        #   "email <Name> saying <body>"  — a named recipient (the
-        #     orchestrator looks up Name in memory)
+        #   "email <addr> saying <body>"
+        #   "email <Name> saying <body>"
+        #   "email to <addr> saying <body>"
+        #   "send (me|a|an) email (to) <addr|Name> saying <body>"
+        #   "send a message to <addr|Name> saying <body>"
         # Excluded: pronouns/articles ("me", "him", "the boss" — too
         # ambiguous; let those fall through to higher tiers).
         m = re.search(
-            r"\bemail\s+(?P<to>\S+@\S+\.\S+|[A-Za-z][A-Za-z0-9._\-]*)"
-            r"\s+(?:saying|with message|that says)\s+(?P<body>.+)$",
+            r"\b(?:send\s+(?:me\s+|an?\s+)?)?(?:e[-\s]?mail|message)\s+"
+            r"(?:to\s+)?"
+            r"(?P<to>\S+@\S+\.\S+|[A-Za-z][A-Za-z0-9._\-]*)"
+            r"\s+(?:saying|with\s+(?:the\s+)?message|that\s+says|with)\s+"
+            r"(?P<body>.+)$",
             t, flags=re.IGNORECASE,
         )
         if m:
