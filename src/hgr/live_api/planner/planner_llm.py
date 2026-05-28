@@ -17,6 +17,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 from .plan import Plan, Step
+from .scheduler import scheduler
 
 DEFAULT_MODEL = "gpt-5-mini"
 API_URL = "https://api.openai.com/v1/chat/completions"
@@ -46,6 +47,12 @@ class LLMPlanner:
             messages = self._build_messages(goal)
             data = self._call(messages)
             return self._parse(goal, data)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                scheduler().record_rate_limit("cheap-llm")
+            if self._logger:
+                self._logger.event("planner_llm_http_error", code=exc.code)
+            return None
         except Exception as exc:
             if self._logger:
                 self._logger.exception("planner_llm_failed", exc)
@@ -118,6 +125,7 @@ class LLMPlanner:
                      "Content-Type": "application/json"},
             method="POST",
         )
+        scheduler().record_call("cheap-llm")
         with urllib.request.urlopen(req, timeout=30) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         text = (payload.get("choices") or [{}])[0].get("message", {}).get("content", "")

@@ -20,6 +20,8 @@ from .classifier import Classifier
 from .executor import Executor
 from .plan import Plan, Step
 from .planner_llm import LLMPlanner, configured as llm_planner_configured
+from .scheduler import scheduler
+from .synthesizer import Synthesizer, configured as synth_configured
 
 
 class IrisPlanner:
@@ -35,6 +37,7 @@ class IrisPlanner:
         self._classifier = Classifier()
         self._llm_planner = LLMPlanner(registry, logger) if registry is not None else None
         self._executor = Executor(registry, logger) if registry is not None else None
+        self._synthesizer = Synthesizer(logger=logger)
 
     def try_handle(self, text: str) -> Optional[Dict[str, Any]]:
         """Try to fully handle a request without the realtime model.
@@ -73,21 +76,41 @@ class IrisPlanner:
             return {"steps": [single], "results": [sr],
                     "message": self._format_message(single, out or {})}
 
-        # --- Phase 2: cheap-LLM JSON plan -> Executor (opt-in flag) ---
-        if (os.environ.get("TOUCHLESS_IRIS_PLAN_LLM", "0") == "1"
+        # --- Phase 2: cheap-LLM JSON plan -> Executor ---
+        # Fires when (a) the explicit flag is on, OR (b) realtime is currently
+        # rate-limited and cheap-LLM is healthy (back-pressure: prefer the
+        # lane that can actually serve the request).
+        flag_on = os.environ.get("TOUCHLESS_IRIS_PLAN_LLM", "0") == "1"
+        sched = scheduler()
+        scheduler_prefers_cheap = sched.prefer_cheap_planner()
+        if ((flag_on or scheduler_prefers_cheap)
                 and llm_planner_configured()
                 and self._llm_planner is not None
                 and self._executor is not None):
             plan = self._llm_planner.plan(text)
             if plan is not None and plan.steps:
                 results = self._executor.run(plan)
+                message = self._summarize(plan, results)
                 return {
                     "steps": plan.steps,
                     "results": results,
                     "plan": plan,
-                    "message": self._format_plan_message(plan, results),
+                    "message": message,
                 }
         return None
+
+    # ---- summarize a multi-step plan --------------------------------------
+    def _summarize(self, plan: "Plan", results: list) -> str:
+        """Pick the right summary path: synthesizer when the plan asks for
+        it AND cheap-LLM is healthy, deterministic format otherwise."""
+        wants_synth = (plan.final or "").lower() in ("synthesize", "speak")
+        if (wants_synth
+                and synth_configured()
+                and scheduler().allow_cheap_synthesis()):
+            text = self._synthesizer.summarize(plan, results)
+            if text:
+                return text
+        return self._format_plan_message(plan, results)
 
     def _format_plan_message(self, plan: "Plan", results: list) -> str:
         ok = sum(1 for r in results if r.status == "ok")

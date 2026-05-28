@@ -741,6 +741,138 @@ class IrisPlannerOrchestratorTests(unittest.TestCase):
         self.assertEqual(send_args["ref"], "abc")
 
 
+class IrisPlannerSchedulerTests(unittest.TestCase):
+    """Phase 3 scheduler: sliding-window back-pressure between lanes."""
+
+    def test_throttle_window_decays(self) -> None:
+        from hgr.live_api.planner.scheduler import RateScheduler
+        t = [0.0]
+        sched = RateScheduler(clock=lambda: t[0])
+        sched.record_rate_limit("realtime")
+        # Inside the window: throttled.
+        t[0] = 30.0
+        self.assertTrue(sched.is_throttled("realtime", window=60.0))
+        # Past the window: cleared.
+        t[0] = 65.0
+        self.assertFalse(sched.is_throttled("realtime", window=60.0))
+
+    def test_prefers_cheap_when_realtime_throttled(self) -> None:
+        from hgr.live_api.planner.scheduler import RateScheduler
+        t = [0.0]
+        sched = RateScheduler(clock=lambda: t[0])
+        # Both healthy → no preference for cheap.
+        self.assertFalse(sched.prefer_cheap_planner())
+        # Realtime takes a 429 → prefer cheap.
+        sched.record_rate_limit("realtime")
+        self.assertTrue(sched.prefer_cheap_planner())
+        # But if cheap is ALSO 429, don't prefer it (no point).
+        sched.record_rate_limit("cheap-llm")
+        self.assertFalse(sched.prefer_cheap_planner())
+        self.assertFalse(sched.allow_cheap_synthesis())
+
+
+class IrisPlannerSynthesizerTests(unittest.TestCase):
+    """Phase 3 synthesizer: trims outputs, calls LLM with goal+steps."""
+
+    def test_trim_output_drops_raw_and_caps_strings(self) -> None:
+        from hgr.live_api.planner.synthesizer import Synthesizer
+        big = "x" * 5000
+        trimmed = Synthesizer._trim_output({
+            "subject": "hi",
+            "body": big,
+            "raw": {"huge": big},     # dropped
+            "count": 3,
+            "items": list(range(50)), # list capped
+        })
+        self.assertEqual(trimmed["subject"], "hi")
+        self.assertLess(len(trimmed["body"]), 5000)
+        self.assertNotIn("raw", trimmed)
+        self.assertEqual(trimmed["count"], 3)
+        self.assertEqual(len(trimmed["items"]), 10)
+
+    def test_summarize_passes_goal_and_steps_to_llm(self) -> None:
+        from hgr.live_api.planner.synthesizer import Synthesizer
+        from hgr.live_api.planner.plan import Plan, StepResult
+        os.environ["OPENAI_API_KEY"] = "fake-for-test"
+        try:
+            synth = Synthesizer()
+            captured: Dict[str, Any] = {}
+            def fake_call(messages):
+                captured["messages"] = messages
+                return "Dani is free Wed after 2pm."
+            synth._call = fake_call  # type: ignore[assignment]
+            plan = Plan(goal="when is Dani free?", steps=[], final="synthesize")
+            results = [StepResult(step_id=1, tool="cal_freebusy",
+                                  status="ok",
+                                  output={"slots": ["Wed 2-4pm"]})]
+            out = synth.summarize(plan, results)
+            self.assertEqual(out, "Dani is free Wed after 2pm.")
+            user = captured["messages"][1]["content"]
+            self.assertIn("when is Dani free", user)
+            self.assertIn("cal_freebusy", user)
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+
+
+class IrisPlannerSynthesisRoutingTests(unittest.TestCase):
+    """Orchestrator routes 'synthesize' plans through the Synthesizer when
+    cheap-LLM is healthy, and falls back to the deterministic format when
+    the scheduler says cheap-LLM is throttled."""
+
+    def _setup(self):
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        from hgr.live_api.planner.plan import Plan, Step
+        from hgr.live_api.planner.scheduler import scheduler
+        reg = _StubRegistry({
+            "cal_freebusy": {"status": "ok", "slots": ["Wed 2-4pm"]},
+        })
+        planner = IrisPlanner(reg)
+        forged = Plan(goal="when is Dani free?", steps=[
+            Step(id=1, tool="cal_freebusy", args={}),
+        ], final="synthesize")
+        planner._llm_planner.plan = lambda _g: forged  # type: ignore[assignment]
+        # Make sure the cheap-LLM scheduler is healthy at the start of each test.
+        sched = scheduler()
+        sched._events.clear()  # type: ignore[attr-defined]
+        return planner, sched
+
+    def _run(self, planner):
+        import hgr.live_api.planner.orchestrator as orch
+        import hgr.live_api.planner.synthesizer as sy
+        os.environ["TOUCHLESS_IRIS_PLAN_LLM"] = "1"
+        old_llm = orch.llm_planner_configured
+        old_syn = orch.synth_configured
+        orch.llm_planner_configured = lambda: True
+        orch.synth_configured = lambda: True
+        try:
+            return planner.try_handle("when is Dani free?")
+        finally:
+            os.environ.pop("TOUCHLESS_IRIS_PLAN_LLM", None)
+            orch.llm_planner_configured = old_llm
+            orch.synth_configured = old_syn
+
+    def test_synthesizer_used_when_healthy(self) -> None:
+        planner, _sched = self._setup()
+        planner._synthesizer.summarize = lambda _p, _r: "Dani is free Wed 2-4pm."
+        out = self._run(planner)
+        self.assertEqual(out["message"], "Dani is free Wed 2-4pm.")
+
+    def test_falls_back_to_format_when_cheap_llm_throttled(self) -> None:
+        planner, sched = self._setup()
+        sched.record_rate_limit("cheap-llm")
+        called = {"n": 0}
+        def _should_not_run(_p, _r):
+            called["n"] += 1
+            return "nope"
+        planner._synthesizer.summarize = _should_not_run
+        out = self._run(planner)
+        self.assertEqual(called["n"], 0)
+        # Deterministic format kicks in instead — content varies, but it
+        # must NOT be the synthesizer output and must be non-empty.
+        self.assertNotEqual(out["message"], "nope")
+        self.assertTrue(out["message"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

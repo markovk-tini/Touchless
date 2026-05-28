@@ -1209,6 +1209,14 @@ class LiveApiManager(QObject):
                 emsg = str((err or {}).get("message", "")) if isinstance(err, dict) else ""
                 ecode = str((err or {}).get("code", "")) if isinstance(err, dict) else ""
                 is_rate = ecode == "rate_limit_exceeded" or "rate limit" in emsg.lower()
+                if is_rate:
+                    # Tell the planner's scheduler so the next user turn can
+                    # route around realtime via the cheap-LLM Phase 2 path.
+                    try:
+                        from .planner.scheduler import scheduler as _sched
+                        _sched().record_rate_limit("realtime")
+                    except Exception:
+                        pass
                 retry_after = None
                 m = re.search(r"try again in ([\d.]+)\s*s", emsg)
                 if m:

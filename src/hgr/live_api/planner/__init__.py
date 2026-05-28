@@ -19,7 +19,10 @@ from .plan import Step, StepResult, Plan
 from .classifier import Classifier
 from .executor import Executor
 from .planner_llm import LLMPlanner
+from .scheduler import RateScheduler, scheduler
+from .synthesizer import Synthesizer
 from .orchestrator import IrisPlanner
 
 __all__ = ["Step", "StepResult", "Plan", "Classifier",
-           "Executor", "LLMPlanner", "IrisPlanner"]
+           "Executor", "LLMPlanner", "Synthesizer",
+           "RateScheduler", "scheduler", "IrisPlanner"]
