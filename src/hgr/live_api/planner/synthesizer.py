@@ -119,7 +119,9 @@ class Synthesizer:
             "model": self._model,
             "messages": messages,
             "temperature": 0.3,
-            "max_tokens": 300,
+            # max_completion_tokens (not max_tokens) — newer models like
+            # gpt-5-mini reject the older param. Older models accept both.
+            "max_completion_tokens": 300,
         }
         req = urllib.request.Request(
             API_URL, data=json.dumps(body).encode("utf-8"),

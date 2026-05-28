@@ -134,7 +134,9 @@ def extract_facts_from_conversation(
         ],
         "temperature": 0.0,
         "response_format": {"type": "json_object"},
-        "max_tokens": 600,
+        # max_completion_tokens (not max_tokens) — newer models like
+        # gpt-5-mini reject the older param. Older models accept both.
+        "max_completion_tokens": 600,
     }
     key = os.environ["OPENAI_API_KEY"]
     req = urllib.request.Request(

@@ -89,8 +89,10 @@ def compose_text(prompt: str, inputs: Any, max_tokens: int = 0,
             {"role": "user", "content": user},
         ],
         "temperature": 0.3,
-        # max_tokens=0 means 'use default'; clamp to a sensible upper bound.
-        "max_tokens": int(max(64, min(int(max_tokens or _MAX_TOKENS), 8000))),
+        # max_completion_tokens (not max_tokens) — newer models like
+        # gpt-5-mini reject the older param. Older models accept both.
+        # 0 means 'use default'; clamp to a sensible upper bound.
+        "max_completion_tokens": int(max(64, min(int(max_tokens or _MAX_TOKENS), 8000))),
     }
     key = os.environ["OPENAI_API_KEY"]
     req = urllib.request.Request(
