@@ -112,11 +112,21 @@ class LLMPlanner:
             "- web_search [iris]  Structured search results "
             "(title/url/snippet) WITHOUT spinning up Chrome — Google CSE if "
             "configured, else DuckDuckGo. Use first for any 'search the web' "
-            "/ 'latest news' request; chain with web_navigate + web_get_text "
-            "to read a chosen result. Args: query, count (default 5), "
-            "site (optional domain), recent_days (e.g. 7 for news).",
-            "- web_navigate / web_get_text / web_get_links [iris]  Drive the "
-            "controllable Chrome (fresh, not the user's signed-in one).",
+            "/ 'latest news' request. Returns {results: [{title, url, "
+            "snippet}, ...]}; reference the first result's URL as "
+            "{step:N.results[0].url}. Args: query, count (default 5), site "
+            "(optional domain), recent_days (e.g. 7 for news).",
+            "- web_navigate [iris]  Open a URL (or run a Google search for "
+            "a plain query) in the controlled Chrome and wait for load. "
+            "Args: url_or_query. MUST come BEFORE web_get_text / "
+            "web_get_links — those two read whatever page is currently "
+            "loaded; they do NOT accept a url arg themselves.",
+            "- web_get_text [iris]  Return the current page's visible text. "
+            "ONLY callable AFTER web_navigate has loaded the page you want. "
+            "Args: max_chars (default 4000). No url arg.",
+            "- web_get_links [iris]  Return the current page's links as "
+            "{index, text, url}. Same rule: requires a prior web_navigate. "
+            "Args: contains, limit.",
         ])
         return "\n".join(lines)
 

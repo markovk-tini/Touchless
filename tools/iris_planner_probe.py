@@ -115,9 +115,31 @@ def _probe(text: str, live: bool) -> None:
     from hgr.live_api.planner.planner_llm import LLMPlanner
     reg = _ProbeRegistry()
     planner = LLMPlanner(reg)
-    plan = planner.plan(text)
+    # Bypass the silent error swallow in LLMPlanner.plan so we can SEE what
+    # actually went wrong (wrong model id, 401, JSON shape mismatch, etc.).
+    try:
+        messages = planner._build_messages(text)
+        data = planner._call(messages)
+        print(f"  Raw response keys : {list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
+        if isinstance(data, dict) and "steps" not in data:
+            print(f"  Raw response     : {data}")
+        plan = planner._parse(text, data)
+    except Exception as exc:
+        print(f"  LLM call FAILED  : {type(exc).__name__}: {exc}")
+        # HTTPError carries the response body — surface it.
+        try:
+            body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else None  # type: ignore[attr-defined]
+            if body:
+                print(f"  Response body    : {body[:500]}")
+        except Exception:
+            pass
+        print(f"  Using model      : {planner._model}")
+        print(f"  Tip              : if model name is wrong, try setting "
+              f"TOUCHLESS_PLANNER_MODEL=gpt-4o-mini")
+        return
     if plan is None:
-        print("  LLM returned no usable plan (parse failure / API error / empty).")
+        print("  Parsed response had no usable steps. Raw keys:",
+              list(data.keys()) if isinstance(data, dict) else type(data).__name__)
         return
 
     print(f"  Plan goal         : {plan.goal!r}")

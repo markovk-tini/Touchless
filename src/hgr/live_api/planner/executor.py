@@ -16,8 +16,14 @@ from typing import Any, Dict, List, Optional
 
 from .plan import Plan, StepResult
 
-# {step:N.field.subfield} → look up results[N].output.field.subfield (str).
-_REF_RE = re.compile(r"\{step:(\d+)\.(?:output\.)?([\w.]+)\}")
+# {step:N.field.subfield[i].leaf} → look up results[N].output.field.subfield[i].leaf
+# Each segment is a word optionally followed by [N]; segments joined by dots.
+_REF_RE = re.compile(
+    r"\{step:(\d+)\.(?:output\.)?"
+    r"(\w+(?:\[\d+\])?(?:\.\w+(?:\[\d+\])?)*)"
+    r"\}"
+)
+_SEG_RE = re.compile(r"(\w+)(?:\[(\d+)\])?")
 
 
 class Executor:
@@ -109,13 +115,23 @@ class Executor:
                 if r is None:
                     return ""
                 val: Any = r.output
-                for key in path.split("."):
+                for segment in path.split("."):
+                    sm = _SEG_RE.match(segment)
+                    if sm is None:
+                        return ""
+                    key, idx = sm.group(1), sm.group(2)
                     if isinstance(val, dict):
                         val = val.get(key)
                     else:
                         return ""
                     if val is None:
                         return ""
+                    if idx is not None:
+                        # Array index, e.g. results[0].
+                        i = int(idx)
+                        if not isinstance(val, list) or not (0 <= i < len(val)):
+                            return ""
+                        val = val[i]
                 return str(val)
             return _REF_RE.sub(sub, args)
         return args

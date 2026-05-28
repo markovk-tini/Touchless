@@ -1934,6 +1934,68 @@ class ConnectorRegistryAvailabilityTests(unittest.TestCase):
         self.assertIsNone(reg.is_available_for("outlook_compose"))
 
 
+class ExecutorArrayRefTests(unittest.TestCase):
+    """The executor's {step:N.field} resolver supports list indexing —
+    needed for web_search output (.results[0].url) and similar patterns
+    the cheap-LLM naturally produces."""
+
+    def test_resolves_indexed_path(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="web_search",
+                 args={"query": "ai news", "count": 3}),
+            Step(id=2, tool="web_navigate",
+                 args={"url_or_query": "{step:1.results[0].url}"},
+                 depends_on=[1]),
+        ])
+        reg = _StubRegistry({
+            "web_search": {
+                "status": "ok",
+                "results": [
+                    {"title": "first", "url": "https://a.example/",
+                     "snippet": "..."},
+                    {"title": "second", "url": "https://b.example/",
+                     "snippet": "..."},
+                ],
+            },
+            "web_navigate": {"status": "ok", "url": "https://a.example/"},
+        })
+        Executor(reg).run(plan)
+        nav_args = next(a for t, a in reg.calls if t == "web_navigate")
+        self.assertEqual(nav_args["url_or_query"], "https://a.example/")
+
+    def test_out_of_range_index_returns_empty(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="src", args={}),
+            Step(id=2, tool="use",
+                 args={"x": "{step:1.results[5].url}"}, depends_on=[1]),
+        ])
+        reg = _StubRegistry({
+            "src": {"status": "ok", "results": [{"url": "https://a/"}]},
+            "use": {"status": "ok"},
+        })
+        Executor(reg).run(plan)
+        use_args = next(a for t, a in reg.calls if t == "use")
+        self.assertEqual(use_args["x"], "")  # graceful empty, no crash
+
+    def test_dotted_after_index(self) -> None:
+        from hgr.live_api.planner import Executor, Plan, Step
+        plan = Plan(goal="g", steps=[
+            Step(id=1, tool="src", args={}),
+            Step(id=2, tool="use",
+                 args={"t": "{step:1.items[1].title}"}, depends_on=[1]),
+        ])
+        reg = _StubRegistry({
+            "src": {"status": "ok",
+                    "items": [{"title": "A"}, {"title": "B"}]},
+            "use": {"status": "ok"},
+        })
+        Executor(reg).run(plan)
+        use_args = next(a for t, a in reg.calls if t == "use")
+        self.assertEqual(use_args["t"], "B")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
