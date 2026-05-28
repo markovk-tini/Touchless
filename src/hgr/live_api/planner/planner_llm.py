@@ -40,11 +40,11 @@ class LLMPlanner:
                        or os.environ.get("TOUCHLESS_PLANNER_MODEL")
                        or DEFAULT_MODEL)
 
-    def plan(self, goal: str) -> Optional[Plan]:
+    def plan(self, goal: str, memory_context: str = "") -> Optional[Plan]:
         if not configured() or self._registry is None:
             return None
         try:
-            messages = self._build_messages(goal)
+            messages = self._build_messages(goal, memory_context=memory_context)
             data = self._call(messages)
             return self._parse(goal, data)
         except urllib.error.HTTPError as exc:
@@ -59,7 +59,8 @@ class LLMPlanner:
             return None
 
     # ---- prompt + tool catalog --------------------------------------------
-    def _build_messages(self, goal: str) -> List[Dict[str, Any]]:
+    def _build_messages(self, goal: str,
+                        memory_context: str = "") -> List[Dict[str, Any]]:
         catalog = self._tool_catalog()
         system = (
             "You are Iris's task planner. Given a user request, output a JSON "
@@ -77,10 +78,13 @@ class LLMPlanner:
             '"tool": <string>, "args": <object>, "depends_on": [<int>]}], '
             '"final": "return" | "synthesize"}'
         )
-        return [
-            {"role": "system", "content": system},
-            {"role": "user", "content": goal},
-        ]
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
+        if memory_context:
+            # Background facts from prior turns. Goes in as system so the model
+            # treats it as established context rather than a new user turn.
+            messages.append({"role": "system", "content": memory_context})
+        messages.append({"role": "user", "content": goal})
+        return messages
 
     def _tool_catalog(self) -> str:
         """Compact tool catalog for the planner — connector tools available

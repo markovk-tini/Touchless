@@ -32,7 +32,8 @@ class IrisPlanner:
     the LLM. Returns a dict on success, None to fall through."""
 
     def __init__(self, registry: Any, logger: Any = None,
-                 confirm: Optional[Callable[[str, str], bool]] = None) -> None:
+                 confirm: Optional[Callable[[str, str], bool]] = None,
+                 memory: Any = None) -> None:
         self._registry = registry
         self._logger = logger
         self._confirm = confirm
@@ -41,6 +42,10 @@ class IrisPlanner:
         self._executor = Executor(registry, logger) if registry is not None else None
         self._synthesizer = Synthesizer(logger=logger)
         self._plan_cache = PlanCache()
+        # Memory is optional — when None, recall/record are no-ops. The
+        # manager wires a real MemoryManager when available; tests can
+        # leave it unset to keep them offline.
+        self._memory = memory
 
     def try_handle(self, text: str) -> Optional[Dict[str, Any]]:
         """Try to fully handle a request without the realtime model.
@@ -79,8 +84,9 @@ class IrisPlanner:
             sr = StepResult(step_id=0, tool=single.tool,
                             status=str((out or {}).get("status") or "ok"),
                             output=out or {}, error=(out or {}).get("error"))
-            return {"steps": [single], "results": [sr],
-                    "message": self._format_message(single, out or {})}
+            message = self._format_message(single, out or {})
+            self._record_turn(text, None, [single], [sr], message)
+            return {"steps": [single], "results": [sr], "message": message}
 
         # --- Phase 2: cheap-LLM JSON plan -> Executor ---
         # Fires when ANY of:
@@ -100,7 +106,8 @@ class IrisPlanner:
             # skips the LLM call entirely.
             plan = self._plan_cache.get(text)
             if plan is None:
-                plan = self._llm_planner.plan(text)
+                memory_ctx = self._recall_context(text)
+                plan = self._llm_planner.plan(text, memory_context=memory_ctx)
                 self._plan_cache.put(text, plan)
             if plan is not None and plan.steps:
                 # Whole-plan confirm-gate: if any step is "risky" (sends email,
@@ -124,6 +131,7 @@ class IrisPlanner:
                     }
                 results = self._executor.run(plan)
                 message = self._summarize(plan, results)
+                self._record_turn(text, plan, plan.steps, results, message)
                 return {
                     "steps": plan.steps,
                     "results": results,
@@ -131,6 +139,32 @@ class IrisPlanner:
                     "message": message,
                 }
         return None
+
+    # ---- memory bridge ----------------------------------------------------
+    def _recall_context(self, text: str) -> str:
+        """Pull a tiny memory-context block for the planner prompt. Empty
+        string when no memory or nothing relevant."""
+        if self._memory is None:
+            return ""
+        try:
+            recall = self._memory.recall(text, k=3)
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("memory_recall_failed", exc)
+            return ""
+        return recall.get("context") or ""
+
+    def _record_turn(self, user_text: str, plan: Any,
+                     steps: list, results: list, message: str) -> None:
+        """Persist this turn into memory. Best-effort; failures never
+        bubble up to the user."""
+        if self._memory is None:
+            return
+        try:
+            self._memory.record(user_text, plan, steps, results, message)
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("memory_record_failed", exc)
 
     @staticmethod
     def _plan_confirm_summary(plan: "Plan") -> str:

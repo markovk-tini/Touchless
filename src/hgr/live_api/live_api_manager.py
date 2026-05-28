@@ -887,8 +887,22 @@ class LiveApiManager(QObject):
             try:
                 if self._iris_planner is None:
                     from .planner.orchestrator import IrisPlanner
+                    # Optional memory layer — wired when not explicitly
+                    # disabled (TOUCHLESS_IRIS_MEMORY=0) so the planner can
+                    # recall prior turns + facts. Failures are non-fatal:
+                    # the planner just runs without memory.
+                    memory = None
+                    if os.environ.get("TOUCHLESS_IRIS_MEMORY", "1") != "0":
+                        try:
+                            from .memory import MemoryManager
+                            memory = MemoryManager(logger=self._logger)
+                        except Exception as exc:
+                            if self._logger:
+                                self._logger.exception("memory_init_failed", exc)
+                            memory = None
                     self._iris_planner = IrisPlanner(self._registry, self._logger,
-                                                     confirm=self._confirm_callback)
+                                                     confirm=self._confirm_callback,
+                                                     memory=memory)
                 handled = self._iris_planner.try_handle(text)
             except Exception as exc:
                 if self._logger:

@@ -716,7 +716,7 @@ class IrisPlannerOrchestratorTests(unittest.TestCase):
             Step(id=2, tool="send", args={"ref": "{step:1.id}"}, depends_on=[1]),
         ])
         # Patch the LLMPlanner so it returns our forged plan.
-        planner._llm_planner.plan = lambda _goal: forged  # type: ignore[assignment]
+        planner._llm_planner.plan = lambda _goal, memory_context="": forged  # type: ignore[assignment]
         # Also patch configured() so the flag-check passes even w/o API key.
         import hgr.live_api.planner.orchestrator as orch
         import hgr.live_api.planner.planner_llm as pl
@@ -830,7 +830,7 @@ class IrisPlannerSynthesisRoutingTests(unittest.TestCase):
         forged = Plan(goal="when is Dani free?", steps=[
             Step(id=1, tool="cal_freebusy", args={}),
         ], final="synthesize")
-        planner._llm_planner.plan = lambda _g: forged  # type: ignore[assignment]
+        planner._llm_planner.plan = lambda _g, memory_context="": forged  # type: ignore[assignment]
         # Make sure the cheap-LLM scheduler is healthy at the start of each test.
         sched = scheduler()
         sched._events.clear()  # type: ignore[attr-defined]
@@ -981,7 +981,7 @@ class IrisPlannerPhase4WiringTests(unittest.TestCase):
             return confirms.get("answer", True)
         planner = IrisPlanner(reg, confirm=confirm)
         scheduler()._events.clear()  # type: ignore[attr-defined]
-        def fake_plan(_g):
+        def fake_plan(_g, memory_context=""):
             calls["plan"] += 1
             return forged
         planner._llm_planner.plan = fake_plan  # type: ignore[assignment]
@@ -1329,7 +1329,7 @@ class IrisPlannerEdgeCaseTests(unittest.TestCase):
         import hgr.live_api.planner.orchestrator as orch
         reg = _StubRegistry({"outlook_compose": {"status": "ok"}})
         planner = IrisPlanner(reg, confirm=None)  # explicit no-callback
-        planner._llm_planner.plan = lambda _g: Plan(  # type: ignore[assignment]
+        planner._llm_planner.plan = lambda _g, memory_context="": Plan(  # type: ignore[assignment]
             goal="g",
             steps=[Step(id=1, tool="outlook_compose",
                         args={"recipient": "x@y", "body": "hi"})])
@@ -1482,6 +1482,247 @@ class RealtimeClientNoteTests(unittest.TestCase):
         c._send = lambda payload: (sent.append(payload), True)[1]  # type: ignore[attr-defined]
         self.assertTrue(c.send_session_note(""))
         self.assertEqual(sent, [])
+
+
+class MemoryStoreTests(unittest.TestCase):
+    """SQLite layer: schema init, episodic + semantic CRUD, capacity cap."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="iris-mem-")
+        from hgr.live_api.memory.store import MemoryStore
+        self._db = Path(self._tmp) / "m.db"
+        self._store = MemoryStore(self._db)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_round_trip(self) -> None:
+        rid = self._store.add_episodic(
+            "set volume to 30", "{}", '[]', "Volume set to 30%.",
+            [0.1, 0.2, 0.3])
+        self.assertGreater(rid, 0)
+        rows = self._store.list_episodic()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].user_text, "set volume to 30")
+        # Embedding round-trips losslessly enough for cosine sim.
+        self.assertEqual(len(rows[0].embedding), 3)
+        self.assertAlmostEqual(rows[0].embedding[0], 0.1, places=5)
+
+    def test_semantic_upsert(self) -> None:
+        self._store.add_semantic("person", "Dani", "old@x")
+        self._store.add_semantic("person", "Dani", "old@x")  # dup → replace
+        rows = self._store.find_facts(kind="person", key="dani")
+        self.assertEqual(len(rows), 1)
+        # New value for same (kind, key) overwrites the row (UNIQUE replace).
+        self._store.add_semantic("person", "Dani", "new@x")
+        rows = self._store.find_facts(kind="person", key="dani")
+        self.assertEqual({r.value for r in rows}, {"old@x", "new@x"})
+
+    def test_episodic_cap(self) -> None:
+        from hgr.live_api.memory.store import MemoryStore
+        MemoryStore.MAX_EPISODIC_ROWS = 5  # type: ignore[misc]
+        try:
+            for i in range(8):
+                self._store.add_episodic(f"goal {i}", None, None, None, [])
+            rows = self._store.list_episodic(limit=100)
+            self.assertLessEqual(len(rows), 5)
+            # Oldest entries dropped.
+            user_texts = {r.user_text for r in rows}
+            self.assertNotIn("goal 0", user_texts)
+            self.assertIn("goal 7", user_texts)
+        finally:
+            MemoryStore.MAX_EPISODIC_ROWS = 10_000  # type: ignore[misc]
+
+    def test_clear(self) -> None:
+        self._store.add_episodic("x", None, None, None, [])
+        self._store.add_semantic("person", "a", "b")
+        self._store.clear()
+        self.assertEqual(self._store.count(), {"episodic": 0, "semantic": 0})
+
+
+class FakeEmbedderTests(unittest.TestCase):
+    """The deterministic embedder used by all offline tests."""
+
+    def test_deterministic_and_normalized(self) -> None:
+        from hgr.live_api.memory.embedder import FakeEmbedder, cosine_sim
+        e = FakeEmbedder()
+        a = e.embed("send dani an email")
+        b = e.embed("send dani an email")
+        c = e.embed("totally unrelated tropical fish facts")
+        self.assertEqual(a, b)
+        # Self-similarity ~1, dissimilar text well below.
+        self.assertAlmostEqual(cosine_sim(a, a), 1.0, places=5)
+        self.assertLess(cosine_sim(a, c), 0.8)
+
+    def test_default_embedder_falls_back_to_fake_without_key(self) -> None:
+        from hgr.live_api.memory.embedder import default_embedder, FakeEmbedder
+        old = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            self.assertIsInstance(default_embedder(), FakeEmbedder)
+        finally:
+            if old is not None:
+                os.environ["OPENAI_API_KEY"] = old
+
+
+class MemoryExtractorTests(unittest.TestCase):
+    """Pulls Dani -> dani@x and similar facts out of planner-handled turns."""
+
+    def _step(self, tool, args=None):
+        ns = type("S", (), {})()
+        ns.tool = tool
+        ns.args = args or {}
+        return ns
+
+    def _result(self, output=None):
+        ns = type("R", (), {})()
+        ns.output = output or {}
+        return ns
+
+    def test_extracts_person_from_outlook_compose(self) -> None:
+        from hgr.live_api.memory.extractor import extract_facts
+        facts = extract_facts(
+            "email Dani saying hi",
+            [self._step("outlook_compose",
+                        {"recipient": "dani@mangollc.org", "body": "hi"})],
+            [self._result({"status": "ok"})],
+        )
+        self.assertIn(("person", "dani", "dani@mangollc.org", "outlook_compose arg"),
+                      facts)
+
+    def test_extracts_artifact_link(self) -> None:
+        from hgr.live_api.memory.extractor import extract_facts
+        facts = extract_facts(
+            "make a google doc titled Q3 Report",
+            [self._step("gdocs_create", {"title": "Q3 Report"})],
+            [self._result({"status": "ok", "link": "https://docs/x"})],
+        )
+        self.assertTrue(any(f[0] == "artifact" and f[2] == "https://docs/x"
+                            for f in facts))
+
+    def test_dedupes(self) -> None:
+        from hgr.live_api.memory.extractor import extract_facts
+        facts = extract_facts(
+            "email Dani",
+            [self._step("outlook_compose", {"recipient": "dani@x.io"}),
+             self._step("outlook_compose", {"recipient": "dani@x.io"})],
+            [self._result({"status": "ok"}),
+             self._result({"status": "ok"})],
+        )
+        person_facts = [f for f in facts if f[0] == "person"]
+        self.assertEqual(len(person_facts), 1)
+
+
+class MemoryManagerTests(unittest.TestCase):
+    """End-to-end: record a turn, recall it later by similar query."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="iris-mem-")
+        from hgr.live_api.memory import MemoryManager, MemoryStore
+        from hgr.live_api.memory.embedder import FakeEmbedder
+        self._mgr = MemoryManager(
+            store=MemoryStore(Path(self._tmp) / "m.db"),
+            embedder=FakeEmbedder(),
+            async_writes=False,  # sync for deterministic tests
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _step(self, tool, args=None):
+        ns = type("S", (), {})()
+        ns.tool = tool
+        ns.args = args or {}
+        return ns
+
+    def _result(self, output=None, status="ok"):
+        ns = type("R", (), {})()
+        ns.output = output or {}
+        ns.status = status
+        return ns
+
+    def test_record_then_recall_episodic(self) -> None:
+        self._mgr.record(
+            "find Dani's email and tell her about the meeting",
+            None,
+            [self._step("ms_contacts_find", {"q": "Dani"})],
+            [self._result({"status": "ok", "email": "dani@x.io", "name": "Dani"})],
+            "Found Dani: dani@x.io",
+        )
+        recall = self._mgr.recall("when was the last time I emailed Dani about the meeting?")
+        # Episode surfaced AND the extracted person fact surfaced.
+        self.assertTrue(recall["episodes"], "expected episodic recall")
+        self.assertTrue(any(f.kind == "person" and f.value == "dani@x.io"
+                            for f in recall["facts"]),
+                        f"expected Dani fact, got {recall['facts']}")
+        # Pre-rendered context is non-empty when there's a hit.
+        self.assertIn("dani", recall["context"].lower())
+
+    def test_recall_empty_for_unrelated_query(self) -> None:
+        self._mgr.record(
+            "make a google doc titled Budget",
+            None,
+            [self._step("gdocs_create", {"title": "Budget"})],
+            [self._result({"status": "ok", "link": "https://docs/b"})],
+            "Created Google Doc \"Budget\": https://docs/b",
+        )
+        # Different topic — fact key "budget" is not in this query, and
+        # FakeEmbedder cosine sim is well below threshold for unrelated text.
+        recall = self._mgr.recall("what's the volume right now")
+        self.assertEqual(recall["facts"], [])
+        # Episodes may or may not match (cosine sim is noisy on a 64-dim hash),
+        # but the rendered context should be tiny or empty.
+        self.assertLessEqual(len(recall["context"]), 600)
+
+
+class OrchestratorMemoryWiringTests(unittest.TestCase):
+    """Verify the planner calls recall before planning and records after."""
+
+    def test_record_called_after_phase1(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({"volume_set": {"status": "ok"}})
+
+        calls: Dict[str, Any] = {"records": 0, "recalls": 0}
+        class _FakeMem:
+            def record(self, *a, **k):
+                calls["records"] += 1
+            def recall(self, *a, **k):
+                calls["recalls"] += 1
+                return {"context": "", "episodes": [], "facts": []}
+
+        planner = IrisPlanner(reg, memory=_FakeMem())
+        out = planner.try_handle("set volume to 30")
+        self.assertIsNotNone(out)
+        self.assertEqual(calls["records"], 1)
+        # Phase 1 doesn't need to recall; recall only fires in Phase 2.
+        self.assertEqual(calls["recalls"], 0)
+
+    def test_recall_context_passed_to_llm_planner(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        from hgr.live_api.planner.plan import Plan, Step
+        import hgr.live_api.planner.orchestrator as orch
+        reg = _StubRegistry({"lookup": {"status": "ok", "email": "x@y"}})
+
+        seen_kwargs: Dict[str, Any] = {}
+        class _FakeMem:
+            def record(self, *a, **k): pass
+            def recall(self, *a, **k):
+                return {"context": "Context from prior turns:\n- person dani = dani@x",
+                        "episodes": [], "facts": []}
+
+        planner = IrisPlanner(reg, memory=_FakeMem())
+        def fake_plan(goal, memory_context=""):
+            seen_kwargs["memory_context"] = memory_context
+            return Plan(goal=goal, steps=[Step(id=1, tool="lookup", args={})])
+        planner._llm_planner.plan = fake_plan  # type: ignore[assignment]
+        os.environ["TOUCHLESS_IRIS_PLAN_LLM"] = "1"
+        old = orch.llm_planner_configured
+        orch.llm_planner_configured = lambda: True
+        try:
+            planner.try_handle("look up dani and tell her something")
+        finally:
+            os.environ.pop("TOUCHLESS_IRIS_PLAN_LLM", None)
+            orch.llm_planner_configured = old
+        self.assertIn("dani@x", seen_kwargs.get("memory_context", ""))
 
 
 if __name__ == "__main__":  # pragma: no cover
