@@ -21,7 +21,7 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO / "src"))
 
-from hgr.live_api.connectors.ms_graph_client import MSGraphClient  # noqa: E402
+from hgr.live_api.connectors.ms_graph_client import MsGraphClient  # noqa: E402
 from hgr.live_api.connectors.ms365_connector import Microsoft365Connector  # noqa: E402
 
 
@@ -32,7 +32,7 @@ def main() -> None:
                     help="restrict to one account (substring of username)")
     args = ap.parse_args()
 
-    client = MSGraphClient()
+    client = MsGraphClient()
     accts = client.all_accounts()
     print(f"Connected Microsoft accounts ({len(accts)}):")
     for a in accts:
