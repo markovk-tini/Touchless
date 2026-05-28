@@ -118,30 +118,65 @@ class IrisPlanner:
         # triggers — their regexes are very specific so false positives are
         # rare, and they answer cheaper than Tier 2 ever could.
         single = self._classifier.classify(text)
-        _BYPASS_MULTI = {"iris_lookup_contact", "iris_set_preference"}
+        _BYPASS_MULTI = {"iris_lookup_contact", "iris_set_preference",
+                         "iris_remember_contact"}
         if multi and single is not None and single.tool not in _BYPASS_MULTI:
             single = None
+
+        # --- Pseudo-tool: contact remember. Writes one or many
+        # (person, name, email) facts straight to memory so subsequent
+        # 'send Vesko hi' / 'what's Vesko's email' resolve cleanly.
+        if single is not None and single.tool == "iris_remember_contact":
+            names = list((single.args or {}).get("names") or [])
+            email = str((single.args or {}).get("email") or "").strip()
+            if self._memory is not None and email and names:
+                for n in names:
+                    try:
+                        self._memory.set_fact("person", n, email)
+                    except Exception as exc:  # pragma: no cover
+                        if self._logger:
+                            self._logger.exception("memory_set_fact_failed", exc)
+            sr = StepResult(step_id=0, tool=single.tool, status="ok",
+                            output={"status": "ok", "names": names,
+                                    "email": email})
+            if len(names) == 1:
+                message = f"Got it — {names[0]} = {email}."
+            else:
+                message = (f"Got it — {', '.join(names[:-1])} and "
+                           f"{names[-1]} all share {email}.")
+            self._record_turn(text, None, [single], [sr], message)
+            return {"steps": [single], "results": [sr], "message": message}
 
         # --- Pseudo-tool: contact lookup. Reads person/<name> from memory
         # and returns the email as the user-facing message.
         if single is not None and single.tool == "iris_lookup_contact":
             name = str((single.args or {}).get("name") or "").strip()
             email: Optional[str] = None
+            resolved_name = name
             if self._memory is not None and name:
-                try:
-                    facts = self._memory._store.find_facts(  # type: ignore[attr-defined]
-                        kind="person", key=name.lower())
-                except Exception:
-                    facts = []
-                if facts:
-                    email = facts[0].value
+                # Try the exact captured name first; if not found, try
+                # stripping a trailing 's' (handles "Veskos email" capture
+                # that should match the stored "vesko" fact).
+                candidates = [name]
+                if len(name) > 3 and name.lower().endswith("s"):
+                    candidates.append(name[:-1])
+                for cand in candidates:
+                    try:
+                        facts = self._memory._store.find_facts(  # type: ignore[attr-defined]
+                            kind="person", key=cand.lower())
+                    except Exception:
+                        facts = []
+                    if facts:
+                        email = facts[0].value
+                        resolved_name = cand
+                        break
             sr = StepResult(
                 step_id=0, tool=single.tool,
                 status="ok" if email else "not_found",
-                output={"name": name, "email": email,
+                output={"name": resolved_name, "email": email,
                         "status": "ok" if email else "not_found"})
             if email:
-                message = f"{name}'s email is {email}."
+                message = f"{resolved_name}'s email is {email}."
             else:
                 message = (f"I don't have {name}'s email in memory yet. "
                            f"Once you email them once, I'll remember.")

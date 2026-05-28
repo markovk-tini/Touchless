@@ -142,6 +142,40 @@ class Classifier:
                     description="compose email draft",
                 )
 
+        # ---- contact remember ("X is for Vesko and Mariya", "Vesko at X") --
+        # Lets the user TEACH Iris facts via Tier 1, no realtime/LLM needed.
+        # Supports one or many names per email so 'shared address' patterns
+        # like 'X is for Vesko and Mariya' record both bindings.
+        _EMAIL = r"(?P<email>[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
+        _NAMES = r"(?P<names>[A-Za-z][a-zA-Z]+(?:\s*(?:,|and)\s*[A-Za-z][a-zA-Z]+)*)"
+        remember_patterns = (
+            # "<email> is for [both] <name(s)>" / "<email> is the email of <names>"
+            rf"{_EMAIL}\s+is\s+(?:for|the\s+email\s+(?:for|of))\s+(?:both\s+)?{_NAMES}\b",
+            # "<email> is <name(s)>'s email"
+            rf"{_EMAIL}\s+is\s+{_NAMES}(?:'s|s)?\s+email\b",
+            # "remember <name(s)> (is|at|=) <email>" / "<name(s)>'s email is <email>"
+            rf"(?:remember\s+)?{_NAMES}(?:'s|s)?\s+(?:email\s+)?(?:is|at|=)\s+{_EMAIL}",
+            # "<name(s)> share/use <email>"
+            rf"{_NAMES}\s+(?:share|use|have\s+the\s+email)\s+{_EMAIL}",
+        )
+        for pat in remember_patterns:
+            m = re.search(pat, t, flags=re.IGNORECASE)
+            if not m:
+                continue
+            raw_names = m.group("names")
+            names = re.findall(r"[A-Za-z][a-zA-Z]+", raw_names)
+            # Skip stopwords masquerading as names.
+            stop = {"and", "is", "for", "the", "of", "both", "at", "or",
+                    "with", "to", "from", "by"}
+            names = [n for n in names if n.lower() not in stop]
+            if names:
+                return Step(
+                    tool="iris_remember_contact",
+                    args={"names": names, "email": m.group("email")},
+                    layer="touchless",
+                    description=f"remember {', '.join(names)} = {m.group('email')}",
+                )
+
         # ---- contact lookup ("what's Dani's email", "find Dani's email") --
         # Read intent, NOT a compose. The orchestrator answers from memory.
         # Verb form patterns are intentionally loose — common typos

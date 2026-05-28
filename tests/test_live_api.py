@@ -2636,6 +2636,90 @@ class ContactLookupIntentTests(unittest.TestCase):
         self.assertIn("don't have ghost", out["message"].lower())
 
 
+class ContactRememberIntentTests(unittest.TestCase):
+    """User-taught facts: 'X is for Vesko and Mariya' / 'Vesko's email is X' /
+    etc. All persist to memory via iris_remember_contact."""
+
+    def test_classifier_extracts_single_name(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        for text in [
+            "remember Vesko's email is markovi@msn.com",
+            "Vesko's email is markovi@msn.com",
+            "markovi@msn.com is Vesko's email",
+            "remember Vesko at markovi@msn.com",
+            "Vesko = markovi@msn.com",
+        ]:
+            step = c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "iris_remember_contact",
+                             f"tool wrong for {text!r}: {step.tool}")
+            self.assertEqual([n.lower() for n in step.args["names"]], ["vesko"])
+            self.assertEqual(step.args["email"], "markovi@msn.com")
+
+    def test_classifier_extracts_multiple_names(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        for text in [
+            "markovi@msn.com is for both Vesko and Mariya",
+            "markovi@msn.com is for Vesko and Mariya",
+            "Vesko and Mariya share markovi@msn.com",
+            "Vesko, Mariya use markovi@msn.com",
+        ]:
+            step = c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "iris_remember_contact",
+                             f"tool wrong for {text!r}: {step.tool}")
+            names = sorted(n.lower() for n in step.args["names"])
+            self.assertEqual(names, ["mariya", "vesko"], f"text={text!r}")
+            self.assertEqual(step.args["email"], "markovi@msn.com")
+
+    def test_orchestrator_writes_all_names_to_memory(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        writes: List[tuple] = []
+        class _Mem:
+            class _S:
+                def find_facts(self, **k): return []
+            def __init__(self): self._store = self._S()
+            def set_fact(self, kind, key, value, source="user said"):
+                writes.append((kind, key, value))
+            def record(self, *a, **k): pass
+            def recall(self, *a, **k):
+                return {"context": "", "episodes": [], "facts": []}
+        planner = IrisPlanner(_StubRegistry({}), memory=_Mem())
+        out = planner.try_handle("markovi@msn.com is for Vesko and Mariya")
+        self.assertIsNotNone(out)
+        kinds_keys = sorted((k, key) for k, key, _ in writes)
+        self.assertEqual(kinds_keys,
+                         [("person", "Mariya"), ("person", "Vesko")])
+        self.assertTrue(all(v == "markovi@msn.com" for _, _, v in writes))
+        self.assertIn("share", out["message"])
+        self.assertIn("markovi@msn.com", out["message"])
+
+    def test_lookup_strips_trailing_s_when_exact_misses(self) -> None:
+        """Captures from 'find Veskos email' should also match the stored
+        'vesko' fact — even though the regex picked up 'Veskos'."""
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+
+        class _Store:
+            def find_facts(self_, kind=None, key=None, limit=50):
+                if kind == "person" and key == "vesko":
+                    return [type("F", (), {"kind": "person", "key": "vesko",
+                                            "value": "markovi@msn.com"})()]
+                return []
+        class _FakeMem:
+            def __init__(self_): self_._store = _Store()
+            def set_fact(self_, *a, **k): pass
+            def record(self_, *a, **k): pass
+            def recall(self_, *a, **k):
+                return {"context": "", "episodes": [], "facts": []}
+        planner = IrisPlanner(_StubRegistry({}), memory=_FakeMem())
+        out = planner.try_handle("find Veskos email")
+        self.assertIn("markovi@msn.com", out["message"])
+        # Reply uses the resolved form (without trailing s).
+        self.assertIn("Vesko", out["message"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
