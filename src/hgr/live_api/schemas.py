@@ -1258,6 +1258,28 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "weather_get",
+        "description": (
+            "Current weather + 1-3 day forecast via wttr.in (free, no API "
+            "key). Auto-detects the user's location from IP when `location` "
+            "is omitted — call with NO args for 'what's the weather'. "
+            "Pass a city/zip/'lat,lon' to query elsewhere. Returns "
+            "{location, description, temperature, feels_like, humidity_pct, "
+            "wind, summary, forecast}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "units": {"type": "string",
+                          "description": "'imperial' (default) or 'metric'"},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
         "name": "web_search",
         "description": (
             "Run a web search and return up to N structured "

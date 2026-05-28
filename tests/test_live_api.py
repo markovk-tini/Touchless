@@ -604,10 +604,10 @@ class IrisPlannerClassifierTests(unittest.TestCase):
 
     def test_misses_safely(self) -> None:
         # Things that must NOT classify (they need the LLM / fall through):
-        self._miss("what's the weather")
         self._miss("read my latest email")
         self._miss("summarize my unread emails")
         self._miss("can you help me figure out what to do today")
+        self._miss("explain quantum entanglement")
 
 
 class _StubRegistry:
@@ -2115,9 +2115,8 @@ class PreferenceClassifierTests(unittest.TestCase):
     def test_non_preference_unaffected(self) -> None:
         # Things that must NOT classify as preference-setting.
         self.assertIsNone(self.c.classify("send dani an email"))
-        # "what's the weather" doesn't classify at all — neither preference
-        # nor a known intent.
-        self.assertIsNone(self.c.classify("what's the weather"))
+        # Genuinely unclassifiable input falls through to higher tiers.
+        self.assertIsNone(self.c.classify("explain quantum entanglement"))
 
 
 class PreferencePseudoToolTests(unittest.TestCase):
@@ -2766,6 +2765,115 @@ class WebSearchArticleRankingTests(unittest.TestCase):
         ]
         ranked = _rank_articles_first(results)
         self.assertEqual([r["title"] for r in ranked], ["A", "B"])
+
+
+class WeatherTests(unittest.TestCase):
+    """weather_get talks to wttr.in. Mocked so the suite is offline."""
+
+    _FAKE_PAYLOAD = json.dumps({
+        "current_condition": [{
+            "weatherDesc": [{"value": "Sunny"}],
+            "temp_F": "72", "temp_C": "22",
+            "FeelsLikeF": "70", "FeelsLikeC": "21",
+            "windspeedMiles": "8", "windspeedKmph": "13",
+            "humidity": "55",
+        }],
+        "nearest_area": [{"areaName": [{"value": "Corvallis"}]}],
+        "weather": [
+            {"date": "2026-05-28", "mintempF": "55", "maxtempF": "75",
+             "mintempC": "13", "maxtempC": "24",
+             "hourly": [{"weatherDesc": [{"value": "Sunny"}]}] * 8},
+        ],
+    }).encode("utf-8")
+
+    class _Resp:
+        def __init__(self, body): self._b = body
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def read(self): return self._b
+
+    def test_summary_built_from_wttr_payload(self) -> None:
+        from hgr.live_api import weather as wmod
+        with patch.object(wmod.urllib.request, "urlopen",
+                          return_value=self._Resp(self._FAKE_PAYLOAD)):
+            out = wmod.get_weather()
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["location"], "Corvallis")
+        self.assertEqual(out["temperature"], "72°F")
+        self.assertIn("Corvallis", out["summary"])
+        self.assertIn("sunny", out["summary"].lower())
+        self.assertIn("72°F", out["summary"])
+        self.assertEqual(len(out["forecast"]), 1)
+
+    def test_metric_units(self) -> None:
+        from hgr.live_api import weather as wmod
+        with patch.object(wmod.urllib.request, "urlopen",
+                          return_value=self._Resp(self._FAKE_PAYLOAD)):
+            out = wmod.get_weather(units="metric")
+        self.assertEqual(out["temperature"], "22°C")
+        self.assertIn("22°C", out["summary"])
+        self.assertIn("13 km/h", out["summary"])
+
+    def test_http_error_returns_structured(self) -> None:
+        from hgr.live_api import weather as wmod
+        import urllib.error
+        def boom(*a, **k):
+            raise urllib.error.HTTPError("url", 503, "down", {}, None)
+        with patch.object(wmod.urllib.request, "urlopen", side_effect=boom):
+            out = wmod.get_weather()
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["code"], "wttr_http_error")
+
+
+class WeatherClassifierTests(unittest.TestCase):
+    """Tier 1 routes weather questions to weather_get without any LLM call."""
+
+    def setUp(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        self.c = Classifier()
+
+    def test_local_weather_phrasings(self) -> None:
+        for text in [
+            "what's the weather",
+            "what's the weather today",
+            "whats the weather",
+            "how's the weather",
+            "what's the temperature",
+            "is it raining",
+            "is it going to rain",
+            "is it cold",
+            "do I need an umbrella",
+            "should I bring a jacket",
+            "tell me the forecast",
+        ]:
+            step = self.c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "weather_get", f"text={text!r}")
+            # No location -> auto-detect from IP.
+            self.assertEqual(step.args.get("location", ""), "")
+
+    def test_location_weather_phrasings(self) -> None:
+        cases = [
+            ("weather in Portland", "Portland"),
+            ("weather for New York", "New York"),
+            ("temperature in Tokyo", "Tokyo"),
+            ("forecast for Los Angeles", "Los Angeles"),
+        ]
+        for text, expected in cases:
+            step = self.c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "weather_get")
+            self.assertEqual(step.args.get("location"), expected)
+
+
+class WeatherSchemaTests(unittest.TestCase):
+    def test_schema_registered(self) -> None:
+        from hgr.live_api.schemas import all_tool_schemas, validate_args
+        names = [s["name"] for s in all_tool_schemas()]
+        self.assertIn("weather_get", names)
+        # No required args (auto-detect location).
+        ok, _, _ = validate_args("weather_get", {})
+        self.assertTrue(ok)
 
 
 if __name__ == "__main__":  # pragma: no cover

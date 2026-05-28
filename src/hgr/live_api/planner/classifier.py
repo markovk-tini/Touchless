@@ -142,6 +142,43 @@ class Classifier:
                     description="compose email draft",
                 )
 
+        # ---- weather ("what's the weather", "is it raining", "weather in X")
+        # Free, no-key wttr.in lookup. Auto-detects location when none given.
+        # "weather in <place>" / "weather for <place>" / "<place> weather"
+        m = re.search(
+            r"\b(?:weather|forecast|temperature|temp)\s+"
+            r"(?:in|for|at|of|near|around)\s+(?P<loc>[A-Za-z][A-Za-z0-9 ,.\-'’]{1,80})\??$",
+            t, flags=re.IGNORECASE,
+        )
+        if m:
+            return Step(
+                tool="weather_get",
+                args={"location": m.group("loc").strip(" ?.,")},
+                layer="touchless",
+                description=f"weather in {m.group('loc').strip()}",
+            )
+        # "what's/how's the weather", "is it raining/snowing/hot/cold",
+        # "what's the temperature", "should I bring an umbrella"
+        m = re.search(
+            r"\b("
+            r"(?:what(?:[’'´]?s|s'?s| is)|how(?:[’'´]?s| is)|tell\s+me|"
+            r"give\s+me)\s+(?:about\s+)?(?:the\s+)?"
+            r"(?:weather|forecast|temperature|temp|conditions?)|"
+            r"is\s+it\s+(?:raining|snowing|cold|hot|warm|chilly|nice\s+out|"
+            r"freezing|sunny|cloudy|going\s+to\s+rain|going\s+to\s+snow)|"
+            r"(?:do\s+i\s+need|should\s+i\s+(?:bring|wear|grab))\s+"
+            r"(?:an?\s+)?(?:umbrella|jacket|coat|sweater)"
+            r")\b",
+            t, flags=re.IGNORECASE,
+        )
+        if m:
+            return Step(
+                tool="weather_get",
+                args={},
+                layer="touchless",
+                description="local weather",
+            )
+
         # ---- contact remember ("X is for Vesko and Mariya", "Vesko at X") --
         # Lets the user TEACH Iris facts via Tier 1, no realtime/LLM needed.
         # Supports one or many names per email so 'shared address' patterns

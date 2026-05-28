@@ -470,4 +470,7 @@ class IrisPlanner:
             return f"Uploaded to Drive" + (f": {link}" if link else ".")
         if tool == "outlook_compose":
             return f"Drafted email to {args.get('recipient')}."
+        if tool == "weather_get":
+            # weather.py already pre-renders the human-readable summary.
+            return str(result.get("summary") or "").strip() or f"Done ({tool})."
         return f"Done ({tool})."

@@ -190,6 +190,7 @@ class ToolExecutor:
             "run_python_script": self._t_run_python_script,
             "skip_youtube_ad": self._t_skip_youtube_ad,
             "ask_user_confirmation": self._t_ask_user_confirmation,
+            "weather_get": self._t_weather_get,
             "web_search": self._t_web_search,
             "web_navigate": self._t_web_navigate,
             "web_get_links": self._t_web_get_links,
@@ -1536,6 +1537,16 @@ class ToolExecutor:
                 self._logger.exception("web_controller_init_failed", exc)
                 self._web = None
         return self._web
+
+    def _t_weather_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        # Free, no-key weather via wttr.in. Auto-detects user location
+        # from IP when `location` is omitted; otherwise pass any city /
+        # zip / 'lat,lon' string. Cheap (~100-200ms HTTP).
+        from .weather import get_weather
+        return get_weather(
+            location=str(args.get("location") or "").strip(),
+            units=str(args.get("units") or "imperial").strip().lower(),
+        )
 
     def _t_web_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
         # Structured search results (Google CSE preferred, DuckDuckGo
