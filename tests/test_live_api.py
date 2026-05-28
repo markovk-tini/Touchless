@@ -2528,6 +2528,74 @@ class ComposeRewriteTests(unittest.TestCase):
         self.assertEqual(out["steps"][0].tool, "outlook_compose")
 
 
+class ContactLookupIntentTests(unittest.TestCase):
+    """'find Dani's email' / 'what's Dani's email' must be a READ intent,
+    not a compose. Tier 0 router skips it; Tier 1 classifier matches it as
+    iris_lookup_contact; orchestrator answers from memory."""
+
+    def test_classifier_matches_lookup_phrasings(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        for text in [
+            "find Dani's email",
+            "find Dani's email and give it to me",
+            "what's Dani's email",
+            "what is Dani's email address",
+            "look up Dani's email",
+            "tell me Dani's email",
+        ]:
+            step = c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "iris_lookup_contact", f"text={text!r}")
+            self.assertEqual(step.args.get("name").lower(), "dani")
+
+    def test_classifier_does_not_mismatch_compose(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        # Composing an email isn't a lookup.
+        step = c.classify("email dani@x.io saying hi")
+        self.assertEqual(step.tool, "outlook_compose")
+
+    def test_orchestrator_returns_memory_email(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+
+        class _Store:
+            def find_facts(self_, kind=None, key=None, limit=50):
+                if kind == "person" and key == "dani":
+                    return [type("F", (), {"kind": "person", "key": "dani",
+                                            "value": "dani@x.io"})()]
+                return []
+        class _FakeMem:
+            def __init__(self_): self_._store = _Store()
+            def set_fact(self_, *a, **k): pass
+            def record(self_, *a, **k): pass
+            def recall(self_, *a, **k):
+                return {"context": "", "episodes": [], "facts": []}
+        reg = _StubRegistry({})
+        planner = IrisPlanner(reg, memory=_FakeMem())
+        out = planner.try_handle("what's Dani's email")
+        self.assertIsNotNone(out)
+        self.assertIn("dani@x.io", out["message"])
+        # Pseudo-tool — no registry calls.
+        self.assertEqual(reg.calls, [])
+
+    def test_orchestrator_returns_not_found_message(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+
+        class _EmptyMem:
+            class _S:
+                def find_facts(self, **k): return []
+            def __init__(self): self._store = self._S()
+            def set_fact(self, *a, **k): pass
+            def record(self, *a, **k): pass
+            def recall(self, *a, **k):
+                return {"context": "", "episodes": [], "facts": []}
+        reg = _StubRegistry({})
+        planner = IrisPlanner(reg, memory=_EmptyMem())
+        out = planner.try_handle("find Ghost's email")
+        self.assertIn("don't have ghost", out["message"].lower())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

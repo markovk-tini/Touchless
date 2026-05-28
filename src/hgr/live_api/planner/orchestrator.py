@@ -115,6 +115,32 @@ class IrisPlanner:
         multi = looks_multi_action(text)
         single = None if multi else self._classifier.classify(text)
 
+        # --- Pseudo-tool: contact lookup. Reads person/<name> from memory
+        # and returns the email as the user-facing message.
+        if single is not None and single.tool == "iris_lookup_contact":
+            name = str((single.args or {}).get("name") or "").strip()
+            email: Optional[str] = None
+            if self._memory is not None and name:
+                try:
+                    facts = self._memory._store.find_facts(  # type: ignore[attr-defined]
+                        kind="person", key=name.lower())
+                except Exception:
+                    facts = []
+                if facts:
+                    email = facts[0].value
+            sr = StepResult(
+                step_id=0, tool=single.tool,
+                status="ok" if email else "not_found",
+                output={"name": name, "email": email,
+                        "status": "ok" if email else "not_found"})
+            if email:
+                message = f"{name}'s email is {email}."
+            else:
+                message = (f"I don't have {name}'s email in memory yet. "
+                           f"Once you email them once, I'll remember.")
+            self._record_turn(text, None, [single], [sr], message)
+            return {"steps": [single], "results": [sr], "message": message}
+
         # --- Pseudo-tool: preference-setting commands. Not a registry tool —
         # writes directly to memory so the planner's recall layer injects the
         # preference into every future Phase-2 prompt.

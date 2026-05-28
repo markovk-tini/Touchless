@@ -221,6 +221,15 @@ _EMAIL_READ_VERBS = (
     "what", "any new", "do i have", "go through", "look at",
 )
 
+# Asking for someone's email ADDRESS (a contact lookup) is NOT a compose
+# intent. The router's deterministic parser doesn't know contacts; let it
+# fall through to Tier 1 (memory recall) / Tier 2 (LLM plan).
+_EMAIL_LOOKUP_MARKERS = (
+    "find ", "what is ", "what's ", "whats ", "tell me ", "give me ",
+    "look up ", "find out ", "do you know ", "can you find ",
+)
+_EMAIL_LOOKUP_OBJECT = ("email address", "email for", "'s email", "s email")
+
 # Phrases that ask Iris to REPORT CONTENT back (read a page, summarize, list
 # results). The deterministic router can only open/search — it can't read a
 # page and tell you what's on it. Anything asking for a spoken/written answer
@@ -358,6 +367,14 @@ class CommandRouter:
         # this the parser mis-fires "read my latest email" as a blank compose.
         if any(n in lower for n in _EMAIL_NOUNS) and any(v in lower for v in _EMAIL_READ_VERBS):
             self._logger.event("router_skip_email_read", text_len=len(text))
+            return RouterResult(matched=False)
+        # Asking for someone's email ADDRESS (a contact lookup) is not a
+        # compose — let it fall through so Tier 1's email-lookup pattern (or
+        # memory recall) can answer. Without this skip, "find Dani's email
+        # and give it to me" parses as a blank compose.
+        if (any(m in lower for m in _EMAIL_LOOKUP_MARKERS)
+                and any(o in lower for o in _EMAIL_LOOKUP_OBJECT)):
+            self._logger.event("router_skip_email_lookup", text_len=len(text))
             return RouterResult(matched=False)
 
         processor = self._ensure_processor()

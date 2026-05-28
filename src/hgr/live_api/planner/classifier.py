@@ -142,6 +142,26 @@ class Classifier:
                     description="compose email draft",
                 )
 
+        # ---- contact lookup ("what's Dani's email", "find Dani's email") --
+        # Read intent, NOT a compose. The orchestrator answers from memory.
+        m = re.search(
+            r"\b(?:find|look\s*up|what(?:'s| is)|tell\s+me|give\s+me|"
+            r"do\s+you\s+know)\b[^?]*?\b(?P<name>[A-Za-z][A-Za-z0-9._\-]*)"
+            r"(?:'s|s|)\s+(?:email|email\s+address|address)\b",
+            t, flags=re.IGNORECASE,
+        )
+        if m:
+            name = m.group("name")
+            # Reject ambiguous "names".
+            if name.lower() not in {"my", "me", "your", "the", "a", "an", "his",
+                                    "her", "their", "our"}:
+                return Step(
+                    tool="iris_lookup_contact",
+                    args={"name": name},
+                    layer="touchless",
+                    description=f"look up {name}'s email in memory",
+                )
+
         # ---- sticky user preferences (saved to memory, 0 tokens) ----------
         # "always send from gmail", "use outlook by default", "set my default
         # sender to gmail" — saved as preference(default_send_via=...). The
