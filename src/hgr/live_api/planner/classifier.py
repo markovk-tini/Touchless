@@ -144,10 +144,22 @@ class Classifier:
 
         # ---- contact lookup ("what's Dani's email", "find Dani's email") --
         # Read intent, NOT a compose. The orchestrator answers from memory.
+        # Verb form patterns are intentionally loose — common typos
+        # ("whats's"), missing apostrophes ("whats"), smart quotes (’),
+        # and conversational openers ("show me", "i need", "do you have")
+        # all map to the same intent. False positives just answer 'I don't
+        # have that in memory' which is harmless.
         m = re.search(
-            r"\b(?:find|look\s*up|what(?:'s| is)|tell\s+me|give\s+me|"
-            r"do\s+you\s+know)\b[^?]*?\b(?P<name>[A-Za-z][A-Za-z0-9._\-]*)"
-            r"(?:'s|s|)\s+(?:email|email\s+address|address)\b",
+            r"\b(?:"
+            r"find|look\s*up|"
+            r"what(?:[’'´]?s|s[’'´]?s?|\s+is)|"
+            r"where(?:[’'´]?s|\s+is)|"
+            r"tell\s+me|give\s+me|show\s+me|"
+            r"i\s+need|i\s+want|"
+            r"do\s+you\s+(?:know|have)|"
+            r"have\s+you\s+got|got\s+(?:the|a)"
+            r")\b[^?]*?\b(?P<name>[A-Za-z][A-Za-z0-9._\-]*)"
+            r"(?:[’'´]?s|s)?\s+(?:email|email\s+address|address)\b",
             t, flags=re.IGNORECASE,
         )
         if m:

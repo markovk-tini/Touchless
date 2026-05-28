@@ -2543,6 +2543,15 @@ class ContactLookupIntentTests(unittest.TestCase):
             "what is Dani's email address",
             "look up Dani's email",
             "tell me Dani's email",
+            # Common typos / forms users actually type:
+            "whats Dani's email",       # missing apostrophe
+            "whats's Dani's email",     # double-s typo from earlier live test
+            "what’s Dani's email",  # smart quote
+            "show me Dani's email",
+            "give me Dani's email",
+            "i need Dani's email",
+            "do you have Dani's email",
+            "wheres Dani's email",
         ]:
             step = c.classify(text)
             self.assertIsNotNone(step, f"missed: {text!r}")
