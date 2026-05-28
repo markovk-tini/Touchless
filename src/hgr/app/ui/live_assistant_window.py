@@ -366,12 +366,10 @@ class LiveAssistantWindow(QWidget):
             self._ms_btn.setVisible(False)
             return
         self._ms_btn.setVisible(True)
-        if st == "connected":
-            self._ms_btn.setText("Microsoft ✓")
-            self._ms_btn.setEnabled(False)
-        else:
-            self._ms_btn.setText("Connect Microsoft")
-            self._ms_btn.setEnabled(True)
+        # Stay enabled when connected so the user can add ANOTHER account
+        # (e.g. school + personal) and switch between them.
+        self._ms_btn.setEnabled(True)
+        self._ms_btn.setText("Microsoft ✓ (+ add)" if st == "connected" else "Connect Microsoft")
 
     def _on_connect_ms(self) -> None:
         self._ms_btn.setEnabled(False)

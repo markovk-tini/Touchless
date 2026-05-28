@@ -156,6 +156,13 @@ class Microsoft365Connector(Connector):
                {"query": {"type": "string"},
                 "max": {"type": "integer", "description": "Max results (default 10)."}},
                ["query"]),
+            fn("ms_list_accounts",
+               "List the connected Microsoft accounts and which one is active "
+               "(the one mail/calendar/Teams/etc. currently act on)."),
+            fn("ms_use_account",
+               "Switch which connected Microsoft account iris uses (by email or "
+               "name), e.g. switch to a school account for Teams/work mail.",
+               {"account": {"type": "string"}}, ["account"]),
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -411,6 +418,16 @@ class Microsoft365Connector(Connector):
                 emails = [e.get("address") for e in (c.get("emailAddresses") or []) if e.get("address")]
                 out.append({"name": c.get("displayName"), "emails": emails})
             return connector_result("ok", count=len(out), contacts=out)
+
+        if name == "ms_list_accounts":
+            return connector_result("ok", accounts=self._client.list_accounts())
+
+        if name == "ms_use_account":
+            q = str(args.get("account") or "").strip()
+            ok = self._client.set_active_account(q)
+            return connector_result(
+                "ok" if ok else "error", switched=ok, account=q,
+                error=None if ok else f"no connected Microsoft account matches '{q}'")
 
         return connector_result("error", error=f"unknown ms365 tool: {name}", code="no_handler")
 

@@ -202,6 +202,10 @@ def build_system_instructions() -> str:
         "re-read between actions; reuse the one read_screen result and only "
         "re-read if the screen actually changed.\n"
         + email_clause +
+        "MICROSOFT ACCOUNTS: several can be connected at once. ms_* tools act "
+        "on the ACTIVE one. If the user wants a different one (e.g. their school "
+        "account for Teams/work mail), call ms_use_account('<email or name>') "
+        "first; ms_list_accounts shows what's connected.\n"
         "FILES: open files/folders by NAME with open_path (don't ask where) — "
         "status='ambiguous'→list+ask, not_found→retry deep=true; open several "
         "at once via its `queries` list. read_file(name) returns a file's text "

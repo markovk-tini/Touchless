@@ -139,16 +139,33 @@ class MsGraphClient:
             cid, authority=AUTHORITY, token_cache=self._cache)
         return self._app
 
+    def _active_account(self, app):
+        """The account ms_* tools target: the one saved as active (by username),
+        else the first connected. Supports multiple connected accounts."""
+        try:
+            accounts = app.get_accounts()
+        except Exception:
+            return None
+        if not accounts:
+            return None
+        from ..user_prefs import load_prefs
+        want = (load_prefs().get("ms_active_account") or "").strip().lower()
+        if want:
+            for a in accounts:
+                if want == (a.get("username") or "").lower() or want == a.get("home_account_id"):
+                    return a
+        return accounts[0]
+
     def token(self) -> Optional[str]:
-        """A valid access token via the cached account (silent), or None."""
+        """A valid access token for the ACTIVE account (silent), or None."""
         app = self._get_app()
         if app is None:
             return None
         try:
-            accounts = app.get_accounts()
-            if not accounts:
+            acct = self._active_account(app)
+            if acct is None:
                 return None
-            result = app.acquire_token_silent(SCOPES, account=accounts[0])
+            result = app.acquire_token_silent(SCOPES, account=acct)
             self._save_cache()
             if result and "access_token" in result:
                 return result["access_token"]
@@ -158,6 +175,37 @@ class MsGraphClient:
 
     def ready(self) -> bool:
         return self.token() is not None
+
+    def list_accounts(self) -> list:
+        """All connected Microsoft accounts, flagging the active one."""
+        app = self._get_app()
+        if app is None:
+            return []
+        try:
+            active = self._active_account(app) or {}
+            return [{"username": a.get("username"),
+                     "active": a.get("home_account_id") == active.get("home_account_id")}
+                    for a in app.get_accounts()]
+        except Exception:
+            return []
+
+    def set_active_account(self, query: str) -> bool:
+        """Switch which connected account is active (matched by email/name)."""
+        app = self._get_app()
+        if app is None:
+            return False
+        q = (query or "").strip().lower()
+        if not q:
+            return False
+        from ..user_prefs import set_pref
+        try:
+            for a in app.get_accounts():
+                if q in (a.get("username") or "").lower():
+                    set_pref("ms_active_account", a.get("username"))
+                    return True
+        except Exception:
+            return False
+        return False
 
     def connect(self) -> tuple[bool, str]:
         """Interactive consent (opens browser). Call off the UI thread."""
@@ -171,8 +219,17 @@ class MsGraphClient:
             result = app.acquire_token_interactive(SCOPES, prompt="select_account")
             self._save_cache()
             if result and "access_token" in result:
+                # Make the just-connected account the active one.
+                try:
+                    from ..user_prefs import set_pref
+                    who = (result.get("id_token_claims") or {}).get("preferred_username")
+                    if who:
+                        set_pref("ms_active_account", who)
+                except Exception:
+                    pass
                 MsGraphClient._shared = None  # rebuild with fresh cache
-                return True, "Microsoft 365 connected."
+                who = (result.get("id_token_claims") or {}).get("preferred_username") or ""
+                return True, f"Microsoft 365 connected{(' as ' + who) if who else ''}."
             return False, f"Authorization failed: {result.get('error_description', 'unknown')}"
         except Exception as exc:
             return False, f"Authorization failed: {type(exc).__name__}: {exc}"
