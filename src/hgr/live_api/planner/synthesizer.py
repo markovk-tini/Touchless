@@ -115,12 +115,12 @@ class Synthesizer:
     # ---- HTTP --------------------------------------------------------------
     def _call(self, messages: List[Dict[str, Any]]) -> str:
         key = os.environ["OPENAI_API_KEY"]
+        # Newer GPT-5-era models only accept default temperature (1.0)
+        # and reject max_tokens — use max_completion_tokens and omit
+        # temperature. Older models still work fine with these params.
         body = {
             "model": self._model,
             "messages": messages,
-            "temperature": 0.3,
-            # max_completion_tokens (not max_tokens) — newer models like
-            # gpt-5-mini reject the older param. Older models accept both.
             "max_completion_tokens": 300,
         }
         req = urllib.request.Request(

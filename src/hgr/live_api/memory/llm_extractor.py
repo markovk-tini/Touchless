@@ -126,16 +126,17 @@ def extract_facts_from_conversation(
         f"ASSISTANT: {assistant_text[:1000]!r}\n\n"
         "Extract durable facts the USER revealed. Output JSON array only."
     )
+    # Note on omitted params: newer GPT-5-era models (gpt-5-mini, o-series)
+    # ONLY accept default temperature (1.0) and reject max_tokens. We use
+    # response_format=json_object + a strict system prompt to keep output
+    # structured even at temperature=1.
     body = {
         "model": chosen_model,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ],
-        "temperature": 0.0,
         "response_format": {"type": "json_object"},
-        # max_completion_tokens (not max_tokens) — newer models like
-        # gpt-5-mini reject the older param. Older models accept both.
         "max_completion_tokens": 600,
     }
     key = os.environ["OPENAI_API_KEY"]

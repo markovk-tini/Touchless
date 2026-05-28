@@ -82,15 +82,15 @@ def compose_text(prompt: str, inputs: Any, max_tokens: int = 0,
     )
     user = f"Instruction:\n{prompt}\n\nInput data:\n{inputs_str}"
 
+    # Newer GPT-5-era models only accept default temperature (1.0) and
+    # reject max_tokens — use max_completion_tokens and omit temperature.
+    # Older models still work with these params.
     body = {
         "model": chosen_model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "temperature": 0.3,
-        # max_completion_tokens (not max_tokens) — newer models like
-        # gpt-5-mini reject the older param. Older models accept both.
         # 0 means 'use default'; clamp to a sensible upper bound.
         "max_completion_tokens": int(max(64, min(int(max_tokens or _MAX_TOKENS), 8000))),
     }

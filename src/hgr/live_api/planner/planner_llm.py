@@ -231,11 +231,13 @@ class LLMPlanner:
     # ---- HTTP --------------------------------------------------------------
     def _call(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
         key = os.environ["OPENAI_API_KEY"]
+        # gpt-5-mini and other newer models only accept default temperature
+        # (1.0). response_format=json_object + strict prompt keeps output
+        # structured even at default temp.
         body = {
             "model": self._model,
             "messages": messages,
             "response_format": {"type": "json_object"},
-            "temperature": 0.2,
         }
         req = urllib.request.Request(
             API_URL, data=json.dumps(body).encode("utf-8"),
