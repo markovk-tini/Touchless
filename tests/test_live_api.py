@@ -1725,6 +1725,102 @@ class OrchestratorMemoryWiringTests(unittest.TestCase):
         self.assertIn("dani@x", seen_kwargs.get("memory_context", ""))
 
 
+class SkillStoreTests(unittest.TestCase):
+    """User-saved Plans, replayable without an LLM call."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="iris-skills-")
+        from hgr.live_api.planner.skills import SkillStore
+        self._store = SkillStore(Path(self._tmp) / "s.db")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _make_plan(self, goal="morning briefing"):
+        from hgr.live_api.planner.plan import Plan, Step
+        return Plan(goal=goal, steps=[
+            Step(id=1, tool="ms_mail_list", args={"folder": "inbox"}),
+            Step(id=2, tool="cal_today", args={}),
+        ])
+
+    def test_save_and_find_exact_trigger(self) -> None:
+        self._store.save("morning briefing", "morning briefing", self._make_plan())
+        plan = self._store.find("morning briefing")
+        self.assertIsNotNone(plan)
+        self.assertEqual([s.tool for s in plan.steps], ["ms_mail_list", "cal_today"])
+
+    def test_find_with_extra_words(self) -> None:
+        self._store.save("morning briefing", "morning briefing", self._make_plan())
+        # User said "do my morning briefing please" — exact-substring pass hits.
+        self.assertIsNotNone(self._store.find("Do my morning briefing please"))
+
+    def test_find_with_token_overlap(self) -> None:
+        # Trigger words present non-contiguously — pass-2 still matches.
+        self._store.save("recap", "weekly recap", self._make_plan())
+        self.assertIsNotNone(self._store.find("give me a recap for the weekly meeting"))
+
+    def test_no_match_returns_none(self) -> None:
+        self._store.save("morning briefing", "morning briefing", self._make_plan())
+        self.assertIsNone(self._store.find("set volume to 30"))
+        self.assertIsNone(self._store.find(""))
+
+    def test_delete(self) -> None:
+        self._store.save("x", "x", self._make_plan())
+        self.assertTrue(self._store.delete("x"))
+        self.assertIsNone(self._store.find("x"))
+
+    def test_use_count_increments(self) -> None:
+        self._store.save("x", "x", self._make_plan())
+        self._store.mark_used("x")
+        self._store.mark_used("x")
+        rows = self._store.list_all()
+        self.assertEqual(rows[0]["use_count"], 2)
+        self.assertIsNotNone(rows[0]["used_ts"])
+
+
+class OrchestratorSkillsTests(unittest.TestCase):
+    """Tier 0.5: a matching skill replays its Plan via Executor, no LLM."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="iris-skills-orch-")
+        os.environ["TOUCHLESS_SKILLS_DB"] = str(Path(self._tmp) / "s.db")
+
+    def tearDown(self) -> None:
+        os.environ.pop("TOUCHLESS_SKILLS_DB", None)
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_matching_skill_runs_through_executor(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        from hgr.live_api.planner.plan import Plan, Step
+        from hgr.live_api.planner.skills import SkillStore
+        reg = _StubRegistry({
+            "ms_mail_list": {"status": "ok", "messages": ["x"]},
+            "cal_today": {"status": "ok", "events": ["mtg @10"]},
+        })
+        store = SkillStore()
+        store.save("morning briefing", "morning briefing", Plan(
+            goal="morning briefing",
+            steps=[Step(id=1, tool="ms_mail_list", args={}),
+                   Step(id=2, tool="cal_today", args={})],
+        ))
+        planner = IrisPlanner(reg)
+        out = planner.try_handle("do my morning briefing")
+        self.assertIsNotNone(out)
+        self.assertEqual([s.tool for s in out["steps"]],
+                         ["ms_mail_list", "cal_today"])
+        self.assertEqual([t for t, _ in reg.calls],
+                         ["ms_mail_list", "cal_today"])
+
+    def test_skill_miss_falls_through_to_classifier(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({"volume_set": {"status": "ok"}})
+        planner = IrisPlanner(reg)
+        # No skill saved — must reach Phase 1.
+        out = planner.try_handle("set volume to 30")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["steps"][0].tool, "volume_set")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

@@ -22,6 +22,7 @@ from .plan import Plan, Step, StepResult
 from .plan_cache import PlanCache
 from .planner_llm import LLMPlanner, configured as llm_planner_configured
 from .scheduler import scheduler
+from .skills import SkillStore
 from .synthesizer import Synthesizer, configured as synth_configured
 from .triggers import looks_multi_action, plan_needs_confirm
 
@@ -46,6 +47,12 @@ class IrisPlanner:
         # manager wires a real MemoryManager when available; tests can
         # leave it unset to keep them offline.
         self._memory = memory
+        # Skills catalog (Tier 0.5: user-saved Plans replayed without an
+        # LLM call). Lazily opened; failures just disable the tier.
+        try:
+            self._skills: Optional[SkillStore] = SkillStore()
+        except Exception:
+            self._skills = None
 
     def try_handle(self, text: str) -> Optional[Dict[str, Any]]:
         """Try to fully handle a request without the realtime model.
@@ -58,6 +65,47 @@ class IrisPlanner:
         """
         if self._registry is None:
             return None
+
+        # --- Tier 0.5: user-defined skills (replay a saved Plan, 0 tokens) ---
+        if self._skills is not None and self._executor is not None:
+            try:
+                skill_plan = self._skills.find(text)
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception("skill_find_failed", exc)
+                skill_plan = None
+            if skill_plan is not None and skill_plan.steps:
+                # Same confirm-gate behaviour as Phase 2.
+                step_tools = [s.tool for s in skill_plan.steps]
+                if (plan_needs_confirm(step_tools)
+                        and self._confirm is not None
+                        and not self._confirm("Run this skill?",
+                                              self._plan_confirm_summary(skill_plan))):
+                    return {
+                        "steps": skill_plan.steps,
+                        "results": [
+                            StepResult(step_id=s.id, tool=s.tool,
+                                       status="cancelled",
+                                       output={"status": "cancelled"})
+                            for s in skill_plan.steps
+                        ],
+                        "plan": skill_plan,
+                        "message": "Cancelled.",
+                    }
+                results = self._executor.run(skill_plan)
+                message = self._summarize(skill_plan, results)
+                try:
+                    self._skills.mark_used(skill_plan.goal)
+                except Exception:
+                    pass
+                self._record_turn(text, skill_plan, skill_plan.steps,
+                                  results, message)
+                return {
+                    "steps": skill_plan.steps,
+                    "results": results,
+                    "plan": skill_plan,
+                    "message": message,
+                }
 
         # --- Phase 1: deterministic classifier -> single connector step ---
         # IMPORTANT: when the input looks multi-action ("set volume to 30 AND
