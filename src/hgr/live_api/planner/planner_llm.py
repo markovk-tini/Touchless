@@ -78,13 +78,13 @@ class LLMPlanner:
             "calls a cheap-LLM at the end automatically. Do NOT add a step "
             'named \"synthesize\" or \"summarize\" — those don\'t exist as '
             "tools.\n\n"
-            "PROVIDER CONSISTENCY: stay inside ONE provider per chain. If "
-            "you used contacts_search (Microsoft Graph), send via "
-            "ms_mail_send (Microsoft) — NOT gmail_send. The two services "
-            "have separate auth and contact lists. Same for Google: if you "
-            "looked something up in google_contacts, send via gmail_send. "
-            "Picking the wrong pair will silently fail because the lookup "
-            "result won't be valid in the other provider's API.\n\n"
+            "CROSS-PROVIDER CHAINS: universal data (email addresses, URLs, "
+            "plain text, names) is fine to pass between providers — pulling "
+            "a contact from Microsoft contacts_search and sending via "
+            "gmail_send is a valid plan. ID-shaped data is NOT: a message "
+            "ID from ms_mail_list / ms_mail_search is only valid in "
+            "Microsoft Graph; do NOT feed it to gmail tools. Same for "
+            "calendar event IDs and OneDrive item IDs.\n\n"
             "OUTPUT SHAPES of common lookup tools (so you reference fields "
             "correctly with {step:N.field...}):\n"
             "  contacts_search → {contacts: [{name, emails: [str, ...]}, "
@@ -107,12 +107,14 @@ class LLMPlanner:
             '{"id":3,"tool":"web_get_text","args":{"max_chars":4000},'
             '"depends_on":[2]}'
             '],"final":"synthesize"}\n\n'
-            "Example for 'find Dani's email and send him a quick hi' (note: "
-            "contacts_search → ms_mail_send, NOT gmail_send):\n"
+            "Example for 'find Dani's email and send him a quick hi' "
+            "(contacts_search returns an email STRING — fine to feed into "
+            "any *_send tool; pick whichever sender the user prefers, or "
+            "the one most likely to be authenticated):\n"
             '{"goal":"find Dani\'s email and send him a quick hi",'
             '"steps":['
             '{"id":1,"tool":"contacts_search","args":{"query":"Dani"}},'
-            '{"id":2,"tool":"ms_mail_send","args":{"to":'
+            '{"id":2,"tool":"gmail_send","args":{"to":'
             '"{step:1.contacts[0].emails[0]}","subject":"Hi",'
             '"body":"Hi Dani!"},"depends_on":[1]}'
             '],"final":"return"}\n\n'
