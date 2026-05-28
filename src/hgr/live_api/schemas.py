@@ -1192,7 +1192,13 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "to end it. `idle_sec` = how long of no activity counts as paused. "
             "This is the RIGHT tool when the user already started Claude/Codex "
             "themselves and asks you to 'watch my VS Code and approve' — just "
-            "call it, no other setup needed."
+            "call it, no other setup needed.\n\n"
+            "DO NOT CALL THIS TOOL UNLESS the user explicitly asks you to "
+            "'approve', 'auto-approve', 'keep approving', 'watch and approve', "
+            "or 'click yes' on prompts. Questions like 'is there a prompt on "
+            "screen?' / 'what's on my screen?' / 'do you see a prompt?' are "
+            "READ intents — answer with read_screen + words, do NOT start "
+            "the auto-approver."
         ),
         "parameters": {
             "type": "object",

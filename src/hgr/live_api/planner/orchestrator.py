@@ -231,6 +231,18 @@ class IrisPlanner:
             self._record_turn(text, None, [single], [sr], message)
             return {"steps": [single], "results": [sr], "message": message}
 
+        # Clarifying follow-up guard: short questions like 'and on my other
+        # screen?' / 'what about that?' / 'how about now?' don't carry enough
+        # signal for Tier 2 to plan against, but the planner has been
+        # confabulating Discord/etc. plans from them. Route to realtime
+        # which has the actual conversation context to resolve the pronoun
+        # references.
+        if self._is_clarifying_followup(text):
+            if self._logger:
+                self._logger.event("planner_skip_clarifying_followup",
+                                   text_len=len(text))
+            return None
+
         # --- Phase 2: cheap-LLM JSON plan -> Executor ---
         # Fires when ANY of:
         #   (a) explicit opt-in flag (TOUCHLESS_IRIS_PLAN_LLM=1)
@@ -385,6 +397,32 @@ class IrisPlanner:
         except Exception as exc:  # pragma: no cover - defensive
             if self._logger:
                 self._logger.exception("memory_record_failed", exc)
+
+    @staticmethod
+    def _is_clarifying_followup(text: str) -> bool:
+        """True when the text reads like a short clarifying follow-up
+        question that needs prior conversation context to make sense.
+        Sending these to Tier 2 produces confabulated plans (the LLM
+        invents tools to call from nothing); realtime can resolve them
+        from session memory instead.
+
+        Conservative: only catches the obvious cases. Long requests with
+        clear actions pass through unaffected."""
+        t = (text or "").strip()
+        if not t or len(t) > 40:
+            return False
+        lower = t.lower()
+        # Common continuation/clarification openers — almost always
+        # reference the prior turn.
+        _OPENERS = (
+            "and ", "or ", "but ", "so ",
+            "what about", "how about", "what if", "and what", "and how",
+            "and on", "and in", "and the", "and is", "and are",
+            "what else", "anything else", "any other",
+        )
+        if lower.startswith(_OPENERS):
+            return True
+        return False
 
     @staticmethod
     def _plan_confirm_summary(plan: "Plan") -> str:

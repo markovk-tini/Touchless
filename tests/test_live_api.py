@@ -2876,6 +2876,68 @@ class WeatherSchemaTests(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class ClarifyingFollowupGuardTests(unittest.TestCase):
+    """Short clarifying follow-ups must not confabulate Tier 2 plans —
+    they need realtime's conversation context to resolve."""
+
+    def test_detects_obvious_followups(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        for text in [
+            "and on my other screen?",
+            "and how about now?",
+            "what about that?",
+            "what if I close it?",
+            "and what about Vesko?",
+            "anything else?",
+            "but why?",
+            "so now what?",
+            "and the other one?",
+            "what about Dani?",
+            "how about now?",
+        ]:
+            self.assertTrue(IrisPlanner._is_clarifying_followup(text),
+                            f"should be follow-up: {text!r}")
+
+    def test_does_not_eat_real_requests(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        for text in [
+            "set volume to 30",
+            "find Dani's email and send him hi",
+            "what's the weather today",
+            "always send from gmail",
+            "explain quantum entanglement",
+            "search for the latest AI news and summarize the top result",
+        ]:
+            self.assertFalse(IrisPlanner._is_clarifying_followup(text),
+                             f"should NOT be follow-up: {text!r}")
+
+    def test_orchestrator_skips_tier2_for_followups(self) -> None:
+        """Even with Tier 2 forced on, a clarifying follow-up returns None
+        so realtime gets to answer with conversation context."""
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        import hgr.live_api.planner.orchestrator as orch
+        reg = _StubRegistry({})
+        planner = IrisPlanner(reg)
+        plan_calls = {"n": 0}
+        def fake_plan(_g, memory_context=""):
+            plan_calls["n"] += 1
+            from hgr.live_api.planner.plan import Plan, Step
+            return Plan(goal=_g, steps=[Step(id=1, tool="discord_mute")])
+        planner._llm_planner.plan = fake_plan  # type: ignore[assignment]
+        os.environ["TOUCHLESS_IRIS_PLAN_LLM"] = "1"
+        old = orch.llm_planner_configured
+        orch.llm_planner_configured = lambda: True
+        try:
+            out = planner.try_handle("and on my other screen?")
+        finally:
+            os.environ.pop("TOUCHLESS_IRIS_PLAN_LLM", None)
+            orch.llm_planner_configured = old
+        # Skipped Tier 2 entirely.
+        self.assertIsNone(out)
+        self.assertEqual(plan_calls["n"], 0)
+        self.assertEqual(reg.calls, [])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
