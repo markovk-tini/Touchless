@@ -926,11 +926,6 @@ class LiveApiManager(QObject):
         # Echo the user's typed message via the same signal voice
         # transcripts use, so the chat UI doesn't need a special path.
         self.transcript_received.emit(text)
-        # Send the memory-context note ONCE per session, before ANY user
-        # turn is processed — so realtime has the user's known facts in
-        # context for either this turn or any future planner-declined
-        # turn. Fires only on first call per session (idempotent).
-        self._maybe_send_memory_summary()
 
         # ---- Layer 0: deterministic router ----
         router = self._command_router
@@ -990,6 +985,12 @@ class LiveApiManager(QObject):
                     self._iris_planner = IrisPlanner(self._registry, self._logger,
                                                      confirm=self._confirm_callback,
                                                      memory=memory)
+                # Now that the planner + memory are wired, send the one-time
+                # session-start memory summary so realtime has the user's
+                # known facts in context for ANY downstream realtime turn
+                # this session. Idempotent: _memory_summary_sent guards
+                # against re-firing on subsequent user turns.
+                self._maybe_send_memory_summary()
                 handled = self._iris_planner.try_handle(text)
             except Exception as exc:
                 if self._logger:
