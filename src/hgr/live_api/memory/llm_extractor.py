@@ -194,12 +194,18 @@ def _parse_facts(raw: str) -> List[Tuple[str, str, str, float]]:
     except Exception:
         return []
     if isinstance(doc, dict):
-        # Models often pick 'facts' or 'items'; accept either, plus a
-        # single-key dict whose only value is a list.
+        # Models pick different envelope shapes — accept any of them, plus
+        # the bare 'this whole object IS a single fact' case (gpt-5-mini
+        # often does this when response_format=json_object forces an object
+        # and the input only revealed one fact).
         if isinstance(doc.get("facts"), list):
             doc = doc["facts"]
         elif isinstance(doc.get("items"), list):
             doc = doc["items"]
+        elif "kind" in doc and "key" in doc and "value" in doc:
+            # Single fact at the top level — wrap it so the loop below
+            # processes it like any other entry.
+            doc = [doc]
         elif len(doc) == 1 and isinstance(next(iter(doc.values())), list):
             doc = next(iter(doc.values()))
         else:

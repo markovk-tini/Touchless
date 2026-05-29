@@ -3344,6 +3344,17 @@ class LLMExtractorTests(unittest.TestCase):
         self.assertEqual(facts,
                          [("person", "vesko", "my brother", 0.9)])
 
+    def test_parse_single_top_level_fact(self) -> None:
+        """gpt-5-mini often returns the fact AS the response, not wrapped:
+            {"kind":"place","key":"office","value":"Kearney Hall room 204","confidence":0.95}
+        That's a valid response — parse it as a 1-item list."""
+        from hgr.live_api.memory.llm_extractor import _parse_facts
+        raw = ('{"kind":"place","key":"office","value":"Kearney Hall room '
+               '204","confidence":0.95}')
+        facts = _parse_facts(raw)
+        self.assertEqual(facts,
+                         [("place", "office", "Kearney Hall room 204", 0.95)])
+
     def test_disallowed_kind_dropped(self) -> None:
         from hgr.live_api.memory.llm_extractor import _parse_facts
         raw = '[{"kind":"emotion","key":"tired","value":"yes","confidence":0.9}]'
