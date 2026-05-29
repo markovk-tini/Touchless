@@ -4119,6 +4119,138 @@ class KiCadCliConnectorTests(unittest.TestCase):
         })
 
 
+class PhoneLinkClassifierTests(unittest.TestCase):
+    """Tier 1 patterns: 'text X saying Y' / 'read my recent texts'."""
+
+    def setUp(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        self.c = Classifier()
+
+    def test_text_send_phrasings(self) -> None:
+        for text, expected_to in [
+            ("text Dani saying hi from iris", "Dani"),
+            ("text +15551234567 saying call me", "+15551234567"),
+            ("send a text to Vesko saying see you tomorrow", "Vesko"),
+            ("send me a text to Dani saying hi", "Dani"),
+            ("text to Dani saying hi", "Dani"),
+            ("send text to Mariya saying happy birthday", "Mariya"),
+            ("send a text to Dani with the message hi there", "Dani"),
+            ("sms Dani that says quick question", "Dani"),
+        ]:
+            step = self.c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "phone_link_send_text",
+                             f"text={text!r}: tool={step.tool}")
+            self.assertEqual(step.args["to"], expected_to,
+                             f"text={text!r}: to={step.args['to']!r}")
+            self.assertTrue(step.args.get("body"),
+                            f"text={text!r}: empty body")
+
+    def test_text_skips_pronoun_recipient(self) -> None:
+        # 'text me/him/her saying...' is ambiguous; let it fall through.
+        for text in ["text me saying done", "text him saying hi"]:
+            step = self.c.classify(text)
+            if step is not None:
+                self.assertNotEqual(step.tool, "phone_link_send_text",
+                                    f"text={text!r}")
+
+    def test_read_recent_texts_phrasings(self) -> None:
+        for text in [
+            "read my texts",
+            "read my recent texts",
+            "read my latest texts",
+            "show me my texts",
+            "show me my recent texts",
+            "check my texts",
+            "any new texts",
+            "any messages on my phone",
+            "read my sms",
+            "read my imessages",
+        ]:
+            step = self.c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "phone_link_read_recent",
+                             f"text={text!r}: tool={step.tool}")
+
+
+class PhoneLinkConnectorTests(unittest.TestCase):
+    """Phone Link connector — focus on what doesn't need a real phone:
+    setup detection, tool schema, error paths when AppX missing."""
+
+    def test_tools_schema_exposes_expected_operations(self) -> None:
+        from hgr.live_api.connectors.phone_link_connector import PhoneLinkConnector
+        conn = PhoneLinkConnector()
+        names = {t["name"] for t in conn.tools()}
+        self.assertEqual(names, {
+            "phone_link_open",
+            "phone_link_send_text",
+            "phone_link_read_recent",
+            "phone_link_open_conversation",
+        })
+
+    def test_setup_self_error_when_appx_missing(self) -> None:
+        from hgr.live_api.connectors import phone_link_connector
+        old = phone_link_connector._find_phone_link_appx
+        phone_link_connector._find_phone_link_appx = lambda: None
+        try:
+            conn = phone_link_connector.PhoneLinkConnector()
+            result = conn.setup_self()
+        finally:
+            phone_link_connector._find_phone_link_appx = old
+        self.assertFalse(result["ok"])
+        self.assertIn("not installed", result["error"].lower())
+        self.assertIn("microsoft store", result["error"].lower())
+
+    def test_setup_self_success_when_appx_found(self) -> None:
+        from hgr.live_api.connectors import phone_link_connector
+        old_find = phone_link_connector._find_phone_link_appx
+        old_ver = phone_link_connector._appx_version
+        old_launch = phone_link_connector._launch_phone_link
+        phone_link_connector._find_phone_link_appx = lambda: "Microsoft.YourPhone"
+        phone_link_connector._appx_version = lambda n: "1.24061.81.0"
+        phone_link_connector._launch_phone_link = lambda: True
+        try:
+            conn = phone_link_connector.PhoneLinkConnector()
+            result = conn.setup_self()
+        finally:
+            phone_link_connector._find_phone_link_appx = old_find
+            phone_link_connector._appx_version = old_ver
+            phone_link_connector._launch_phone_link = old_launch
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["appx_name"], "Microsoft.YourPhone")
+        self.assertEqual(result["version"], "1.24061.81.0")
+        self.assertTrue(result["launched"])
+
+    def test_execute_rejects_when_not_available(self) -> None:
+        from hgr.live_api.connectors import phone_link_connector
+        old = phone_link_connector._find_phone_link_appx
+        phone_link_connector._find_phone_link_appx = lambda: None
+        try:
+            conn = phone_link_connector.PhoneLinkConnector()
+            out = conn.execute("phone_link_send_text",
+                               {"to": "Dani", "body": "hi"})
+        finally:
+            phone_link_connector._find_phone_link_appx = old
+        self.assertEqual(out["status"], "error")
+        self.assertIn("set up phone link", out["error"].lower())
+
+    def test_send_text_rejects_missing_args(self) -> None:
+        from hgr.live_api.connectors import phone_link_connector
+        old = phone_link_connector._find_phone_link_appx
+        phone_link_connector._find_phone_link_appx = lambda: "Microsoft.YourPhone"
+        try:
+            conn = phone_link_connector.PhoneLinkConnector()
+            conn._verified = True
+            self.assertEqual(
+                conn.execute("phone_link_send_text", {"body": "hi"})["status"],
+                "error")
+            self.assertEqual(
+                conn.execute("phone_link_send_text", {"to": "Dani"})["status"],
+                "error")
+        finally:
+            phone_link_connector._find_phone_link_appx = old
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

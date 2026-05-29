@@ -192,6 +192,50 @@ class Classifier:
                 description="local weather",
             )
 
+        # ---- phone / SMS via Phone Link ("text X saying Y", "send a
+        # text to X saying Y", "read my texts") --------------------------
+        # Routes to phone_link_send_text / phone_link_read_recent
+        # connector tools. Recipient resolution from memory happens at
+        # the connector level (just like ms_mail_send).
+        m = re.search(
+            r"\b(?:send\s+(?:a\s+|me\s+)?)?(?:text|sms|imessage|"
+            r"message\s+(?:via|on)\s+(?:phone|imessage|text))"
+            r"\s+(?:to\s+)?"
+            r"(?P<to>\+?[\d\s\-()]{7,}|[A-Za-z][A-Za-z0-9._\-]*)"
+            r"\s+(?:saying|with\s+(?:the\s+)?message|that\s+says)\s+"
+            r"(?P<body>.+)$",
+            t, flags=re.IGNORECASE,
+        )
+        if m:
+            recipient = m.group("to").strip(",.;")
+            _PHONE_STOP = {"me", "him", "her", "them", "us", "the", "a",
+                            "an", "my"}
+            if recipient.lower() not in _PHONE_STOP:
+                return Step(
+                    tool="phone_link_send_text",
+                    args={"to": recipient,
+                          "body": m.group("body").strip()},
+                    layer="connector",
+                    description=f"send text via Phone Link to {recipient}",
+                )
+        # "read my (recent) texts" / "show me my latest texts" /
+        # "any new messages on my phone"
+        m = re.search(
+            r"\b(?:read|show\s+me|check|any|got\s+any|what\s+(?:are|'s|s))"
+            r"\s+(?:any\s+)?(?:my\s+)?"
+            r"(?:new\s+|recent\s+|latest\s+|unread\s+)?"
+            r"(?:texts?|sms|imessages?|messages\s+on\s+my\s+phone)"
+            r"\b",
+            lower,
+        )
+        if m:
+            return Step(
+                tool="phone_link_read_recent",
+                args={"limit": 10},
+                layer="connector",
+                description="read recent texts via Phone Link",
+            )
+
         # ---- self-setup ("set up KiCAD", "install kicad cli", "connect
         # spotify", "configure notion") --------------------------------
         # Generic: catches any '(set up|install|configure|connect)

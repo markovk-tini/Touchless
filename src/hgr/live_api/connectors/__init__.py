@@ -44,12 +44,16 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
             # not take down the whole registry.
             pass
 
-    # NOTE: SpotifyConnector exists (spotify_connector.py) but is deliberately
-    # NOT registered. Spotify is owned by the Touchless Layer-0 command router
-    # (play/pause/next/search), which handles it before the model. A connector
-    # was a redundant second path that mis-parsed requests (e.g. "play feel
-    # good rock playlist" played a single track), so Spotify is left to
-    # Touchless. Re-register here only if Layer 0 stops covering Spotify.
+    # SpotifyConnector is registered SETUP-ONLY (its tools() returns [], so
+    # the 8 playback verbs stay hidden). The Touchless Layer-0 command router
+    # still owns play/pause/next/search at runtime — that's intentional, a
+    # previous full registration regressed playlist parsing ("play feel good
+    # rock playlist" played a single track). What setup-only buys us: "set up
+    # spotify" routes to iris_setup_tool -> find_by_id('spotify') ->
+    # SpotifyConnector.setup_self() which walks the PKCE OAuth flow via the
+    # existing controller. Flip setup_only=False the day Web-API playlist
+    # parsing is reliable enough to take over from Layer 0.
+    from .spotify_connector import SpotifyConnector
     from .volume_connector import VolumeConnector
     from .media_connector import MediaConnector
     from .youtube_connector import YouTubeConnector
@@ -66,6 +70,7 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     from .directions_connector import DirectionsConnector
     from .ms365_connector import Microsoft365Connector
     from .kicad_cli_connector import KiCadCliConnector
+    from .phone_link_connector import PhoneLinkConnector
 
     _add(lambda: VolumeConnector())
     _add(lambda: MediaConnector())
@@ -83,6 +88,8 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     _add(lambda: DirectionsConnector())
     _add(lambda: Microsoft365Connector())
     _add(lambda: KiCadCliConnector())
+    _add(lambda: PhoneLinkConnector(executor=executor))
+    _add(lambda: SpotifyConnector(setup_only=True))
 
     # MCP servers (breadth for everything not hand-written). Each configured
     # server becomes a connector whose tools the search router can discover.
