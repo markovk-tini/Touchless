@@ -398,6 +398,7 @@ class LiveApiManager(QObject):
         self._nudge_max = 6
         self._turn_text = ""          # assistant text accumulated this response
         self._last_user_text = ""     # for realtime fact-extraction observation
+        self._memory_summary_sent = False  # send memory note once per session
         self._failed_retries = 0      # retries used for a failed response turn
         self._last_nudge_ts = 0.0     # min-interval guard against nudge bursts
         # Task QUEUE — a multi-action command is split into atomic sub-tasks and
@@ -493,6 +494,7 @@ class LiveApiManager(QObject):
             # Fresh session: nothing loaded on demand yet.
             self._loaded_connector_schemas = []
             self._iris_planner = None
+            self._memory_summary_sent = False  # re-send on fresh session
             # Layer 0 router. Lazy-import keeps the manager loadable on
             # systems where Touchless's voice modules can't initialize
             # (e.g. headless CI without sounddevice).
@@ -716,6 +718,41 @@ class LiveApiManager(QObject):
             note += f" reply to user: {rep}"
         note += ")"
         return note[:600]
+
+    def _maybe_send_memory_summary(self) -> None:
+        """Inject a compact memory-context note into the realtime session
+        ONCE per session, before the user's first turn. Lets realtime
+        answer recall questions ('where's my office?', 'what should you
+        call me?') without needing Tier 2 recall.
+
+        No-ops cleanly: if memory is empty / not wired / already sent /
+        client doesn't support session notes, just skip silently."""
+        if self._memory_summary_sent:
+            return
+        client = self._client
+        if client is None or not hasattr(client, "send_session_note"):
+            return
+        planner = self._iris_planner
+        memory = getattr(planner, "_memory", None) if planner is not None else None
+        if memory is None or not hasattr(memory, "summary_for_session"):
+            return
+        try:
+            note = memory.summary_for_session()
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("memory_summary_failed", exc)
+            return
+        if not note:
+            self._memory_summary_sent = True  # nothing to send, don't keep trying
+            return
+        try:
+            client.send_session_note(note)
+            self._memory_summary_sent = True
+            if self._logger:
+                self._logger.event("memory_summary_injected", chars=len(note))
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("memory_summary_send_failed", exc)
 
     def _observe_realtime_turn(self) -> None:
         """Hand the just-completed realtime turn to the memory layer for
@@ -1008,6 +1045,10 @@ class LiveApiManager(QObject):
             if ok:
                 self._request_model_response()
             return ok
+        # First realtime turn of this session: prepend a memory summary as a
+        # system note so realtime can answer 'where's my office?' / 'what
+        # should you call me?' / etc. without going through Tier 2 recall.
+        self._maybe_send_memory_summary()
         ok = bool(client.send_text_message(text))
         if ok:
             # Track for fact-extraction on response.done. Only capture turns

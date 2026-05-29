@@ -3583,6 +3583,45 @@ class ForgetIntentTests(unittest.TestCase):
         self.assertEqual(removed_calls, [("person", "dani", None)])
 
 
+class MemorySummaryForSessionTests(unittest.TestCase):
+    """The session-start memory injection that lets realtime answer
+    'where's my office?' without going through Tier 2 recall."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="iris-sum-")
+        from hgr.live_api.memory import MemoryManager, MemoryStore
+        from hgr.live_api.memory.embedder import FakeEmbedder
+        self._mgr = MemoryManager(
+            store=MemoryStore(Path(self._tmp) / "m.db"),
+            embedder=FakeEmbedder(),
+            async_writes=False,
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_empty_memory_returns_empty_string(self) -> None:
+        self.assertEqual(self._mgr.summary_for_session(), "")
+
+    def test_renders_preferences_first_then_other_kinds(self) -> None:
+        self._mgr.set_fact("preference", "preferred_name", "Konstantin")
+        self._mgr.set_fact("place", "office", "Kearney Hall 204")
+        self._mgr.set_fact("person", "vesko", "my brother")
+        note = self._mgr.summary_for_session()
+        self.assertIn("preferred_name = Konstantin", note)
+        self.assertIn("office = Kearney Hall 204", note)
+        self.assertIn("vesko = my brother", note)
+        # Preferences appear before person/place groups.
+        self.assertLess(note.index("preference"), note.index("place"))
+        self.assertLess(note.index("preference"), note.index("person"))
+
+    def test_capped_at_max_chars(self) -> None:
+        for i in range(40):
+            self._mgr.set_fact("fact", f"k{i}", "value-" + "x" * 100)
+        note = self._mgr.summary_for_session(max_facts=40, max_chars=300)
+        self.assertLessEqual(len(note), 300)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

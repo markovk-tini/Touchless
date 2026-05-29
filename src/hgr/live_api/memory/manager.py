@@ -69,6 +69,51 @@ class MemoryManager:
         self._async = async_writes
         self._logger = logger
 
+    # ---- session-start context summary -----------------------------------
+    def summary_for_session(self, max_facts: int = 30,
+                            max_chars: int = 1500) -> str:
+        """Render a compact 'what Iris knows about this user' note for
+        realtime session start. Lets realtime answer recall questions
+        like 'where's my office?' directly, without needing to enter a
+        Tier 2 planning round-trip.
+
+        Returns empty string when memory is empty / nothing useful to say.
+        Caps at 30 facts (recent first) and 1500 chars so the session
+        prompt doesn't bloat."""
+        try:
+            facts = self._store.find_facts(limit=max_facts)
+        except Exception:
+            return ""
+        if not facts:
+            return ""
+        # Group by kind for readability. Sort within each group by most
+        # recent first (find_facts already returns by ts desc, so order
+        # is preserved when we iterate).
+        by_kind: Dict[str, List[str]] = {}
+        for f in facts:
+            line = f"{f.key} = {f.value}"
+            by_kind.setdefault(f.kind, []).append(line)
+        parts: List[str] = []
+        # Preferences first — they shape every interaction.
+        kind_order = ["preference", "alias", "person", "place", "schedule",
+                      "relation", "course", "interest", "role", "contact",
+                      "fact", "artifact"]
+        for kind in kind_order:
+            if kind not in by_kind:
+                continue
+            entries = ", ".join(by_kind[kind][:8])
+            parts.append(f"{kind}: {entries}")
+        for kind, entries in by_kind.items():
+            if kind not in kind_order:
+                joined = ", ".join(entries[:8])
+                parts.append(f"{kind}: {joined}")
+        body = " | ".join(parts)
+        if not body:
+            return ""
+        note = ("(Background context from prior conversations with this "
+                f"user — use freely when relevant: {body})")
+        return note[:max_chars]
+
     # ---- realtime conversation observation -------------------------------
     def observe_conversation(self, user_text: str,
                              assistant_text: str = "") -> None:
