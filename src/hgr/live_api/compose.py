@@ -31,7 +31,10 @@ API_URL = "https://api.openai.com/v1/chat/completions"
 # within 2500 output tokens (~10 lines per email at most). gpt-5-mini's
 # context is large; we can afford the headroom.
 _MAX_INPUT_CHARS = 32000
-_MAX_TOKENS = 2500
+# Includes invisible reasoning tokens on GPT-5-era models — bump
+# generously so a 'list every email' synthesis isn't truncated by the
+# model exhausting its budget on internal thought.
+_MAX_TOKENS = 6000
 
 
 def configured() -> bool:

@@ -115,13 +115,14 @@ class Synthesizer:
     # ---- HTTP --------------------------------------------------------------
     def _call(self, messages: List[Dict[str, Any]]) -> str:
         key = os.environ["OPENAI_API_KEY"]
-        # Newer GPT-5-era models only accept default temperature (1.0)
-        # and reject max_tokens — use max_completion_tokens and omit
-        # temperature. Older models still work fine with these params.
+        # Newer GPT-5-era models: only default temperature (1.0), use
+        # max_completion_tokens (not max_tokens), and the budget includes
+        # INVISIBLE reasoning tokens — a tight cap can leave 0 for actual
+        # output. 3000 gives the reasoning headroom + a real reply.
         body = {
             "model": self._model,
             "messages": messages,
-            "max_completion_tokens": 300,
+            "max_completion_tokens": 3000,
         }
         req = urllib.request.Request(
             API_URL, data=json.dumps(body).encode("utf-8"),
