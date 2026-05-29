@@ -63,6 +63,12 @@ class ToolRegistry:
         executor). Used to label which layer executed a command."""
         return self._connectors.handles(name)
 
+    def find_connector(self, name: str) -> Optional[Any]:
+        """Look up a connector by id substring. Used by iris_setup_tool
+        ('set up kicad') to find the right connector and invoke
+        setup_self()."""
+        return self._connectors.find_by_id(name)
+
     def is_available(self, name: str) -> Optional[str]:
         """Precondition check: None when the tool is runnable now, else a
         short human-readable reason (e.g. 'ms_graph not connected'). Used by

@@ -19,7 +19,7 @@ Author: Konstantin Markov
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .plan import Step
 
@@ -191,6 +191,52 @@ class Classifier:
                 layer="touchless",
                 description="local weather",
             )
+
+        # ---- self-setup ("set up KiCAD", "install kicad cli", "connect
+        # spotify", "configure notion") --------------------------------
+        # Generic: catches any '(set up|install|configure|connect)
+        # <connector-name>' and routes to iris_setup_tool which finds the
+        # connector by id/alias and calls its setup_self() — auto-discovers
+        # binaries on PATH, walks OAuth flows, etc.
+        # Path captured greedy-to-end so "set up X at C:\Program Files\..."
+        # (with spaces) works. Use ORIGINAL `t` to preserve the path's
+        # capitalization, not `lower`.
+        m = re.search(
+            r"\b(?:set\s*up|setup|install|configure|connect|enable)\b"
+            r"\s+(?:the\s+|my\s+)?(?P<name>[a-z][a-z0-9_\-]*)"
+            r"(?:\s+(?:cli|connector|api|integration))?"
+            r"(?:\s+at\s+(?P<path>.+))?",
+            lower,
+        )
+        if m:
+            name = m.group("name")
+            # Pronouns + common non-connector targets ('the meeting', 'the
+            # project', etc.) — those clearly aren't connector ids.
+            _SETUP_STOP = {
+                "my", "the", "a", "an", "it", "that", "this",
+                "all", "everything",
+                "meeting", "appointment", "event", "project", "task",
+                "file", "document", "doc", "sheet", "spreadsheet",
+                "slide", "presentation", "session", "call", "alarm",
+                "reminder", "notification", "schedule", "appointment",
+            }
+            if name not in _SETUP_STOP:
+                args: Dict[str, Any] = {"name": name}
+                # Pull the path from the ORIGINAL text (not lowercased) so
+                # case-sensitive paths like 'C:\Program Files\...' survive.
+                if m.group("path"):
+                    orig_match = re.search(
+                        r"\bat\s+(?P<orig_path>.+)$",
+                        t, flags=re.IGNORECASE,
+                    )
+                    if orig_match:
+                        args["path"] = orig_match.group("orig_path").strip()
+                return Step(
+                    tool="iris_setup_tool",
+                    args=args,
+                    layer="touchless",
+                    description=f"set up {name}",
+                )
 
         # ---- open the last-created artifact ("open it", "can you open
         # it", "show me that", "open the doc you just made") --------------

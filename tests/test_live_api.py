@@ -3952,6 +3952,173 @@ class OpenLastIntentTests(unittest.TestCase):
         self.assertIn("B", out["message"])
 
 
+class SetupIntentTests(unittest.TestCase):
+    """'set up X' / 'install X' / 'connect X' route to iris_setup_tool
+    which finds the connector by id and calls setup_self()."""
+
+    def test_classifier_matches_setup_phrasings(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        for text in [
+            "set up kicad",
+            "set up kicad cli",
+            "install kicad",
+            "configure kicad",
+            "connect kicad",
+            "enable kicad",
+            "setup kicad connector",
+        ]:
+            step = c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "iris_setup_tool")
+            self.assertEqual(step.args["name"], "kicad")
+
+    def test_classifier_captures_explicit_path(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        step = c.classify("set up kicad at C:\\Program Files\\KiCad\\bin\\kicad-cli.exe")
+        self.assertIsNotNone(step)
+        self.assertIn("kicad-cli.exe", step.args.get("path", ""))
+
+    def test_classifier_skips_pronoun_targets(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        # 'set up the meeting' etc. shouldn't match — only real connector
+        # names.
+        for text in ["set up the meeting", "install it", "configure that"]:
+            step = c.classify(text)
+            if step is not None:
+                self.assertNotEqual(step.tool, "iris_setup_tool",
+                                    f"text={text!r}")
+
+
+class IrisSetupToolOrchestratorTests(unittest.TestCase):
+    """Orchestrator routes 'set up X' to connector.setup_self()."""
+
+    def _registry_with(self, connector) -> Any:
+        # Mirrors the real ConnectorRegistry.find_by_id: exact match first,
+        # then substring either direction (so 'kicad' finds 'kicad_cli').
+        class _Reg:
+            def __init__(self_):
+                self_.calls = []
+            def handles_connector(self_, n): return False
+            def call(self_, n, a):
+                self_.calls.append((n, a))
+                return {"status": "ok"}
+            def find_connector(self_, name):
+                norm = (name or "").lower()
+                cid = (getattr(connector, "id", "") or "").lower()
+                if norm == cid or norm in cid or cid in norm:
+                    return connector
+                return None
+        return _Reg()
+
+    def test_calls_setup_self_on_matching_connector(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+
+        class _FakeConnector:
+            id = "kicad_cli"
+            def __init__(self_): self_.setup_called = False
+            def available(self_): return True
+            def setup_self(self_, path=""):
+                self_.setup_called = True
+                return {"ok": True, "cli_path": "/usr/bin/kicad-cli",
+                        "version": "KiCAD 10.0"}
+
+        conn = _FakeConnector()
+        planner = IrisPlanner(self._registry_with(conn))
+        out = planner.try_handle("set up kicad")
+        self.assertIsNotNone(out)
+        self.assertTrue(conn.setup_called)
+        self.assertEqual(out["results"][0].status, "ok")
+        self.assertIn("kicad", out["message"].lower())
+        self.assertIn("KiCAD 10.0", out["message"])
+
+    def test_setup_with_explicit_path(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+
+        class _FakeConnector:
+            id = "kicad_cli"
+            def __init__(self_): self_.received_path = None
+            def available(self_): return True
+            def setup_self(self_, path=""):
+                self_.received_path = path
+                return {"ok": True, "cli_path": path or "found"}
+
+        conn = _FakeConnector()
+        planner = IrisPlanner(self._registry_with(conn))
+        planner.try_handle("set up kicad at C:\\tools\\kicad-cli.exe")
+        self.assertEqual(conn.received_path, "C:\\tools\\kicad-cli.exe")
+
+    def test_not_found_when_no_matching_connector(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+
+        class _FakeConnector:
+            id = "kicad_cli"
+            def available(self_): return True
+            def setup_self(self_, path=""):
+                return {"ok": True}
+
+        planner = IrisPlanner(self._registry_with(_FakeConnector()))
+        out = planner.try_handle("set up notion")
+        self.assertEqual(out["results"][0].status, "not_found")
+        self.assertIn("don't have a connector named", out["message"].lower())
+
+
+class KiCadCliConnectorTests(unittest.TestCase):
+    """KiCAD CLI auto-discovery + execution shape (no real binary needed)."""
+
+    def test_find_returns_override_path_when_set(self) -> None:
+        import tempfile
+        from hgr.live_api.connectors.kicad_cli_connector import _find_kicad_cli
+        # Create a tempfile to act as a fake binary.
+        fd, path = tempfile.mkstemp(suffix=".exe")
+        os.close(fd)
+        try:
+            found = _find_kicad_cli(override_path=path)
+            self.assertEqual(found, path)
+        finally:
+            os.unlink(path)
+
+    def test_setup_self_returns_error_when_not_found(self) -> None:
+        from hgr.live_api.connectors.kicad_cli_connector import KiCadCliConnector
+        # Force a no-find by passing a bogus override.
+        conn = KiCadCliConnector(cli_path=None)
+        # Mock _find_kicad_cli to return None inside setup_self.
+        from hgr.live_api.connectors import kicad_cli_connector
+        old = kicad_cli_connector._find_kicad_cli
+        kicad_cli_connector._find_kicad_cli = lambda **k: None
+        try:
+            result = conn.setup_self()
+        finally:
+            kicad_cli_connector._find_kicad_cli = old
+        self.assertFalse(result["ok"])
+        self.assertIn("not found", result["error"].lower())
+
+    def test_execute_rejects_when_not_available(self) -> None:
+        from hgr.live_api.connectors.kicad_cli_connector import KiCadCliConnector
+        from hgr.live_api.connectors import kicad_cli_connector
+        old = kicad_cli_connector._find_kicad_cli
+        kicad_cli_connector._find_kicad_cli = lambda **k: None
+        try:
+            conn = KiCadCliConnector(cli_path=None)
+            out = conn.execute("kicad_version", {})
+        finally:
+            kicad_cli_connector._find_kicad_cli = old
+        self.assertEqual(out["status"], "error")
+        self.assertIn("kicad-cli not found", out["error"])
+
+    def test_tools_schema_exposes_expected_operations(self) -> None:
+        from hgr.live_api.connectors.kicad_cli_connector import KiCadCliConnector
+        conn = KiCadCliConnector(cli_path="/fake/path")
+        tools = conn.tools()
+        names = {t["name"] for t in tools}
+        self.assertEqual(names, {
+            "kicad_export_gerbers", "kicad_export_pdf", "kicad_export_bom",
+            "kicad_run_drc", "kicad_export_step", "kicad_version",
+        })
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

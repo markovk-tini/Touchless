@@ -59,6 +59,24 @@ class ConnectorRegistry:
     def register(self, connector: Connector) -> None:
         self._connectors.append(connector)
 
+    def find_by_id(self, name: str) -> Optional[Connector]:
+        """Look up a connector by its `id` attribute (case-insensitive).
+        Used by the iris_setup_tool pseudo-tool to invoke setup_self() on
+        the right connector after a 'set up X' command."""
+        norm = (name or "").strip().lower()
+        if not norm:
+            return None
+        # Try exact match first, then substring (so 'kicad' finds
+        # 'kicad_cli', 'ms' finds 'ms365').
+        for c in self._connectors:
+            if (getattr(c, "id", "") or "").lower() == norm:
+                return c
+        for c in self._connectors:
+            cid = (getattr(c, "id", "") or "").lower()
+            if norm in cid or cid in norm:
+                return c
+        return None
+
     def is_available_for(self, name: str) -> Optional[str]:
         """None when the connector owning `name` is runnable right now,
         else a short human-readable reason ('outlook not connected', etc.).

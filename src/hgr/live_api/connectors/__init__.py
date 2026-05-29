@@ -65,6 +65,7 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     from .drive_connector import DriveConnector
     from .directions_connector import DirectionsConnector
     from .ms365_connector import Microsoft365Connector
+    from .kicad_cli_connector import KiCadCliConnector
 
     _add(lambda: VolumeConnector())
     _add(lambda: MediaConnector())
@@ -81,6 +82,7 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     _add(lambda: DriveConnector())
     _add(lambda: DirectionsConnector())
     _add(lambda: Microsoft365Connector())
+    _add(lambda: KiCadCliConnector())
 
     # MCP servers (breadth for everything not hand-written). Each configured
     # server becomes a connector whose tools the search router can discover.

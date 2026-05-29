@@ -145,7 +145,7 @@ class IrisPlanner:
         single = self._classifier.classify(text)
         _BYPASS_MULTI = {"iris_lookup_contact", "iris_set_preference",
                          "iris_remember_contact", "iris_forget_contact",
-                         "iris_open_last"}
+                         "iris_open_last", "iris_setup_tool"}
         if multi and single is not None and single.tool not in _BYPASS_MULTI:
             single = None
 
@@ -199,6 +199,61 @@ class IrisPlanner:
             else:
                 message = (f"I didn't have anything stored for {name}, "
                            f"so nothing to forget.")
+            self._record_turn(text, None, [single], [sr], message)
+            return {"steps": [single], "results": [sr], "message": message}
+
+        # --- Pseudo-tool: self-setup. 'set up kicad' / 'install spotify'
+        # / 'connect notion'. Looks up the connector by id substring and
+        # calls its setup_self() — auto-discovers binaries on PATH, walks
+        # OAuth flows, etc. Connectors without setup_self() just report
+        # availability.
+        if single is not None and single.tool == "iris_setup_tool":
+            name = str((single.args or {}).get("name") or "").strip()
+            path_arg = str((single.args or {}).get("path") or "").strip()
+            connector = (self._registry.find_connector(name)
+                         if hasattr(self._registry, "find_connector") else None)
+            if connector is None:
+                sr = StepResult(step_id=0, tool=single.tool,
+                                status="not_found",
+                                output={"status": "not_found", "name": name})
+                message = (f"I don't have a connector named '{name}'. "
+                           f"Common ones I can set up: kicad. (Others come "
+                           f"pre-wired and just need auth.)")
+                self._record_turn(text, None, [single], [sr], message)
+                return {"steps": [single], "results": [sr], "message": message}
+            setup = getattr(connector, "setup_self", None)
+            if callable(setup):
+                try:
+                    result = setup(path=path_arg) if path_arg else setup()
+                except Exception as exc:
+                    if self._logger:
+                        self._logger.exception("iris_setup_tool_failed", exc)
+                    result = {"ok": False,
+                              "error": f"{type(exc).__name__}: {exc}"}
+            else:
+                # No custom setup; just check whether it's already available.
+                try:
+                    ok = bool(connector.available())
+                except Exception:
+                    ok = False
+                result = {"ok": ok,
+                          "error": ("" if ok else
+                                    f"{name} has no automated setup. "
+                                    "Likely needs OAuth from the UI.")}
+            status = "ok" if result.get("ok") else "error"
+            sr = StepResult(step_id=0, tool=single.tool,
+                            status=status,
+                            output={"status": status, "name": name, **result})
+            if status == "ok":
+                version = (str(result.get("version") or "")[:80]
+                           if result.get("version") else "")
+                where = result.get("cli_path") or result.get("path") or ""
+                message = (f"Set up — {name} ready"
+                           + (f" ({version})" if version else "")
+                           + (f" at {where}" if where else "")
+                           + ". Tools added to the next session.")
+            else:
+                message = f"Couldn't set up {name}: {result.get('error') or 'unknown error'}"
             self._record_turn(text, None, [single], [sr], message)
             return {"steps": [single], "results": [sr], "message": message}
 
