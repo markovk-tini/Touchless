@@ -3622,6 +3622,82 @@ class MemorySummaryForSessionTests(unittest.TestCase):
         self.assertLessEqual(len(note), 300)
 
 
+class OneNoteCreateAndAppendTests(unittest.TestCase):
+    """onenote_create returns page_id; onenote_append_text patches the page."""
+
+    def _make_connector(self, page_id="abc-123"):
+        from hgr.live_api.connectors.ms365_connector import Microsoft365Connector
+        class _FakeClient:
+            def all_accounts(self_): return [{"username": "u@x"}]
+            def token_for(self_, account): return "tok"
+            def token(self_): return "tok"
+
+        seen: List[tuple] = []
+        def fake_graph(self_, method, path, body=None, raw=None,
+                       content_type=None, token=None, extra_headers=None):
+            seen.append((method, path, body, raw))
+            if method == "POST" and "/me/onenote/pages" in path:
+                return ({"id": page_id,
+                         "links": {"oneNoteWebUrl": {"href": "https://x/page"}}},
+                        None)
+            if method == "PATCH" and "/me/onenote/pages" in path:
+                return ({}, None)
+            return None, "unknown"
+        conn = Microsoft365Connector(_FakeClient())  # type: ignore[arg-type]
+        conn._graph = fake_graph.__get__(conn, Microsoft365Connector)  # type: ignore[method-assign]
+        return conn, seen
+
+    def test_create_returns_page_id_and_link(self) -> None:
+        conn, seen = self._make_connector(page_id="page-xyz")
+        out = conn.execute("onenote_create",
+                           {"title": "Daily Brief", "text": "para 1\n\npara 2"})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["page_id"], "page-xyz")
+        self.assertEqual(out["link"], "https://x/page")
+        # POST body included multi-paragraph HTML.
+        post = next(c for c in seen if c[0] == "POST")
+        body = post[3].decode("utf-8")
+        self.assertIn("<p>para 1</p>", body)
+        self.assertIn("<p>para 2</p>", body)
+
+    def test_create_escapes_html_special_chars(self) -> None:
+        conn, seen = self._make_connector()
+        conn.execute("onenote_create",
+                     {"title": "Q&A <test>",
+                      "text": 'note with "quotes" and <html>'})
+        post = next(c for c in seen if c[0] == "POST")
+        body = post[3].decode("utf-8")
+        self.assertNotIn("<test>", body)  # the title's < got escaped
+        self.assertIn("&lt;test&gt;", body)
+        self.assertNotIn("<html>", body[body.index("<body>"):])
+        self.assertIn("&amp;", body)
+
+    def test_append_requires_page_id_and_text(self) -> None:
+        conn, _ = self._make_connector()
+        self.assertEqual(
+            conn.execute("onenote_append_text", {"text": "hi"})["status"],
+            "error")
+        self.assertEqual(
+            conn.execute("onenote_append_text", {"page_id": "p1"})["status"],
+            "error")
+
+    def test_append_sends_patch_with_html(self) -> None:
+        conn, seen = self._make_connector()
+        out = conn.execute("onenote_append_text",
+                           {"page_id": "page-1",
+                            "text": "Summary:\n\nThe article says X."})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["page_id"], "page-1")
+        patch = next(c for c in seen if c[0] == "PATCH")
+        self.assertIn("/me/onenote/pages/page-1/content", patch[1])
+        body = patch[2]
+        self.assertIsInstance(body, list)
+        self.assertEqual(body[0]["action"], "append")
+        self.assertEqual(body[0]["target"], "body")
+        self.assertIn("<p>Summary:</p>", body[0]["content"])
+        self.assertIn("<p>The article says X.</p>", body[0]["content"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 

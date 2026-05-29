@@ -27,6 +27,14 @@ _HTML_ENTITY_RE = re.compile(r"&(?:nbsp|amp|lt|gt|quot|apos|#\d+);")
 _WS_COLLAPSE_RE = re.compile(r"\s+")
 
 
+def _escape_html(s: str) -> str:
+    """Minimal HTML escape for OneNote body content. Replaces the four
+    characters that would break an HTML document if a user's title or
+    body contained them."""
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;") \
+                    .replace(">", "&gt;").replace('"', "&quot;")
+
+
 def _strip_html(html: str) -> str:
     """Turn an HTML email body into plain text. Not a full parser; just
     enough that the synthesizer prompt sees readable content instead of
@@ -181,8 +189,26 @@ class Microsoft365Connector(Connector):
                "List tasks from Microsoft To Do (default list).",
                {"max": {"type": "integer", "description": "Max tasks (default 20)."}}),
             fn("onenote_create",
-               "Create a OneNote page with a title and text in the default section.",
-               {"title": {"type": "string"}, "text": {"type": "string"}}, ["title"]),
+               "Create a OneNote page in the default section with `title` "
+               "and optional `text` (the body content). PREFER passing the "
+               "body via `text` in this single call when possible — that's "
+               "the 1-step path. Returns {created, title, page_id, link}; "
+               "page_id chains into onenote_append_text if you need to add "
+               "more content later. Use \\n\\n to separate paragraphs.",
+               {"title": {"type": "string"},
+                "text": {"type": "string",
+                         "description": "Body content. Plain text; use \\n\\n "
+                                        "between paragraphs."}}, ["title"]),
+            fn("onenote_append_text",
+               "Append text to an EXISTING OneNote page (e.g. one created "
+               "earlier by onenote_create). Use the page_id from "
+               "onenote_create's return, OR a page_id obtained another way. "
+               "Multi-paragraph text supported (\\n\\n between paragraphs). "
+               "Use this when you've already created a page and want to add "
+               "more content to it — e.g. 'paste the summary I just generated "
+               "into the OneNote I made'.",
+               {"page_id": {"type": "string"},
+                "text": {"type": "string"}}, ["page_id", "text"]),
             fn("contacts_search",
                "Find someone's email across ALL connected Microsoft accounts. "
                "Searches three pathways per account: (1) /me/contacts formal "
@@ -447,15 +473,44 @@ class Microsoft365Connector(Connector):
             if not title:
                 return connector_result("error", error="title is required")
             text = str(args.get("text") or "")
-            html = (f"<!DOCTYPE html><html><head><title>{title}</title></head>"
-                    f"<body><p>{text}</p></body></html>")
+            # OneNote treats double-newlines as paragraph breaks; respect
+            # them so multi-paragraph content arrives formatted.
+            body_html = "".join(
+                f"<p>{_escape_html(p)}</p>" for p in text.split("\n\n")
+            ) if text else "<p></p>"
+            html_doc = (f"<!DOCTYPE html><html><head><title>{_escape_html(title)}"
+                        f"</title></head><body>{body_html}</body></html>")
             data, err = self._graph("POST", "/me/onenote/pages",
-                                    raw=html.encode("utf-8"), content_type="text/html")
+                                    raw=html_doc.encode("utf-8"),
+                                    content_type="text/html")
             if err:
                 return connector_result("error", error=err)
             links = (data or {}).get("links", {}) or {}
-            return connector_result("ok", created=True, title=title,
-                                    link=(links.get("oneNoteWebUrl") or {}).get("href"))
+            return connector_result(
+                "ok", created=True, title=title,
+                # page_id lets the planner chain onenote_append_text on it.
+                page_id=(data or {}).get("id"),
+                link=(links.get("oneNoteWebUrl") or {}).get("href"))
+
+        if name == "onenote_append_text":
+            page_id = str(args.get("page_id") or "").strip()
+            text = str(args.get("text") or "").strip()
+            if not page_id:
+                return connector_result("error", error="page_id is required")
+            if not text:
+                return connector_result("error", error="text is required")
+            # Multi-paragraph append: each \n\n becomes a new <p>.
+            body_html = "".join(
+                f"<p>{_escape_html(p)}</p>" for p in text.split("\n\n"))
+            patch_body = [{"target": "body", "action": "append",
+                           "content": body_html}]
+            data, err = self._graph(
+                "PATCH", f"/me/onenote/pages/{page_id}/content",
+                body=patch_body)
+            if err:
+                return connector_result("error", error=err)
+            return connector_result("ok", appended=True, page_id=page_id,
+                                    chars=len(text))
 
         if name == "contacts_search":
             q = str(args.get("query") or "").strip()
