@@ -926,6 +926,11 @@ class LiveApiManager(QObject):
         # Echo the user's typed message via the same signal voice
         # transcripts use, so the chat UI doesn't need a special path.
         self.transcript_received.emit(text)
+        # Send the memory-context note ONCE per session, before ANY user
+        # turn is processed — so realtime has the user's known facts in
+        # context for either this turn or any future planner-declined
+        # turn. Fires only on first call per session (idempotent).
+        self._maybe_send_memory_summary()
 
         # ---- Layer 0: deterministic router ----
         router = self._command_router
@@ -1058,10 +1063,6 @@ class LiveApiManager(QObject):
             if ok:
                 self._request_model_response()
             return ok
-        # First realtime turn of this session: prepend a memory summary as a
-        # system note so realtime can answer 'where's my office?' / 'what
-        # should you call me?' / etc. without going through Tier 2 recall.
-        self._maybe_send_memory_summary()
         ok = bool(client.send_text_message(text))
         if ok:
             # Track for fact-extraction on response.done. Only capture turns
