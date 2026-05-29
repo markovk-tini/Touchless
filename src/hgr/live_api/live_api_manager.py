@@ -725,16 +725,25 @@ class LiveApiManager(QObject):
         answer recall questions ('where's my office?', 'what should you
         call me?') without needing Tier 2 recall.
 
-        No-ops cleanly: if memory is empty / not wired / already sent /
-        client doesn't support session notes, just skip silently."""
+        Every skip path now logs so we can audit when injection didn't
+        happen — the absence of a log was itself the bug to diagnose."""
         if self._memory_summary_sent:
-            return
+            return  # silent on this path — fires every turn after the first
         client = self._client
         if client is None or not hasattr(client, "send_session_note"):
+            if self._logger:
+                self._logger.event("memory_summary_skip_no_client",
+                                   has_client=bool(client),
+                                   has_method=(client is not None and hasattr(
+                                       client, "send_session_note")))
             return
         planner = self._iris_planner
         memory = getattr(planner, "_memory", None) if planner is not None else None
         if memory is None or not hasattr(memory, "summary_for_session"):
+            if self._logger:
+                self._logger.event("memory_summary_skip_no_memory",
+                                   has_planner=bool(planner),
+                                   has_memory=bool(memory))
             return
         try:
             note = memory.summary_for_session()
@@ -744,12 +753,16 @@ class LiveApiManager(QObject):
             return
         if not note:
             self._memory_summary_sent = True  # nothing to send, don't keep trying
+            if self._logger:
+                self._logger.event("memory_summary_skip_empty")
             return
         try:
             client.send_session_note(note)
             self._memory_summary_sent = True
             if self._logger:
-                self._logger.event("memory_summary_injected", chars=len(note))
+                self._logger.event("memory_summary_injected",
+                                   chars=len(note),
+                                   note_preview=note[:200])
         except Exception as exc:  # pragma: no cover - defensive
             if self._logger:
                 self._logger.exception("memory_summary_send_failed", exc)
