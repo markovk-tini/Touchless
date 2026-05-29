@@ -172,9 +172,14 @@ def extract_facts_from_conversation(
            .get("message", {}).get("content") or "").strip()
     facts = _parse_facts(raw)
     if logger:
+        # Include the raw response itself (capped) so we can see WHY parse
+        # returned 0 when raw_chars > 0 — usually 'model said no facts' vs
+        # 'model returned shape we don't handle'.
         logger.event("memory_llm_extract_api_returned",
-                     raw_chars=len(raw), parsed_count=len(facts),
-                     model=chosen_model)
+                     raw_chars=len(raw),
+                     parsed_count=len(facts),
+                     model=chosen_model,
+                     raw=raw[:400])
     return facts
 
 
