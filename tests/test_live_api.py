@@ -3698,6 +3698,160 @@ class OneNoteCreateAndAppendTests(unittest.TestCase):
         self.assertIn("<p>The article says X.</p>", body[0]["content"])
 
 
+class GoogleAppendTests(unittest.TestCase):
+    """Docs/Sheets/Slides — append after create, chained via {step:N.id}."""
+
+    def _make_docs(self):
+        from hgr.live_api.connectors.gdocs_connector import GoogleDocsConnector
+
+        seen: List[Dict[str, Any]] = []
+
+        class _Get:
+            def __init__(self_, doc): self_._doc = doc
+            def execute(self_): return self_._doc
+
+        class _Documents:
+            def create(self_, body):
+                seen.append({"op": "create", "body": body})
+                return _Get({"documentId": "doc-1"})
+            def batchUpdate(self_, documentId, body):
+                seen.append({"op": "batchUpdate", "documentId": documentId, "body": body})
+                return _Get({})
+
+        class _Svc:
+            def documents(self_): return _Documents()
+
+        class _Client:
+            def ready(self_): return True
+            def service(self_, *a, **k): return _Svc()
+
+        return GoogleDocsConnector(_Client()), seen
+
+    def test_gdocs_create_returns_id_for_chaining(self) -> None:
+        conn, _ = self._make_docs()
+        out = conn.execute("gdocs_create", {"title": "X", "text": "init"})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["id"], "doc-1")
+        self.assertIn("link", out)
+
+    def test_gdocs_append_text_uses_end_of_segment(self) -> None:
+        conn, seen = self._make_docs()
+        out = conn.execute("gdocs_append_text",
+                           {"doc_id": "doc-1", "text": "appended"})
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["id"], "doc-1")
+        # The PATCH request used endOfSegmentLocation, not index=1.
+        update = next(s for s in seen if s["op"] == "batchUpdate")
+        req = update["body"]["requests"][0]
+        self.assertIn("endOfSegmentLocation", req["insertText"])
+        self.assertEqual(req["insertText"]["text"], "appended")
+
+    def test_gdocs_append_rejects_missing_args(self) -> None:
+        conn, _ = self._make_docs()
+        self.assertEqual(
+            conn.execute("gdocs_append_text", {"text": "hi"})["status"], "error")
+        self.assertEqual(
+            conn.execute("gdocs_append_text", {"doc_id": "d"})["status"], "error")
+
+    def _make_sheets(self):
+        from hgr.live_api.connectors.sheets_connector import GoogleSheetsConnector
+        seen: List[Dict[str, Any]] = []
+
+        class _Get:
+            def __init__(self_, doc): self_._doc = doc
+            def execute(self_): return self_._doc
+
+        class _Values:
+            def update(self_, **kw):
+                seen.append({"op": "update", **kw})
+                return _Get({})
+            def append(self_, **kw):
+                seen.append({"op": "append", **kw})
+                return _Get({"updates": {"updatedRows": 3,
+                                          "updatedRange": "Sheet1!A2:C4"}})
+
+        class _Spreadsheets:
+            def create(self_, body, fields):
+                seen.append({"op": "create", "body": body, "fields": fields})
+                return _Get({"spreadsheetId": "ss-1",
+                             "spreadsheetUrl": "https://x/ss-1"})
+            def values(self_): return _Values()
+
+        class _Svc:
+            def spreadsheets(self_): return _Spreadsheets()
+
+        class _Client:
+            def ready(self_): return True
+            def service(self_, *a, **k): return _Svc()
+
+        return GoogleSheetsConnector(_Client()), seen
+
+    def test_sheets_append_rows_at_correct_range(self) -> None:
+        conn, seen = self._make_sheets()
+        out = conn.execute("sheets_append_rows", {
+            "spreadsheet_id": "ss-1",
+            "rows": [["a", "b"], ["c", "d"]],
+        })
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["rows_added"], 3)
+        append = next(s for s in seen if s["op"] == "append")
+        self.assertEqual(append["spreadsheetId"], "ss-1")
+        self.assertEqual(append["range"], "A1")
+        self.assertEqual(append["insertDataOption"], "INSERT_ROWS")
+
+    def test_sheets_append_rows_with_named_sheet(self) -> None:
+        conn, seen = self._make_sheets()
+        conn.execute("sheets_append_rows", {
+            "spreadsheet_id": "ss-1",
+            "rows": [["x"]],
+            "sheet": "Q3 Data",
+        })
+        append = next(s for s in seen if s["op"] == "append")
+        self.assertEqual(append["range"], "Q3 Data!A1")
+
+    def _make_slides(self):
+        from hgr.live_api.connectors.slides_connector import GoogleSlidesConnector
+        seen: List[Dict[str, Any]] = []
+
+        class _Get:
+            def __init__(self_, doc): self_._doc = doc
+            def execute(self_): return self_._doc
+
+        class _Presentations:
+            def create(self_, body):
+                seen.append({"op": "create", "body": body})
+                return _Get({"presentationId": "pres-1"})
+            def batchUpdate(self_, presentationId, body):
+                seen.append({"op": "batchUpdate",
+                             "presentationId": presentationId, "body": body})
+                return _Get({})
+
+        class _Svc:
+            def presentations(self_): return _Presentations()
+
+        class _Client:
+            def ready(self_): return True
+            def service(self_, *a, **k): return _Svc()
+
+        return GoogleSlidesConnector(_Client()), seen
+
+    def test_slides_add_slide_with_title_and_body(self) -> None:
+        conn, seen = self._make_slides()
+        out = conn.execute("slides_add_slide", {
+            "presentation_id": "pres-1",
+            "title": "Q3 Summary",
+            "body": "Bullet 1\nBullet 2",
+        })
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["id"], "pres-1")
+        self.assertTrue(out["slide_id"].startswith("slide_"))
+        # batchUpdate had createSlide + two insertText requests.
+        update = next(s for s in seen if s["op"] == "batchUpdate")
+        reqs = update["body"]["requests"]
+        ops = [list(r.keys())[0] for r in reqs]
+        self.assertEqual(ops, ["createSlide", "insertText", "insertText"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
