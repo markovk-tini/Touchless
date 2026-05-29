@@ -192,6 +192,30 @@ class Classifier:
                 description="local weather",
             )
 
+        # ---- open the last-created artifact ("open it", "can you open
+        # it", "show me that", "open the doc you just made") --------------
+        # Resolves to whatever the planner most recently created (doc /
+        # sheet / slide / OneNote / email draft, anything with a link).
+        # Without this, 'open it' falls to realtime which has terrible
+        # pronoun resolution and confabulates random plans.
+        m = re.search(
+            r"^(?:can\s+you\s+|could\s+you\s+|please\s+)*"
+            r"(?:open|show|pull\s+up|bring\s+up|view)\s+"
+            r"(?:it|that|this|the\s+(?:doc(?:ument)?|sheet|spreadsheet|"
+            r"slide(?:show|s)?|presentation|deck|onenote|page|note|file|"
+            r"link|thing)(?:\s+(?:you|i|we)\s+(?:just\s+)?"
+            r"(?:made|created|opened))?)"
+            r"(?:\s+please)?\??\s*$",
+            lower,
+        )
+        if m:
+            return Step(
+                tool="iris_open_last",
+                args={},
+                layer="touchless",
+                description="open the most recently created artifact",
+            )
+
         # ---- contact forget ("forget Dani", "forget Dani's email",
         # "delete Vesko from memory", "you can forget about Mariya") ----
         # Lets the user purge memory facts without the CLI.

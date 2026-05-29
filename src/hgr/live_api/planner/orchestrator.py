@@ -27,6 +27,27 @@ from .synthesizer import Synthesizer, configured as synth_configured
 from .triggers import looks_multi_action, plan_needs_confirm
 
 
+_ARTIFACT_KIND_BY_TOOL = {
+    "gdocs_create": "doc",
+    "gdocs_append_text": "doc",
+    "sheets_create": "sheet",
+    "sheets_append_rows": "sheet",
+    "slides_create": "slideshow",
+    "slides_add_slide": "slideshow",
+    "onenote_create": "OneNote page",
+    "onenote_append_text": "OneNote page",
+    "drive_upload": "file",
+    "onedrive_upload": "file",
+    "excel_create": "Excel workbook",
+}
+
+
+def _artifact_kind_from_tool(tool: str) -> str:
+    """Friendly name for the 'kind' of thing a tool created — used in the
+    'Opening the doc \"X\"' reply when the user says 'open it'."""
+    return _ARTIFACT_KIND_BY_TOOL.get(tool, "page")
+
+
 class IrisPlanner:
     """Public entrypoint for the planner. The manager calls `try_handle(text)`
     after Layer 0 (command_router) declines and BEFORE handing the request to
@@ -47,6 +68,10 @@ class IrisPlanner:
         # manager wires a real MemoryManager when available; tests can
         # leave it unset to keep them offline.
         self._memory = memory
+        # Tracks the most recent artifact created in this session so
+        # 'open it' / 'show me that' (Tier 1 iris_open_last) can resolve
+        # without realtime's bad pronoun resolution. {kind, title, link}.
+        self._last_artifact: Optional[Dict[str, Any]] = None
         # Skills catalog (Tier 0.5: user-saved Plans replayed without an
         # LLM call). Lazily opened; failures just disable the tier.
         try:
@@ -119,7 +144,8 @@ class IrisPlanner:
         # rare, and they answer cheaper than Tier 2 ever could.
         single = self._classifier.classify(text)
         _BYPASS_MULTI = {"iris_lookup_contact", "iris_set_preference",
-                         "iris_remember_contact", "iris_forget_contact"}
+                         "iris_remember_contact", "iris_forget_contact",
+                         "iris_open_last"}
         if multi and single is not None and single.tool not in _BYPASS_MULTI:
             single = None
 
@@ -173,6 +199,45 @@ class IrisPlanner:
             else:
                 message = (f"I didn't have anything stored for {name}, "
                            f"so nothing to forget.")
+            self._record_turn(text, None, [single], [sr], message)
+            return {"steps": [single], "results": [sr], "message": message}
+
+        # --- Pseudo-tool: open the last-created artifact ('open it',
+        # 'show me that', etc.). Resolves to whatever artifact (doc /
+        # sheet / slide / OneNote / etc.) the planner most recently
+        # produced in this session. Without this, 'open it' falls to
+        # realtime which confabulates random plans.
+        if single is not None and single.tool == "iris_open_last":
+            last = self._last_artifact
+            if not last or not last.get("link"):
+                sr = StepResult(step_id=0, tool=single.tool,
+                                status="not_found",
+                                output={"status": "not_found"})
+                message = ("I don't have anything recent to open yet. "
+                           "Make a doc, sheet, slide, OneNote page, etc., "
+                           "and I'll be able to open it.")
+                self._record_turn(text, None, [single], [sr], message)
+                return {"steps": [single], "results": [sr], "message": message}
+            link = str(last.get("link") or "")
+            title = str(last.get("title") or "the last one")
+            # Use the iris open_url tool to launch it in the browser.
+            try:
+                out = self._registry.call("open_url", {"url": link})
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception("iris_open_last_failed", exc)
+                out = {"status": "error",
+                       "error": f"{type(exc).__name__}: {exc}"}
+            status = str((out or {}).get("status") or "ok")
+            sr = StepResult(step_id=0, tool=single.tool,
+                            status=status,
+                            output={"link": link, "title": title,
+                                    "status": status,
+                                    "kind": last.get("kind")})
+            kind = last.get("kind") or "page"
+            message = (f"Opening the {kind} \"{title}\"."
+                       if status == "ok"
+                       else f"Couldn't open it: {out.get('error') if out else 'error'}")
             self._record_turn(text, None, [single], [sr], message)
             return {"steps": [single], "results": [sr], "message": message}
 
@@ -417,8 +482,25 @@ class IrisPlanner:
 
     def _record_turn(self, user_text: str, plan: Any,
                      steps: list, results: list, message: str) -> None:
-        """Persist this turn into memory. Best-effort; failures never
-        bubble up to the user."""
+        """Persist this turn into memory + update the 'last artifact'
+        pointer so 'open it' / 'show me that' work. Best-effort;
+        failures never bubble up to the user."""
+        # Walk results for any link — the LAST one wins (the planner
+        # tends to create-then-fill, so the final artifact is the one
+        # the user means).
+        for sr in results or []:
+            out = getattr(sr, "output", None)
+            if not isinstance(out, dict):
+                continue
+            link = out.get("link")
+            if not link:
+                continue
+            tool = getattr(sr, "tool", "") or ""
+            kind = _artifact_kind_from_tool(tool)
+            title = out.get("title") or out.get("name") or kind
+            self._last_artifact = {
+                "kind": kind, "title": title, "link": link, "tool": tool,
+            }
         if self._memory is None:
             return
         try:

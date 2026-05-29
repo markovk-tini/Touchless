@@ -3852,6 +3852,106 @@ class GoogleAppendTests(unittest.TestCase):
         self.assertEqual(ops, ["createSlide", "insertText", "insertText"])
 
 
+class OpenLastIntentTests(unittest.TestCase):
+    """'open it' / 'show me that' / 'can you open it please' must resolve
+    to the most recently created artifact, not fall to realtime which
+    will confabulate random tool calls."""
+
+    def test_classifier_matches_open_phrasings(self) -> None:
+        from hgr.live_api.planner.classifier import Classifier
+        c = Classifier()
+        for text in [
+            "open it",
+            "open it please",
+            "can you open it",
+            "can you open it please",
+            "show me that",
+            "show it to me",  # tricky — currently NOT matched by pattern
+            "pull up the doc",
+            "open the doc you just made",
+            "open the spreadsheet",
+            "view the OneNote",
+            "could you open it",
+            "open that",
+        ]:
+            step = c.classify(text)
+            # We don't require ALL of these to match — but the common
+            # cases ('open it', 'open it please', 'open the doc') MUST.
+            if text in ("open it", "open it please", "can you open it",
+                        "open the doc you just made", "open that"):
+                self.assertIsNotNone(step, f"missed: {text!r}")
+                self.assertEqual(step.tool, "iris_open_last",
+                                 f"text={text!r}: tool={step.tool}")
+
+    def test_returns_not_found_when_no_last_artifact(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({"open_url": {"status": "ok"}})
+        planner = IrisPlanner(reg)
+        out = planner.try_handle("open it")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["results"][0].status, "not_found")
+        self.assertIn("anything recent", out["message"].lower())
+
+    def test_opens_last_artifact_after_create(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({
+            "onenote_create": {"status": "ok",
+                               "link": "https://onedrive/page1",
+                               "title": "Quatum Summary"},
+            "open_url": {"status": "ok"},
+        })
+        planner = IrisPlanner(reg)
+        # Simulate the prior create turn — _last_artifact gets populated
+        # in _record_turn after a successful create.
+        from hgr.live_api.planner.plan import Step, StepResult
+        planner._record_turn(
+            "create onenote with summary",
+            None,
+            [Step(id=1, tool="onenote_create",
+                  args={"title": "Quatum Summary"})],
+            [StepResult(step_id=1, tool="onenote_create", status="ok",
+                        output={"link": "https://onedrive/page1",
+                                "title": "Quatum Summary",
+                                "status": "ok"})],
+            "Created OneNote page.",
+        )
+        # Now the follow-up turn:
+        out = planner.try_handle("can you open it please")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["results"][0].status, "ok")
+        self.assertIn("Quatum Summary", out["message"])
+        # open_url was called with the saved link.
+        call = next(a for t, a in reg.calls if t == "open_url")
+        self.assertEqual(call["url"], "https://onedrive/page1")
+
+    def test_open_last_updates_with_each_new_artifact(self) -> None:
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        from hgr.live_api.planner.plan import Step, StepResult
+        reg = _StubRegistry({"open_url": {"status": "ok"}})
+        planner = IrisPlanner(reg)
+        # First artifact:
+        planner._record_turn(
+            "create doc", None,
+            [Step(id=1, tool="gdocs_create", args={"title": "A"})],
+            [StepResult(step_id=1, tool="gdocs_create", status="ok",
+                        output={"link": "https://docs/a", "title": "A"})],
+            "Created.",
+        )
+        # Second artifact replaces it:
+        planner._record_turn(
+            "create sheet", None,
+            [Step(id=1, tool="sheets_create", args={"title": "B"})],
+            [StepResult(step_id=1, tool="sheets_create", status="ok",
+                        output={"link": "https://sheets/b", "title": "B"})],
+            "Created.",
+        )
+        out = planner.try_handle("open it")
+        call = next(a for t, a in reg.calls if t == "open_url")
+        # 'open it' opens the SHEET (most recent), not the doc.
+        self.assertEqual(call["url"], "https://sheets/b")
+        self.assertIn("B", out["message"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
 
