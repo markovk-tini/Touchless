@@ -133,6 +133,14 @@ class LiveAssistantWindow(QWidget):
         _qpal.setColor(QPalette.WindowText, _text)
         self.setPalette(_qpal)
         self.setAutoFillBackground(True)
+        # Belt-and-suspenders: even with palette + early title bar styling,
+        # Qt's very first paint cycle on Windows still briefly shows the
+        # default chrome+white client area before our styles land. Hide the
+        # window completely during that frame by starting opacity=0;
+        # show_window() flips it back to 1.0 on the next event-loop tick
+        # AFTER show() has fully painted, so the user only ever sees the
+        # already-styled window appear.
+        self.setWindowOpacity(0.0)
 
         self._manager = LiveApiManager(text_only=True)
         self._current_assistant_label: Optional[QLabel] = None
@@ -155,6 +163,11 @@ class LiveAssistantWindow(QWidget):
         # True between _on_send and the first response signal: blocks the
         # delayed _show_typing if a reply arrived inside the 250ms window.
         self._typing_pending: bool = False
+        # Current LiveApiState (mirrored from _on_state_changed). Used by
+        # _reshow_typing_if_busy to decide whether to bring the dots back
+        # between intermediate outputs (THINKING/EXECUTING = still
+        # working; LISTENING = task done, stay hidden).
+        self._current_state: Optional[LiveApiState] = None
 
         self._build_ui()
         self._wire_manager()
@@ -343,6 +356,8 @@ class LiveAssistantWindow(QWidget):
     # ---- manager signal handlers (GUI thread) ----
 
     def _on_state_changed(self, state: LiveApiState, status: str) -> None:
+        prev = self._current_state
+        self._current_state = state
         self._set_state_pill(state, status)
         ready = state in (LiveApiState.LISTENING, LiveApiState.THINKING, LiveApiState.EXECUTING)
         self._input.setEnabled(ready)
@@ -351,6 +366,21 @@ class LiveAssistantWindow(QWidget):
         self._start_btn.setText("Stop" if running else "Start")
         if ready and self._input.isEnabled():
             self._input.setFocus()
+        # Task is fully done — clear any lingering dots. Catches the case
+        # where a Tier-2 plan finished its last step but the post-output
+        # _reshow_typing_if_busy timer fires AFTER the state transitioned.
+        if state == LiveApiState.LISTENING and prev in (
+                LiveApiState.THINKING, LiveApiState.EXECUTING):
+            self._hide_typing()
+
+    _BUSY_STATES = (LiveApiState.THINKING, LiveApiState.EXECUTING)
+
+    def _reshow_typing_if_busy(self) -> None:
+        """After an intermediate output (tool pill, text delta), bring the
+        dots back so the user sees iris is still working. No-op if the
+        task has reached a terminal state."""
+        if self._current_state in self._BUSY_STATES:
+            self._show_typing()
 
     def _on_transcript(self, text: str) -> None:
         self._current_assistant_label = None
@@ -364,9 +394,13 @@ class LiveAssistantWindow(QWidget):
 
     def _on_assistant_break(self) -> None:
         # Close the current bubble so the next reply starts a fresh one
-        # (separate messages instead of one growing text box).
+        # (separate messages instead of one growing text box). Then bring
+        # the dots back if iris is still working — user expects to see
+        # "still typing" between each visible output until the WHOLE task
+        # is done (state -> LISTENING).
         self._current_assistant_label = None
         self._scroll_to_bottom()
+        QTimer.singleShot(200, self._reshow_typing_if_busy)
 
     # Which layer ran a command — shown as a badge on each tool pill so the
     # user can see Touchless (free local), Connector (fast API), or iris
@@ -378,10 +412,13 @@ class LiveAssistantWindow(QWidget):
     }
 
     def _on_tool_event(self, kind: str, info: dict) -> None:
-        # First tool event of a turn = response is now in flight; drop the
-        # typing dots so the tool pill takes their slot in the transcript.
+        # Each tool event = a visible output; drop the typing dots so the
+        # pill takes their slot, then schedule a re-show so the dots come
+        # back BETWEEN steps until the whole task settles to LISTENING.
         if kind == "called":
             self._hide_typing()
+        if kind == "completed":
+            QTimer.singleShot(200, self._reshow_typing_if_busy)
         name = str(info.get("name", "") or "")
         call_id = str(info.get("call_id", "") or name)
         source = str(info.get("source", "") or "")
@@ -564,8 +601,8 @@ class LiveAssistantWindow(QWidget):
     _TYPING_TICK_MS = 55
     _TYPING_PERIOD = 20
     _TYPING_DOT_COUNT = 3
-    _TYPING_BUBBLE_W = 64
-    _TYPING_BUBBLE_H = 30
+    _TYPING_BUBBLE_W = 78
+    _TYPING_BUBBLE_H = 34
 
     def _maybe_show_typing(self) -> None:
         """Called by the 250ms QTimer after _on_send. Only actually shows
@@ -587,22 +624,24 @@ class LiveAssistantWindow(QWidget):
         bubble.setFixedSize(self._TYPING_BUBBLE_W, self._TYPING_BUBBLE_H)
         bubble.setStyleSheet("background:#1E293B; border-radius:12px;")
         bh = QHBoxLayout(bubble)
-        bh.setContentsMargins(12, 0, 12, 0)
-        bh.setSpacing(5)
+        bh.setContentsMargins(14, 0, 14, 0)
+        bh.setSpacing(7)
         bh.setAlignment(Qt.AlignCenter)
         dots: list = []
         effects: list = []
         for _ in range(self._TYPING_DOT_COUNT):
             dot = QLabel("●")
+            # Blue (#58E3FF, same as the CONNECTOR pill accent) so
+            # the dots read as Iris/AI-activity, not generic UI chrome.
             dot.setStyleSheet(
-                f"color:{pal['text']}; font-size:9px; "
+                "color:#58E3FF; font-size:14px; "
                 "background:transparent;"
             )
             dot.setAlignment(Qt.AlignCenter)
-            dot.setFixedSize(8, self._TYPING_BUBBLE_H)
+            dot.setFixedSize(14, self._TYPING_BUBBLE_H)
             # Per-dot opacity effect so each dot fades independently.
             effect = QGraphicsOpacityEffect(dot)
-            effect.setOpacity(0.3)
+            effect.setOpacity(0.15)
             dot.setGraphicsEffect(effect)
             bh.addWidget(dot)
             dots.append(dot)
@@ -626,14 +665,32 @@ class LiveAssistantWindow(QWidget):
         self._tick_typing()  # paint frame 0 immediately
 
     def _tick_typing(self) -> None:
-        if self._typing_label is None:
+        if not self._typing_dot_effects:
             return
-        self._typing_step = (self._typing_step + 1) % 3
-        # Cycle through ·  · ·  · · · so the row looks like dots filling in.
-        dots = "·" + (" ·" * self._typing_step)
-        self._typing_label.setText(dots)
+        period = self._TYPING_PERIOD
+        # Each dot is offset by 1/3 of the period so they appear to
+        # bounce left-to-right in a wave (iMessage-style).
+        stagger = period // self._TYPING_DOT_COUNT
+        t = self._typing_step
+        for i, effect in enumerate(self._typing_dot_effects):
+            phase = (2 * math.pi * ((t - i * stagger) % period)) / period
+            # Smooth 0..1 sine wave, shifted so each dot starts dim.
+            wave = 0.5 + 0.5 * math.sin(phase - math.pi / 2)
+            # Fade: 0.12 (almost gone) -> 1.0 (solid) - more
+            # dramatic so the wave reads clearly at small size.
+            effect.setOpacity(0.12 + 0.88 * wave)
+            # Bounce: negative top margin lifts the dot UP within the
+            # fixed-height container. Max lift is 5px (slightly more
+            # than before, to match the larger dots).
+            dot = self._typing_dot_widgets[i]
+            offset = int(round(-5 * wave))
+            dot.setContentsMargins(0, offset, 0, -offset)
+        self._typing_step = (self._typing_step + 1) % period
 
     def _hide_typing(self) -> None:
+        # Cancel a pending delayed show - reply arrived inside the
+        # 250ms window before _maybe_show_typing could fire.
+        self._typing_pending = False
         if self._typing_timer is not None:
             self._typing_timer.stop()
             self._typing_timer.deleteLater()
@@ -642,7 +699,8 @@ class LiveAssistantWindow(QWidget):
             self._transcript.removeWidget(self._typing_row)
             self._typing_row.deleteLater()
             self._typing_row = None
-        self._typing_label = None
+        self._typing_dot_widgets = []
+        self._typing_dot_effects = []
         self._typing_step = 0
 
     def _add_bubble(self, text: str, *, role: str) -> QLabel:
@@ -720,9 +778,16 @@ class LiveAssistantWindow(QWidget):
             apply_touchless_titlebar(self)
         except Exception:
             pass
+        # Window was created with opacity=0 in __init__ to swallow Qt's
+        # default first-paint frame (white client + native chrome). show()
+        # now triggers that frame invisibly, then we restore opacity to 1.0
+        # on the next event-loop tick — by which point the title bar is
+        # already indigo and the client is already the surface color, so
+        # the user only ever sees the fully-styled window.
         self.show()
         self.raise_()
         self.activateWindow()
+        QTimer.singleShot(0, lambda: self.setWindowOpacity(1.0))
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt override)
         super().showEvent(event)

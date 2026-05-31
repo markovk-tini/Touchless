@@ -266,6 +266,13 @@ class TouchlessSplash(QWidget):
         #      doesn't flash. The per-letter content starts at 0 opacity,
         #      so revealing shows nothing until the animation begins.
         splash.move(-10000, -10000)
+        # winId() forces native HWND allocation BEFORE show() so the
+        # subsequent setWindowOpacity(0.0) actually takes effect — without a
+        # real HWND, setWindowOpacity is silently a no-op on Windows, and
+        # the first mapped frame still flashes at full opacity. With the
+        # HWND created up-front, the window is invisible from frame zero
+        # and the off-screen move is just belt-and-suspenders.
+        splash.winId()
         splash.setWindowOpacity(0.0)
         splash.show()
         splash.raise_()
