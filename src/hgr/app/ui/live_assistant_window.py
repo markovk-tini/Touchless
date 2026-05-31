@@ -26,10 +26,13 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
+import math
+
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QCursor
+from PySide6.QtGui import QColor, QCursor, QPalette
 from PySide6.QtWidgets import (
     QFrame,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -111,7 +114,25 @@ class LiveAssistantWindow(QWidget):
 
         self.setWindowTitle("Touchless · Iris")
         self.setMinimumSize(520, 640)
+        # Explicit initial size — setMinimumSize alone leaves the window at
+        # Qt's default ~200x100 px until show() asks for layout, which is
+        # what was flashing as a 'tiny window' before the layout settled.
+        self.resize(520, 720)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
+        # Set the surface color via PALETTE (not just stylesheet) so Qt's
+        # very first paint — which happens BEFORE stylesheets are processed —
+        # already shows the dark Touchless background. Without this, the
+        # window briefly flashes white between Windows drawing the chrome
+        # and Qt processing setStyleSheet on the first paint cycle. Also
+        # opt out of any system background so Qt strictly uses our palette.
+        _surface = QColor(self._palette["surface"])
+        _text = QColor(self._palette["text"])
+        _qpal = QPalette()
+        _qpal.setColor(QPalette.Window, _surface)
+        _qpal.setColor(QPalette.Base, _surface)
+        _qpal.setColor(QPalette.WindowText, _text)
+        self.setPalette(_qpal)
+        self.setAutoFillBackground(True)
 
         self._manager = LiveApiManager(text_only=True)
         self._current_assistant_label: Optional[QLabel] = None
@@ -119,14 +140,21 @@ class LiveAssistantWindow(QWidget):
         self._tool_pills: dict = {}
         # Lazily-created Cortex visualization window (opens on header click).
         self._cortex_window: Optional[QWidget] = None
-        # Typing-dots indicator state: shown after the user sends a prompt,
-        # cleared on the first response signal (assistant delta / tool
-        # event / error). Without it the window APPEARS to freeze while
-        # the planner / executor / realtime thinks.
-        self._typing_label: Optional[QLabel] = None
+        # Typing-dots indicator state: shown ~250ms after the user sends
+        # a prompt, cleared on the first response signal (assistant delta
+        # / tool event / error). Without it the window APPEARS to freeze
+        # while the planner / executor / realtime thinks. The 250ms delay
+        # means quick replies (Layer-0 router / cached classifier hits)
+        # never flash the indicator at all.
         self._typing_row: Optional[QWidget] = None
         self._typing_timer: Optional[QTimer] = None
         self._typing_step: int = 0
+        # Per-dot widgets + opacity effects, populated by _show_typing.
+        self._typing_dot_widgets: list = []
+        self._typing_dot_effects: list = []
+        # True between _on_send and the first response signal: blocks the
+        # delayed _show_typing if a reply arrived inside the 250ms window.
+        self._typing_pending: bool = False
 
         self._build_ui()
         self._wire_manager()
@@ -305,10 +333,12 @@ class LiveAssistantWindow(QWidget):
         if not self._manager.send_user_text(text):
             self._add_system_bubble("Not ready — start the session and wait for \"Ready\".")
             return
-        # Show a typing indicator so the window doesn't look frozen while
-        # Tier-2 plans / connectors execute / realtime thinks. Cleared on
-        # the first response signal (tool event, assistant delta, or error).
-        self._show_typing()
+        # Show a typing indicator AFTER a short delay so the window
+        # doesn't look frozen while Tier-2 plans / connectors execute /
+        # realtime thinks. The delay (~250ms) means quick replies
+        # (Layer-0 router / classifier hits) never flash the dots.
+        self._typing_pending = True
+        QTimer.singleShot(250, self._maybe_show_typing)
 
     # ---- manager signal handlers (GUI thread) ----
 
@@ -529,35 +559,71 @@ class LiveAssistantWindow(QWidget):
 
     # ---- typing-dots indicator ----
 
+    # Animation parameters. TICK_MS * PERIOD = ~1.1s per full cycle —
+    # fast enough to read as active, slow enough for the bounce to land.
+    _TYPING_TICK_MS = 55
+    _TYPING_PERIOD = 20
+    _TYPING_DOT_COUNT = 3
+    _TYPING_BUBBLE_W = 64
+    _TYPING_BUBBLE_H = 30
+
+    def _maybe_show_typing(self) -> None:
+        """Called by the 250ms QTimer after _on_send. Only actually shows
+        the dots if a response hasn't already arrived (in which case
+        _typing_pending was cleared by _hide_typing)."""
+        if self._typing_pending:
+            self._show_typing()
+
     def _show_typing(self) -> None:
-        """Insert an assistant-style 'typing' bubble with animated dots.
-        Idempotent — if already showing, just keeps animating."""
-        if self._typing_label is not None:
+        """Insert an assistant-style typing bubble with three bouncing /
+        fading dots. Idempotent — if already showing, returns early."""
+        if self._typing_row is not None:
             return
+        self._typing_pending = False
         pal = self._palette
-        label = QLabel("·")
-        label.setStyleSheet(
-            f"background:#1E293B; color:{pal['text']}88; "
-            "border-radius:12px; padding:9px 14px; "
-            "font-size:18px; font-weight:700; letter-spacing:3px;"
-        )
-        label.setMaximumWidth(80)
-        # Build the row ourselves so we can pull JUST this row out of the
-        # transcript later (the helpers in _insert_row don't track rows).
+        # Bubble: same dark slate as assistant bubbles, FIXED size so it
+        # doesn't reflow as the dots bounce and pulse inside it.
+        bubble = QWidget()
+        bubble.setFixedSize(self._TYPING_BUBBLE_W, self._TYPING_BUBBLE_H)
+        bubble.setStyleSheet("background:#1E293B; border-radius:12px;")
+        bh = QHBoxLayout(bubble)
+        bh.setContentsMargins(12, 0, 12, 0)
+        bh.setSpacing(5)
+        bh.setAlignment(Qt.AlignCenter)
+        dots: list = []
+        effects: list = []
+        for _ in range(self._TYPING_DOT_COUNT):
+            dot = QLabel("●")
+            dot.setStyleSheet(
+                f"color:{pal['text']}; font-size:9px; "
+                "background:transparent;"
+            )
+            dot.setAlignment(Qt.AlignCenter)
+            dot.setFixedSize(8, self._TYPING_BUBBLE_H)
+            # Per-dot opacity effect so each dot fades independently.
+            effect = QGraphicsOpacityEffect(dot)
+            effect.setOpacity(0.3)
+            dot.setGraphicsEffect(effect)
+            bh.addWidget(dot)
+            dots.append(dot)
+            effects.append(effect)
+        # Wrap in a row so the bubble hugs the LEFT of the transcript.
         row = QWidget()
-        h = QHBoxLayout(row)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.addWidget(label)
-        h.addStretch(1)
+        rh = QHBoxLayout(row)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.addWidget(bubble)
+        rh.addStretch(1)
         self._transcript.insertWidget(self._transcript.count() - 1, row)
         self._scroll_to_bottom()
-        self._typing_label = label
         self._typing_row = row
+        self._typing_dot_widgets = dots
+        self._typing_dot_effects = effects
         self._typing_step = 0
         self._typing_timer = QTimer(self)
-        self._typing_timer.setInterval(380)
+        self._typing_timer.setInterval(self._TYPING_TICK_MS)
         self._typing_timer.timeout.connect(self._tick_typing)
         self._typing_timer.start()
+        self._tick_typing()  # paint frame 0 immediately
 
     def _tick_typing(self) -> None:
         if self._typing_label is None:
