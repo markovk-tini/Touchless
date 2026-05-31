@@ -3922,7 +3922,8 @@ class OpenLastIntentTests(unittest.TestCase):
         self.assertIn("Quatum Summary", out["message"])
         # open_url was called with the saved link.
         call = next(a for t, a in reg.calls if t == "open_url")
-        self.assertEqual(call["url"], "https://onedrive/page1")
+        self.assertEqual(call.get("url_or_query") or call.get("url"),
+                         "https://onedrive/page1")
 
     def test_open_last_updates_with_each_new_artifact(self) -> None:
         from hgr.live_api.planner.orchestrator import IrisPlanner
@@ -3948,7 +3949,8 @@ class OpenLastIntentTests(unittest.TestCase):
         out = planner.try_handle("open it")
         call = next(a for t, a in reg.calls if t == "open_url")
         # 'open it' opens the SHEET (most recent), not the doc.
-        self.assertEqual(call["url"], "https://sheets/b")
+        self.assertEqual(call.get("url_or_query") or call.get("url"),
+                         "https://sheets/b")
         self.assertIn("B", out["message"])
 
 

@@ -21,6 +21,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .base import Connector, connector_result
+from ...utils.subprocess_utils import hidden_subprocess_kwargs, launch_external
 
 
 # Phone Link's AppX package name. Microsoft renamed it twice; we check
@@ -325,13 +326,16 @@ class PhoneLinkConnector(Connector):
 # ---- module-level helpers (no UIA needed) ---------------------------------
 def _find_phone_link_appx() -> Optional[str]:
     """Returns the AppX package name if Phone Link is installed, else None.
-    Uses PowerShell which is universally available on Win10+."""
+    Uses PowerShell which is universally available on Win10+.
+    hidden_subprocess_kwargs suppresses the PowerShell console-window
+    flash in PyInstaller --windowed builds."""
     try:
         for candidate in _APPX_NAMES:
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  f"(Get-AppxPackage -Name {candidate} | Select-Object -First 1).Name"],
                 capture_output=True, text=True, timeout=8,
+                **hidden_subprocess_kwargs(),
             )
             out = (r.stdout or "").strip()
             if out and out.lower() == candidate.lower():
@@ -348,6 +352,7 @@ def _appx_version(appx_name: str) -> str:
             ["powershell", "-NoProfile", "-Command",
              f"(Get-AppxPackage -Name {appx_name}).Version"],
             capture_output=True, text=True, timeout=6,
+            **hidden_subprocess_kwargs(),
         )
         return (r.stdout or "").strip()
     except Exception:
@@ -355,16 +360,13 @@ def _appx_version(appx_name: str) -> str:
 
 
 def _launch_phone_link() -> bool:
-    """Launch (or focus) Phone Link via its URI scheme."""
+    """Launch (or focus) Phone Link via its URI scheme. Uses
+    ShellExecuteW (via launch_external) so the OS resolves the URI the
+    same way Explorer does — no cmd.exe / no flash / no AV alerts on
+    PyInstaller builds."""
     for uri in _LAUNCH_URIS:
         try:
-            # `start` via cmd handles URI schemes reliably without spawning
-            # a separate cmd window.
-            r = subprocess.run(
-                ["cmd", "/c", "start", "", uri],
-                capture_output=True, timeout=4,
-            )
-            if r.returncode == 0:
+            if launch_external(uri):
                 return True
         except Exception:
             continue

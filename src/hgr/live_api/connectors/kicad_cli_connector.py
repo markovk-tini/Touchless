@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .base import Connector, connector_result
+from ...utils.subprocess_utils import hidden_subprocess_kwargs
 
 
 # Common locations checked when kicad-cli isn't on PATH. We probe the
@@ -113,10 +114,13 @@ class KiCadCliConnector(Connector):
                           "path: 'set up kicad at C:\\path\\to\\kicad-cli.exe'."),
             }
         self._cli_path = found
-        # Quick version probe to confirm it actually runs.
+        # Quick version probe to confirm it actually runs. hidden_subprocess_
+        # kwargs suppresses the console-window flash on Windows --windowed
+        # builds (kicad-cli is a console-mode binary).
         try:
             r = subprocess.run([found, "version"], capture_output=True,
-                               text=True, timeout=5)
+                               text=True, timeout=5,
+                               **hidden_subprocess_kwargs())
             version = (r.stdout or "").strip().splitlines()[0] if r.stdout else ""
         except Exception:
             version = ""
@@ -264,9 +268,12 @@ def _abs(p: Any) -> str:
 
 
 def _run(cmd: List[str], **extra) -> Dict[str, Any]:
-    """Run kicad-cli, capture stdout/stderr, return a structured result."""
+    """Run kicad-cli, capture stdout/stderr, return a structured result.
+    hidden_subprocess_kwargs keeps the console flash from appearing on
+    Windows --windowed builds."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120,
+                           **hidden_subprocess_kwargs())
     except subprocess.TimeoutExpired:
         return connector_result("error", error="kicad-cli timed out (>120s)")
     if r.returncode != 0:
