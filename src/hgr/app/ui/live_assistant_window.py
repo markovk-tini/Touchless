@@ -27,6 +27,7 @@ import threading
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -41,6 +42,24 @@ from PySide6.QtWidgets import (
 
 from ...live_api.live_api_manager import LiveApiManager, LiveApiState
 from .custom_gestures_chrome import apply_touchless_titlebar
+
+
+class _ClickableLabel(QLabel):
+    """QLabel that emits ``clicked`` on left mouse press. Used for the
+    "Iris" header so the user can open the Cortex visualization."""
+
+    clicked = Signal()
+
+    def __init__(self, text: str = "", parent: Optional[QWidget] = None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(QCursor(Qt.PointingHandCursor))
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 # Fallback palette (matches AppConfig defaults). Overridden per-instance
@@ -90,7 +109,7 @@ class LiveAssistantWindow(QWidget):
                 if val:
                     self._palette[key] = str(val)
 
-        self.setWindowTitle("Touchless Assistant")
+        self.setWindowTitle("Touchless · Iris")
         self.setMinimumSize(520, 640)
         self.setAttribute(Qt.WA_DeleteOnClose, True)
 
@@ -98,6 +117,16 @@ class LiveAssistantWindow(QWidget):
         self._current_assistant_label: Optional[QLabel] = None
         # call_id -> the QLabel showing that tool's status pill.
         self._tool_pills: dict = {}
+        # Lazily-created Cortex visualization window (opens on header click).
+        self._cortex_window: Optional[QWidget] = None
+        # Typing-dots indicator state: shown after the user sends a prompt,
+        # cleared on the first response signal (assistant delta / tool
+        # event / error). Without it the window APPEARS to freeze while
+        # the planner / executor / realtime thinks.
+        self._typing_label: Optional[QLabel] = None
+        self._typing_row: Optional[QWidget] = None
+        self._typing_timer: Optional[QTimer] = None
+        self._typing_step: int = 0
 
         self._build_ui()
         self._wire_manager()
@@ -113,10 +142,15 @@ class LiveAssistantWindow(QWidget):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
 
-        # Header: title + state pill.
+        # Header: clickable "Iris" title (opens Cortex viz) + state pill.
         header = QHBoxLayout()
-        title = QLabel("Touchless Assistant")
-        title.setStyleSheet("font-size: 18px; font-weight: 800;")
+        title = _ClickableLabel("Iris  🧠")
+        title.setToolTip("Open the Iris Cortex visualization")
+        title.setStyleSheet(
+            f"QLabel {{ font-size: 18px; font-weight: 800; color: {pal['text']}; }}"
+            f"QLabel:hover {{ color: {pal['accent']}; }}"
+        )
+        title.clicked.connect(self._open_cortex_window)
         header.addWidget(title)
         header.addStretch(1)
         self._state_pill = QLabel("Off")
@@ -207,6 +241,35 @@ class LiveAssistantWindow(QWidget):
             f"QPushButton:disabled {{ color:#64748B; border-color:#33415544; }}"
         )
 
+    # ---- Cortex visualization ----
+
+    def _open_cortex_window(self) -> None:
+        """Open (or raise) the Iris Cortex 3D visualization window.
+
+        Lazy import so we don't pay the QWebEngine startup cost unless
+        the user actually clicks the Iris header. Failures degrade
+        gracefully — clicking "Iris" must never break the assistant.
+        """
+        try:
+            if self._cortex_window is not None:
+                try:
+                    self._cortex_window.show()
+                    self._cortex_window.raise_()
+                    self._cortex_window.activateWindow()
+                    return
+                except RuntimeError:
+                    # Underlying C++ object deleted — recreate below.
+                    self._cortex_window = None
+
+            from ...live_api.cortex.window import CortexWindow
+
+            self._cortex_window = CortexWindow(parent=None)
+            self._cortex_window.show()
+            self._cortex_window.raise_()
+            self._cortex_window.activateWindow()
+        except Exception as exc:
+            self._add_system_bubble(f"⚠ Couldn't open Iris Cortex: {exc}")
+
     # ---- manager wiring ----
 
     def _wire_manager(self) -> None:
@@ -241,6 +304,11 @@ class LiveAssistantWindow(QWidget):
         self._current_assistant_label = None
         if not self._manager.send_user_text(text):
             self._add_system_bubble("Not ready — start the session and wait for \"Ready\".")
+            return
+        # Show a typing indicator so the window doesn't look frozen while
+        # Tier-2 plans / connectors execute / realtime thinks. Cleared on
+        # the first response signal (tool event, assistant delta, or error).
+        self._show_typing()
 
     # ---- manager signal handlers (GUI thread) ----
 
@@ -259,6 +327,7 @@ class LiveAssistantWindow(QWidget):
         self._add_bubble(text, role="user")
 
     def _on_assistant_delta(self, delta: str) -> None:
+        self._hide_typing()
         if self._current_assistant_label is None:
             self._current_assistant_label = self._add_bubble("", role="assistant")
         self._current_assistant_label.setText(self._current_assistant_label.text() + delta)
@@ -279,6 +348,10 @@ class LiveAssistantWindow(QWidget):
     }
 
     def _on_tool_event(self, kind: str, info: dict) -> None:
+        # First tool event of a turn = response is now in flight; drop the
+        # typing dots so the tool pill takes their slot in the transcript.
+        if kind == "called":
+            self._hide_typing()
         name = str(info.get("name", "") or "")
         call_id = str(info.get("call_id", "") or name)
         source = str(info.get("source", "") or "")
@@ -306,6 +379,7 @@ class LiveAssistantWindow(QWidget):
                 self._add_tool_pill(text, color=fill)
 
     def _on_error(self, message: str) -> None:
+        self._hide_typing()
         self._add_bubble(f"⚠ {message}", role="error")
 
     # ---- Gmail connect (one-click OAuth) ----
@@ -402,14 +476,27 @@ class LiveAssistantWindow(QWidget):
 
     def _on_confirm_request(self, title: str, detail: str, holder: dict) -> None:
         try:
-            btn = QMessageBox.question(
-                self,
-                "Confirm action",
-                f"{title}\n\n{detail}",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            holder["result"] = btn == QMessageBox.Yes
+            # Instantiate manually (not QMessageBox.question) so we can
+            # paint the OS titlebar Touchless deep-indigo to match every
+            # other Touchless window — the static .question() call doesn't
+            # expose the box before it goes modal.
+            mbox = QMessageBox(self)
+            mbox.setIcon(QMessageBox.Question)
+            mbox.setWindowTitle("Confirm action")
+            mbox.setText(f"{title}\n\n{detail}")
+            mbox.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            mbox.setDefaultButton(QMessageBox.No)
+            # Apply the titlebar tint after the HWND exists. Qt creates it
+            # lazily during show(), so this singleShot fires after the
+            # event loop processes show — DwmSetWindowAttribute then has
+            # a real window handle to colour.
+            def _tint():
+                try:
+                    apply_touchless_titlebar(mbox)
+                except Exception:
+                    pass
+            QTimer.singleShot(0, _tint)
+            holder["result"] = mbox.exec() == QMessageBox.Yes
         finally:
             holder["event"].set()
 
@@ -439,6 +526,58 @@ class LiveAssistantWindow(QWidget):
 
     def _add_system_bubble(self, text: str) -> QLabel:
         return self._add_bubble(text, role="system")
+
+    # ---- typing-dots indicator ----
+
+    def _show_typing(self) -> None:
+        """Insert an assistant-style 'typing' bubble with animated dots.
+        Idempotent — if already showing, just keeps animating."""
+        if self._typing_label is not None:
+            return
+        pal = self._palette
+        label = QLabel("·")
+        label.setStyleSheet(
+            f"background:#1E293B; color:{pal['text']}88; "
+            "border-radius:12px; padding:9px 14px; "
+            "font-size:18px; font-weight:700; letter-spacing:3px;"
+        )
+        label.setMaximumWidth(80)
+        # Build the row ourselves so we can pull JUST this row out of the
+        # transcript later (the helpers in _insert_row don't track rows).
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(label)
+        h.addStretch(1)
+        self._transcript.insertWidget(self._transcript.count() - 1, row)
+        self._scroll_to_bottom()
+        self._typing_label = label
+        self._typing_row = row
+        self._typing_step = 0
+        self._typing_timer = QTimer(self)
+        self._typing_timer.setInterval(380)
+        self._typing_timer.timeout.connect(self._tick_typing)
+        self._typing_timer.start()
+
+    def _tick_typing(self) -> None:
+        if self._typing_label is None:
+            return
+        self._typing_step = (self._typing_step + 1) % 3
+        # Cycle through ·  · ·  · · · so the row looks like dots filling in.
+        dots = "·" + (" ·" * self._typing_step)
+        self._typing_label.setText(dots)
+
+    def _hide_typing(self) -> None:
+        if self._typing_timer is not None:
+            self._typing_timer.stop()
+            self._typing_timer.deleteLater()
+            self._typing_timer = None
+        if self._typing_row is not None:
+            self._transcript.removeWidget(self._typing_row)
+            self._typing_row.deleteLater()
+            self._typing_row = None
+        self._typing_label = None
+        self._typing_step = 0
 
     def _add_bubble(self, text: str, *, role: str) -> QLabel:
         pal = self._palette
@@ -482,6 +621,9 @@ class LiveAssistantWindow(QWidget):
         ))
 
     def _clear_transcript(self) -> None:
+        # Stop the typing timer first so it doesn't fire on a label that's
+        # about to be deleted by the loop below.
+        self._hide_typing()
         # Remove every row except the trailing stretch.
         while self._transcript.count() > 1:
             item = self._transcript.takeAt(0)
@@ -501,15 +643,25 @@ class LiveAssistantWindow(QWidget):
     # ---- lifecycle ----
 
     def show_window(self) -> None:
+        # Apply the Touchless title bar BEFORE show() so Windows never
+        # paints the default white caption — without this you see a
+        # ~50ms white-window flash on first open while Windows draws the
+        # default chrome before our showEvent recolors it.
+        # winId() forces native HWND allocation without making the window
+        # visible, giving DwmSetWindowAttribute a real handle to act on.
+        try:
+            self.winId()  # force HWND creation
+            apply_touchless_titlebar(self)
+        except Exception:
+            pass
         self.show()
         self.raise_()
         self.activateWindow()
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt override)
         super().showEvent(event)
-        # Paint the OS title bar Touchless deep-indigo to match the main
-        # app + other Touchless windows. Needs a live HWND, so it runs
-        # here rather than in __init__. No-ops on Win10 / non-Windows.
+        # Safety net: if show_window() wasn't used (e.g. Qt re-shows the
+        # window after a state change), the title bar still gets painted.
         try:
             apply_touchless_titlebar(self)
         except Exception:
