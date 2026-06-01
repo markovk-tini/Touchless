@@ -82,6 +82,13 @@ hiddenimports = list(dict.fromkeys(hiddenimports))
 for source_path, target_name in (
     (ASSETS, "assets"),
     (GESTURE_GUIDE, "GestureGuide"),
+    # NOTE: the Iris Cortex web assets (vendored Three.js + HTML/JS) used
+    # to be bundled here, but Iris is excluded from shipping builds (see
+    # `excludes` below). Including the static demo files alongside the
+    # excluded Python code is dead weight at best and "looks like an
+    # unshipped feature leaked into the build" at worst. Re-add the
+    # tuple below if/when Iris ships:
+    #     (SRC / "hgr" / "live_api" / "cortex" / "web", "hgr/live_api/cortex/web"),
 ):
     if source_path.exists():
         datas.append((str(source_path), target_name))
