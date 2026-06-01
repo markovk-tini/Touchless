@@ -43,6 +43,34 @@ from .release_checker import ReleaseInfo
 _PROGRESS_CHUNK_BYTES = 256 * 1024
 
 
+def _update_work_dir() -> Path:
+    """Where update downloads, the apply-helper bat, and logs live.
+
+    Lives under %LOCALAPPDATA%\\Touchless\\Updates\\ instead of %TEMP%
+    because Norton SONAR's dropper heuristic fires hard on the pattern
+    "signed binary writes an executable into %TEMP% and then launches
+    it" — that's exactly what got Touchless 1.1.2 quarantined for some
+    users. %LOCALAPPDATA% reads as the app's own working directory, a
+    legitimate spot for an app to stage its own update, so the same
+    operations don't trip the same heuristic. Falls back to the OS
+    temp dir if LOCALAPPDATA is somehow unset (shouldn't happen on
+    Windows but the fallback keeps source-runs / unusual envs working).
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        base = tempfile.gettempdir()
+    d = Path(base) / "Touchless" / "Updates"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # If even mkdir fails (perms, disk full), fall back to TEMP so
+        # the updater can at least try — better a SONAR flag than no
+        # update path at all.
+        d = Path(tempfile.gettempdir()) / "Touchless_Update"
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 class _DownloadWorker(threading.Thread):
     """Plain threading.Thread + Qt-thread-safe signals via callbacks.
 
@@ -141,9 +169,11 @@ class Updater(QObject):
             )
             return
         self._info = info
-        # Stable temp folder so partial downloads survive retries
-        # within a session. Cleaned up by the OS on reboot.
-        target_dir = Path(tempfile.gettempdir()) / "Touchless_Update"
+        # Stable work folder under %LOCALAPPDATA% so partial downloads
+        # survive retries within a session. Lives outside %TEMP%
+        # specifically to avoid Norton SONAR's "drops exe in temp,
+        # runs it" heuristic — see _update_work_dir for context.
+        target_dir = _update_work_dir()
         if info.update_kind == "app-zip":
             target_path = target_dir / f"Touchless_App_Update_{info.version}.zip"
         else:
@@ -282,7 +312,7 @@ class Updater(QObject):
         # this method was even reached and which step (if any) bailed.
         # Useful to disambiguate "bat didn't run" from "bat-writer
         # crashed silently". Build round 5 marker.
-        py_log = Path(tempfile.gettempdir()) / "Touchless_Update" / "_python_apply.log"
+        py_log = _update_work_dir() / "_python_apply.log"
         def _plog(msg: str) -> None:
             try:
                 py_log.parent.mkdir(parents=True, exist_ok=True)
@@ -374,7 +404,7 @@ class Updater(QObject):
              (60 retries, 1s apart) so any lingering file lock on a
              specific dependency DLL doesn't corrupt the install.
           4. Verifies Touchless.exe exists post-copy before relaunch.
-          5. Logs every step to %TEMP%\\Touchless_Update\\
+          5. Logs every step to %LOCALAPPDATA%\\Touchless\\Updates\\
              _apply_update.log so failures are diagnosable instead
              of silent.
         """
@@ -384,12 +414,16 @@ class Updater(QObject):
             helper = zip_dir / "_apply_update.bat"
             content = (
                 "@echo off\r\n"
-                "rem [BUILD-MARKER: v1.0.6-round-5 with bat-rewrite + os.startfile + python-log]\r\n"
+                "rem [BUILD-MARKER: v1.1.3 — localappdata staging (Norton SONAR fix)]\r\n"
                 "setlocal enabledelayedexpansion\r\n"
                 f"set \"INSTALL_DIR={install_dir}\"\r\n"
                 f"set \"UPDATE_ZIP={zip_path}\"\r\n"
-                "set \"STAGING=%TEMP%\\Touchless_Update\\staging\"\r\n"
-                "set \"LOG=%TEMP%\\Touchless_Update\\_apply_update.log\"\r\n"
+                # Stage + log under %LOCALAPPDATA% (not %TEMP%) — Norton
+                # SONAR weights %TEMP% heavily for dropper heuristics
+                # and was quarantining 1.1.2 here. %LOCALAPPDATA% is
+                # the app's own per-user dir and reads as legitimate.
+                "set \"STAGING=%LOCALAPPDATA%\\Touchless\\Updates\\staging\"\r\n"
+                "set \"LOG=%LOCALAPPDATA%\\Touchless\\Updates\\_apply_update.log\"\r\n"
                 "echo [start] %DATE% %TIME% INSTALL_DIR=%INSTALL_DIR% > \"%LOG%\" 2>&1\r\n"
                 "\r\n"
                 "rem Initial settle window — gives Windows a chance to release\r\n"
