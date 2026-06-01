@@ -11809,8 +11809,12 @@ class MainWindow(QMainWindow):
         # adds, so the camera panel doesn't grow past the viewport (and
         # trip the scrollbar) the moment a phone connects.
         self._phone_qr_note = qr_note
-        qr_note.setVisible(not bool(getattr(self.config, "phone_camera_qr_paired", False)))
+        # Attach to the layout BEFORE setVisible — calling setVisible on a
+        # widget whose layout has no parent yet promotes it to a top-level
+        # window (Qt's default 640x480), which flashed as a small white
+        # popup on every app startup.
         box_layout.addWidget(qr_note)
+        qr_note.setVisible(not bool(getattr(self.config, "phone_camera_qr_paired", False)))
 
         qr_row = QHBoxLayout()
         qr_row.setSpacing(8)
@@ -11829,9 +11833,10 @@ class MainWindow(QMainWindow):
         self.phone_camera_qr_disconnect_button = QPushButton("Disconnect Phone")
         self.phone_camera_qr_disconnect_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.phone_camera_qr_disconnect_button.clicked.connect(self._on_phone_camera_qr_disconnect_clicked)
-        self.phone_camera_qr_disconnect_button.setVisible(already_paired)
         self.phone_camera_qr_disconnect_button.setStyleSheet(camera_button_style)
+        # addWidget BEFORE setVisible — see qr_note above for why.
         qr_row.addWidget(self.phone_camera_qr_disconnect_button)
+        self.phone_camera_qr_disconnect_button.setVisible(already_paired)
 
         qr_row.addStretch(1)
         box_layout.addLayout(qr_row)

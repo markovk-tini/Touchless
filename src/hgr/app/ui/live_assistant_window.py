@@ -85,6 +85,36 @@ _STATE_STYLE = {
 }
 
 
+# Persist whether the chat speaks responses. Survives restarts.
+_VOICE_ENABLED_SETTINGS_KEY = "live_api/voice_enabled"
+
+
+def _load_voice_enabled(*, default: bool = True) -> bool:
+    try:
+        from PySide6.QtCore import QSettings
+        s = QSettings("Touchless", "Touchless")
+        v = s.value(_VOICE_ENABLED_SETTINGS_KEY, default)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(v, int):
+            return bool(v)
+    except Exception:
+        pass
+    return default
+
+
+def _save_voice_enabled(enabled: bool) -> None:
+    try:
+        from PySide6.QtCore import QSettings
+        s = QSettings("Touchless", "Touchless")
+        s.setValue(_VOICE_ENABLED_SETTINGS_KEY, bool(enabled))
+        s.sync()
+    except Exception:
+        pass
+
+
 class LiveAssistantWindow(QWidget):
     """Modeless chat window wrapping a LiveApiManager (text-only)."""
 
@@ -142,7 +172,24 @@ class LiveAssistantWindow(QWidget):
         # already-styled window appear.
         self.setWindowOpacity(0.0)
 
-        self._manager = LiveApiManager(text_only=True)
+        # Voice output: load persisted toggle (default ON). Pass to
+        # the manager so the session is created with audio output
+        # enabled. Toggling the mute button only takes effect on the
+        # NEXT session start (modalities change mid-session requires
+        # a session reset on OpenAI's side).
+        self._voice_enabled = _load_voice_enabled(default=True)
+        self._manager = LiveApiManager(
+            text_only=True, voice_output=self._voice_enabled)
+        # Apply the persisted voice choice (if any) before anything that
+        # snapshots the config — so the first session starts with it.
+        try:
+            from .voice_picker import load_saved_voice
+            saved = load_saved_voice(default=getattr(self._manager.config, "voice", "sage"))
+            self._manager.config.voice = saved
+        except Exception:
+            pass
+        # Lazily-created Voice picker dialog (opens on toolbar click).
+        self._voice_dialog: Optional[QWidget] = None
         self._current_assistant_label: Optional[QLabel] = None
         # call_id -> the QLabel showing that tool's status pill.
         self._tool_pills: dict = {}
@@ -247,6 +294,17 @@ class LiveAssistantWindow(QWidget):
         self._start_btn.setStyleSheet(self._button_style())
         controls.addWidget(self._start_btn)
 
+        # Voice mute/unmute. Toggling persists and applies on the NEXT
+        # session start (modalities can't be flipped mid-session — the
+        # server rejects session.update that swaps output_modalities).
+        self._voice_btn = QPushButton(
+            self._voice_btn_label(self._voice_enabled))
+        self._voice_btn.setToolTip(
+            "Toggle spoken replies. Takes effect on next Start.")
+        self._voice_btn.clicked.connect(self._on_toggle_voice)
+        self._voice_btn.setStyleSheet(self._button_style(subtle=True))
+        controls.addWidget(self._voice_btn)
+
         # One-click Gmail connect (only shown when the Google libs are present
         # and not yet connected). Runs the OAuth consent flow in the browser.
         self._gmail_btn = QPushButton("Connect Gmail")
@@ -254,7 +312,14 @@ class LiveAssistantWindow(QWidget):
         self._gmail_btn.clicked.connect(self._on_connect_gmail)
         controls.addWidget(self._gmail_btn)
         self._gmail_result.connect(self._on_gmail_result)
-        self._refresh_gmail_button()
+        # NOTE: _refresh_gmail_button() and _refresh_ms_button() are deferred
+        # to the END of _build_ui — they call setVisible() on these buttons,
+        # and setVisible() on a widget whose owning layout hasn't yet been
+        # attached to a parent (`root.addLayout(controls)` happens below)
+        # makes Qt promote it to a top-level window. That's what caused the
+        # "tiny white popup" that flashed every time Iris opened: an orphan
+        # QPushButton at Qt's default 640x480, mistakenly shown as its own
+        # window. Wire the layouts first, THEN refresh.
 
         # One-click Microsoft 365 connect (same pattern as Gmail).
         self._ms_btn = QPushButton("Connect Microsoft")
@@ -262,7 +327,13 @@ class LiveAssistantWindow(QWidget):
         self._ms_btn.clicked.connect(self._on_connect_ms)
         controls.addWidget(self._ms_btn)
         self._ms_result.connect(self._on_ms_result)
-        self._refresh_ms_button()
+
+        # Voice picker — opens a modeless dialog where the user can
+        # preview each Realtime voice and pick one as Iris's default.
+        self._voice_btn = QPushButton("🔊 Voice")
+        self._voice_btn.setStyleSheet(self._button_style(subtle=True))
+        self._voice_btn.clicked.connect(self._open_voice_picker)
+        controls.addWidget(self._voice_btn)
 
         controls.addStretch(1)
         clear_btn = QPushButton("Clear")
@@ -270,6 +341,13 @@ class LiveAssistantWindow(QWidget):
         clear_btn.setStyleSheet(self._button_style(subtle=True))
         controls.addWidget(clear_btn)
         root.addLayout(controls)
+
+        # Now that the controls layout is attached to the root layout (which
+        # is attached to `self`), the gmail/ms buttons have a real ancestor
+        # widget. Safe to call setVisible() — they'll be shown/hidden inside
+        # the controls row instead of as their own top-level windows.
+        self._refresh_gmail_button()
+        self._refresh_ms_button()
 
     def _button_style(self, *, subtle: bool = False) -> str:
         pal = self._palette
@@ -311,6 +389,59 @@ class LiveAssistantWindow(QWidget):
         except Exception as exc:
             self._add_system_bubble(f"⚠ Couldn't open Iris Cortex: {exc}")
 
+    # ---- Voice picker ----
+
+    def _open_voice_picker(self) -> None:
+        """Open (or raise) the modeless Voice picker dialog. Saves the
+        chosen voice to QSettings and applies it to the live config so
+        the next session start uses it. Failures degrade gracefully —
+        clicking Voice must never break the assistant."""
+        try:
+            if self._voice_dialog is not None:
+                try:
+                    self._voice_dialog.show()
+                    self._voice_dialog.raise_()
+                    self._voice_dialog.activateWindow()
+                    return
+                except RuntimeError:
+                    self._voice_dialog = None
+
+            from .voice_picker import VoicePickerDialog
+
+            current = getattr(self._manager.config, "voice", "sage")
+            api_key = getattr(self._manager.config, "api_key", None)
+            self._voice_dialog = VoicePickerDialog(
+                current_voice=current,
+                api_key=api_key,
+                palette=self._palette,
+                parent=self,
+            )
+            self._voice_dialog.voice_chosen.connect(self._on_voice_chosen)
+            self._voice_dialog.show()
+            self._voice_dialog.raise_()
+            self._voice_dialog.activateWindow()
+        except Exception as exc:
+            self._add_system_bubble(f"⚠ Couldn't open Voice picker: {exc}")
+
+    def _on_voice_chosen(self, voice_id: str) -> None:
+        """User saved a voice choice. Update the live config + tell
+        the user; the change applies next time they start a session
+        (Realtime session.voice is set during session.update)."""
+        try:
+            self._manager.config.voice = voice_id
+        except Exception:
+            pass
+        running = False
+        try:
+            running = self._manager.is_running()
+        except Exception:
+            pass
+        note = (
+            f"Voice set to {voice_id}."
+            + (" Stop + start the session to hear it." if running else " It'll be used next time you start.")
+        )
+        self._add_system_bubble(note)
+
     # ---- manager wiring ----
 
     def _wire_manager(self) -> None:
@@ -324,6 +455,31 @@ class LiveAssistantWindow(QWidget):
         self._manager.error_occurred.connect(self._on_error)
 
     # ---- session control ----
+
+    @staticmethod
+    def _voice_btn_label(enabled: bool) -> str:
+        return "🔊 Voice on" if enabled else "🔇 Voice off"
+
+    def _on_toggle_voice(self) -> None:
+        """Flip the spoken-reply toggle. Persists immediately; the change
+        applies on the next session start (the server rejects modality
+        swaps mid-session)."""
+        self._voice_enabled = not self._voice_enabled
+        _save_voice_enabled(self._voice_enabled)
+        self._voice_btn.setText(self._voice_btn_label(self._voice_enabled))
+        if self._manager.is_running():
+            self._add_system_bubble(
+                "Voice " + ("on" if self._voice_enabled else "off")
+                + " — takes effect on next Start.")
+        else:
+            # No live session, so apply immediately by rebuilding the
+            # manager on the next start. Easier: just stash the flag and
+            # we'll pass it when start() runs (manager already reads it
+            # from its own _voice_output at start time).
+            try:
+                self._manager._voice_output = self._voice_enabled
+            except Exception:
+                pass
 
     def _on_toggle_session(self) -> None:
         if self._manager.is_running():
