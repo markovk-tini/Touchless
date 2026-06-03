@@ -528,6 +528,12 @@ class LiveApiManager(QObject):
         self._pending_override_text: Optional[str] = None
         self._last_override_tool: str = ""
         self._last_user_text = ""     # for realtime fact-extraction observation
+        # Rolling conversation buffer for the Jarvis prose renderer — the
+        # last ~6 (role, text) turns so replies can naturally reference
+        # earlier context ("heads up before your meeting", "since you
+        # mentioned the BBQ"). Bounded; oldest entries fall off.
+        self._convo_buffer: List[str] = []
+        self._CONVO_BUFFER_MAX = 8
         self._memory_summary_sent = False  # send memory note once per session
         self._failed_retries = 0      # retries used for a failed response turn
         self._last_nudge_ts = 0.0     # min-interval guard against nudge bursts
@@ -1721,8 +1727,35 @@ class LiveApiManager(QObject):
             # that ACTUALLY went to realtime — planner-handled requests
             # already record themselves via the orchestrator's _record_turn.
             self._last_user_text = text
+            self._record_convo_turn("user", text)
             self._request_model_response()
         return
+
+    def _record_convo_turn(self, role: str, text: str) -> None:
+        """Append a turn to the rolling conversation buffer used by the
+        Jarvis prose renderer for natural follow-up references. Trims
+        to the most recent _CONVO_BUFFER_MAX entries. Safe to call from
+        any thread — list append is atomic in CPython."""
+        if not text:
+            return
+        snip = text.strip().replace("\r", " ").replace("\n", " ")
+        if len(snip) > 280:
+            snip = snip[:277] + "..."
+        try:
+            self._convo_buffer.append(f"{role}: {snip}")
+            if len(self._convo_buffer) > self._CONVO_BUFFER_MAX:
+                # Trim from the front, keep the tail.
+                del self._convo_buffer[:-self._CONVO_BUFFER_MAX]
+        except Exception:
+            pass
+
+    def _convo_context(self) -> str:
+        """Render the convo buffer as a small block the renderer can
+        scan for natural follow-up references."""
+        try:
+            return "\n".join(self._convo_buffer[-self._CONVO_BUFFER_MAX:])
+        except Exception:
+            return ""
 
     def _parse_plan(self, text: str) -> list:
         """Extract the JSON task array the model returned during planning."""
@@ -2072,6 +2105,7 @@ class LiveApiManager(QObject):
                                     "override_speak_failed", exc)
                             except Exception:
                                 pass
+                self._record_convo_turn("assistant", override)
                 self._set_state(LiveApiState.LISTENING, "Listening")
                 return
 
@@ -2087,6 +2121,7 @@ class LiveApiManager(QObject):
                                     "realtime_text_done_tts_failed", exc)
                             except Exception:
                                 pass
+                    self._record_convo_turn("assistant", spoken)
             self._set_state(LiveApiState.LISTENING, "Listening")
             return
 
@@ -2581,7 +2616,24 @@ class LiveApiManager(QObject):
             if isinstance(output, dict) and name in self._DETERMINISTIC_SUMMARY_TOOLS:
                 summary_val = output.get("summary")
                 if isinstance(summary_val, str) and summary_val.strip():
-                    self._pending_override_text = summary_val.strip()
+                    # Jarvis prose pass: rewrite the deterministic
+                    # summary as conversational Iris-voice prose with
+                    # fact-preservation guard + conversation context.
+                    # Falls back to summary_val.strip() on any error,
+                    # so we never DOWNGRADE from the verbatim summary.
+                    base = summary_val.strip()
+                    try:
+                        from .prose_renderer import render_jarvis
+                        composed = render_jarvis(
+                            question=self._last_user_text,
+                            tool_name=name,
+                            tool_result=output,
+                            fallback=base,
+                            context=self._convo_context(),
+                        )
+                    except Exception:
+                        composed = base
+                    self._pending_override_text = composed or base
                     self._last_override_tool = name
                     try:
                         import sys as _sys

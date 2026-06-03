@@ -376,7 +376,24 @@ class IrisPlanner:
             sr = StepResult(step_id=0, tool=single.tool,
                             status=str((out or {}).get("status") or "ok"),
                             output=out or {}, error=(out or {}).get("error"))
-            message = self._format_message(single, out or {})
+            base_message = self._format_message(single, out or {})
+            # Jarvis prose pass: rewrite the deterministic message as
+            # conversational Iris-voice prose, with fact-preservation
+            # guard. Falls back to base_message on any failure. The
+            # renderer auto-skips very short status confirmations
+            # ('Volume set to 30%.') so it never adds latency for
+            # trivial replies.
+            try:
+                from ..prose_renderer import render_jarvis
+                message = render_jarvis(
+                    question=text,
+                    tool_name=single.tool,
+                    tool_result=out or {},
+                    fallback=base_message,
+                    context="",  # Layer-1 path doesn't carry convo buffer
+                )
+            except Exception:
+                message = base_message
             self._record_turn(text, None, [single], [sr], message)
             return {"steps": [single], "results": [sr], "message": message}
 
