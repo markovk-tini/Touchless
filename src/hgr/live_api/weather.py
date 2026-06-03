@@ -156,8 +156,15 @@ _OPEN_METEO_FORECAST = (
     "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
     "weather_code,wind_speed_10m"
     "&daily=temperature_2m_min,temperature_2m_max,weather_code"
-    "&forecast_days=3"
+    "&forecast_days={days}"
     "&temperature_unit={t_unit}&wind_speed_unit={w_unit}&timezone=auto")
+# Open-Meteo supports up to 16; we cap at 10 — past a week the data
+# quality drops and the spoken reply gets too long anyway.
+_MAX_FORECAST_DAYS = 10
+_DEFAULT_FORECAST_DAYS = 3
+# wttr.in always returns 3 days. If the user asks for >3, skip wttr and
+# go straight to Open-Meteo so we don't truncate silently.
+_WTTR_MAX_DAYS = 3
 # ipapi.co for IP geolocation (no key, ~1000 req/day free).
 _IPAPI_URL = "https://ipapi.co/json/"
 _GEO_TIMEOUT = 5.0
@@ -244,7 +251,9 @@ def _geo_from_ip() -> Optional[Tuple[float, float, str]]:
 
 
 def _get_weather_open_meteo(location: str,
-                            use_imperial: bool) -> Optional[Dict[str, Any]]:
+                            use_imperial: bool,
+                            days: int = _DEFAULT_FORECAST_DAYS,
+                            ) -> Optional[Dict[str, Any]]:
     """Fallback path. Returns the SAME dict shape as the wttr branch, or
     None if any step fails (caller surfaces the wttr error in that case)."""
     coords = _geocode_open_meteo(location) if location else _geo_from_ip()
@@ -253,10 +262,13 @@ def _get_weather_open_meteo(location: str,
     lat, lon, label = coords
     t_unit = "fahrenheit" if use_imperial else "celsius"
     w_unit = "mph" if use_imperial else "kmh"
+    days = max(1, min(int(days or _DEFAULT_FORECAST_DAYS),
+                      _MAX_FORECAST_DAYS))
     try:
         data = _fetch(
             _OPEN_METEO_FORECAST.format(lat=lat, lon=lon,
-                                        t_unit=t_unit, w_unit=w_unit),
+                                        t_unit=t_unit, w_unit=w_unit,
+                                        days=days),
             timeout=_GEO_TIMEOUT + 5.0)
     except Exception:
         return None
@@ -292,7 +304,7 @@ def _get_weather_open_meteo(location: str,
 
     today_date = date.today()
     forecast_parts: List[str] = []
-    for i in range(min(3, len(dates))):
+    for i in range(min(days, len(dates))):
         date_str = dates[i]
         try:
             day_date = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -337,9 +349,19 @@ def _get_weather_open_meteo(location: str,
 
 # ---- wttr.in primary -------------------------------------------------------
 
-def _get_weather_wttr(loc: str, use_imperial: bool) -> Optional[Dict[str, Any]]:
+def _get_weather_wttr(loc: str, use_imperial: bool,
+                       days: int = _DEFAULT_FORECAST_DAYS,
+                       ) -> Optional[Dict[str, Any]]:
     """Primary path. Returns the planner-friendly dict, or None on any
-    failure (caller falls back to Open-Meteo)."""
+    failure (caller falls back to Open-Meteo).
+
+    wttr.in always returns 3 days; if the caller asked for more, return
+    None so the caller falls back to Open-Meteo (which supports up to
+    16 days)."""
+    if days > _WTTR_MAX_DAYS:
+        return None
+    days = max(1, min(int(days or _DEFAULT_FORECAST_DAYS),
+                      _WTTR_MAX_DAYS))
     safe = urllib.parse.quote(loc) if loc else ""
     url = _WTTR_URL.format(loc=safe)
     payload = None
@@ -417,7 +439,7 @@ def _get_weather_wttr(loc: str, use_imperial: bool) -> Optional[Dict[str, Any]]:
     # Build per-day forecast in conversational form (skip 'today' since
     # the current-conditions sentence already covers it).
     forecast_parts: List[str] = []
-    for i, day in enumerate(weather_days[:3]):
+    for i, day in enumerate(weather_days[:days]):
         date_str = day.get("date") or ""
         try:
             day_date = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -465,16 +487,26 @@ def _get_weather_wttr(loc: str, use_imperial: bool) -> Optional[Dict[str, Any]]:
 
 # ---- public entry point ----------------------------------------------------
 
-def get_weather(location: str = "", units: str = "imperial") -> Dict[str, Any]:
-    """Current conditions + a 1-3 day forecast. `location` empty = auto from
-    IP; pass a city name / ZIP / "lat,lon" for elsewhere. Tries wttr.in
-    first, falls back to Open-Meteo if wttr is slow or down."""
+def get_weather(location: str = "", units: str = "imperial",
+                days: int = _DEFAULT_FORECAST_DAYS) -> Dict[str, Any]:
+    """Current conditions + 1-10 day forecast. `location` empty = auto
+    from IP; pass a city name / ZIP / "lat,lon" for elsewhere. `days`
+    controls how many days of forecast to return (default 3, max 10).
+    For 1-3 days tries wttr.in first then Open-Meteo; for 4+ days uses
+    Open-Meteo directly (wttr only returns 3)."""
     loc = (location or "").strip()[:_MAX_LOC_CHARS]
     use_imperial = (units or "").lower() != "metric"
-    result = _get_weather_wttr(loc, use_imperial)
-    if result is not None:
-        return result
-    result = _get_weather_open_meteo(loc, use_imperial)
+    try:
+        days_n = max(1, min(int(days or _DEFAULT_FORECAST_DAYS),
+                            _MAX_FORECAST_DAYS))
+    except (TypeError, ValueError):
+        days_n = _DEFAULT_FORECAST_DAYS
+    # Skip wttr entirely for >3-day requests (wttr is hardcoded to 3).
+    if days_n <= _WTTR_MAX_DAYS:
+        result = _get_weather_wttr(loc, use_imperial, days_n)
+        if result is not None:
+            return result
+    result = _get_weather_open_meteo(loc, use_imperial, days_n)
     if result is not None:
         return result
     return {

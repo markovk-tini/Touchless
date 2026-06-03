@@ -28,10 +28,152 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from . import cortex_emit
+from .action_classifier import classify_tool_action
 from .config import LiveApiConfig
 from .live_api_logger import LiveApiLogger
 from .schemas import validate_args
 from .screen_context import ScreenContext
+
+
+# Module-level snapshot of the rich Cortex world payload
+# (the same shape ``run_iris_simulator.load_world_payload`` returns —
+# projects with nested ``branches`` and ``leaves``). Populated by
+# ``set_rich_world_payload`` from the assistant window's background
+# payload-preload worker so iris_query_node can answer with real
+# folder/file structure WITHOUT calling load_world_payload synchronously
+# (which would block tool dispatch on a multi-second FS scan).
+#
+# Read by ``_load_iris_world_cache`` as an opportunistic enrichment;
+# absence is fine — the query path falls back to the cheap world_state +
+# combined_project_roots merge it already used.
+_INJECTED_RICH_PAYLOAD: Optional[Dict[str, Any]] = None
+
+
+# Module-level cache for iris_describe_project. Maps absolute project
+# root path → (summary_text, project_label, file_count, timestamp).
+# 24h TTL — described in the tool schema; the model is told the summary
+# may be stale. write_md=True forces a re-scan so the freshly-written
+# CLAUDE.md reflects current content.
+_PROJECT_DESCRIPTION_CACHE: Dict[str, Dict[str, Any]] = {}
+_PROJECT_DESCRIPTION_TTL_SEC = 24 * 60 * 60  # 24 hours
+
+
+# Module-level JS runner fallback for cortex visualization.
+#
+# The QWebChannel signal path (CortexBridge.emit_project_added /
+# emit_project_removed) occasionally drops events — the JS-side handler
+# may not have wired up its listener before the signal fires, or the
+# bridge instance may have been torn down between emit and dispatch.
+# When that happens, projects appear/disappear from the world state but
+# the cortex viz never animates, leaving the user staring at a stale
+# scene.
+#
+# The assistant window registers a runner here that schedules a
+# ``page.runJavaScript(src)`` call on the GUI thread via QTimer; the
+# iris_add_project / iris_remove_project handlers invoke it as a
+# belt-and-braces guarantee that the visual transition always fires.
+# Safe-by-default: a missing runner is a no-op, and the runner itself
+# wraps every call in try/except so a torn-down view can't crash the
+# handler.
+_CORTEX_JS_RUNNER: Optional[Callable[[str], None]] = None
+
+
+def set_cortex_js_runner(runner: Optional[Callable[[str], None]]) -> None:
+    """Register (or clear) the GUI-thread JS runner used as a fallback
+    for cortex add/remove visual transitions. Pass ``None`` to unregister
+    when the cortex view is destroyed."""
+    global _CORTEX_JS_RUNNER
+    if runner is None or callable(runner):
+        _CORTEX_JS_RUNNER = runner
+
+
+def _run_cortex_js(src: str) -> None:
+    """Invoke the registered GUI-thread JS runner if any, swallowing
+    every failure. The cortex viz is decorative — a missing runner,
+    torn-down view, or runtime exception must never break the tool."""
+    runner = _CORTEX_JS_RUNNER
+    if runner is None:
+        return
+    try:
+        runner(src)
+    except Exception:
+        pass
+
+
+def set_rich_world_payload(payload: Optional[Dict[str, Any]]) -> None:
+    """Inject the rich Cortex payload (with branches/leaves) for iris_query_node.
+
+    Called by ``live_assistant_window`` after its background preload of
+    ``load_world_payload()`` completes. Any in-flight ``ToolExecutor``
+    instances will see the rich data on their NEXT query (since each
+    instance's per-call cache is invalidated when this is set).
+
+    Safe to call with ``None`` to clear. Never raises."""
+    global _INJECTED_RICH_PAYLOAD
+    try:
+        _INJECTED_RICH_PAYLOAD = payload if isinstance(payload, dict) else None
+    except Exception:
+        _INJECTED_RICH_PAYLOAD = None
+
+
+# Confidence floor for memory-write side-effects from tool classification.
+# Action_classifier's per-kind floors are already conservative; this is an
+# extra gate so noisy near-misses never reach long-lived storage. Anything
+# below this is logged-only (other pipelines already cover those kinds).
+_CLASSIFY_MEMORY_THRESHOLD = 0.8
+
+
+# Tool-name → cortex world-touch mapping. Used by _emit_world_touches
+# below. Purely additive — touch failures never affect tool results.
+
+# Tools whose primary path argument identifies a file Iris just acted on.
+# Keys = candidate arg names tried in order; first present wins.
+_FILE_PATH_KEYS = (
+    "path", "file_path", "filepath",
+    "dest_path", "destination", "new_path", "target_path",
+    "source_path", "source",
+)
+
+# Tools where the operation produces a "new" file location (the
+# destination matters more than the source for "where it lives now").
+_FILE_TOOLS = {
+    "create_file", "read_file", "write_file", "append_file",
+    "open_in_editor", "delete_file", "move_file", "rename_file",
+}
+
+
+def _emit_world_touches(name: str, args: Dict[str, Any]) -> None:
+    """Map (tool_name, args) → cortex_emit.touch() calls.
+
+    Called once after a tool dispatched successfully. Everything is
+    best-effort + silent on failure — the cortex viz must never break
+    tool execution. Designed to be cheap when the cortex window isn't
+    open (cortex_emit.touch is a near-no-op).
+    """
+    if name == "open_app":
+        app_name = args.get("name") or args.get("app_name") or args.get("app")
+        if app_name:
+            cortex_emit.touch("app", str(app_name))
+        return
+
+    if name == "open_url":
+        url = args.get("url")
+        if url:
+            url_s = str(url)
+            display = url_s if len(url_s) <= 48 else (url_s[:45] + "...")
+            cortex_emit.touch("url", display, path=url_s)
+        return
+
+    if name in _FILE_TOOLS:
+        for key in _FILE_PATH_KEYS:
+            v = args.get(key)
+            if not v:
+                continue
+            path_s = str(v)
+            label = os.path.basename(path_s) or path_s
+            cortex_emit.touch("file", label, path=path_s)
+            return
 from ..debug.foreground_window import get_foreground_window_info
 from ..debug.mouse_controller import MouseController
 from ..debug.text_input_controller import TextInputController
@@ -82,6 +224,7 @@ class ToolExecutor:
         confirm_callback: Optional[ConfirmCallback] = None,
         external_action_router: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
         notify_callback: Optional[Callable[[str], None]] = None,
+        memory_manager: Optional[Any] = None,
     ) -> None:
         self._config = config
         self._logger = logger
@@ -91,6 +234,13 @@ class ToolExecutor:
         # Called (from a background thread) to push a proactive message into
         # the session — e.g. when auto-approve detects the app paused.
         self._notify = notify_callback
+        # Optional MemoryManager used by the action_classifier wiring. When
+        # None (default — live_api_manager doesn't wire it in yet), the
+        # classifier still routes file/project touches via world_state and
+        # logs unknowns; only fact/preference writes are skipped because
+        # they have nowhere to land. Wiring this is a one-line change in
+        # live_api_manager.ToolExecutor() when ready.
+        self._memory = memory_manager
 
         # Lazy-init heavy controllers — only created when first used so
         # the main app's startup cost is unaffected when Live API is OFF.
@@ -115,6 +265,18 @@ class ToolExecutor:
         # context when it loses track of "where did I just put that".
         self._recent_paths: list[str] = []
 
+        # Cached cortex world payload for iris_query_node. Populated lazily
+        # on first query (and refreshed whenever iris_remove_project runs)
+        # by ``_load_iris_world_cache`` — calling ``load_world_payload`` on
+        # every query is too slow (filesystem scan + auto-discovery). The
+        # cache is a snapshot, NOT a live view; the staleness is documented
+        # in the tool schema description.
+        self._iris_world_cache: Optional[Dict[str, Any]] = None
+        # ``id()`` of the injected rich payload the per-instance cache was
+        # last built against — lets us auto-invalidate when the assistant
+        # window swaps in fresh data.
+        self._iris_world_cache_rich_id: Optional[int] = None
+
     # ---- public ----
 
     def execute(self, name: str, raw_args: Dict[str, Any]) -> Dict[str, Any]:
@@ -131,6 +293,29 @@ class ToolExecutor:
             tool=name,
             args=_summarize_args(name, args, debug=self._config.debug_text_logging),
         )
+        # Cortex viz: pulse core -> tools as the dispatch fires.
+        try:
+            cortex_emit.tool_call(name)
+        except Exception:
+            pass
+        # Cortex viz: also light up the SPECIFIC tool node ('tool-<name>')
+        # so the user can see which built-in fired. Best-effort — the JS
+        # handler silently skips unknown node ids, so a tool whose slug
+        # doesn't match a seeded node just gets the generic cap-tools
+        # pulse above. Must NEVER break tool dispatch.
+        try:
+            cortex_emit.node_activity(f"tool-{name}",
+                                      intensity=0.9, duration_ms=150)
+        except Exception:
+            pass
+        # Persistent tool-call log used for cross-session co-occurrence
+        # aggregation (powers the cortex tool_links cross-edges).
+        # Best-effort — must NEVER break tool dispatch.
+        try:
+            from .cortex.tool_call_log import record_tool_call as _record_tc
+            _record_tc(name)
+        except Exception:
+            pass
 
         try:
             handler = self._handlers().get(name)
@@ -147,7 +332,169 @@ class ToolExecutor:
             )
 
         self._logger.latency(f"tool:{name}", started, status=result.get("status"))
+        # Cortex viz: drop a short-lived leaf showing the tool that ran.
+        try:
+            status = str(result.get("status", "") or "")
+            label = name if status == "ok" else f"{name} ✕"
+            cortex_emit.leaf_add("cap-tools", label, ttl_ms=4500)
+        except Exception:
+            pass
+        # Cortex world: record persistent touches (files, apps, urls)
+        # so the cortex builds up Iris's world model across sessions.
+        try:
+            if result.get("status") == "ok":
+                _emit_world_touches(name, args)
+        except Exception:
+            pass
+        # Cortex bridge: fire the discrete toolUsed signal so the live
+        # simulator JS can animate the tool firing without parsing the
+        # generic `event` stream. No-op when the simulator isn't running
+        # (get_active_bridge returns None). Decorative — must NEVER
+        # break tool dispatch. NOTE: leaf/project events are NOT fired
+        # here — world_state.touch_file already fires `file_added` for
+        # file-touching tools, and double-firing would duplicate leaves
+        # in the simulator.
+        try:
+            if result.get("status") == "ok":
+                from .cortex.bridge import get_active_bridge
+                bridge = get_active_bridge()
+                if bridge is not None:
+                    bridge.emit_tool_used({"tool": name, "label": name})
+        except Exception:
+            pass
+        # Action classifier: deterministic rule-based categorisation of the
+        # tool dispatch (file_touch / new_project / fact / preference / ...).
+        # Routes high-confidence results to long-lived stores. Must NEVER
+        # break tool dispatch — wrapped in a broad try/except and a no-op
+        # when status != "ok" (the classifier itself also early-returns on
+        # failed status, but the guard here keeps the cost off the hot
+        # path for the failure case).
+        try:
+            if result.get("status") == "ok":
+                self._route_tool_classification(name, args, result)
+        except Exception:
+            pass
         return result
+
+    def _route_tool_classification(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> None:
+        """Run the deterministic action_classifier on a completed tool call
+        and route the result to the matching long-lived store.
+
+        Routing matrix (only fires when confidence >= _CLASSIFY_MEMORY_THRESHOLD):
+
+          * ``kind == 'fact'`` or ``'preference'`` → MemoryManager.set_fact()
+            when a memory_manager was injected. Skipped silently when no
+            memory_manager is wired in (live_api_manager doesn't pass one
+            yet — see __init__). Note: the LLM extractor in
+            MemoryManager.observe_conversation / extract_facts already mines
+            facts from conversation turns; this classifier covers a DIFFERENT
+            channel — tool-dispatch — so the two don't double-fire.
+
+          * ``kind == 'new_project'`` → world_state.add_project() if the
+            target looks like a real folder. The world_state singleton is
+            module-global so no injection is needed.
+
+          * ``kind in {'file_touch', 'tool_use', 'pattern_seed',
+            'episode', 'unknown'}`` → no-op. ``file_touch`` and app/url
+            touches are already persisted by ``_emit_world_touches`` +
+            ``world_state.touch_file/app/url`` above; tool_use is covered
+            by the persistent tool_call_log; pattern_seed / episode /
+            unknown have no destination store today (logged only).
+
+        Failures inside the classifier or the routing target are swallowed.
+        """
+        try:
+            classification = classify_tool_action(name, args, result)
+        except Exception as exc:
+            # Classifier bug must NEVER break dispatch.
+            self._logger.exception("classify_tool_action_failed", exc, tool=name)
+            return
+
+        kind = str(classification.get("kind") or "unknown")
+        target = classification.get("target")
+        payload = classification.get("payload") or {}
+        confidence = float(classification.get("confidence") or 0.0)
+
+        # Always log the classification so we can audit what would have
+        # routed and what didn't. Cheap, single structured-event line.
+        try:
+            self._logger.event(
+                "tool_classification",
+                tool=name,
+                kind=kind,
+                target=(str(target)[:160] if target is not None else None),
+                confidence=round(confidence, 3),
+            )
+        except Exception:
+            pass
+
+        if confidence < _CLASSIFY_MEMORY_THRESHOLD:
+            return
+
+        if kind in ("fact", "preference"):
+            # MemoryManager wiring is optional — when absent, the
+            # extractor pipeline still mines conversational facts; we
+            # just don't add tool-derived ones until live_api_manager
+            # passes the manager in.
+            if self._memory is None:
+                return
+            try:
+                key = str(target) if target else "unknown"
+                if kind == "preference":
+                    value = str(payload.get("polarity")
+                                or payload.get("text")
+                                or "unknown")
+                else:
+                    value = str(payload.get("value")
+                                or payload.get("text")
+                                or "")
+                self._memory.set_fact(
+                    kind=kind,
+                    key=key,
+                    value=value,
+                    source="tool_classifier",
+                    source_kind="tool_classifier",
+                    source_id=name,
+                )
+            except Exception as exc:
+                self._logger.exception("classify_memory_set_fact_failed",
+                                       exc, tool=name, kind=kind)
+            return
+
+        if kind == "new_project":
+            # Promote an editor-opened folder to a Cortex project node.
+            # world_state.add_project is idempotent (no-op if the
+            # project_id already exists), so re-firing on the same
+            # folder is safe.
+            if not target:
+                return
+            try:
+                from .cortex.world_state import get_world
+                world = get_world()
+                folder_path = str(target)
+                # Use the folder's basename as both id and label so the
+                # node is human-readable in the Cortex view. world_state
+                # de-dupes by id, so repeated opens collapse to one node.
+                project_id = os.path.basename(folder_path.rstrip("\\/")) or folder_path
+                world.add_project(
+                    project_id=project_id,
+                    label=project_id,
+                    root_path=folder_path,
+                )
+            except Exception as exc:
+                self._logger.exception("classify_add_project_failed",
+                                       exc, tool=name, target=str(target))
+            return
+
+        # Remaining kinds (file_touch, tool_use, pattern_seed, episode,
+        # unknown) are already handled by other pipelines or have no
+        # destination store yet — log-only above is sufficient.
+        return
 
     # ---- handlers ----
 
@@ -209,6 +556,16 @@ class ToolExecutor:
             "wait_and_press": self._t_wait_and_press,
             "auto_approve": self._t_auto_approve,
             "stop_auto_approve": self._t_stop_auto_approve,
+            "iris_add_project": self._t_iris_add_project,
+            "iris_remove_project": self._t_iris_remove_project,
+            "iris_query_node": self._t_iris_query_node,
+            "iris_describe_project": self._t_iris_describe_project,
+            # ---- ambient / power-tools pack ---------------------------
+            "notify_toast": self._t_notify_toast,
+            "get_active_window": self._t_get_active_window,
+            "clipboard_read": self._t_clipboard_read,
+            "clipboard_write": self._t_clipboard_write,
+            "clipboard_transform": self._t_clipboard_transform,
         }
 
     def _t_get_screen_context(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1552,13 +1909,19 @@ class ToolExecutor:
         )
 
     def _t_weather_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        # Free, no-key weather via wttr.in. Auto-detects user location
-        # from IP when `location` is omitted; otherwise pass any city /
-        # zip / 'lat,lon' string. Cheap (~100-200ms HTTP).
+        # Free, no-key weather via wttr.in / Open-Meteo. Auto-detects
+        # user location from IP when `location` is omitted; otherwise
+        # pass any city / zip / 'lat,lon' string. `days` controls the
+        # forecast horizon (1-10, default 3). Cheap (~100-200ms HTTP).
         from .weather import get_weather
+        try:
+            days = int(args.get("days") or 0)
+        except (TypeError, ValueError):
+            days = 0
         return get_weather(
             location=str(args.get("location") or "").strip(),
             units=str(args.get("units") or "imperial").strip().lower(),
+            days=days or 3,
         )
 
     def _t_web_search(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2688,6 +3051,1594 @@ class ToolExecutor:
             return _result(status="ok", stopped=True)
         return uia.stop_auto_approve()
 
+    def _t_iris_add_project(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Bulletproof entrypoint for iris_add_project.
+
+        Wraps the real implementation in a catch-all so ANY unhandled
+        exception (subprocess hang/abort, pathological Unicode path,
+        Windows UNC resolve failure, world_state import bomb, JSON
+        serialization of a Path object, etc.) becomes a normal error
+        response instead of propagating up the realtime/planner stack
+        and killing the app. Catches BaseException so SystemExit /
+        KeyboardInterrupt / fatal Qt callbacks can't take down the
+        process either.
+        """
+        # Entry log — even if the handler crashes before _logger.event
+        # can write, this stderr line proves we got called. Helps
+        # distinguish "handler ran and threw" from "handler never
+        # called because crash was upstream".
+        try:
+            print(
+                "iris_add_project: entry args="
+                + repr({k: (str(v)[:80] if isinstance(v, str) else v)
+                        for k, v in (args or {}).items()})[:200],
+                file=sys.stderr, flush=True,
+            )
+        except Exception:
+            pass
+        try:
+            return self._iris_add_project_impl(args)
+        except BaseException as exc:
+            try:
+                self._logger.exception("iris_add_project_handler_crashed", exc)
+            except Exception:
+                pass
+            try:
+                print(
+                    f"iris_add_project: caught {type(exc).__name__}: {exc}",
+                    file=sys.stderr, flush=True,
+                )
+            except Exception:
+                pass
+            return _result(
+                status="error",
+                error=f"iris_add_project crashed: {type(exc).__name__}: {exc}",
+                code="handler_exception",
+            )
+
+    def _iris_add_project_impl(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Add a project to Iris's cortex / world model.
+
+        Mirrors ``_t_iris_remove_project`` in spirit — same exclusion-
+        list / cache / cortex-viz surface — but inverts every step:
+
+          1. Resolve the folder: prefer ``project_path`` (absolute or
+             folder name); fall back to ``project_label`` via the
+             desktop file-search resolver.
+          2. Validate: path must exist on disk, be a directory, and
+             not sit under a protected system root.
+          3. Derive the canonical project_id slug + label from the
+             folder name (same regex world_state uses, so the id we
+             register here is identical to what auto-discovery would
+             have produced).
+          4. Register in the cortex world via WorldState.add_project()
+             (idempotent — no-op if the slug already exists). This
+             fires the world-state observer chain which auto-emits
+             ``project_added`` to the cortex bridge, so any live
+             iris_simulator window splats the new node into its
+             scene without us touching JS.
+          5. Remove the project from project_exclusions.json (case-
+             insensitive bi-directional substring match against both
+             the slug and the label, mirroring the matching style
+             iris_remove_project uses) so a previously-excluded
+             project actually shows.
+          6. Append the project to auto_discovered_projects.json so
+             it persists across launches without waiting for the
+             next filesystem sweep.
+          7. Fire a defensive cortex_emit.project_added() — redundant
+             with world_state's observer chain when the bridge is
+             active, but harmless and gives older bridges a second
+             path.
+          8. Invalidate the iris_query_node cache so the next query
+             reflects the post-add world.
+
+        Idempotent — re-adding an existing project succeeds without
+        error.
+        """
+        raw_path = str(args.get("project_path", "") or "").strip()
+        raw_label = str(args.get("project_label", "") or "").strip()
+        if not raw_path and not raw_label:
+            return _result(
+                status="error",
+                error="project_path or project_label is required",
+                code="invalid_arguments",
+            )
+
+        # ---- step 1: resolve the folder ----
+        # If project_path looks like an absolute or relative path,
+        # resolve it directly; otherwise treat it as a folder name and
+        # search common roots. project_label is used as a fallback name.
+        folder_path: Optional[Path] = None
+        candidates_to_try: list = []
+        if raw_path:
+            candidates_to_try.append(raw_path)
+        if raw_label and raw_label != raw_path:
+            candidates_to_try.append(raw_label)
+
+        for candidate in candidates_to_try:
+            try:
+                p = Path(candidate).expanduser().resolve()
+            except Exception:
+                p = None
+            if p is not None and p.exists() and p.is_dir():
+                folder_path = p
+                break
+
+        # Fall back to desktop file search by name if direct resolution
+        # didn't land on an existing directory. We require every word in
+        # the requested name to appear in the resolved path so 'HGR App'
+        # doesn't silently match 'src\\hgr'.
+        if folder_path is None:
+            desktop = self._ensure_desktop()
+            for candidate in candidates_to_try:
+                name = Path(candidate).name or candidate
+                req = [
+                    w for w in name.lower().replace("-", " ").replace("_", " ").split()
+                    if len(w) >= 2
+                ]
+                if desktop is None or not req:
+                    continue
+                try:
+                    r, _amb = desktop.resolve_named_folder(name)
+                except Exception:
+                    r = None
+                if r is not None:
+                    rp = Path(r)
+                    if rp.exists() and rp.is_dir() and all(w in str(rp).lower() for w in req):
+                        folder_path = rp
+                        break
+
+        if folder_path is None:
+            return _result(
+                status="error",
+                error=(
+                    f"folder not found: {raw_path or raw_label}. "
+                    "Provide the EXACT folder name or an absolute path."
+                ),
+                code="folder_not_found",
+            )
+
+        # ---- step 2: validate ----
+        if not folder_path.exists() or not folder_path.is_dir():
+            return _result(
+                status="error",
+                error=f"path is not a directory: {folder_path}",
+                code="not_a_directory",
+            )
+        try:
+            if _is_protected_path(folder_path):
+                return _result(
+                    status="error",
+                    error=(
+                        f"'{folder_path}' sits under a protected system "
+                        "directory and cannot be added as a project."
+                    ),
+                    code="protected_path",
+                )
+        except Exception as exc:
+            self._logger.exception("iris_add_project_protected_check_failed", exc)
+            # If the protection check itself crashed, refuse rather
+            # than silently accept — safer default.
+            return _result(
+                status="error",
+                error="failed to validate folder safety",
+                code="validation_failed",
+            )
+
+        # ---- step 3: derive canonical id + label ----
+        try:
+            from .cortex.world_state import (
+                _DEFAULT_COLOR,
+                derive_project_id,
+                derive_project_label,
+                get_world,
+            )
+        except Exception as exc:
+            self._logger.exception("iris_add_project_world_import_failed", exc)
+            return _result(
+                status="error",
+                error=f"world_state unavailable: {exc}",
+                code="world_unavailable",
+            )
+
+        try:
+            project_id = derive_project_id(folder_path)
+            label = derive_project_label(folder_path)
+        except Exception as exc:
+            self._logger.exception("iris_add_project_derive_failed", exc)
+            return _result(
+                status="error",
+                error=f"failed to derive project id/label: {exc}",
+                code="derive_failed",
+            )
+
+        # ---- step 4: register in cortex world ----
+        world_added = False
+        try:
+            world = get_world()
+            # add_project is idempotent and fires the project_added
+            # observer chain (which auto-routes to the cortex bridge
+            # and from there to liveAddProject() in iris_simulator.html).
+            world.add_project(
+                project_id=project_id,
+                label=label,
+                root_path=str(folder_path),
+                color=_DEFAULT_COLOR,
+            )
+            world_added = True
+        except Exception as exc:
+            self._logger.exception("iris_add_project_world_add_failed", exc)
+            return _result(
+                status="error",
+                error=f"failed to add project to world: {exc}",
+                code="world_add_failed",
+            )
+
+        # ---- step 5: un-exclude from project_exclusions.json ----
+        # Mirror iris_remove_project's matching style: case-insensitive
+        # bi-directional substring against both slug and label so a
+        # previously-excluded project like 'HGR App v1.0.0 - jarvis test'
+        # (whose exclusion entry might be the label, the slug, or even
+        # the absolute path) is actually un-hidden.
+        unexcluded: list = []
+        try:
+            from .project_autodetect import (
+                load_project_exclusions,
+                save_project_exclusions,
+            )
+            try:
+                exclusions = load_project_exclusions()
+            except Exception:
+                exclusions = []
+            pid_l = project_id.lower()
+            lab_l = label.lower()
+            path_l = str(folder_path).lower()
+            kept: list = []
+            for entry in exclusions:
+                e_l = str(entry).strip().lower()
+                if not e_l:
+                    continue
+                # Drop on any case-insensitive substring overlap.
+                drop = False
+                for needle in (pid_l, lab_l, path_l):
+                    if not needle:
+                        continue
+                    if e_l == needle or needle in e_l or e_l in needle:
+                        drop = True
+                        break
+                if drop:
+                    unexcluded.append(entry)
+                else:
+                    kept.append(entry)
+            if unexcluded:
+                try:
+                    save_project_exclusions(kept)
+                except Exception as exc:
+                    # Non-fatal: project still added to world, just
+                    # may be re-hidden by exclusion on next launch.
+                    self._logger.exception(
+                        "iris_add_project_exclusion_save_failed", exc)
+        except Exception as exc:
+            self._logger.exception("iris_add_project_exclusion_failed", exc)
+
+        # ---- step 6: append to auto-discovered cache ----
+        cache_persisted = False
+        try:
+            from .project_autodetect import (
+                load_cached_auto_discovered,
+                save_cached_auto_discovered,
+            )
+            try:
+                cached = load_cached_auto_discovered()
+            except Exception:
+                cached = []
+            already_present = any(
+                str(c.get("id", "")).strip().lower() == project_id.lower()
+                for c in cached
+            )
+            if not already_present:
+                # IMPORTANT: ``root`` MUST be a str — save_cached_auto_discovered
+                # serializes via json.dumps() and a Path object would silently
+                # fail (the swallowed exception used to leave the cache stale).
+                cached.append({
+                    "id": project_id,
+                    "label": label,
+                    "root": str(folder_path),
+                })
+                try:
+                    cache_persisted = save_cached_auto_discovered(cached)
+                except Exception as exc:
+                    self._logger.exception(
+                        "iris_add_project_cache_save_failed", exc)
+            else:
+                cache_persisted = True
+        except Exception as exc:
+            # Cache failures are non-fatal — discover_and_cache will
+            # regenerate it next launch and pick up the world entry.
+            self._logger.exception("iris_add_project_cache_failed", exc)
+
+        # ---- step 7: cortex viz signal (defensive) ----
+        # world.add_project() already fired the project_added observer,
+        # which auto-routes via _fire_observers -> bridge.emit_project_added.
+        # We additionally call cortex_emit.project_added() so older
+        # bridges (or test setups with a non-WorldState bus) still see
+        # the event. The bridge path is idempotent on the JS side
+        # (liveAddProject no-ops on duplicate ids).
+        try:
+            project_added_emit = getattr(cortex_emit, "project_added", None)
+            if callable(project_added_emit):
+                project_added_emit({
+                    "project_id": project_id,
+                    "label": label,
+                    "root_path": str(folder_path),
+                    "color": _DEFAULT_COLOR,
+                })
+        except Exception:
+            # Decorative — never break the tool.
+            pass
+
+        # Belt-and-braces JS fallback. The bridge signal path above
+        # occasionally misses (jsReady race, torn-down bridge, etc.);
+        # the GUI-thread runner registered by the assistant window
+        # invokes liveAddProject(projectId, label) directly so the
+        # visual fade-in is guaranteed to fire as long as the embedded
+        # cortex view is alive. The JS function is idempotent — it
+        # no-ops on duplicate ids — so a double-add (bridge + fallback
+        # both landing) is safe. Mirrors cortex/bridge.py's
+        # emit_project_added fallback exactly.
+        # NOTE: direct runJavaScript fallback temporarily disabled while
+        # debugging a hard crash users reported on iris_add_project.
+        # The bridge signal path (cortex_emit.project_added above) +
+        # the embedded view's QWebChannel handler still drive the
+        # visual fade; this fallback is purely belt-and-suspenders.
+        # Re-enable once the crash is root-caused. Guarded with broad
+        # BaseException + entry log so re-enabling is safe to test.
+        try:
+            if False:  # disabled — see comment above
+                import json as _json_cortex
+                pid_js = _json_cortex.dumps(project_id)
+                label_js = _json_cortex.dumps(label)
+                _run_cortex_js(
+                    "if (typeof window.liveAddProject === 'function') { "
+                    f"window.liveAddProject({pid_js}, {label_js}); "
+                    "} else if (typeof liveAddProject === 'function') { "
+                    f"liveAddProject({pid_js}, {label_js}); }}"
+                )
+        except BaseException:
+            pass
+
+        # ---- step 8: invalidate query cache ----
+        self._iris_world_cache = None
+
+        return _result(
+            status="ok",
+            message=(
+                f"Added project '{label}' to your cortex."
+                + (f" Un-excluded {len(unexcluded)} matching entries."
+                   if unexcluded else "")
+            ),
+            project_id=project_id,
+            label=label,
+            root_path=str(folder_path),
+            world_added=world_added,
+            unexcluded=unexcluded,
+            cache_persisted=cache_persisted,
+        )
+
+    def _t_iris_remove_project(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove a project from Iris's cortex / world model.
+
+        Steps (all wrapped in try/except, partial failure tolerated):
+          1. Resolve project_id from args (id or label).
+          2. Guard: hardcoded KNOWN_PROJECT_ROOTS entries are NEVER
+             removable via this tool — return error.
+          3. Append to the user exclusion list (project_exclusions.json).
+          4. Remove from cortex_world.json via WorldState.remove_project().
+          5. Purge from auto_discovered_projects.json cache.
+          6. Fire cortex_emit.project_remove() so the live viz fades
+             the project node.
+
+        Idempotent — re-running for an already-excluded project succeeds
+        with a "no-op" message rather than failing.
+        """
+        raw_id = str(args.get("project_id", "") or "").strip()
+        raw_label = str(args.get("project_label", "") or "").strip()
+        if not raw_id and not raw_label:
+            return _result(
+                status="error",
+                error="project_id or project_label is required",
+                code="invalid_arguments",
+            )
+
+        # ---- step 2: guard hardcoded projects ----
+        protected_labels: set = set()
+        protected_ids: set = set()
+        try:
+            from .known_projects import KNOWN_PROJECT_ROOTS
+            for kp in KNOWN_PROJECT_ROOTS:
+                protected_ids.add(str(kp["id"]).strip().lower())
+                if kp.get("label"):
+                    protected_labels.add(str(kp["label"]).strip().lower())
+        except Exception as exc:
+            self._logger.exception("iris_remove_project_known_load_failed", exc)
+            # Fall back to a hardcoded safety net so a known-list import
+            # failure can't accidentally unprotect a real Touchless project.
+            protected_ids = {
+                "touchless-dev", "touchless-website",
+                "touchless-marketing", "touchless-tracking",
+            }
+
+        id_lower = raw_id.lower()
+        label_lower = raw_label.lower()
+        if (id_lower and id_lower in protected_ids) or (
+            label_lower and label_lower in protected_labels
+        ):
+            return _result(
+                status="error",
+                error=(
+                    f"project '{raw_id or raw_label}' is a protected "
+                    "Touchless project root and cannot be removed."
+                ),
+                code="protected_project",
+            )
+
+        # ---- step 3: append to the exclusion list ----
+        added_identifiers: list = []
+        try:
+            from .project_autodetect import (
+                add_project_exclusion,
+                purge_from_cache,
+                load_cached_auto_discovered,
+            )
+            if raw_id:
+                add_project_exclusion(raw_id)
+                added_identifiers.append(raw_id)
+            if raw_label and raw_label.lower() != raw_id.lower():
+                add_project_exclusion(raw_label)
+                added_identifiers.append(raw_label)
+        except Exception as exc:
+            self._logger.exception("iris_remove_project_exclude_failed", exc)
+            return _result(
+                status="error",
+                error=f"failed to update exclusion list: {exc}",
+                code="exclusion_failed",
+            )
+
+        # ---- step 4: remove from cortex_world.json ----
+        # Try the exact id first; if not present, look for any
+        # auto-discovered cache entry whose id/label substring-matches
+        # what the user typed (handles "remove vcpkg" when the slug
+        # is actually "vcpkg-master" or similar).
+        removed_world_ids: list = []
+        try:
+            from .cortex.world_state import get_world
+            world = get_world()
+            candidates: list = []
+            # Direct hit.
+            if raw_id:
+                candidates.append(raw_id)
+            # Substring matches across the cache (auto-discovered only).
+            try:
+                cached = load_cached_auto_discovered()
+            except Exception:
+                cached = []
+            for entry in cached:
+                pid = str(entry.get("id", "")).strip()
+                lab = str(entry.get("label") or pid).strip()
+                pid_l = pid.lower()
+                lab_l = lab.lower()
+                hit = False
+                if id_lower and (id_lower in pid_l or pid_l in id_lower
+                                 or id_lower in lab_l or lab_l in id_lower):
+                    hit = True
+                if label_lower and (label_lower in pid_l or pid_l in label_lower
+                                    or label_lower in lab_l or lab_l in label_lower):
+                    hit = True
+                if hit and pid and pid_l not in protected_ids:
+                    candidates.append(pid)
+            # Dedup while preserving order.
+            seen: set = set()
+            uniq_candidates = []
+            for c in candidates:
+                c_l = c.lower()
+                if c_l in seen:
+                    continue
+                seen.add(c_l)
+                uniq_candidates.append(c)
+            for cand in uniq_candidates:
+                try:
+                    if world.remove_project(cand):
+                        removed_world_ids.append(cand)
+                except Exception as exc:
+                    self._logger.exception(
+                        "iris_remove_project_world_remove_failed", exc, target=cand)
+        except Exception as exc:
+            # Don't fail the entire tool if world removal blew up —
+            # the exclusion already landed, which is the durable
+            # contract.
+            self._logger.exception("iris_remove_project_world_failed", exc)
+
+        # ---- step 5: purge from auto-discovered cache ----
+        purged_cache_ids: list = []
+        try:
+            for cand in (removed_world_ids or ([raw_id] if raw_id else [])):
+                try:
+                    purge_from_cache(cand)
+                    purged_cache_ids.append(cand)
+                except Exception:
+                    pass
+        except Exception as exc:
+            # Cache failures are non-fatal — discover_and_cache will
+            # regenerate it next launch with the exclusion applied.
+            self._logger.exception("iris_remove_project_cache_purge_failed", exc)
+
+        # ---- step 6: cortex viz signal ----
+        # Send BOTH the raw cand AND its 'proj-<slug>' form so the JS
+        # handler can resolve regardless of which id convention the
+        # world store happened to use. Duplicate emits are harmless —
+        # handleProjectRemoved no-ops on the second hit (node already
+        # gone). Without this, a cached id stored bare ('vcpkg-master')
+        # could miss when JS expects 'proj-vcpkg-master' under NODES.
+        #
+        # Fallback chain: prefer the world-removed ids (the canonical
+        # form the world store actually knew about), else the raw_id
+        # the user gave us, else derive a slug from raw_label. The
+        # label fallback is critical for runtime-injected fixtures
+        # (e.g. Demo Project: keyed 'proj-demo-project' in NODES but
+        # NOT in the auto-discovered cache, so substring matching on
+        # the cache returns nothing → without this fallback, the fade
+        # signal would never fire when the user said 'remove demo
+        # project').
+        emit_candidates: list = list(removed_world_ids)
+        if not emit_candidates and raw_id:
+            emit_candidates.append(raw_id)
+        if not emit_candidates and raw_label:
+            # Slugify the label the same way liveAddProject does on the
+            # JS side (lower-case, non-[a-z0-9_-] → '-', collapse
+            # double-dashes) so 'Demo Project' → 'demo-project' → JS
+            # finds NODES['proj-demo-project'].
+            import re as _re_slug
+            _slug = _re_slug.sub(
+                r"[^a-z0-9_-]+", "-", raw_label.lower()).strip("-")
+            while "--" in _slug:
+                _slug = _slug.replace("--", "-")
+            if _slug:
+                emit_candidates.append(_slug)
+        try:
+            sent: set = set()
+            for cand in emit_candidates:
+                if not cand:
+                    continue
+                cand_str = str(cand).strip()
+                if not cand_str:
+                    continue
+                forms = [cand_str]
+                if not cand_str.lower().startswith("proj-"):
+                    forms.append(f"proj-{cand_str}")
+                for form in forms:
+                    if form in sent:
+                        continue
+                    sent.add(form)
+                    try:
+                        cortex_emit.project_remove(form, duration_ms=2000)
+                    except Exception as exc:
+                        # Per-form failure must not kill the loop — the
+                        # other form may still land.
+                        self._logger.exception(
+                            "iris_remove_project_cortex_emit_failed",
+                            exc, target=form,
+                        )
+                    # Belt-and-braces JS fallback: directly call
+                    # handleProjectRemoved on the page in case the
+                    # QWebChannel signal path drops the event (cold
+                    # start, signal race during bridge re-registration,
+                    # etc). The registered runner marshals onto the
+                    # GUI thread via QTimer.singleShot(0) so calling
+                    # this from the Realtime worker is safe. The JS
+                    # handler is idempotent — it tracks in-flight
+                    # removals in _projectRemovalInFlight and silently
+                    # no-ops on duplicate emits, so a double-fire
+                    # (bridge + fallback both landing) does NOT start
+                    # a second tween.
+                    try:
+                        import json as _json_cortex
+                        form_js = _json_cortex.dumps(form)
+                        _run_cortex_js(
+                            "if (typeof window.handleProjectRemoved === 'function') { "
+                            f"window.handleProjectRemoved({form_js}); "
+                            "} else if (typeof handleProjectRemoved === 'function') { "
+                            f"handleProjectRemoved({form_js}); }}"
+                        )
+                    except BaseException:
+                        pass
+        except Exception as exc:
+            # Decorative — never break the tool, but log so we know.
+            self._logger.exception(
+                "iris_remove_project_cortex_signal_failed", exc)
+
+        # Invalidate the iris_query_node cache so the next query reflects
+        # the post-removal world. Cheap (just drops the dict reference);
+        # the next call to _t_iris_query_node will re-materialise it.
+        self._iris_world_cache = None
+
+        return _result(
+            status="ok",
+            message=(
+                f"Removed project '{raw_id or raw_label}'. "
+                f"Added to exclusion list ({len(added_identifiers)} entries); "
+                f"removed {len(removed_world_ids)} from world; "
+                f"purged {len(purged_cache_ids)} from cache."
+            ),
+            excluded=added_identifiers,
+            world_removed=removed_world_ids,
+            cache_purged=purged_cache_ids,
+        )
+
+    # ---- iris_query_node ------------------------------------------------
+
+    def _load_iris_world_cache(self) -> Dict[str, Any]:
+        """Return (and cache) a snapshot of the cortex world payload for
+        iris_query_node lookups. Layered fallback so we never trip up the
+        query path on a heavy filesystem scan:
+
+          1. If ``self._iris_world_cache`` is already populated, reuse it.
+          2. Otherwise try to read the live ``WorldState`` singleton —
+             cheap, in-memory, and already authoritative for projects /
+             touch_counts / labels. We synthesise the same shape
+             ``load_world_payload`` exposes (projects / memory / tools)
+             so the query handler doesn't care about the source.
+          3. Merge in ``known_projects.combined_project_roots()`` —
+             KNOWN_PROJECT_ROOTS (e.g. "Touchless dev") + the cached
+             auto-discovered list. This is cheap (in-memory list +
+             one small JSON read) and ensures projects that haven't
+             been touched in cortex_world.json yet are still
+             discoverable. Deduped by raw_id (case-insensitive).
+          4. The expensive ``run_iris_simulator.load_world_payload`` path
+             is INTENTIONALLY not called here — it triggers filesystem
+             walks + auto-discovery and would make every query feel laggy.
+             Callers wanting fresh disk data should refresh out-of-band.
+          5. If ``_INJECTED_RICH_PAYLOAD`` is populated (the assistant
+             window's background preload completed), we opportunistically
+             enrich shaped_projects with the ``branches`` / nested ``leaves``
+             from that rich payload — so queries like "Touchless dev"
+             return real folder structure instead of an empty leaves list.
+
+        Returns ``{}`` on total failure — the query handler treats that
+        as "no matches" rather than an exception."""
+        # If the injected rich payload changed since we built our cache,
+        # drop the stale snapshot so the fresh branches make it through.
+        rich = _INJECTED_RICH_PAYLOAD
+        rich_id = id(rich) if rich is not None else None
+        if rich_id != self._iris_world_cache_rich_id:
+            self._iris_world_cache = None
+            self._iris_world_cache_rich_id = rich_id
+        if isinstance(self._iris_world_cache, dict) and self._iris_world_cache:
+            return self._iris_world_cache
+
+        # Build a lookup of rich-payload projects by their raw slug id
+        # (e.g. "touchless-dev") AND by lowercased label, so we can merge
+        # branches in regardless of which ID flavor our cheap source used.
+        # Rich payload entries look like:
+        #   {"id": "proj-touchless-dev", "label": "Touchless dev",
+        #    "branches": [{"id": ..., "label": "src", "leaves": [...]}]}
+        rich_by_key: Dict[str, Dict[str, Any]] = {}
+        try:
+            if isinstance(rich, dict):
+                for rp in (rich.get("projects") or []):
+                    rid = str((rp or {}).get("id") or "")
+                    if rid.startswith("proj-"):
+                        rid = rid[len("proj-"):]
+                    rid = rid.strip().lower()
+                    if rid:
+                        rich_by_key[rid] = rp
+                    rlabel = str((rp or {}).get("label") or "").strip().lower()
+                    if rlabel and rlabel not in rich_by_key:
+                        rich_by_key[rlabel] = rp
+        except Exception:
+            rich_by_key = {}
+
+        def _branches_for(raw_id: str, label: str) -> list:
+            """Return the rich-payload branches list (or []) for the
+            given project, matched by raw_id then by label."""
+            if not isinstance(rich_by_key, dict) or not rich_by_key:
+                return []
+            for key in (
+                (raw_id or "").strip().lower(),
+                (label or "").strip().lower(),
+            ):
+                if key and key in rich_by_key:
+                    return list((rich_by_key[key] or {}).get("branches") or [])
+            return []
+
+        payload: Dict[str, Any] = {}
+        try:
+            from .cortex.world_state import get_world
+            world = get_world()
+            projects = []
+            try:
+                projects = list(world.list_projects() or [])
+            except Exception as exc:
+                self._logger.exception("iris_query_world_list_failed", exc)
+                projects = []
+            shaped_projects = []
+            for p in projects:
+                pid = str((p or {}).get("id") or "").strip()
+                if not pid:
+                    continue
+                label = str((p or {}).get("label") or pid)
+                # Leaves: recent files for this project (capped so a
+                # noisy project doesn't bloat the query response).
+                leaves = []
+                try:
+                    files = world.files_for_project(pid, limit=20) or []
+                    for f in files:
+                        leaves.append({
+                            "id": f.get("path") or "",
+                            "label": f.get("label") or "",
+                            "path": f.get("path"),
+                        })
+                except Exception:
+                    leaves = []
+                shaped_projects.append({
+                    "id": f"proj-{pid}" if not pid.startswith("proj-") else pid,
+                    "raw_id": pid,
+                    "label": label,
+                    "root_path": (p or {}).get("root_path"),
+                    "touch_count": int((p or {}).get("touch_count", 0)),
+                    "last_touched_at": (p or {}).get("last_touched_at"),
+                    "leaves": leaves,
+                    "branches": _branches_for(pid, label),
+                })
+            payload["projects"] = shaped_projects
+        except Exception as exc:
+            self._logger.exception("iris_query_world_load_failed", exc)
+            payload["projects"] = []
+
+        # --- step 3: merge in KNOWN_PROJECT_ROOTS + auto-discovered ---
+        # Without this, projects that exist on disk (e.g. "Touchless
+        # dev") but haven't been touched in the current session are
+        # invisible to iris_query_node. combined_project_roots() is
+        # cheap — hardcoded list + one ~10KB JSON read — and never
+        # raises (best-effort by contract). Dedup by lowercased raw_id
+        # so cortex_world entries (already in shaped_projects) win.
+        try:
+            from .known_projects import combined_project_roots
+            existing_ids = {
+                str(p.get("raw_id") or "").strip().lower()
+                for p in payload["projects"]
+            }
+            existing_ids.discard("")
+            for entry in combined_project_roots() or []:
+                pid = str((entry or {}).get("id") or "").strip()
+                if not pid or pid.lower() in existing_ids:
+                    continue
+                label = str((entry or {}).get("label") or pid)
+                root = (entry or {}).get("root")
+                root_path_str: Optional[str] = None
+                if root is not None:
+                    try:
+                        root_path_str = str(root)
+                    except Exception:
+                        root_path_str = None
+                payload["projects"].append({
+                    "id": f"proj-{pid}" if not pid.startswith("proj-") else pid,
+                    "raw_id": pid,
+                    "label": label,
+                    "root_path": root_path_str,
+                    "touch_count": 0,
+                    "last_touched_at": None,
+                    "leaves": [],
+                    "branches": _branches_for(pid, label),
+                })
+                existing_ids.add(pid.lower())
+        except Exception as exc:
+            # Auto-discovery is best-effort — never let it block the
+            # query path. Cortex_world projects (step 2) still work.
+            self._logger.exception("iris_query_known_projects_merge_failed", exc)
+
+        # Tools — populated from the static tool schema list so even
+        # tools never invoked this session resolve. Connector tools
+        # added best-effort.
+        tools: list = []
+        try:
+            from .schemas import all_tool_schemas
+            for schema in all_tool_schemas() or []:
+                tid = (schema or {}).get("name") or ""
+                if not tid:
+                    continue
+                tools.append({
+                    "id": f"tool-{tid}",
+                    "raw_id": tid,
+                    "label": tid.replace("_", " ").title(),
+                    "description": ((schema or {}).get("description") or "")[:280],
+                })
+        except Exception as exc:
+            self._logger.exception("iris_query_tools_load_failed", exc)
+        payload["tools"] = tools
+
+        # Hardcoded capability + memory anchor nodes (mirror the four
+        # cap-* / mem-* nodes seeded in iris_simulator.html). Lets the
+        # model answer "what is cap-tools" without us having to import
+        # the JS scaffold.
+        payload["capabilities"] = [
+            {"id": "cap-memory",   "label": "Memory",        "kind": "capability"},
+            {"id": "cap-voice",    "label": "Voice",         "kind": "capability"},
+            {"id": "cap-tools",    "label": "Tools",         "kind": "capability"},
+            {"id": "cap-realtime", "label": "Realtime",      "kind": "capability"},
+            {"id": "mem-facts",    "label": "Facts",         "kind": "memory"},
+            {"id": "mem-patterns", "label": "Patterns",      "kind": "memory"},
+            {"id": "mem-episodes", "label": "Episodes",      "kind": "memory"},
+            {"id": "core",         "label": "Iris",          "kind": "core"},
+        ]
+
+        self._iris_world_cache = payload
+        return payload
+
+    def _t_iris_query_node(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Look up a node in the cached cortex world payload.
+
+        Case-insensitive substring match against project ids, project
+        labels, project slugs ("proj-<slug>"), tool ids ("tool-<name>")
+        and capability/memory anchor ids. Returns the FIRST unambiguous
+        hit; on multiple matches, returns the candidate list so the
+        model can disambiguate.
+
+        Never calls ``load_world_payload`` synchronously — that would
+        re-walk the filesystem and auto-discovery. Reads from
+        ``_load_iris_world_cache`` (built lazily, invalidated on
+        iris_remove_project). Stale-after-changes is documented in the
+        tool schema description.
+        """
+        raw_id = str(args.get("node_id", "") or "").strip()
+        raw_label = str(args.get("node_label", "") or "").strip()
+        if not raw_id and not raw_label:
+            return _result(
+                status="error",
+                error="node_id or node_label is required",
+                code="invalid_arguments",
+            )
+
+        needle_id = raw_id.lower()
+        needle_label = raw_label.lower()
+
+        payload = self._load_iris_world_cache()
+        candidates: list = []  # list of (kind, dict)
+
+        def _match(*haystacks: str) -> bool:
+            for hay in haystacks:
+                h = (hay or "").lower()
+                if not h:
+                    continue
+                if needle_id and (needle_id in h or h in needle_id):
+                    return True
+                if needle_label and (needle_label in h or h in needle_label):
+                    return True
+            return False
+
+        # Projects.
+        for proj in payload.get("projects", []) or []:
+            pid = str(proj.get("id") or "")
+            raw_pid = str(proj.get("raw_id") or "")
+            label = str(proj.get("label") or "")
+            if _match(pid, raw_pid, label):
+                candidates.append(("project", proj))
+
+        # Tools.
+        for tool in payload.get("tools", []) or []:
+            tid = str(tool.get("id") or "")
+            raw_tid = str(tool.get("raw_id") or "")
+            label = str(tool.get("label") or "")
+            if _match(tid, raw_tid, label):
+                candidates.append(("tool", tool))
+
+        # Capability + memory + core anchors.
+        for cap in payload.get("capabilities", []) or []:
+            cid = str(cap.get("id") or "")
+            label = str(cap.get("label") or "")
+            if _match(cid, label):
+                candidates.append((cap.get("kind") or "capability", cap))
+
+        if not candidates:
+            # Best-effort "did you mean?" — rank all known labels/ids by
+            # similarity to the needle and surface the top few so the
+            # model can retry without a full re-listing. difflib is
+            # stdlib + cheap on a few hundred strings.
+            suggestions: list = []
+            try:
+                import difflib
+                needle = (raw_label or raw_id).lower()
+                pool: list = []
+                for proj in payload.get("projects", []) or []:
+                    for key in ("label", "raw_id", "id"):
+                        v = str(proj.get(key) or "")
+                        if v:
+                            pool.append(v)
+                for tool in payload.get("tools", []) or []:
+                    for key in ("label", "raw_id", "id"):
+                        v = str(tool.get(key) or "")
+                        if v:
+                            pool.append(v)
+                for cap in payload.get("capabilities", []) or []:
+                    for key in ("label", "id"):
+                        v = str(cap.get(key) or "")
+                        if v:
+                            pool.append(v)
+                # Dedup while preserving order; lowercased for matching.
+                seen: set = set()
+                uniq = []
+                for v in pool:
+                    k = v.lower()
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    uniq.append(v)
+                suggestions = difflib.get_close_matches(needle, uniq, n=5, cutoff=0.4)
+            except Exception:
+                suggestions = []
+            msg = (
+                f"no node matched '{raw_id or raw_label}'. "
+                "Try the full project label, the slug, or 'cap-tools' "
+                "for the tool root."
+            )
+            if suggestions:
+                msg += f" Did you mean: {', '.join(suggestions)}?"
+            return _result(
+                status="error",
+                error=msg,
+                code="not_found",
+                suggestions=suggestions,
+            )
+
+        # If exactly one hit, return rich details; otherwise return the
+        # disambiguation list so the model can ask the user to narrow.
+        if len(candidates) > 1:
+            return _result(
+                status="ambiguous",
+                error=(
+                    f"'{raw_id or raw_label}' matched {len(candidates)} "
+                    "nodes — please provide a more specific id or label."
+                ),
+                code="ambiguous_match",
+                matches=[
+                    {
+                        "id": (item.get("id") or ""),
+                        "label": (item.get("label") or ""),
+                        "kind": kind,
+                    }
+                    for kind, item in candidates[:12]
+                ],
+            )
+
+        kind, node = candidates[0]
+        if kind == "project":
+            leaves = node.get("leaves", []) or []
+            branches_raw = node.get("branches", []) or []
+            parent_id = "core"  # projects hang off the core anchor
+
+            # When the rich payload is available, return the folder
+            # hierarchy: up to 10 branches, 5 leaves per branch. This is
+            # the answer to "what's inside <project>?" — way more useful
+            # than a flat last-touched file list.
+            branches_out: list = []
+            for b in branches_raw[:10]:
+                b_leaves = (b or {}).get("leaves") or []
+                branches_out.append({
+                    "id": (b or {}).get("id"),
+                    "label": (b or {}).get("label"),
+                    "leaves_count": len(b_leaves),
+                    "leaves": [
+                        {"label": (lf or {}).get("label"),
+                         "path": (lf or {}).get("path")}
+                        for lf in b_leaves[:5]
+                    ],
+                })
+
+            # Sparse-data note when neither rich branches nor world_state
+            # leaves were populated — tells the model "this project is
+            # known but Iris hasn't indexed its contents yet" so it
+            # doesn't hallucinate folder structure.
+            note: Optional[str] = None
+            if not branches_out and not leaves:
+                note = (
+                    "sparse data: project is known but its file tree "
+                    "hasn't been indexed yet (open the assistant once "
+                    "to trigger a background scan)"
+                )
+
+            result: Dict[str, Any] = {
+                "kind": "project",
+                "id": node.get("id"),
+                "label": node.get("label"),
+                "root_path": node.get("root_path"),
+                "touch_count": node.get("touch_count", 0),
+                "last_touched_at": node.get("last_touched_at"),
+                "parent_id": parent_id,
+                "children_count": len(branches_out) if branches_out else len(leaves),
+                "branches": branches_out,
+                # Preserve the flat leaves list for backward-compat with
+                # callers that already use it; capped to 20 as before.
+                "leaves_count": len(leaves),
+                "leaves": [
+                    {"id": l.get("id"), "label": l.get("label"), "path": l.get("path")}
+                    for l in leaves[:20]
+                ],
+            }
+            if note:
+                result["note"] = note
+            return _result(status="ok", **result)
+        if kind == "tool":
+            return _result(
+                status="ok",
+                kind="tool",
+                id=node.get("id"),
+                label=node.get("label"),
+                description=node.get("description"),
+                parent_id="cap-tools",
+                children_count=0,
+                leaves_count=0,
+                leaves=[],
+            )
+        # Capability / memory / core anchor — minimal payload.
+        return _result(
+            status="ok",
+            kind=kind,
+            id=node.get("id"),
+            label=node.get("label"),
+            parent_id="core" if kind != "core" else None,
+            children_count=0,
+            leaves_count=0,
+            leaves=[],
+        )
+
+    # ---------- iris_describe_project ----------
+
+    def _resolve_project_root_for_describe(
+        self,
+        project_id: str,
+        project_label: str,
+    ) -> Optional[Path]:
+        """Resolve a project id/label to an absolute folder path.
+
+        Reuses the cached iris world payload (same source as
+        ``iris_query_node``) so we don't hit disk: every project in
+        the cache already carries a ``root_path`` field. Matching is
+        case-insensitive substring against both the raw slug and the
+        label, mirroring ``_t_iris_query_node``.
+        """
+        needle_id = (project_id or "").strip().lower()
+        needle_label = (project_label or "").strip().lower()
+        if not needle_id and not needle_label:
+            return None
+
+        try:
+            payload = self._load_iris_world_cache()
+        except Exception:
+            payload = {}
+
+        def _match(*haystacks: str) -> bool:
+            for hay in haystacks:
+                h = (hay or "").lower()
+                if not h:
+                    continue
+                if needle_id and (needle_id in h or h in needle_id):
+                    return True
+                if needle_label and (needle_label in h or h in needle_label):
+                    return True
+            return False
+
+        for proj in payload.get("projects", []) or []:
+            pid = str(proj.get("id") or "")
+            raw_pid = str(proj.get("raw_id") or "")
+            label = str(proj.get("label") or "")
+            root = proj.get("root_path")
+            if not root:
+                continue
+            if _match(pid, raw_pid, label):
+                try:
+                    p = Path(str(root)).expanduser().resolve()
+                except Exception:
+                    p = None
+                if p is not None and p.is_dir():
+                    return p
+
+        # Fallback: treat project_id/label as a literal path or folder
+        # name and try the desktop file-search resolver (same pattern as
+        # iris_add_project). Helps when the user names a project not yet
+        # in the cortex world.
+        for raw in (project_id, project_label):
+            raw = (raw or "").strip()
+            if not raw:
+                continue
+            try:
+                p = Path(raw).expanduser().resolve()
+            except Exception:
+                p = None
+            if p is not None and p.is_dir():
+                return p
+        try:
+            desktop = self._ensure_desktop()
+        except Exception:
+            desktop = None
+        if desktop is not None:
+            for raw in (project_id, project_label):
+                raw = (raw or "").strip()
+                if not raw:
+                    continue
+                name = Path(raw).name or raw
+                req = [
+                    w for w in name.lower().replace("-", " ").replace("_", " ").split()
+                    if len(w) >= 2
+                ]
+                if not req:
+                    continue
+                try:
+                    r, _amb = desktop.resolve_named_folder(name)
+                except Exception:
+                    r = None
+                if r is not None:
+                    rp = Path(r)
+                    if rp.is_dir() and all(w in str(rp).lower() for w in req):
+                        return rp.resolve()
+        return None
+
+    def _scan_project_for_description(
+        self,
+        root: Path,
+    ) -> Dict[str, Any]:
+        """Read up to ~50KB of context (metadata + sampled source files)
+        from ``root``. Returns ``{label, file_count, context}``.
+
+        Context is a single string composed of:
+          * Metadata files first (CLAUDE.md, README.md, package.json
+            description, pyproject.toml description), each truncated.
+          * Then up to 10 sampled source files (.md, .py, .js, .ts,
+            .html, .json, .yaml, .toml), prioritized by file
+            extension weight and presence in src/docs/pages.
+
+        Skips binaries (via ``_safe_read_text``) and noisy directories
+        (``__pycache__``, ``node_modules``, ``.git``, ``.venv``, ``dist``,
+        ``build``). Honors the 100KB-per-file cap from
+        ``project_memory._safe_read_text`` and an overall 50KB context
+        cap (the prompt + content is comfortably inside compose_text's
+        32K input budget after metadata is added).
+        """
+        try:
+            from .memory.project_memory import _safe_read_text
+        except Exception:
+            _safe_read_text = None
+
+        TOTAL_CAP = 50 * 1024  # 50KB total context cap per spec
+        used = 0
+        parts: list = []
+
+        # Metadata files — read first, truncated to ~5KB each.
+        metadata_files = ["CLAUDE.md", "README.md", "package.json", "pyproject.toml"]
+        for fname in metadata_files:
+            if used >= TOTAL_CAP:
+                break
+            fpath = root / fname
+            if not fpath.is_file():
+                continue
+            text = None
+            if _safe_read_text is not None:
+                try:
+                    text = _safe_read_text(fpath)
+                except Exception:
+                    text = None
+            if text is None:
+                # Last-resort plain read with size guard.
+                try:
+                    if fpath.stat().st_size > 100 * 1024:
+                        continue
+                    text = fpath.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+            # For package.json / pyproject.toml, extract just the
+            # description field rather than the whole manifest (saves
+            # context budget for source files).
+            if fname == "package.json":
+                try:
+                    import json as _json
+                    obj = _json.loads(text)
+                    desc = str(obj.get("description") or "").strip()
+                    name = str(obj.get("name") or "").strip()
+                    text = f"name: {name}\ndescription: {desc}" if (desc or name) else text[:1000]
+                except Exception:
+                    text = text[:1000]
+            elif fname == "pyproject.toml":
+                # Cheap line-scan; avoids the tomllib import for a one-
+                # field lookup.
+                lines = []
+                for line in text.splitlines():
+                    s = line.strip()
+                    if s.startswith(("name", "description", "version")):
+                        lines.append(line)
+                text = "\n".join(lines) if lines else text[:1000]
+            chunk = f"# {fname}\n{text}"
+            remaining = TOTAL_CAP - used
+            chunk = chunk[:min(5000, remaining)]
+            parts.append(chunk)
+            used += len(chunk)
+
+        # Sampled source files — prioritized by extension and folder.
+        ext_weight = {
+            ".md": 10, ".rst": 9,
+            ".py": 8, ".ts": 8, ".tsx": 8, ".jsx": 8, ".js": 7,
+            ".html": 7, ".yaml": 6, ".yml": 6, ".toml": 6, ".json": 5,
+        }
+        skip_dirs = {
+            ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
+            "dist", "build", ".next", "target", ".cache", ".idea",
+            ".vscode", "site-packages", ".pytest_cache", ".mypy_cache",
+            ".tox",
+        }
+        priority_folders = {"src", "docs", "pages", "lib", "app"}
+
+        # Walk shallowly first, then deeper — bounded total iterations
+        # so a giant project doesn't take seconds to enumerate.
+        candidates: list = []
+        try:
+            files_seen = 0
+            total_files = 0
+            for dirpath, dirnames, filenames in os.walk(str(root)):
+                # Mutate dirnames in place so os.walk doesn't descend.
+                dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+                total_files += len(filenames)
+                for fn in filenames:
+                    files_seen += 1
+                    if files_seen > 5000:
+                        break
+                    fp = Path(dirpath) / fn
+                    ext = fp.suffix.lower()
+                    if ext not in ext_weight:
+                        continue
+                    # Skip metadata files we already read (avoid dups).
+                    if fp.parent == root and fn in metadata_files:
+                        continue
+                    # Score: extension weight + folder bonus + depth penalty.
+                    score = ext_weight[ext]
+                    try:
+                        rel_parts = fp.relative_to(root).parts
+                    except Exception:
+                        rel_parts = (fn,)
+                    for part in rel_parts[:-1]:
+                        if part.lower() in priority_folders:
+                            score += 3
+                            break
+                    score -= max(0, len(rel_parts) - 3)
+                    candidates.append((score, fp))
+                if files_seen > 5000:
+                    break
+        except Exception:
+            candidates = []
+            total_files = 0
+
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        samples_taken = 0
+        for _, fp in candidates:
+            if samples_taken >= 10 or used >= TOTAL_CAP:
+                break
+            text = None
+            if _safe_read_text is not None:
+                try:
+                    text = _safe_read_text(fp)
+                except Exception:
+                    text = None
+            if text is None:
+                continue
+            try:
+                rel = fp.relative_to(root)
+            except Exception:
+                rel = fp
+            remaining = TOTAL_CAP - used
+            # Per-file cap: keep it small so we fit several samples.
+            chunk = f"\n# {rel}\n{text}"
+            chunk = chunk[:min(4000, remaining)]
+            if not chunk.strip():
+                continue
+            parts.append(chunk)
+            used += len(chunk)
+            samples_taken += 1
+
+        context = "\n".join(parts)
+        return {
+            "label": root.name,
+            "file_count": total_files,
+            "samples_count": samples_taken,
+            "context": context,
+            "context_bytes": used,
+        }
+
+    def _describe_project_via_llm(
+        self,
+        label: str,
+        context: str,
+    ) -> Dict[str, Any]:
+        """Call the cheap LLM to synthesize a 1-2 paragraph description.
+
+        Uses urllib directly (30-second timeout, no temperature) so we
+        don't depend on the openai SDK and can keep this tool
+        independent of compose.py's defaults. The 30s timeout matches
+        compose.py — LLM synthesis of ~50KB of project files routinely
+        takes 5-15s depending on model latency; the prior 5s ceiling
+        was guaranteed to time out on every call.
+        """
+        import json as _json
+        import urllib.error as _ue
+        import urllib.request as _ur
+
+        api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+        if not api_key:
+            return {"status": "error", "error": "OPENAI_API_KEY not set",
+                    "code": "not_configured"}
+
+        # gpt-4o-mini is the correct current small/cheap model. The
+        # prior default ('gpt-5-mini') does not exist in OpenAI's API
+        # and caused every describe call to hang until the request
+        # timed out. Env overrides still win if the user has a model
+        # they prefer.
+        model = (os.environ.get("TOUCHLESS_COMPOSE_MODEL")
+                 or os.environ.get("TOUCHLESS_PLANNER_MODEL")
+                 or "gpt-4o-mini")
+
+        system = (
+            "You're describing a project. Output 1-2 paragraphs "
+            "covering purpose, audience, tech stack (if code), and "
+            "current focus. Be concrete and practical. Works for any "
+            "project type — code, school, writing, research. "
+            "Plain text only — no markdown headers, no bullet lists, "
+            "no preamble like 'This project is...'. Just the "
+            "description prose."
+        )
+        user = f"Project: {label}\n\nFiles:\n{context}"
+
+        body = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "max_completion_tokens": 800,
+        }
+        req = _ur.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=_json.dumps(body).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with _ur.urlopen(req, timeout=30) as resp:
+                payload = _json.loads(resp.read().decode("utf-8"))
+        except _ue.HTTPError as exc:
+            # Surface the HTTP body when present — invalid model names
+            # (e.g. a future env override pointing at a model OpenAI
+            # doesn't serve) return 404 with a JSON body that explains
+            # exactly what's wrong, which is far more useful than a
+            # bare 'HTTP 404'.
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                pass
+            return {"status": "error",
+                    "error": f"HTTP {exc.code}{(' — ' + detail) if detail else ''}",
+                    "code": "http_error"}
+        except Exception as exc:
+            # Includes socket.timeout / URLError — friendly error so the
+            # caller can show a sensible bubble instead of crashing.
+            return {"status": "error",
+                    "error": f"describe failed: {type(exc).__name__}: {exc}",
+                    "code": "describe_failed"}
+
+        text = ((payload.get("choices") or [{}])[0]
+                .get("message", {}).get("content") or "").strip()
+        if not text:
+            return {"status": "error",
+                    "error": "empty LLM response",
+                    "code": "empty_response"}
+        return {"status": "ok", "text": text, "model": model}
+
+    def _get_project_description_cache(self, key: str) -> Optional[Dict[str, Any]]:
+        entry = _PROJECT_DESCRIPTION_CACHE.get(key)
+        if not entry:
+            return None
+        ts = float(entry.get("ts") or 0.0)
+        if (time.time() - ts) > _PROJECT_DESCRIPTION_TTL_SEC:
+            try:
+                del _PROJECT_DESCRIPTION_CACHE[key]
+            except KeyError:
+                pass
+            return None
+        return entry
+
+    def _set_project_description_cache(
+        self,
+        key: str,
+        summary: str,
+        label: str,
+        file_count: int,
+    ) -> None:
+        _PROJECT_DESCRIPTION_CACHE[key] = {
+            "summary": summary,
+            "label": label,
+            "file_count": int(file_count),
+            "ts": time.time(),
+        }
+
+    def _t_iris_describe_project(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Scan a project folder and produce a 1-2 paragraph description.
+
+        Pipeline:
+          1. Resolve project root from project_id / project_label
+             (cached iris world payload first, then path fallback,
+             then desktop file-search).
+          2. Check the 24h in-memory cache (keyed by resolved absolute
+             path). Skip on cache hit unless write_md=True (which
+             forces re-scan so the freshly-written CLAUDE.md reflects
+             current state).
+          3. Scan: read metadata files + sample 5-10 source files,
+             capped to 50KB total context.
+          4. Call gpt-5-mini (5-second timeout, max_completion_tokens
+             only — newer GPT-5 models reject temperature/max_tokens).
+          5. Cache the result.
+          6. If write_md=True AND no CLAUDE.md exists in the project
+             root AND the folder is user-writable, write CLAUDE.md
+             with the summary.
+
+        All steps after argument validation are wrapped in try/except
+        so a bug in any phase never blocks tool dispatch.
+        """
+        try:
+            project_id = str(args.get("project_id", "") or "").strip()
+            project_label = str(args.get("project_label", "") or "").strip()
+            write_md = bool(args.get("write_md", False))
+
+            if not project_id and not project_label:
+                return _result(
+                    status="error",
+                    error="project_id or project_label is required",
+                    code="invalid_arguments",
+                )
+
+            # ---- step 1: resolve project root ----
+            root = self._resolve_project_root_for_describe(project_id, project_label)
+            if root is None:
+                return _result(
+                    status="error",
+                    error=(
+                        f"project not found: {project_id or project_label}. "
+                        "Try iris_query_node first to see available "
+                        "projects, or pass an absolute path as project_id."
+                    ),
+                    code="not_found",
+                )
+
+            try:
+                if _is_protected_path(root):
+                    return _result(
+                        status="error",
+                        error=(
+                            f"'{root}' sits under a protected system "
+                            "directory and cannot be scanned."
+                        ),
+                        code="protected_path",
+                    )
+            except Exception:
+                pass
+
+            cache_key = str(root)
+
+            # ---- step 2: cache lookup ----
+            if not write_md:
+                cached = self._get_project_description_cache(cache_key)
+                if cached:
+                    return _result(
+                        status="ok",
+                        summary=cached["summary"],
+                        project_label=cached["label"],
+                        root_path=cache_key,
+                        file_count=cached["file_count"],
+                        cached=True,
+                    )
+
+            # ---- step 3: scan files ----
+            try:
+                scan = self._scan_project_for_description(root)
+            except Exception as exc:
+                self._logger.exception("iris_describe_scan_failed", exc, root=str(root))
+                return _result(
+                    status="error",
+                    error=f"failed to scan project: {exc}",
+                    code="scan_failed",
+                )
+
+            label = scan.get("label") or root.name
+            context = scan.get("context") or ""
+            if not context.strip():
+                return _result(
+                    status="error",
+                    error=(
+                        f"no readable text files found in '{root}'. "
+                        "The folder may be empty or contain only binary files."
+                    ),
+                    code="no_content",
+                )
+
+            # ---- step 4: LLM synthesis ----
+            try:
+                llm = self._describe_project_via_llm(label, context)
+            except Exception as exc:
+                self._logger.exception("iris_describe_llm_failed", exc)
+                return _result(
+                    status="error",
+                    error=f"LLM call failed: {exc}",
+                    code="describe_failed",
+                )
+            if llm.get("status") != "ok":
+                return _result(
+                    status="error",
+                    error=str(llm.get("error") or "LLM call failed"),
+                    code=str(llm.get("code") or "describe_failed"),
+                )
+            summary = str(llm.get("text") or "").strip()
+
+            # ---- step 5: cache ----
+            try:
+                self._set_project_description_cache(
+                    cache_key,
+                    summary=summary,
+                    label=label,
+                    file_count=int(scan.get("file_count") or 0),
+                )
+            except Exception:
+                # Caching is best-effort.
+                pass
+
+            # ---- step 6: optional CLAUDE.md write ----
+            generated_md_path: Optional[str] = None
+            md_skipped_reason: Optional[str] = None
+            if write_md:
+                claude_md = root / "CLAUDE.md"
+                if claude_md.exists():
+                    md_skipped_reason = "CLAUDE.md already exists"
+                else:
+                    try:
+                        from datetime import datetime
+                        stamp = datetime.now().strftime("%Y-%m-%d")
+                        header = (
+                            f"# {label}\n\n"
+                            f"<!-- Auto-generated by Iris iris_describe_project on {stamp}. "
+                            f"Edit freely — Iris won't overwrite a CLAUDE.md that already exists. -->\n\n"
+                        )
+                        claude_md.write_text(header + summary + "\n",
+                                             encoding="utf-8")
+                        generated_md_path = str(claude_md)
+                    except Exception as exc:
+                        md_skipped_reason = f"write failed: {exc}"
+
+            return _result(
+                status="ok",
+                summary=summary,
+                project_label=label,
+                root_path=cache_key,
+                file_count=int(scan.get("file_count") or 0),
+                samples_count=int(scan.get("samples_count") or 0),
+                context_bytes=int(scan.get("context_bytes") or 0),
+                model=str(llm.get("model") or ""),
+                cached=False,
+                generated_md_path=generated_md_path,
+                md_skipped_reason=md_skipped_reason,
+            )
+        except Exception as exc:
+            # Outer guard — must NEVER let this tool break dispatch.
+            self._logger.exception("iris_describe_project_uncaught", exc)
+            return _result(
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+                code="exception",
+            )
+
     def close(self) -> None:
         """Tear down background workers. Called when the Iris session stops so
         the auto-approve watcher thread (a daemon that polls + clicks on a
@@ -2808,8 +4759,347 @@ class ToolExecutor:
         )
 
 
+    # ====================================================================
+    # Ambient / power-tools pack — added after the "everywhere" roadmap.
+    # Each tool is small, deterministic, OS-level. All have graceful
+    # fallbacks so a missing dep (winsdk, pywin32, pycaw) returns a
+    # clear error instead of crashing the session.
+    # ====================================================================
+
+    def _t_notify_toast(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Show a Windows toast. Tries `win11toast` first (zero ALU-side
+        deps), then `winsdk.windows.ui.notifications` (newer). Both are
+        non-blocking and return immediately."""
+        title = str(args.get("title") or "").strip()
+        if not title:
+            return _result(status="error", error="title is required")
+        body = str(args.get("body") or "").strip()
+        urgency = str(args.get("urgency") or "normal").lower()
+        # win11toast is a thin wrapper that handles AUMID registration
+        # for us — preferred when installed because it Just Works on
+        # Win10/11 across packaging modes.
+        try:
+            from win11toast import toast as _toast  # type: ignore
+            duration = "short" if urgency == "low" else (
+                "long" if urgency == "high" else "short")
+            try:
+                _toast(title, body or None, duration=duration,
+                       app_id="Touchless.Iris", on_click=None)
+                return _result(status="ok", surface="win11toast",
+                               title=title)
+            except TypeError:
+                # Older win11toast: missing some kwargs.
+                _toast(title, body or None)
+                return _result(status="ok", surface="win11toast",
+                               title=title)
+        except Exception:
+            pass
+        # Fallback: raw winsdk path. AUMID is set globally by main.py.
+        try:
+            from winsdk.windows.ui.notifications import (  # type: ignore
+                ToastNotification, ToastNotificationManager,
+            )
+            from winsdk.windows.data.xml.dom import XmlDocument  # type: ignore
+            xml_template = (
+                '<toast><visual><binding template="ToastGeneric">'
+                f'<text>{_xml_escape(title)}</text>'
+                + (f'<text>{_xml_escape(body)}</text>' if body else '')
+                + '</binding></visual></toast>'
+            )
+            doc = XmlDocument()
+            doc.load_xml(xml_template)
+            ToastNotificationManager.create_toast_notifier(
+                "Touchless.Iris").show(ToastNotification(doc))
+            return _result(status="ok", surface="winsdk", title=title)
+        except Exception as exc:
+            return _result(
+                status="error",
+                error=("no toast backend available — pip install "
+                       "win11toast (or winsdk). Detail: "
+                       f"{type(exc).__name__}: {exc}"))
+
+    def _t_get_active_window(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Return focused window context. Combines the existing
+        foreground_window probe with UIA TextPattern for selected text."""
+        info = get_foreground_window_info()
+        title = info.title if info else ""
+        app_name = (getattr(info, "process_name", "") or "") if info else ""
+        exe_path = (getattr(info, "process_path", "") or "") if info else ""
+        hwnd = (getattr(info, "hwnd", 0) or 0) if info else 0
+        window_class = (getattr(info, "class_name", "") or "") if info else ""
+        selected_text = ""
+        selection_app = ""
+        if bool(args.get("include_selection", True)) and hwnd:
+            try:
+                selected_text, selection_app = _read_uia_selection(hwnd)
+            except Exception:
+                selected_text, selection_app = "", ""
+        # Truncate selection so a 5MB document open in an editor doesn't
+        # blow up the model context.
+        if len(selected_text) > 4000:
+            selected_text = selected_text[:4000] + "…[truncated]"
+        return _result(
+            status="ok",
+            title=title,
+            app_name=app_name,
+            exe_path=exe_path,
+            hwnd=int(hwnd) if hwnd else 0,
+            window_class=window_class,
+            selected_text=selected_text,
+            selection_app=selection_app,
+            has_selection=bool(selected_text),
+        )
+
+    def _t_clipboard_read(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        text, source_app = _read_clipboard_text()
+        if text is None:
+            return _result(
+                status="error",
+                error="clipboard is empty or contains non-text content")
+        return _result(status="ok",
+                       text=text,
+                       length=len(text),
+                       source_app=source_app)
+
+    def _t_clipboard_write(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        text = args.get("text")
+        if text is None:
+            return _result(status="error", error="text is required")
+        text = str(text)
+        ok, err = _write_clipboard_text(text)
+        if not ok:
+            return _result(status="error", error=err or "clipboard write failed")
+        if bool(args.get("notify", True)):
+            preview = text.replace("\n", " ")[:60]
+            if len(text) > 60:
+                preview += "…"
+            try:
+                self._t_notify_toast({
+                    "title": f"Copied {len(text)} chars to clipboard",
+                    "body": preview, "urgency": "low",
+                })
+            except Exception:
+                pass
+        return _result(status="ok", chars=len(text))
+
+    def _t_clipboard_transform(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Read clipboard → run instruction via Ollama → replace
+        clipboard. Falls back to an error message when Ollama isn't
+        configured so the realtime path can take over."""
+        instruction = str(args.get("instruction") or "").strip()
+        if not instruction:
+            return _result(status="error",
+                           error="instruction is required")
+        text, source_app = _read_clipboard_text()
+        if text is None:
+            return _result(
+                status="error",
+                error="clipboard is empty or contains non-text content")
+        if len(text) > 8000:
+            return _result(
+                status="error",
+                error=(f"clipboard text is {len(text)} chars — too "
+                       "long for in-process transform. Read it, "
+                       "summarize first, then transform."))
+        try:
+            from .connectors.ollama_connector import OllamaConnector
+            ollama = OllamaConnector()
+            if not ollama.available():
+                return _result(
+                    status="error",
+                    error=("Ollama isn't running — install + "
+                           "start it (the local model powers free "
+                           "clipboard transforms), or do this via "
+                           "realtime instead."))
+            prompt = (
+                f"{instruction}\n\n"
+                "Apply the instruction above to the text below. "
+                "Return ONLY the transformed text — no preamble, "
+                "no explanation, no quotes around it.\n\n"
+                f"---\n{text}\n---"
+            )
+            out = ollama.execute("ollama_generate", {"prompt": prompt})
+        except Exception as exc:
+            return _result(
+                status="error",
+                error=f"ollama call failed: {type(exc).__name__}: {exc}")
+        if (out or {}).get("status") != "ok":
+            return _result(
+                status="error",
+                error=str((out or {}).get("error") or "ollama returned no text"))
+        new_text = str(out.get("text") or "").strip()
+        if not new_text:
+            return _result(status="error",
+                           error="ollama returned an empty string")
+        ok, err = _write_clipboard_text(new_text)
+        if not ok:
+            return _result(status="error",
+                           error=err or "clipboard write failed")
+        try:
+            self._t_notify_toast({
+                "title": "Clipboard transformed",
+                "body": (instruction[:48]
+                         + ("…" if len(instruction) > 48 else "")),
+                "urgency": "low",
+            })
+        except Exception:
+            pass
+        return _result(
+            status="ok",
+            original_chars=len(text),
+            new_chars=len(new_text),
+            preview=new_text[:200],
+            source_app=source_app,
+        )
+
+
 def _result(**fields: Any) -> Dict[str, Any]:
     return dict(fields)
+
+
+def _xml_escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+# ---- clipboard helpers -----------------------------------------------------
+
+def _read_clipboard_text() -> tuple:
+    """Returns (text|None, source_app_name). Tolerant of:
+      * empty clipboard → (None, "")
+      * non-text content (image, file list) → (None, "")
+      * other process holding the clipboard → retries once
+      * pywin32 missing → (None, "") (graceful degrade)"""
+    try:
+        import win32clipboard  # type: ignore
+        import win32con  # type: ignore
+    except Exception:
+        return None, ""
+    # Source app = whoever last set the clipboard. Best-effort.
+    source_app = ""
+    text = None
+    for attempt in (1, 2):
+        try:
+            win32clipboard.OpenClipboard()
+        except Exception:
+            import time
+            time.sleep(0.05)
+            continue
+        try:
+            try:
+                owner_hwnd = win32clipboard.GetClipboardOwner()
+                if owner_hwnd:
+                    import win32process  # type: ignore
+                    import win32api  # type: ignore
+                    _, pid = win32process.GetWindowThreadProcessId(owner_hwnd)
+                    try:
+                        h = win32api.OpenProcess(0x0400 | 0x0010, False, pid)
+                        source_app = win32process.GetModuleFileNameEx(h, 0)
+                        source_app = source_app.rsplit("\\", 1)[-1]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                data = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                text = str(data) if data is not None else None
+            except Exception:
+                # Not text content (image, file list, etc.).
+                text = None
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+        break
+    return text, source_app
+
+
+def _write_clipboard_text(text: str) -> tuple:
+    """Returns (ok, err). Retries once on race with other clipboard
+    consumers."""
+    try:
+        import win32clipboard  # type: ignore
+        import win32con  # type: ignore
+    except Exception:
+        return False, "pywin32 not available"
+    last_err = ""
+    for attempt in (1, 2):
+        try:
+            win32clipboard.OpenClipboard()
+        except Exception as exc:
+            last_err = f"{type(exc).__name__}: {exc}"
+            import time
+            time.sleep(0.05)
+            continue
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32con.CF_UNICODETEXT, text)
+            return True, ""
+        except Exception as exc:
+            last_err = f"{type(exc).__name__}: {exc}"
+        finally:
+            try:
+                win32clipboard.CloseClipboard()
+            except Exception:
+                pass
+    return False, last_err or "unknown clipboard write error"
+
+
+# ---- UIA selection helper --------------------------------------------------
+
+def _read_uia_selection(hwnd: int) -> tuple:
+    """Best-effort: probe the focused UIA element for selected text. Returns
+    (text, owner_app_name). On any failure returns ("", "")."""
+    try:
+        import uiautomation as uia  # type: ignore
+    except Exception:
+        return "", ""
+    try:
+        focused = uia.GetFocusedControl()
+        if not focused:
+            return "", ""
+        # Owner app name from the focused element's process.
+        owner = ""
+        try:
+            owner = (focused.ProcessId  # type: ignore[attr-defined]
+                     and uia.GetRootControl().Name) or ""
+        except Exception:
+            owner = ""
+        # Prefer the TextPattern selection (most editors, browsers,
+        # Office apps). Fall back to the ValuePattern (input fields)
+        # if no selection range exists.
+        try:
+            tp = focused.GetTextPattern()
+            if tp:
+                try:
+                    sels = tp.GetSelection()
+                    if sels:
+                        parts = []
+                        for r in sels:
+                            try:
+                                parts.append(r.GetText(-1) or "")
+                            except Exception:
+                                pass
+                        joined = "".join(parts).strip()
+                        if joined:
+                            return joined, owner
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # ValuePattern fallback (single-line inputs).
+        try:
+            vp = focused.GetValuePattern()
+            if vp:
+                v = (vp.Value or "").strip()
+                if v:
+                    return v, owner
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return "", ""
 
 
 def _is_within(path: Path, parent: Path) -> bool:

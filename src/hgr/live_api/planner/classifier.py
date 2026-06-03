@@ -24,6 +24,51 @@ from typing import Any, Dict, Optional
 from .plan import Step
 
 
+# ---- shared helpers --------------------------------------------------------
+
+_NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "couple": 2, "few": 3, "several": 4,
+}
+
+
+def _extract_forecast_days(text: str) -> Optional[int]:
+    """Parse the forecast horizon from a phrase like 'forecast for the
+    next four days', '5-day forecast', 'this week', 'this weekend'. Returns
+    None when no horizon is implied (caller uses weather_get's default)."""
+    t = (text or "").lower()
+    # "this week" / "next week" → 7 days
+    if re.search(r"\b(?:this|next|coming|upcoming|the)\s+week\b", t):
+        return 7
+    # "weekend" → 2 days
+    if re.search(r"\b(?:this|next|the|over\s+the|for\s+the|coming|upcoming)?\s*weekend\b", t):
+        return 2
+    # "tomorrow" → 2 (today + tomorrow)
+    if re.search(r"\btomorrow\b", t) and not re.search(r"\b(?:after|day\s+after)\s+tomorrow\b", t):
+        return 2
+    # "day after tomorrow" → 3
+    if re.search(r"\b(?:after|day\s+after)\s+tomorrow\b", t):
+        return 3
+    # "next N days" / "N day forecast" / "N-day"
+    m = re.search(
+        r"\b(?:next\s+|coming\s+|upcoming\s+|for\s+|over\s+(?:the\s+)?(?:next\s+)?)?"
+        r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten|"
+        r"couple(?:\s+of)?|few|several)"
+        r"[-\s]+(?:day|night)s?\b",
+        t,
+    )
+    if m:
+        token = m.group(1)
+        if token.isdigit():
+            n = int(token)
+        else:
+            n = _NUMBER_WORDS.get(token.split()[0], 0)
+        if 1 <= n <= 10:
+            return n
+    return None
+
+
 class Classifier:
     """Try to deterministically map a normalized command to a Step."""
 
@@ -300,9 +345,13 @@ class Classifier:
             r"\b",
             t, flags=re.IGNORECASE,
         ):
+            args: Dict[str, Any] = {}
+            days = _extract_forecast_days(t)
+            if days:
+                args["days"] = days
             return Step(
                 tool="weather_get",
-                args={},
+                args=args,
                 layer="touchless",
                 description="weather forecast (auto-detect location)",
             )

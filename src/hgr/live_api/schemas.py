@@ -1298,12 +1298,17 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "weather_get",
         "description": (
-            "Current weather + 1-3 day forecast via wttr.in (free, no API "
-            "key). Auto-detects the user's location from IP when `location` "
-            "is omitted — call with NO args for 'what's the weather'. "
-            "Pass a city/zip/'lat,lon' to query elsewhere. Returns "
-            "{location, description, temperature, feels_like, humidity_pct, "
-            "wind, summary, forecast}."
+            "Current weather + N-day forecast via wttr.in / Open-Meteo "
+            "(free, no API key). Auto-detects the user's location from IP "
+            "when `location` is omitted — call with NO location for "
+            "'what's the weather'. Pass a city/zip/'lat,lon' to query "
+            "elsewhere. `days` sets the forecast horizon (1-10, default 3) — "
+            "use what the user asked for: 'forecast for the next four days' "
+            "→ days=4; 'this week' → days=7; 'weekend' → days=2 or 3; "
+            "'tomorrow' → days=2 (today + tomorrow). Returns {location, "
+            "description, temperature, feels_like, humidity_pct, wind, "
+            "summary, forecast[]} — forecast is a list of {day, min, max, "
+            "description} entries, one per day."
         ),
         "parameters": {
             "type": "object",
@@ -1311,6 +1316,8 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                 "location": {"type": "string"},
                 "units": {"type": "string",
                           "description": "'imperial' (default) or 'metric'"},
+                "days": {"type": "integer",
+                         "description": "Forecast horizon, 1-10. Default 3."},
             },
             "required": [],
             "additionalProperties": False,
@@ -1406,6 +1413,322 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {"text": {"type": "string"}},
             "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "iris_remove_project",
+        "description": (
+            "Remove a project from Iris's cortex / world model. The project "
+            "is added to the user's exclusion list (so it won't reappear from "
+            "the auto-discovery sweep on next launch), purged from the cortex "
+            "world state, and removed from the auto-discovered project cache. "
+            "Use when the user asks you to 'remove', 'hide', 'forget', or "
+            "'get rid of' a project node in your cortex / brain / world. "
+            "Provide EITHER project_id (the slug or folder name) OR "
+            "project_label (the display name); matching is case-insensitive "
+            "and substring-based, so either works. IMPORTANT: only "
+            "auto-discovered projects can be removed — the four hardcoded "
+            "Touchless project roots (touchless-dev, touchless-website, "
+            "touchless-marketing, touchless-tracking) are protected and will "
+            "return an error if requested."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": (
+                        "Slug id of the project to remove "
+                        "(e.g. 'vcpkg', 'hgr-app-v1-0-0-jarvis-test'). "
+                        "Either this or project_label is required."
+                    ),
+                },
+                "project_label": {
+                    "type": "string",
+                    "description": (
+                        "Human-readable label / folder name "
+                        "(e.g. 'vcpkg', 'Jarvis Assistant'). Used as a "
+                        "fallback when project_id isn't known."
+                    ),
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "iris_add_project",
+        "description": (
+            "Add a project folder to Iris's cortex / world model. The "
+            "project is registered in the cortex world state, removed "
+            "from the user's exclusion list if previously hidden, "
+            "added to the auto-discovered cache so it persists across "
+            "launches, and the cortex visualization is updated so the "
+            "new project node appears in the live sphere. Use when the "
+            "user asks to 'add', 'register', 'include', or 'un-hide' a "
+            "folder as a project in your cortex / brain / world. Provide "
+            "EITHER project_path (absolute path or folder name) OR "
+            "project_label (display / folder name); when only a name is "
+            "given, Iris will search the user's common folders to "
+            "resolve it. Idempotent — re-adding an existing project is "
+            "a safe no-op."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_path": {
+                    "type": "string",
+                    "description": (
+                        "Absolute filesystem path to the project folder "
+                        "(e.g. 'c:\\HGR App v1.0.0 - jarvis test') or "
+                        "just the folder name (e.g. 'HGR App v1.0.0 - "
+                        "jarvis test'). Either this or project_label is "
+                        "required."
+                    ),
+                },
+                "project_label": {
+                    "type": "string",
+                    "description": (
+                        "Human-readable display / folder name "
+                        "(e.g. 'HGR App v1.0.0 - jarvis test', "
+                        "'My Project'). Used as a fallback to resolve "
+                        "the folder via file search when project_path "
+                        "isn't an absolute path. Either this or "
+                        "project_path is required."
+                    ),
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "iris_query_node",
+        "description": (
+            "Look up a node in Iris's cortex / world model by id or label. "
+            "Returns the node's details (kind, label, root path, touch count, "
+            "parent, direct children count, leaf count, and a short list of "
+            "leaf labels). Use when the user asks 'what is this node', "
+            "'tell me about <project>', 'what's in your cortex about X', or "
+            "to inspect the structure before acting. Provide EITHER node_id "
+            "(slug) OR node_label (display name); matching is case-insensitive "
+            "and substring-based, so either works. Reads from the cached "
+            "world payload (snapshot at the most recent load) — fast and "
+            "synchronous, never re-scans the filesystem."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "node_id": {
+                    "type": "string",
+                    "description": (
+                        "Slug id of the node (e.g. 'proj-vcpkg', "
+                        "'cap-tools', 'tool-open_app'). Either this or "
+                        "node_label is required."
+                    ),
+                },
+                "node_label": {
+                    "type": "string",
+                    "description": (
+                        "Human-readable label (e.g. 'vcpkg', 'Tools', "
+                        "'Open App'). Case-insensitive, substring-based. "
+                        "Either this or node_id is required."
+                    ),
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "iris_describe_project",
+        "description": (
+            "Scan a project folder and produce a 1-2 paragraph summary "
+            "describing the project. Reads CLAUDE.md, README.md, "
+            "package.json (description field), pyproject.toml (description), "
+            "and samples 5-10 of the most relevant source files (markdown, "
+            "code, config) under src/docs/pages. Uses GPT-5-mini to "
+            "synthesize: purpose, audience, tech stack (if code), and "
+            "current focus/status. Works for ANY project type — code, "
+            "writing, research, school projects. "
+            "Summaries are cached for 24 hours. Pass write_md=True to "
+            "additionally write the summary to a fresh CLAUDE.md (only "
+            "if none exists). "
+            "Provide EITHER project_id (slug or folder name) OR "
+            "project_label (display name); matching is case-insensitive "
+            "and substring-based. Requires OPENAI_API_KEY env var."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": (
+                        "Slug/folder name of the project (e.g. "
+                        "'hgr-app-v1-0-0'). Either this or project_label "
+                        "is required."
+                    ),
+                },
+                "project_label": {
+                    "type": "string",
+                    "description": (
+                        "Display name of the project (e.g. 'HGR App "
+                        "v1.0.0'). Used as a fallback when project_id "
+                        "isn't known."
+                    ),
+                },
+                "write_md": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "If true AND no CLAUDE.md exists in the project "
+                        "root, write the auto-generated summary to "
+                        "CLAUDE.md. Existing CLAUDE.md is never "
+                        "overwritten."
+                    ),
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+
+    # ====================================================================
+    # Ambient / power-tools pack — added after the "everywhere" roadmap.
+    # Each tool is small, deterministic, and high-frequency-of-use.
+    # ====================================================================
+
+    # ---- toast notification --------------------------------------------
+    {
+        "type": "function",
+        "name": "notify_toast",
+        "description": (
+            "Show a Windows toast notification. Use to deliver a "
+            "background result without stealing focus — better than a "
+            "chat bubble when the user is in another app. Quiet by "
+            "default; only use for completions / status the user "
+            "actually wants surfaced."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string",
+                          "description": "Short headline shown bold."},
+                "body": {"type": "string",
+                         "description": "Optional sub-line below the title."},
+                "urgency": {
+                    "type": "string",
+                    "enum": ["low", "normal", "high"],
+                    "default": "normal",
+                    "description": ("low = silent + short; normal = "
+                                    "default banner; high = stays "
+                                    "longer, uses urgent style."),
+                },
+            },
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+    },
+
+    # ---- active-window context -----------------------------------------
+    {
+        "type": "function",
+        "name": "get_active_window",
+        "description": (
+            "Return what window is FOCUSED right now: title, app name, "
+            "exe path, window class, and the user's selected text (if "
+            "any, via UIA). Use to resolve 'this' / 'this email' / "
+            "'rename this file' / 'reply to this' without screen "
+            "reading. Free — no OCR, no screenshot. Always call BEFORE "
+            "asking the user 'which one?' for pronoun references."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "include_selection": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": ("Read the currently-selected text "
+                                    "via UIA TextPattern (can be slow "
+                                    "for huge documents — set false "
+                                    "if you don't need it)."),
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+
+    # ---- clipboard pipeline --------------------------------------------
+    {
+        "type": "function",
+        "name": "clipboard_read",
+        "description": (
+            "Read the user's current clipboard text. Returns "
+            "{text, length, source_app}. Use when the user says "
+            "'summarize what I just copied' / 'translate this' / "
+            "'what's in my clipboard'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "clipboard_write",
+        "description": (
+            "Replace the clipboard contents with the given text so the "
+            "user can paste it. Use AFTER generating something the "
+            "user wants to paste (a summary, a rephrased email, a "
+            "regex)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string"},
+                "notify": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": ("Show a quiet toast confirming "
+                                    "'copied to clipboard' so the user "
+                                    "knows it's ready to paste."),
+                },
+            },
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
+        "name": "clipboard_transform",
+        "description": (
+            "Read the clipboard, run an instruction over its text via "
+            "the local Ollama model, REPLACE the clipboard with the "
+            "result, and toast the user. The one-call shortcut for "
+            "'copy text → ask Iris to fix it → paste'. Use for "
+            "rephrase / proofread / shorten / translate / convert "
+            "format. Falls back to realtime when Ollama isn't "
+            "available."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "instruction": {
+                    "type": "string",
+                    "description": ("Short imperative: 'fix grammar', "
+                                    "'translate to Spanish', "
+                                    "'rephrase formally', etc."),
+                },
+            },
+            "required": ["instruction"],
             "additionalProperties": False,
         },
     },
