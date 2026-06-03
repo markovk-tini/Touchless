@@ -223,18 +223,28 @@ def build_system_instructions() -> str:
         "youtube_* (a YouTube tab), chrome_* (browser), and the email/Google "
         "tools below. Only control the app on-screen (click/type) when no such "
         "tool is available for the task.\n"
-        "READING THE SCREEN: to READ or SUMMARIZE on-screen text — the user's "
-        "email in their open Outlook/Mail window, a document, a chat, a web "
-        "page — call read_screen (accurate OCR text, cheap, no image). Use "
-        "get_screen_context (a picture) only to SEE layout or find something "
-        "to click. The user's mailbox lives in Outlook; there is no mail-read "
-        "API, so 'read/summarize my email' = open Outlook if it isn't already "
-        "(open_app('outlook')), then read_screen on it. Do NOT compose a new "
-        "email when asked to READ one. If "
-        "content is cut off below the fold (a long inbox/doc), call read_screen "
-        "with scroll_passes (e.g. 6) so it scrolls and reads ALL of it — don't "
-        "say items may be hidden, just scroll. To read one email's full body, "
-        "click it, then read_screen the reading pane.\n"
+        "READING THE SCREEN: to READ or SUMMARIZE on-screen text — a "
+        "document, a chat, a web page — call read_screen (accurate OCR text, "
+        "cheap, no image). Use get_screen_context (a picture) only to SEE "
+        "layout or find something to click. If content is cut off below the "
+        "fold (a long inbox/doc), call read_screen with scroll_passes (e.g. "
+        "6) so it scrolls and reads ALL of it — don't say items may be "
+        "hidden, just scroll.\n"
+        "EMAIL READS / SUMMARIES (HARD RULE — connector first, screen-read "
+        "last): for ANY 'read/summarize/check/show my email(s) / inbox / "
+        "unread' request, ALWAYS call find_capability('summarize unread "
+        "emails') FIRST. It loads the fast API tool — gmail_list when Gmail "
+        "is connected (use unread_only=true, include_body=true to get the "
+        "text in one call) or ms_mail_list for Microsoft accounts. Both "
+        "return structured messages in a single round trip — no window to "
+        "open, no OCR, no scrolling. Only if find_capability returns NOTHING "
+        "(no email connector wired) fall back to open_app('outlook') + "
+        "read_screen. Do NOT default to opening Outlook + read_screen when a "
+        "connector is available — that path is slow, brittle, and the user "
+        "explicitly does not want it. Do NOT compose a new email when asked "
+        "to READ one. To read ONE email's full body via the connector pass "
+        "include_body=true on the list call (or message_get with the id) "
+        "instead of clicking into the message in a window.\n"
         "PERSONAL TEAMS / APPS WITH NO API: teams_send/teams_channel_post work "
         "only for work/school Microsoft accounts. For a PERSONAL Teams account "
         "(or any app the connectors don't cover), DRIVE THE APP BY SCREEN: "
@@ -2920,10 +2930,16 @@ class LiveApiManager(QObject):
         downloading. Cuts perceived audio latency dramatically for
         long replies. With no callback, behaves as before (full read).
 
-        Strategy: try gpt-4o-mini-tts with the requested voice first; if
-        the API rejects the voice (e.g. region lag, voice not enabled),
-        retry with the mapped fallback voice; if the whole model is
-        rejected, drop to tts-1 with the fallback voice.
+        Voice consistency rule: the user-configured voice (marin by
+        default) MUST be used for every reply, otherwise mixing two
+        voices in one session sounds unprofessional. So transient
+        failures (timeout / 429 / 5xx) retry the SAME (model, voice)
+        with brief backoff before any fallback. Only HARD failures
+        (400/404 on the voice itself) move on to the fallback voice.
+
+        Strategy: gpt-4o-mini-tts + requested voice → retry on
+        transient. Only on HARD voice-rejection move to fallback
+        voice. Only if the whole model is rejected drop to tts-1.
 
         response_format='pcm' returns exactly the format AudioPlayer
         consumes — 24 kHz mono signed-16 little-endian, no header — so we
@@ -2936,6 +2952,12 @@ class LiveApiManager(QObject):
         if fallback_voice != voice:
             attempts.append((self._TTS_MODEL_PRIMARY, fallback_voice))
         attempts.append((self._TTS_MODEL_FALLBACK, fallback_voice))
+
+        # Per-attempt transient-retry budget. Tight enough that a real
+        # outage doesn't block the user for long, generous enough that
+        # a one-off rate-limit blip doesn't flip the voice to sage.
+        _TRANSIENT_RETRIES = 2
+        _BACKOFF_S = 0.4
 
         last_err: Optional[str] = None
         for model, attempt_voice in attempts:
@@ -3020,10 +3042,37 @@ class LiveApiManager(QObject):
                                             voice=attempt_voice)
                     except Exception:
                         pass
-                # 400 typically means invalid voice/model — try next combo.
                 # 401/403 (auth) won't be fixed by a retry; bail.
                 if code in (401, 403):
                     return b""
+                # 429 / 5xx are transient — retry the SAME (model, voice)
+                # before falling through to a different voice. This keeps
+                # the user-configured voice (marin) intact across blips.
+                if code == 429 or 500 <= code < 600:
+                    import time as _time
+                    for retry in range(_TRANSIENT_RETRIES):
+                        _time.sleep(_BACKOFF_S * (retry + 1))
+                        try:
+                            with urllib.request.urlopen(req, timeout=15.0) as resp2:
+                                if getattr(resp2, "status", 200) == 200:
+                                    if on_chunk is not None:
+                                        buf2 = bytearray()
+                                        while True:
+                                            chunk = resp2.read(8192)
+                                            if not chunk:
+                                                break
+                                            buf2.extend(chunk)
+                                            try:
+                                                on_chunk(chunk)
+                                            except Exception:
+                                                pass
+                                        return bytes(buf2)
+                                    return resp2.read() or b""
+                        except Exception:
+                            continue
+                    # Retries exhausted: still skip to next (model, voice)
+                    # rather than return silence — partial fallback beats
+                    # nothing, and the loud log above flags the issue.
                 continue
             except Exception as exc:
                 if self._logger:
@@ -3032,6 +3081,29 @@ class LiveApiManager(QObject):
                     except Exception:
                         pass
                 last_err = str(exc)
+                # Network-level transient — retry the same combo before
+                # moving on, same reasoning as above.
+                import time as _time
+                for retry in range(_TRANSIENT_RETRIES):
+                    _time.sleep(_BACKOFF_S * (retry + 1))
+                    try:
+                        with urllib.request.urlopen(req, timeout=15.0) as resp2:
+                            if getattr(resp2, "status", 200) == 200:
+                                if on_chunk is not None:
+                                    buf2 = bytearray()
+                                    while True:
+                                        chunk = resp2.read(8192)
+                                        if not chunk:
+                                            break
+                                        buf2.extend(chunk)
+                                        try:
+                                            on_chunk(chunk)
+                                        except Exception:
+                                            pass
+                                    return bytes(buf2)
+                                return resp2.read() or b""
+                    except Exception:
+                        continue
                 continue
         return b""
 
