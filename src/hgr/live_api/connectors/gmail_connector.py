@@ -189,21 +189,14 @@ class GmailConnector(Connector):
                 "body": {"type": "string"}},
                ["to", "subject", "body"]),
             fn("gmail_list",
-               "List recent Gmail inbox messages. Set unread_only=true for "
-               "INBOX + UNREAD only. Returns {messages: [{id, from, "
-               "from_name, subject, received, snippet}], count}. `count` is "
-               "the EXACT number of messages returned — quote it directly, "
-               "never round or guess. Set include_body=true to ALSO fetch "
-               "each full body (HTML stripped, capped at 2 KB) inline as "
-               "body_text — required for any real 'summarize/read my "
-               "emails' request so the reply has substance. Set max=50 "
-               "(the cap) for any 'summarize ALL my unread' request; the "
-               "default of 10 silently truncates a real inbox. NEVER "
-               "invent message content not in the returned array — if "
-               "count=0, say there are no unread emails. Works for the "
-               "user's actual Gmail inbox; prefer this over ms_mail_list "
-               "when the connected MS account is a personal MSA (Graph "
-               "contacts/inbox are incomplete on those).",
+               "NOT SHIPPED for reads in public builds — the gmail.readonly "
+               "scope requires paid CASA verification. This tool will return "
+               "an error directing the user to Outlook desktop or Microsoft "
+               "Graph instead. Do NOT call it for 'summarize/read my emails' "
+               "requests — call email_summary instead, which cascades through "
+               "the free read paths (Outlook desktop COM, MS Graph) "
+               "automatically. Only acceptable use is dev/personal builds "
+               "where TOUCHLESS_GMAIL_READONLY=1 was opted in.",
                {"max": {"type": "integer",
                         "description": "Max messages 1-50 (default 10). "
                                        "Use 50 for 'summarize unread'."},
@@ -231,14 +224,23 @@ class GmailConnector(Connector):
         need_readonly = name in ("gmail_list", "gmail_read")
         need_send = name == "gmail_send"
         if need_readonly and not self._has_readonly():
+            # The shipped app intentionally does NOT request gmail.readonly
+            # (it's a Google "restricted" scope requiring a $10-30k/yr
+            # CASA security assessment for verified distribution — not
+            # viable for free). Direct the user to the free read paths
+            # instead: Outlook desktop COM (covers Gmail via IMAP +
+            # everything else) or Microsoft Graph if they have an MSA.
             return connector_result(
                 "error",
-                error=("Gmail is connected, but you didn't grant the "
-                       "'Read your email' (gmail.readonly) scope on "
-                       "the consent screen. Click 'Connect Gmail' "
-                       "again and make sure every checkbox — "
-                       "especially 'Read your email' — is ticked."),
-                code="scope_missing",
+                error=("Reading Gmail directly via the Gmail API isn't "
+                       "supported in this build (the scope requires "
+                       "Google's paid CASA verification). Free "
+                       "alternatives: (1) launch Outlook desktop with "
+                       "Gmail added via IMAP and Iris will read it "
+                       "automatically, or (2) connect a Microsoft "
+                       "account in Touchless settings and Iris will "
+                       "read its mailbox via Microsoft Graph."),
+                code="not_supported",
                 missing_scope="gmail.readonly")
         if need_send and not self._has_send():
             return connector_result(

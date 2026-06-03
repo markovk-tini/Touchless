@@ -49,7 +49,14 @@ SCOPES: List[str] = [
     "https://www.googleapis.com/auth/presentations",
     "https://www.googleapis.com/auth/drive.file",
 ]
-if os.environ.get("TOUCHLESS_GMAIL_READONLY", "1") != "0":
+# gmail.readonly is a Google "restricted" scope that requires CASA Tier 2
+# security assessment ($10-30k upfront + annual renewal) for verified
+# distribution. NOT shippable for free, so we OPT-OUT by default and
+# leave reads to Outlook desktop COM (free, no verification) and MS
+# Graph Mail.Read ($99/yr Microsoft Partner, no CASA). Personal devs
+# can flip it on via TOUCHLESS_GMAIL_READONLY=1 — but the shipped app
+# never asks for it, so users never see the "unverified app" warning.
+if os.environ.get("TOUCHLESS_GMAIL_READONLY", "0") == "1":
     SCOPES.append("https://www.googleapis.com/auth/gmail.readonly")
 
 

@@ -1974,8 +1974,16 @@ class ToolExecutor:
                 # collapse to "unavailable" which then read as "no
                 # email accounts connected" — misleading when the user
                 # IS connected but just missed a scope checkbox.
-                if code in ("not_connected",):
+                if code == "not_connected":
                     tag = "not_connected"
+                elif code == "not_supported":
+                    # Connector exists and (often) is even connected,
+                    # but the specific operation isn't shippable in
+                    # this build (e.g. Gmail reads require paid CASA
+                    # verification). Skip silently to the next
+                    # connector — the cascade's job is to find a path
+                    # that WORKS, not lecture the user.
+                    tag = "not_supported"
                 else:
                     # Anything else (scope_missing, http_error, quota,
                     # etc.) is "err" — connector IS reachable, we have
@@ -2025,6 +2033,10 @@ class ToolExecutor:
         gmail_errored = gmail_state == "err"
         ms_errored = ms_state == "err"
         outlook_errored = outlook_state == "err"
+        # not_supported is by design (Gmail read requires paid CASA in
+        # public builds) — surface it as a single helpful line at the
+        # bottom of the summary instead of as an "error".
+        gmail_unsupported = gmail_state == "not_supported"
         any_errored = gmail_errored or ms_errored or outlook_errored
         if any_errored:
             parts: List[str] = []
@@ -2112,7 +2124,7 @@ class ToolExecutor:
         # Exactly one connector returned 0 and the other isn't connected.
         # Name the one we checked AND say plainly that the other wasn't
         # checked — never claim "no unread emails" globally.
-        if gmail_ok_empty and ms_state in ("missing", "not_connected", "unavailable"):
+        if gmail_ok_empty and ms_state in ("missing", "not_connected", "unavailable", "not_supported"):
             return _result(
                 status="ok", count=0, messages=[], source="gmail",
                 summary=("Your Gmail has no unread. I didn't check Outlook "
@@ -2121,28 +2133,35 @@ class ToolExecutor:
                          "say 'read my Outlook screen' and I'll OCR the "
                          "inbox you have open."),
                 suggested_actions=["connect_ms", "read_outlook_screen"])
-        if ms_ok_empty and gmail_state in ("missing", "not_connected", "unavailable"):
+        if ms_ok_empty and gmail_state in ("missing", "not_connected", "unavailable", "not_supported"):
             return _result(
                 status="ok", count=0, messages=[], source="microsoft",
-                summary=("Your Outlook (via Microsoft Graph) has no "
-                         "unread. I didn't check Gmail because it isn't "
-                         "connected to Touchless yet — connect it in "
-                         "settings, or say 'read my Outlook screen' and "
-                         "I'll OCR the inbox you have open."),
-                suggested_actions=["connect_gmail", "read_outlook_screen"])
+                summary=("Your Microsoft mailbox shows no unread. If "
+                         "you actually use a different provider (Gmail, "
+                         "iCloud, etc.), launch Outlook desktop with "
+                         "that account synced and I'll read it there, "
+                         "or say 'read my Outlook screen' and I'll OCR "
+                         "whatever window you have open."),
+                suggested_actions=["read_outlook_screen"])
 
-        # Neither connector is wired up / available at all. Be explicit
-        # about both options (connect, or screen-read).
+        # Nothing reachable. List the actually-shippable free paths
+        # in order of likely-to-work — Outlook desktop comes first
+        # because it covers ANY account Outlook syncs (including
+        # Gmail-via-IMAP). Gmail API reads aren't in the list because
+        # they require Google's paid CASA verification and aren't
+        # shipped in public builds.
         return _result(
             status="ok", count=0, messages=[], source="none",
-            summary=("I don't have Gmail or Outlook connected via the "
-                     "connectors. To summarize your inbox I can either "
-                     "(a) connect Gmail / Microsoft in Touchless "
-                     "settings, or (b) read your Outlook desktop window "
-                     "directly — say 'read my Outlook screen' and I'll "
-                     "OCR it."),
-            suggested_actions=["connect_gmail", "connect_ms",
-                               "read_outlook_screen"])
+            summary=("I can't read your email yet. Two free options: "
+                     "(1) launch Outlook desktop — once it's open, I'll "
+                     "read whatever inbox(es) you have synced there "
+                     "(Gmail via IMAP, Exchange, Outlook.com, all of "
+                     "them); (2) connect a Microsoft account in "
+                     "Touchless settings and I'll read its mailbox via "
+                     "Microsoft Graph. If you'd rather not set either "
+                     "up, say 'read my Outlook screen' and I'll OCR "
+                     "whatever window you have open."),
+            suggested_actions=["connect_ms", "read_outlook_screen"])
 
     def _t_weather_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         # Free, no-key weather via wttr.in / Open-Meteo. Auto-detects
