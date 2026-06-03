@@ -277,7 +277,7 @@ class IrisPlanner:
             title = str(last.get("title") or "the last one")
             # Use the iris open_url tool to launch it in the browser.
             try:
-                out = self._registry.call("open_url", {"url": link})
+                out = self._registry.call("open_url", {"url_or_query": link})
             except Exception as exc:
                 if self._logger:
                     self._logger.exception("iris_open_last_failed", exc)
@@ -615,19 +615,153 @@ class IrisPlanner:
     def _format_plan_message(self, plan: "Plan", results: list) -> str:
         ok = sum(1 for r in results if r.status == "ok")
         if ok == len(results) and results:
-            # If a "useful" final result exists, surface its message.
-            last = results[-1].output if results else {}
+            last_result = results[-1]
+            last_tool = getattr(last_result, "tool", "") or ""
+            last = last_result.output if isinstance(last_result.output, dict) else {}
+            # Tool-specific surface FIRST — for connectors whose useful output
+            # isn't in one of the generic keys below (e.g. notion_search has a
+            # results list, ollama_list_models has a models list). Returns None
+            # to fall through to the generic scan.
+            specific = self._surface_connector_result(last_tool, last)
+            if specific is not None:
+                return specific
+            # Generic key scan. `text` covers LLM-generated and read-back
+            # content (ollama_generate, notion_read_page, etc.) — without it,
+            # the model's actual answer got swallowed into "Done (1/1 steps:
+            # ollama_generate)" which is what made testing feel broken.
             if isinstance(last, dict):
-                for key in ("link", "message", "result", "summary"):
+                for key in ("link", "message", "result", "summary", "text"):
                     val = last.get(key)
                     if val:
-                        return str(val)[:600]
+                        return str(val)[:2000]
             tools = ", ".join(r.tool for r in results)
             return f"Done ({ok}/{len(results)} steps: {tools})."
         errs = [r for r in results if r.status != "ok"]
         first = errs[0] if errs else None
         return f"Plan ran {ok}/{len(results)} steps" + (
             f"; {first.tool} failed: {first.error}" if first else ".")
+
+    @staticmethod
+    def _surface_connector_result(tool: str,
+                                  r: Dict[str, Any]) -> Optional[str]:
+        """Format a single-tool plan result for tools whose useful output
+        isn't a single text field. Returns None to let the caller fall
+        through to the generic key scan (link/message/result/summary/text)."""
+        if not isinstance(r, dict) or not tool:
+            return None
+        # Notion: a search returns a hit list + count, not a "message" string.
+        if tool == "notion_search":
+            hits = r.get("results") or []
+            count = int(r.get("count") or 0)
+            if not hits:
+                return ("Nothing in your Notion workspace matched. If you "
+                        "expected a hit, check the page is shared with the "
+                        "Iris integration (Share -> Add connections).")
+            lines = []
+            for h in hits[:8]:
+                title = (h.get("title") or "(untitled)").strip()
+                kind = (h.get("object") or "").strip()
+                lines.append(f"- {title}" + (f"  [{kind}]" if kind else ""))
+            more = "" if count <= 8 else f"\n...and {count - 8} more."
+            return (f"Found {count} result"
+                    f"{'s' if count != 1 else ''}:\n"
+                    + "\n".join(lines) + more)
+        if tool == "notion_append_to_page":
+            n = int(r.get("blocks_appended") or 0)
+            return (f"Appended {n} block{'s' if n != 1 else ''} "
+                    "to the page.")
+        if tool == "notion_create_page":
+            url = (r.get("url") or "").strip()
+            return (f"Created the page: {url}" if url
+                    else "Created the page.")
+        if tool == "notion_add_to_database":
+            url = (r.get("url") or "").strip()
+            return (f"Added the row to your database: {url}" if url
+                    else "Added the row.")
+        # Mail send results — show which account ACTUALLY sent + the
+        # recipient + a verify link when ms_mail_send confirmed via Sent
+        # folder lookup. Without this the user gets a generic 'Done.' and
+        # has to guess why no message appeared in their Sent folder.
+        if tool in ("ms_mail_send", "gmail_send"):
+            to = (r.get("to") or "").strip()
+            from_acct = (r.get("from_account") or "").strip()
+            sender = (r.get("sender_address") or "").strip()
+            web_link = (r.get("web_link") or "").strip()
+            sent = r.get("sent")
+            if sent is True or (sent is None and r.get("status") == "ok"):
+                base = f"Sent to {to or 'recipient'}"
+                # Prefer the actual SMTP sender (from Graph) over the
+                # login account name — clearer when the login is e.g.
+                # a gmail address that aliases to an outlook mailbox.
+                shown_from = sender or from_acct
+                if shown_from:
+                    base += f" (from {shown_from}"
+                    if sender and from_acct and sender != from_acct:
+                        base += f", login {from_acct}"
+                    base += ")"
+                base += "."
+                if web_link:
+                    base += f"\nVerify: {web_link}"
+                return base
+            err = (r.get("error") or "").strip()
+            return f"Couldn't send: {err or 'unknown error'}"
+        # Ollama list: friendly inventory.
+        if tool == "ollama_list_models":
+            models = r.get("models") or []
+            default = (r.get("default") or "").strip()
+            if not models:
+                return "No Ollama models installed yet."
+            listing = ", ".join(models)
+            return (f"Installed Ollama models: {listing}."
+                    + (f" Default for quick tasks: {default}." if default
+                       else ""))
+        return None
+
+    # ---- email list formatter (deterministic, never LLM-rephrased) ----
+    @staticmethod
+    def _format_email_list(result: Dict[str, Any],
+                           args: Dict[str, Any]) -> str:
+        """Render gmail_list / ms_mail_list output as a casual but
+        FAITHFUL summary. No LLM in the loop — every sender, subject,
+        and snippet comes straight from the tool response. The model
+        was caught fabricating demo emails when given freedom to
+        'write the reply itself', so this path bypasses it entirely."""
+        msgs = result.get("messages") or []
+        count = int(result.get("count") or len(msgs))
+        unread_only = bool(args.get("unread_only"))
+        kind = "unread email" if unread_only else "email"
+        if count == 0:
+            return (f"You're all caught up — no {kind}s in your inbox."
+                    if unread_only else f"No {kind}s in your inbox.")
+        # Headline. Be honest about truncation.
+        max_n = int(args.get("max") or 0)
+        truncated = max_n and len(msgs) < count
+        if count == 1:
+            head = f"You've got one {kind}:"
+        else:
+            head = f"You've got {count} {kind}s — here they are:"
+            if truncated:
+                head = (f"You've got {count} {kind}s; here are the "
+                        f"first {len(msgs)}:")
+        lines = [head]
+        for i, m in enumerate(msgs, start=1):
+            sender = (str(m.get("from_name") or "").strip()
+                      or str(m.get("from") or "").strip()
+                      or "unknown sender")
+            subject = str(m.get("subject") or "").strip() or "(no subject)"
+            snippet = str(m.get("snippet") or m.get("body_text") or "").strip()
+            # Trim snippet to roughly one sentence so the spoken
+            # version doesn't drone on for 30 emails.
+            if snippet:
+                snippet = snippet.replace("\r", " ").replace("\n", " ")
+                snippet = " ".join(snippet.split())
+                if len(snippet) > 140:
+                    snippet = snippet[:137].rstrip() + "..."
+                lines.append(f"{i}. {sender} — \"{subject}\". {snippet}")
+            else:
+                lines.append(f"{i}. {sender} — \"{subject}\".")
+        lines.append("Want me to open any of them or dig deeper?")
+        return "\n".join(lines)
 
     # ---- friendly result text ----
     @staticmethod
@@ -677,4 +811,18 @@ class IrisPlanner:
         if tool == "weather_get":
             # weather.py already pre-renders the human-readable summary.
             return str(result.get("summary") or "").strip() or f"Done ({tool})."
+        if tool in ("gmail_list", "ms_mail_list"):
+            # Format the reply DETERMINISTICALLY from the actual tool
+            # result so the LLM never gets a chance to hallucinate
+            # sender names, subjects, or counts. The model has been
+            # caught inventing canonical-looking demo emails (Carl,
+            # Sarah, Mark, etc.) instead of reading the real array.
+            return Orchestrator._format_email_list(result, args)
+        if tool == "ollama_generate":
+            # The generated text IS the user-facing response. Without this,
+            # the haiku/poem/regex/etc. would get hidden behind
+            # "Done (ollama_generate)." and the call would feel broken.
+            text = (str(result.get("text") or result.get("response")
+                        or result.get("output") or "")).strip()
+            return text[:4000] if text else f"Done ({tool})."
         return f"Done ({tool})."

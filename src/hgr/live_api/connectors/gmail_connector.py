@@ -100,6 +100,46 @@ def _walk_for_body(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _format_email_summary(msgs: List[Dict[str, Any]], *,
+                          unread_only: bool,
+                          max_arg: int) -> str:
+    """Render a faithful, casual summary of an email list.
+
+    Every sender, subject, and snippet comes verbatim from the message
+    array. No LLM rephrasing — the model has hallucinated demo emails
+    here, so the deterministic format is what the user actually sees."""
+    count = len(msgs or [])
+    kind = "unread email" if unread_only else "email"
+    if count == 0:
+        if unread_only:
+            return "You're all caught up — no unread emails."
+        return "No emails in your inbox."
+    if count == 1:
+        head = f"You've got one {kind}:"
+    else:
+        head = f"You've got {count} {kind}s — here they are:"
+        if max_arg and count >= max_arg:
+            head = (f"Showing the {count} most recent {kind}s "
+                    f"(cap is {max_arg} — say 'show more' to dig deeper):")
+    lines: List[str] = [head]
+    for i, m in enumerate(msgs, start=1):
+        sender = (str(m.get("from_name") or "").strip()
+                  or str(m.get("from") or "").strip()
+                  or "unknown sender")
+        subject = str(m.get("subject") or "").strip() or "(no subject)"
+        snippet = str(m.get("snippet") or m.get("body_text") or "").strip()
+        if snippet:
+            snippet = " ".join(snippet.replace("\r", " ")
+                               .replace("\n", " ").split())
+            if len(snippet) > 140:
+                snippet = snippet[:137].rstrip() + "..."
+            lines.append(f"{i}. {sender} — \"{subject}\". {snippet}")
+        else:
+            lines.append(f"{i}. {sender} — \"{subject}\".")
+    lines.append("Want me to open any of them or dig deeper?")
+    return "\n".join(lines)
+
+
 class GmailConnector(Connector):
     id = "gmail"
 
@@ -228,8 +268,19 @@ class GmailConnector(Connector):
                         body_text = _walk_for_body(msg.get("payload") or {})
                         out["body_text"] = body_text[:2000]
                     out_msgs.append(out)
+                # Deterministic, faithful summary built directly from the
+                # real message array. The LLM has been caught fabricating
+                # demo emails when given freedom to "summarize"; emitting
+                # this summary verbatim guarantees the user sees real
+                # senders and subjects.
+                summary = _format_email_summary(
+                    out_msgs,
+                    unread_only=bool(args.get("unread_only")),
+                    max_arg=max_n,
+                )
                 return connector_result("ok", count=len(out_msgs),
-                                        messages=out_msgs)
+                                        messages=out_msgs,
+                                        summary=summary)
 
             if name == "gmail_read":
                 mid = str(args.get("id") or "").strip()
