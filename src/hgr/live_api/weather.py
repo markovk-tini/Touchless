@@ -32,14 +32,29 @@ _FORECAST_OPENERS = [
     "At the moment it's {temp}",
 ]
 
+# Casual follow-up offers (never a raw URL — TTS reading a link aloud
+# sounds awful).
+_FOLLOWUP_OFFERS = [
+    "Want me to dig into anything?",
+    "Anything else you want to know?",
+    "Let me know if you want more on any of that.",
+    "Curious about anything else?",
+]
+
 
 def _phrase_for_now(place: str, desc: str, temp: str, feels: str,
-                    wind: str, humidity, time_hint: str = "") -> str:
+                    wind: str, humidity, time_hint: str = "",
+                    temp_num: Optional[float] = None,
+                    feels_num: Optional[float] = None) -> str:
     """Build a conversational sentence for current conditions."""
     opener = random.choice(_NOW_OPENERS).format(
         desc=desc.lower(), place=place, temp=temp)
-    feels_clause = (f" (feels like {feels})"
-                    if feels and feels != temp else "")
+    # Only mention "feels like" when it differs meaningfully from the
+    # air temperature — saying "65°F (feels like 65°F)" sounds silly.
+    feels_clause = ""
+    if feels and feels != temp and temp_num is not None and feels_num is not None:
+        if abs(feels_num - temp_num) >= 3:
+            feels_clause = f" (feels like {feels})"
     extras: List[str] = []
     if wind and wind.strip() not in {"—", "0 mph", "0 km/h"}:
         extras.append(f"wind around {wind}")
@@ -271,7 +286,7 @@ def _get_weather_open_meteo(location: str,
     feels_num = feels if isinstance(feels, (int, float)) else None
     time_hint = _time_hint(temp_num, today_hi, today_lo)
     summary = _phrase_for_now(label, desc, temp_s, feels_s, wind_s,
-                              humidity, time_hint)
+                              humidity, time_hint, temp_num, feels_num)
     for adv in _advisories(desc, temp_num, wind_num, feels_num):
         summary += " " + adv
 
@@ -298,15 +313,14 @@ def _get_weather_open_meteo(location: str,
                 day_label, d_desc, f"{round(d_max)}{deg}",
                 f"{round(d_min)}{deg}"))
         forecast.append({
-            "date": date_str,
-            "day_label": day_label,
+            "day": day_label,
             "min": (f"{round(d_min)}{deg}" if d_min is not None else "—"),
             "max": (f"{round(d_max)}{deg}" if d_max is not None else "—"),
             "description": d_desc,
         })
     if forecast_parts:
         summary += " " + ". ".join(forecast_parts) + "."
-    summary += " Want more details?"
+    summary += " " + random.choice(_FOLLOWUP_OFFERS)
     return {
         "status": "ok",
         "location": label,
@@ -394,7 +408,8 @@ def _get_weather_wttr(loc: str, use_imperial: bool) -> Optional[Dict[str, Any]]:
 
     time_hint = _time_hint(temp_now_num, today_hi, today_lo)
     summary = _phrase_for_now(place, desc, temp_now, feels, wind_spd,
-                              cur.get("humidity"), time_hint)
+                              cur.get("humidity"), time_hint,
+                              temp_now_num, feels_num)
     # Advisories tacked on as a short sentence.
     for adv in _advisories(desc, temp_now_num, wind_num, feels_num):
         summary += " " + adv
@@ -425,8 +440,7 @@ def _get_weather_wttr(loc: str, use_imperial: bool) -> Optional[Dict[str, Any]]:
             forecast_parts.append(_phrase_for_day(
                 day_label, desc_mid, f"{max_t}{unit}", f"{min_t}{unit}"))
         forecast.append({
-            "date": date_str,
-            "day_label": day_label,
+            "day": day_label,
             "min": (f"{min_t}{unit}" if min_t else ""),
             "max": (f"{max_t}{unit}" if max_t else ""),
             "description": desc_mid,
@@ -434,7 +448,7 @@ def _get_weather_wttr(loc: str, use_imperial: bool) -> Optional[Dict[str, Any]]:
     if forecast_parts:
         summary += " " + ". ".join(forecast_parts) + "."
     # Offer follow-up details instead of a raw URL.
-    summary += " Want more details?"
+    summary += " " + random.choice(_FOLLOWUP_OFFERS)
     return {
         "status": "ok",
         "location": place,
