@@ -151,8 +151,26 @@ class GmailConnector(Connector):
         return self._client.service("gmail", "v1")
 
     def available(self) -> bool:
+        # "Available at all" — we have SOME valid Google grant. Per-tool
+        # scope checks live in execute() so the user gets a precise
+        # error ("Reading email needs gmail.readonly") instead of a
+        # generic "Gmail not authorized" when their grant is partial.
         try:
             return self._client.ready()
+        except Exception:
+            return False
+
+    def _has_readonly(self) -> bool:
+        try:
+            return self._client.has_scope(
+                "https://www.googleapis.com/auth/gmail.readonly")
+        except Exception:
+            return False
+
+    def _has_send(self) -> bool:
+        try:
+            return self._client.has_scope(
+                "https://www.googleapis.com/auth/gmail.send")
         except Exception:
             return False
 
@@ -202,19 +220,41 @@ class GmailConnector(Connector):
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        svc = self._svc()
-        if svc is None:
-            # available()==False before we got here usually, but if a stale
-            # token slipped through the scope check, the read tools will hit
-            # this branch. Phrase it so the user knows the fix is in their UI.
-            need_readonly = name in ("gmail_list", "gmail_read")
-            extra = (" Reading email needs gmail.readonly — disconnect "
-                     "Google in the app and reconnect to grant the new "
-                     "scope.") if need_readonly else ""
+        # Per-tool scope precondition: read tools need gmail.readonly,
+        # send tools need gmail.send. If the user granted a partial
+        # set of scopes (very common — Google's consent screen lets
+        # them uncheck individual boxes), we want a precise, actionable
+        # error like "you're connected to Google but didn't grant
+        # 'Read your email' — reconnect and tick that box" instead of
+        # a generic "Gmail not authorized" that makes the user think
+        # nothing is connected.
+        need_readonly = name in ("gmail_list", "gmail_read")
+        need_send = name == "gmail_send"
+        if need_readonly and not self._has_readonly():
             return connector_result(
                 "error",
-                error=f"Gmail not authorized.{extra}",
-                code="not_ready")
+                error=("Gmail is connected, but you didn't grant the "
+                       "'Read your email' (gmail.readonly) scope on "
+                       "the consent screen. Click 'Connect Gmail' "
+                       "again and make sure every checkbox — "
+                       "especially 'Read your email' — is ticked."),
+                code="scope_missing",
+                missing_scope="gmail.readonly")
+        if need_send and not self._has_send():
+            return connector_result(
+                "error",
+                error=("Gmail is connected, but you didn't grant the "
+                       "'Send email' (gmail.send) scope. Reconnect "
+                       "with that box ticked."),
+                code="scope_missing",
+                missing_scope="gmail.send")
+        svc = self._svc()
+        if svc is None:
+            return connector_result(
+                "error",
+                error=("Gmail isn't connected. Click 'Connect Gmail' "
+                       "to grant access."),
+                code="not_connected")
         try:
             if name == "gmail_send":
                 to = str(args.get("to") or "").strip()

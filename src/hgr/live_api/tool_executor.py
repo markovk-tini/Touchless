@@ -1965,16 +1965,23 @@ class ToolExecutor:
                     error=f"{type(exc).__name__}: {exc}",
                     code="connector_failed"))
             if isinstance(result, dict) and result.get("status") == "error":
-                err_msg = str(result.get("error") or "")[:200]
-                # Distinguish "not connected at all" from "connected but
-                # the call failed for another reason" by re-checking
-                # availability AFTER the failure.
-                try:
-                    available_now = bool(connector.available())
-                except Exception:
-                    available_now = False
-                tag = "unavailable" if not available_now else "err"
-                _diag(f"{connector_id}.{tool_name}: status=error available={available_now} -> {tag}; err={err_msg}")
+                err_msg = str(result.get("error") or "")[:300]
+                code = str(result.get("code") or "")
+                # Distinguish "user never connected at all" (so they
+                # need the Connect button) from "connected but a
+                # specific scope / call failed" (so they need to
+                # reconnect with the right boxes ticked). Both used to
+                # collapse to "unavailable" which then read as "no
+                # email accounts connected" — misleading when the user
+                # IS connected but just missed a scope checkbox.
+                if code in ("not_connected",):
+                    tag = "not_connected"
+                else:
+                    # Anything else (scope_missing, http_error, quota,
+                    # etc.) is "err" — connector IS reachable, we have
+                    # the precise error to surface.
+                    tag = "err"
+                _diag(f"{connector_id}.{tool_name}: status=error code={code} -> {tag}; err={err_msg}")
                 return (tag, result)
             count = int((result or {}).get("count") or 0)
             _diag(f"{connector_id}.{tool_name}: ok count={count}")
@@ -2012,33 +2019,53 @@ class ToolExecutor:
         # the REAL failure instead of "no email accounts connected" when
         # actually Gmail is connected but the OAuth grant is missing
         # gmail.readonly scope. The connector's own error message tells
-        # the user exactly how to fix it. Wrap it in a friendly summary
-        # so the prose renderer + override hook display it well.
-        gmail_errored = (gmail_state == "err" and gmail_res is not None
-                         and gmail_res.get("status") == "error")
-        ms_errored = (ms_state == "err" and ms_res is not None
-                      and ms_res.get("status") == "error")
-        if gmail_errored or ms_errored:
+        # the user exactly how to fix it. Reports per-source so the user
+        # can see "Gmail connected (scope issue), Outlook connected (5
+        # unread), Outlook desktop unavailable" all at once.
+        gmail_errored = gmail_state == "err"
+        ms_errored = ms_state == "err"
+        outlook_errored = outlook_state == "err"
+        any_errored = gmail_errored or ms_errored or outlook_errored
+        if any_errored:
             parts: List[str] = []
             actions: List[str] = []
+            # Outlook desktop COM first — likely to be where their real
+            # mail lives.
+            if outlook_errored:
+                msg = str(outlook_res.get("error") or
+                          "Outlook desktop error.").strip()
+                parts.append(f"Outlook desktop: {msg}")
+            elif outlook_state == "ok" and outlook_res is not None:
+                parts.append(
+                    f"Outlook desktop has "
+                    f"{int(outlook_res.get('count') or 0)} unread.")
+            # Gmail
             if gmail_errored:
                 msg = str(gmail_res.get("error") or "Gmail error.").strip()
-                parts.append(f"Gmail returned an error: {msg}")
-                actions.append("connect_gmail")
+                parts.append(f"Gmail: {msg}")
+                if "connect_gmail" not in actions:
+                    actions.append("connect_gmail")
             elif gmail_state == "ok" and gmail_res is not None:
                 parts.append(
-                    f"Your Gmail has {int(gmail_res.get('count') or 0)} "
-                    f"unread.")
+                    f"Gmail has {int(gmail_res.get('count') or 0)} unread.")
+            elif gmail_state == "not_connected":
+                parts.append("Gmail isn't connected.")
+                actions.append("connect_gmail")
+            # Microsoft 365 / Outlook.com via Graph
             if ms_errored:
                 msg = str(ms_res.get("error") or "Microsoft error.").strip()
-                parts.append(f"Outlook returned an error: {msg}")
-                actions.append("connect_ms")
+                parts.append(f"Microsoft: {msg}")
+                if "connect_ms" not in actions:
+                    actions.append("connect_ms")
             elif ms_state == "ok" and ms_res is not None:
                 parts.append(
-                    f"Outlook has {int(ms_res.get('count') or 0)} unread.")
-            elif ms_state == "missing" or ms_state == "unavailable":
-                parts.append("Outlook isn't connected to Touchless.")
+                    f"Microsoft mailbox has "
+                    f"{int(ms_res.get('count') or 0)} unread.")
+            elif ms_state == "not_connected":
+                parts.append("Microsoft isn't connected.")
                 actions.append("connect_ms")
+            if "read_outlook_screen" not in actions:
+                actions.append("read_outlook_screen")
             return _result(
                 status="ok", count=0, messages=[],
                 source="error",
@@ -2085,7 +2112,7 @@ class ToolExecutor:
         # Exactly one connector returned 0 and the other isn't connected.
         # Name the one we checked AND say plainly that the other wasn't
         # checked — never claim "no unread emails" globally.
-        if gmail_ok_empty and ms_state != "ok":
+        if gmail_ok_empty and ms_state in ("missing", "not_connected", "unavailable"):
             return _result(
                 status="ok", count=0, messages=[], source="gmail",
                 summary=("Your Gmail has no unread. I didn't check Outlook "
@@ -2094,7 +2121,7 @@ class ToolExecutor:
                          "say 'read my Outlook screen' and I'll OCR the "
                          "inbox you have open."),
                 suggested_actions=["connect_ms", "read_outlook_screen"])
-        if ms_ok_empty and gmail_state != "ok":
+        if ms_ok_empty and gmail_state in ("missing", "not_connected", "unavailable"):
             return _result(
                 status="ok", count=0, messages=[], source="microsoft",
                 summary=("Your Outlook (via Microsoft Graph) has no "

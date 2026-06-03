@@ -162,28 +162,31 @@ class GoogleClient:
         token_path = _token_path()
         if not token_path.exists():
             return None
+        # Read whatever scopes the token was ACTUALLY granted (not the
+        # SCOPES we'd LIKE). Stored in self._granted_scopes so per-
+        # operation callers (gmail_list needs readonly, etc.) can check
+        # exactly what's available without invalidating the whole grant.
+        self._granted_scopes = set()
+        try:
+            token_doc = json.loads(token_path.read_text(encoding="utf-8"))
+            self._granted_scopes = set(token_doc.get("scopes") or [])
+        except Exception:
+            pass
         try:
             from google.oauth2.credentials import Credentials
             from google.auth.transport.requests import Request
 
-            # IMPORTANT: Credentials.from_authorized_user_file(path, SCOPES)
-            # sets creds.scopes to whatever scopes we pass in, NOT what the
-            # token was actually granted. So creds.has_scopes(SCOPES) is
-            # tautologically True. To detect a stale token (e.g. we added
-            # gmail.readonly after the user authorized just gmail.send),
-            # parse the JSON ourselves and check the granted-scopes list.
-            try:
-                token_doc = json.loads(token_path.read_text(encoding="utf-8"))
-                granted = set(token_doc.get("scopes") or [])
-                missing = [s for s in SCOPES if s not in granted]
-                if missing:
-                    # Stale: clear cache and force the caller to reconnect.
-                    self._creds = None
-                    return None
-            except Exception:
-                pass
-
-            creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+            # Use the granted scope list to construct the Credentials so
+            # refresh works even when the user granted only a subset.
+            # Passing the full SCOPES list here causes
+            # Credentials.from_authorized_user_file to mark every scope
+            # as "current" — refresh succeeds but per-API calls fail at
+            # the server for the missing ones. Using granted_scopes keeps
+            # the credentials object truthful.
+            scopes_for_creds = (sorted(self._granted_scopes)
+                                if self._granted_scopes else SCOPES)
+            creds = Credentials.from_authorized_user_file(
+                str(token_path), scopes_for_creds)
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
                 token_path.write_text(creds.to_json(), encoding="utf-8")
@@ -193,6 +196,13 @@ class GoogleClient:
         except Exception:
             return None
         return None
+
+    def has_scope(self, scope: str) -> bool:
+        """True if the user's Google grant includes `scope`. Forces a
+        creds reload so a freshly-reconnected token is reflected."""
+        if self._load_creds() is None:
+            return False
+        return scope in getattr(self, "_granted_scopes", set())
 
     def service(self, api: str, version: str):
         """Return a cached googleapiclient service, or None if not ready."""
