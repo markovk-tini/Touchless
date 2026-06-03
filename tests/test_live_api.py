@@ -2889,6 +2889,55 @@ class WeatherClassifierTests(unittest.TestCase):
             self.assertEqual(step.tool, "weather_get")
             self.assertEqual(step.args.get("location"), expected)
 
+    def test_temporal_forecast_phrasings_do_not_capture_as_location(self) -> None:
+        """Regression: 'forecast for the next three days' used to greedily
+        capture 'the next three days' as a location string, which then
+        failed geocoding and surfaced 'Both weather sources failed' to
+        the user. These must route to weather_get with empty location
+        so the casual summary from weather.py reaches the user."""
+        for text in [
+            "forecast for the next three days",
+            "forecast for next 3 days",
+            "weather for tomorrow",
+            "weather for today",
+            "forecast for the next 7 days",
+            "forecast for this week",
+            "weather for the weekend",
+            "forecast for the coming days",
+            "weather for Monday",
+            "weather for the next 24 hours",
+            "forecast for the next couple of days",
+            "forecast for the next few days",
+        ]:
+            step = self.c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "weather_get", f"text={text!r}")
+            # CRITICAL: temporal phrase must NOT leak in as location.
+            self.assertEqual(step.args.get("location", ""), "",
+                             f"temporal phrase leaked as location: {text!r}")
+
+    def test_extended_question_phrasings(self) -> None:
+        """Added coverage for 'will it rain', 'how hot', 'chance of rain',
+        'gonna rain' — phrasings that used to fall through to the LLM."""
+        for text in [
+            "will it rain",
+            "will it rain tomorrow",
+            "will it be sunny tomorrow",
+            "how hot is it",
+            "how cold will it be",
+            "chance of rain today",
+            "any rain today",
+            "any storms this week",
+            "gonna rain",
+            "going to snow",
+            "should I bring sunscreen",
+            "what is the weather like",
+        ]:
+            step = self.c.classify(text)
+            self.assertIsNotNone(step, f"missed: {text!r}")
+            self.assertEqual(step.tool, "weather_get", f"text={text!r}")
+            self.assertEqual(step.args.get("location", ""), "")
+
 
 class WeatherSchemaTests(unittest.TestCase):
     def test_schema_registered(self) -> None:

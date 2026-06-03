@@ -24,6 +24,7 @@ import getpass
 import json
 import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -31,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Signal
 
+from . import cortex_emit
 from .audio_stream import AudioStream
 from .config import LiveApiConfig, load_config
 from .live_api_logger import LiveApiLogger
@@ -58,8 +60,43 @@ SYSTEM_INSTRUCTIONS = (
     "launching.', 'Couldn't find PLAY yet.' No paragraphs, lists, or "
     "step-by-step narration. Expand to more than a sentence ONLY when the user "
     "explicitly asks to explain/why, then go short again.\n"
+    "VOICE DELIVERY: match prosody to content. Joke or playful comment → "
+    "lighter, chipper, slight smile; quick status update ('Done.', "
+    "'Set to 30.') → matter-of-fact and even-keeled; reading something "
+    "back (article summary, email content, weather) → natural narrator, "
+    "small pauses at punctuation, no flat monotone; asking the user "
+    "something → rising questioning intonation on the question itself; "
+    "delivering bad news / errors → warmer, slightly apologetic; "
+    "confirming a risky action → calm and clear, no rush. Keep the SAME "
+    "underlying voice identity throughout the session — do not shift "
+    "gender, accent, or vocal weight between turns. Only the prosody / "
+    "energy varies with content.\n"
     "SAFETY: confirm before destructive/risky actions; never expose secrets; "
     "never bypass security, DRM, anti-cheat, CAPTCHA, or non-skippable ads.\n"
+    "ROUTING DEFAULTS (decide BEFORE answering — never default to "
+    "answering from your own knowledge or to web search when a more "
+    "specific tool is available):\n"
+    " • TEXT GENERATION (write, summarize, translate, regex, code, "
+    "classify, extract, paraphrase, brainstorm — anything that turns "
+    "words into other words): if ollama_generate is in the toolset, "
+    "CALL IT. Do NOT answer from your own knowledge. The local model "
+    "is free, fast, and private; the user expects Iris to use it "
+    "automatically, not only when they say 'use ollama'.\n"
+    " • PERSONAL KNOWLEDGE QUERIES ('my notes', 'my pages', 'my docs', "
+    "'what's in my X', 'what did I write about Y', 'search my notion'): "
+    "if notion_search / notion_read_page are in the toolset, CALL THEM. "
+    "Do NOT web_search. The user means their Notion workspace, not the "
+    "internet.\n"
+    " • read_screen / get_screen_context / click_text_on_screen are ONLY "
+    "for what's CURRENTLY VISIBLE on the user's monitor (e.g. 'what does "
+    "this error say', 'click the Send button I see'). NEVER for 'what's "
+    "in my X' if X could be a page, file, or document. The word 'use' "
+    "in 'use the local model' / 'use Ollama' / 'use Notion' refers to "
+    "the TOOL FAMILY, not anything visible on screen.\n"
+    " • If the user explicitly names a tool family ('use ollama', 'use "
+    "the local model', 'search my notion', 'check my drive'), CALL THAT "
+    "TOOL — never substitute another tool because you think you can "
+    "answer directly.\n"
     "ACTION HIERARCHY — for ANY action (launch, click, trigger) use the FIRST "
     "that fits (earlier tiers beat pixel-clicking):\n"
     " 1) BYPASS the UI: a direct launch/exe, a CLI/launch arg, a URL/deep link "
@@ -310,12 +347,19 @@ def build_system_instructions() -> str:
         "one). A page may take 1-3s; if blank, retry once.\n"
         "run_quick_command: MEDIA / built-in voice commands ONLY ('play X on "
         "spotify', 'next song', 'pause') — not for web/clicking/windows.\n"
-        "MULTI-STEP: a request with several actions is auto-split and fed to "
-        "you ONE sub-task at a time ('[Step N of M] do ONLY this…'). Finish "
-        "that ONE task fully (right tool, confirm it actually worked), give a "
-        "one-line confirmation (which ends the step — the next is sent "
+        "MULTI-STEP: a request with several actions is USUALLY auto-split and "
+        "fed to you ONE sub-task at a time ('[Step N of M] do ONLY this…'). "
+        "Finish that ONE task fully (right tool, confirm it actually worked), "
+        "give a one-line confirmation (which ends the step — the next is sent "
         "automatically), and don't do other steps in it. If a step fails or is "
-        "ambiguous, retry or ask — never skip it."
+        "ambiguous, retry or ask — never skip it.\n"
+        "MULTI-ACTION FALLBACK: occasionally a multi-action request slips "
+        "through WITHOUT '[Step N of M]' wrapping (e.g. 'write me a haiku "
+        "about coffee and add a task to drink some'). When that happens, do "
+        "ALL the actions yourself in sequence — call each tool in turn, "
+        "don't stop after the first verb. Treat 'X and Y', 'X, then Y', "
+        "and comma-separated verb lists as multiple actions you must each "
+        "complete, not as a single action."
     )
 
 
@@ -326,6 +370,20 @@ class LiveApiState(enum.Enum):
     THINKING = "thinking"
     EXECUTING = "executing"
     ERROR = "error"
+
+
+# Cortex viz: (visual-state-name, intensity 0..1) for each LiveApiState.
+# Used inside _set_state to push core state to the Cortex window via
+# cortex_emit. Mapping is best-effort and intentionally lossy (the
+# viz has fewer + coarser visual states than the operational machine).
+_CORTEX_STATE_MAP = {
+    LiveApiState.OFF: ("idle", 0.3),
+    LiveApiState.CONNECTING: ("idle", 0.45),
+    LiveApiState.LISTENING: ("listening", 0.6),
+    LiveApiState.THINKING: ("thinking", 0.8),
+    LiveApiState.EXECUTING: ("thinking", 0.9),
+    LiveApiState.ERROR: ("error", 0.7),
+}
 
 
 # A confirmation callback the manager will invoke for risky tools.
@@ -347,15 +405,21 @@ class LiveApiManager(QObject):
         config: Optional[LiveApiConfig] = None,
         external_action_router: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
         text_only: bool = False,
+        voice_output: bool = False,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self._config = config or load_config()
         # text_only=True means we don't open the mic / VAD pipeline; the
         # only inputs come from explicit `send_user_text` calls. Used by
-        # the typed-command UI in Phase 1A. When voice comes back in
-        # Phase 1B, leave this False.
+        # the typed-command UI. voice_output controls whether the model's
+        # spoken reply is played back through speakers — independent of
+        # text_only so the chat panel can have typed input + voice reply
+        # (text_only=True, voice_output=True).
         self._text_only = bool(text_only)
+        self._voice_output = bool(voice_output)
+        # Lazily-created PCM player; only built when voice_output is True.
+        self._audio_player: Optional[Any] = None
         self._logger: Optional[LiveApiLogger] = None
         self._client: Optional[RealtimeClient] = None
         self._audio: Optional[AudioStream] = None
@@ -413,6 +477,48 @@ class LiveApiManager(QObject):
         # Layer 0 deterministic command router — initialized lazily on
         # first start() once the per-session logger exists.
         self._command_router = None
+        # Project-RAG indexer — a single ProjectMemoryStore instance shared
+        # across sessions, plus a daemon thread that re-indexes known
+        # sibling project roots on an interval. Both built lazily in
+        # start(); the stop event lets stop() break the sleep loop
+        # cleanly without waiting for the next interval.
+        self._project_store: Optional[Any] = None
+        self._indexer_thread: Optional[threading.Thread] = None
+        self._stop_indexer = threading.Event()
+        # Self-learning daemon — mines project files, git config, tool
+        # call history, and connector endpoints (Gmail / MS365 contacts)
+        # for facts to write into the memory store. Same lifecycle as
+        # the project indexer: built lazily in start(), stop() sets the
+        # stop event so the worker exits before its next interval.
+        self._self_learner: Optional[Any] = None
+        self._self_learner_thread: Optional[threading.Thread] = None
+        self._stop_self_learner = threading.Event()
+        # Local-handler TTS — synthesize spoken reply for Layer 0 / Layer 1
+        # responses that DON'T go through the realtime websocket (which
+        # already streams its own PCM16 audio). Uses OpenAI's REST TTS
+        # endpoint (/v1/audio/speech) with response_format='pcm' so the
+        # bytes can be fed straight into AudioPlayer (24 kHz mono int16).
+        # Per-text cache keeps repeat phrases ('Done.', 'On it.') free.
+        self._tts_lock = threading.Lock()
+        self._tts_cache: Dict[str, bytes] = {}
+        self._tts_cache_max = 64  # ~few MB at most for short replies
+        # Conversational-speech rewriter cache. Keyed by ORIGINAL text so a
+        # cache hit avoids both the gpt-5-mini round-trip AND keeps the
+        # corresponding TTS-bytes cache (keyed on humanized text) coherent
+        # across calls. Capped separately from the PCM cache.
+        self._tts_humanize_cache: Dict[str, str] = {}
+        self._tts_humanize_cache_max = 64
+        # Cortex viz: monotonic timestamp until which the core should
+        # stay PURPLE (speaking). _emit_reply_output_pulse sets this to
+        # now + speak_ms when it flips the core to 'speaking'; _set_state
+        # consults it to suppress competing 'listening' pushes that
+        # would otherwise immediately overwrite the purple glow when an
+        # internal state machine transition (e.g. response.done arriving
+        # from the WS reader, or the Layer 0 router moving back to
+        # LISTENING right after dispatching a local reply) races the
+        # speaking pulse. UI state still updates normally — only the
+        # cortex_emit.core_state('listening') call is suppressed.
+        self._cortex_speaking_until: float = 0.0
 
     # ---- public API ----
 
@@ -459,6 +565,14 @@ class LiveApiManager(QObject):
                 log_dir=self._config.log_dir,
                 debug_text_logging=self._config.debug_text_logging,
             )
+            # Bind the tool-call log session id to this LiveApiManager
+            # session so cross-tool co-occurrence buckets line up with
+            # what the user perceives as one conversation. Best-effort.
+            try:
+                from .cortex.tool_call_log import set_session_id as _set_tc_sid
+                _set_tc_sid(Path(self._logger.jsonl_log_path).stem)
+            except Exception:
+                pass
             self._logger.event(
                 "session_start",
                 backend=backend_kind,
@@ -505,7 +619,53 @@ class LiveApiManager(QObject):
                 self._logger.exception("command_router_init_failed", exc)
                 self._command_router = None
 
+            # Project-RAG: lazily build the shared ProjectMemoryStore,
+            # register the known sibling roots, and spawn ONE daemon
+            # indexer thread that runs incremental re-indexes on a
+            # 5-min interval. All best-effort — a RAG failure must
+            # NEVER block realtime startup. The thread itself is a
+            # no-op when TOUCHLESS_IRIS_MEMORY=0.
+            if (self._project_store is None
+                    and self._indexer_thread is None
+                    and os.environ.get("TOUCHLESS_IRIS_MEMORY", "1") != "0"):
+                try:
+                    self._init_project_indexer()
+                except Exception as exc:
+                    if self._logger:
+                        self._logger.exception("project_indexer_init_failed", exc)
+                    self._project_store = None
+
+            # Self-learning daemon — mines project files, git config,
+            # tool call patterns, and email/calendar contacts for
+            # facts. Same lifecycle as the project indexer; gated by
+            # TOUCHLESS_SELF_LEARN_ENABLED (default on). Memory wiring
+            # also requires TOUCHLESS_IRIS_MEMORY to be enabled — the
+            # daemon writes through a MemoryManager and there's nothing
+            # to do without that store.
+            if (self._self_learner_thread is None
+                    and os.environ.get("TOUCHLESS_IRIS_MEMORY", "1") != "0"
+                    and os.environ.get("TOUCHLESS_SELF_LEARN_ENABLED", "1") != "0"):
+                try:
+                    self._init_self_learner()
+                except Exception as exc:
+                    if self._logger:
+                        self._logger.exception("self_learner_init_failed", exc)
+                    self._self_learner = None
+
             backend_kind = (self._config.backend or "cloud").strip().lower()
+            if backend_kind == "subscription":
+                # Stub — the hosted Touchless proxy doesn't exist yet.
+                # Surface a clear error so the chat panel can show a
+                # "Subscription not yet available — falling back to
+                # local model. Restart Iris to use it." note instead of
+                # silently hanging on session start.
+                self._emit_error(
+                    "Touchless subscription backend isn't shipped yet. "
+                    "Set OPENAI_API_KEY to use the cloud backend, or "
+                    "wait for the bundled local model to ship in a "
+                    "future Touchless update.")
+                self._set_state(LiveApiState.ERROR, "Subscription unavailable")
+                return
             if backend_kind == "local":
                 # Local backend exposes the same shape as RealtimeClient
                 # (start/stop/join, send_audio_chunk, send_tool_result,
@@ -534,7 +694,66 @@ class LiveApiManager(QObject):
                     on_closed=self._on_ws_closed,
                     on_error=self._on_ws_error,
                     text_only=self._text_only,
+                    voice_output=self._voice_output,
                 )
+
+            # Reset per-session diagnostic flag so the first audio-drop
+            # event re-logs each new session (helps diagnose 'audio went
+            # silent again' after a stop()/start() cycle).
+            self._audio_drop_logged = False
+            # Spin up the audio output player on demand. Lives as a child
+            # of the manager so it gets cleaned up on stop(). Failure
+            # leaves the player as None and audio deltas become no-ops.
+            if self._voice_output and self._audio_player is None:
+                try:
+                    from .audio_player import AudioPlayer
+                    self._audio_player = AudioPlayer(
+                        sample_rate=self._config.audio_sample_rate,
+                        parent=self,
+                    )
+                    if not self._audio_player.is_enabled():
+                        # Init failed (no device, format unsupported) — drop
+                        # the reference so we don't try to feed it bytes.
+                        reason = "unknown"
+                        try:
+                            reason = self._audio_player.init_error() or "unknown"
+                        except Exception:
+                            pass
+                        # Surface to terminal too — JSONL logs are easy
+                        # to miss; users hit 'why is voice silent' a lot.
+                        print(
+                            f"AUDIO: player init failed (no device) — {reason}",
+                            file=sys.stderr, flush=True,
+                        )
+                        if self._logger:
+                            self._logger.event(
+                                "audio_player_init_no_device",
+                                reason=reason)
+                        self._audio_player = None
+                    else:
+                        print(
+                            f"AUDIO: player init ok (voice_output={self._voice_output}, "
+                            f"sample_rate={self._config.audio_sample_rate})",
+                            file=sys.stderr, flush=True,
+                        )
+                        if self._logger:
+                            self._logger.event(
+                                "audio_player_init_ok",
+                                voice_output=self._voice_output,
+                                sample_rate=self._config.audio_sample_rate)
+                except Exception as exc:
+                    print(
+                        f"AUDIO: player init crashed — {type(exc).__name__}: {exc}",
+                        file=sys.stderr, flush=True,
+                    )
+                    if self._logger:
+                        self._logger.exception("audio_player_init_failed", exc)
+                    self._audio_player = None
+            elif self._voice_output and self._audio_player is not None:
+                if self._logger:
+                    self._logger.event("audio_player_already_alive")
+            elif not self._voice_output and self._logger:
+                self._logger.event("audio_player_skipped_voice_off")
 
             if self._text_only:
                 # No mic in text-only mode — the user types commands in
@@ -842,6 +1061,7 @@ class LiveApiManager(QObject):
             screen_thread = self._screen_thread
             executor = self._executor
             logger = self._logger
+            player = self._audio_player
             self._audio = None
             self._client = None
             self._screen_thread = None
@@ -849,15 +1069,30 @@ class LiveApiManager(QObject):
             self._registry = None
             self._screen = None
             self._command_router = None
+            self._audio_player = None
             # Don't drop the logger yet — we still want the stop events
             # written. Cleared once everything joined.
             self._screen_stop.set()
             self._screen_request.set()
+            # Tell the project indexer to break out of its sleep loop
+            # before the next interval. Daemon thread — we don't join.
+            self._stop_indexer.set()
+            # Same for the self-learning daemon: signal it to exit
+            # before its next interval so the next session start can
+            # spawn a fresh worker.
+            self._stop_self_learner.set()
             if logger is not None:
                 logger.event("session_stop_requested")
             self._set_state(LiveApiState.OFF, "Off")
 
         # Heavy/joining work outside the lock.
+        # Tear down the audio output player so the Qt event loop can
+        # drain its tail before subsequent work.
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                pass
         # Stop any background watchers (auto-approve thread, controllers) so
         # they don't keep polling — and moving the cursor — after the session
         # ends. The watcher is a daemon thread that otherwise outlives stop().
@@ -897,6 +1132,207 @@ class LiveApiManager(QObject):
             self._screen_request.clear()
             self._pending_tool_calls.clear()
 
+    # ---- Project-RAG indexer -------------------------------------------
+    def _init_project_indexer(self) -> None:
+        """Build the shared ProjectMemoryStore, register every existing
+        known sibling project root into it, and spawn a single daemon
+        thread that runs incremental ``index_project`` re-passes on a
+        5-minute interval.
+
+        The thread is daemonic, so it never blocks process exit; stop()
+        sets ``_stop_indexer`` to break the sleep loop cleanly.
+        """
+        from .memory.project_memory import ProjectMemoryStore
+        from .known_projects import existing_known_roots
+
+        roots = existing_known_roots()
+        store = ProjectMemoryStore(logger=self._logger)
+        for entry in roots:
+            try:
+                store.register_project(entry["id"],
+                                       entry["root"],
+                                       label=entry.get("label"))
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception("project_register_failed", exc,
+                                           project_id=entry.get("id"))
+        self._project_store = store
+        # Fresh session: clear any stale stop signal from a previous run.
+        self._stop_indexer.clear()
+        ids = [e["id"] for e in roots]
+        if not ids:
+            # Nothing to index — skip the worker entirely.
+            if self._logger:
+                self._logger.event("project_indexer_no_roots")
+            return
+
+        def _worker() -> None:
+            # Wait a few seconds before the first pass so the realtime
+            # client gets to finish handshake without competing for
+            # the embedder's first HTTP call.
+            if self._stop_indexer.wait(timeout=5.0):
+                return
+            while not self._stop_indexer.is_set():
+                for pid in ids:
+                    if self._stop_indexer.is_set():
+                        return
+                    try:
+                        self._project_store.index_project(pid)
+                    except Exception as exc:
+                        if self._logger:
+                            self._logger.exception(
+                                "project_index_failed", exc, project_id=pid)
+                # 5-minute incremental re-pass; mtime-skip makes
+                # this nearly free when nothing changed.
+                if self._stop_indexer.wait(timeout=300.0):
+                    return
+
+        thread = threading.Thread(target=_worker,
+                                  name="iris-project-indexer",
+                                  daemon=True)
+        thread.start()
+        self._indexer_thread = thread
+        if self._logger:
+            self._logger.event("project_indexer_started",
+                                project_ids=ids)
+
+    # ---- Self-learning daemon -----------------------------------------
+    def _init_self_learner(self) -> None:
+        """Build the SelfLearner + a daemon thread that runs cycles on
+        a 10-min interval (with a 30 s warm-up before the first cycle
+        so the realtime handshake doesn't compete for the embedder).
+
+        Same lifecycle pattern as ``_init_project_indexer``:
+        ``_stop_self_learner`` is cleared here, set by ``stop()`` so
+        the worker exits cleanly before the next interval.
+        """
+        from .learning import SelfLearner
+        from .memory import MemoryManager
+        from .cortex.tool_call_log import default_log_path
+
+        # Construct a dedicated MemoryManager for the daemon. We don't
+        # piggyback on the planner's manager because the planner is
+        # lazily built (only after the user's first turn), and the
+        # daemon should start mining as soon as the session opens.
+        # SQLite is thread-safe across connections so two managers
+        # writing to the same DB is fine.
+        try:
+            memory_manager = MemoryManager(
+                logger=self._logger,
+                project_store=self._project_store,
+            )
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("self_learner_memory_init_failed", exc)
+            return
+
+        # Activate action-classifier routing — ToolExecutor reads this
+        # to call MemoryManager.set_fact() when a tool dispatch is
+        # classified as a fact/preference at confidence >= 0.8. Without
+        # this, classification still runs + logs but the writes are
+        # skipped. One-line activation per impl note.
+        try:
+            if self._executor is not None:
+                self._executor._memory = memory_manager
+        except Exception:
+            pass
+
+        try:
+            learner = SelfLearner(
+                memory_manager=memory_manager,
+                project_store=self._project_store,
+                tool_call_log_path=default_log_path(),
+                connector_registry=self._registry,
+                logger=self._logger,
+            )
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("self_learner_construct_failed", exc)
+            return
+        self._self_learner = learner
+        self._stop_self_learner.clear()
+
+        # 10 minutes between cycles. The first cycle waits 30 s so the
+        # realtime client gets to settle without competing for the
+        # embedder's first HTTP call (mirrors the project indexer's
+        # 5 s warm-up but longer since this daemon's first pass on a
+        # fresh install can touch every registered project).
+        cycle_interval = 600.0
+        warmup = 30.0
+
+        def _worker() -> None:
+            if self._stop_self_learner.wait(timeout=warmup):
+                return
+            while not self._stop_self_learner.is_set():
+                try:
+                    report = learner.run_once()
+                    if self._logger:
+                        self._logger.event(
+                            "self_learner_cycle_done",
+                            sources=list(report.keys()),
+                            total=sum(report.values()),
+                        )
+                except Exception as exc:
+                    if self._logger:
+                        self._logger.exception(
+                            "self_learner_cycle_failed", exc)
+                if self._stop_self_learner.wait(timeout=cycle_interval):
+                    return
+
+        thread = threading.Thread(target=_worker,
+                                  name="iris-self-learner",
+                                  daemon=True)
+        thread.start()
+        self._self_learner_thread = thread
+        if self._logger:
+            self._logger.event("self_learner_started",
+                               interval_sec=cycle_interval,
+                               warmup_sec=warmup)
+
+    def self_learn_now(self) -> Dict[str, int]:
+        """Manual / debug trigger that runs a single self-learn cycle
+        synchronously. Returns the per-source fact counts so a CLI
+        caller can confirm something happened (or didn't).
+
+        Safe to call even when the background daemon is disabled —
+        builds a transient SelfLearner if one wasn't constructed for
+        this session. Returns ``{}`` when no MemoryManager can be
+        built (e.g. TOUCHLESS_IRIS_MEMORY=0).
+        """
+        learner = self._self_learner
+        if learner is None:
+            # Try a one-shot construction so debug callers can use this
+            # even when the daemon was disabled. Mirrors the eager
+            # _init path but doesn't spawn a thread.
+            if os.environ.get("TOUCHLESS_IRIS_MEMORY", "1") == "0":
+                return {}
+            try:
+                from .learning import SelfLearner
+                from .memory import MemoryManager
+                from .cortex.tool_call_log import default_log_path
+                memory_manager = MemoryManager(
+                    logger=self._logger,
+                    project_store=self._project_store,
+                )
+                learner = SelfLearner(
+                    memory_manager=memory_manager,
+                    project_store=self._project_store,
+                    tool_call_log_path=default_log_path(),
+                    connector_registry=self._registry,
+                    logger=self._logger,
+                )
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception(
+                        "self_learner_now_construct_failed", exc)
+                return {}
+        try:
+            return learner.run_once()
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("self_learner_now_failed", exc)
+            return {}
+
     def request_screen_now(self) -> None:
         """Wake the screen worker so it captures and sends immediately."""
         self._screen_request.set()
@@ -904,16 +1340,25 @@ class LiveApiManager(QObject):
     def send_user_text(self, text: str) -> bool:
         """Inject a typed user message into the current session.
 
-        Routing flow:
-          1. Echo the user's text in the chat (transcript_received).
+        GUI-thread safe and NON-BLOCKING. This method performs only the
+        fast preconditions (state check + transcript echo), then
+        dispatches the actual routing/planner/realtime work to a
+        background worker thread. All UI updates from the worker are
+        marshaled back through Qt signals (queued connections), so the
+        GUI thread never blocks on HTTP, time.sleep, or LLM planning.
+
+        Routing flow (runs in worker thread `_run_send_user_text`):
+          1. Echo the user's text in the chat (transcript_received,
+             emitted here on the GUI thread for instant feedback).
           2. Try Layer 0 router — if it matches a known intent (open
              chrome, search X, play next song, ...), execute it
-             instantly and DO NOT call the LLM. The chat shows what
-             happened via tool_event signals.
-          3. Otherwise forward to the backend (LLM agent loop) as before.
+             instantly and DO NOT call the LLM.
+          3. Try Layer 1 iris planner — deterministic classifier →
+             connector, 0 model tokens.
+          4. Otherwise forward to the backend (LLM agent loop).
 
-        UI-thread safe: returns True if the manager accepted the input;
-        False otherwise so the UI can show a hint.
+        Returns True if the manager accepted the input (and dispatched
+        the worker); False otherwise so the UI can show a hint.
         """
         text = (text or "").strip()
         if not text:
@@ -925,7 +1370,93 @@ class LiveApiManager(QObject):
             return False
         # Echo the user's typed message via the same signal voice
         # transcripts use, so the chat UI doesn't need a special path.
+        # Done here on the GUI thread for instant echo before the worker
+        # spins up (negligible cost — just a signal emit).
         self.transcript_received.emit(text)
+
+        # Dispatch the slow path (router + planner + realtime send) to a
+        # background thread so the GUI stays responsive. Wrapped in try/
+        # except so a thread-spawn failure surfaces as a system bubble
+        # instead of silently losing the user's input.
+        try:
+            worker = threading.Thread(
+                target=self._run_send_user_text,
+                args=(text,),
+                name="iris-send-user-text",
+                daemon=True,
+            )
+            worker.start()
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("send_user_text_dispatch_failed", exc)
+            # Surface the failure to the chat as an assistant text so the
+            # user knows the input wasn't dropped silently.
+            dispatch_err = "Internal error — couldn't dispatch your message. Try again."
+            try:
+                self.assistant_text.emit(dispatch_err)
+            except Exception:
+                pass
+            # Cortex viz: fire core→output pulse for this final reply.
+            self._emit_reply_output_pulse(dispatch_err)
+            # Local error reply — speak it too so voice-only users notice.
+            try:
+                self._speak_text(dispatch_err)
+            except Exception:
+                pass
+            return False
+        return True
+
+    # NOTE: _run_send_user_text runs on a BACKGROUND THREAD. It must not
+    # touch any Qt widget directly — only emit signals (which Qt auto-
+    # marshals to the GUI thread via queued connection) and call
+    # thread-safe client methods (RealtimeClient.send_* are guarded by
+    # _send_lock; cortex_emit is best-effort thread-safe; the planner
+    # and router internals use only stdlib + their own state).
+    def _run_send_user_text(self, text: str) -> None:
+        """Worker-thread implementation of send_user_text — runs the
+        slow path (router, iris planner, LLM agent dispatch) off the
+        GUI thread. All UI updates go through Qt signals."""
+        # Immediately flip state to THINKING so the cortex core turns
+        # orange the moment Send is clicked — don't wait for the
+        # planner to decide. Final state transition (LISTENING /
+        # SPEAKING) happens at the end of each layer's reply.
+        try:
+            self._set_state(LiveApiState.THINKING, "Thinking…")
+        except Exception:
+            pass
+        try:
+            self._send_user_text_pipeline(text)
+        except Exception as exc:
+            # Last-resort guard — never let a worker exception crash the
+            # background thread silently. Log it and notify the user.
+            if self._logger:
+                self._logger.exception("send_user_text_worker_failed", exc)
+            err_msg = "Internal error processing your message — please try again."
+            try:
+                self.assistant_text.emit(err_msg)
+            except Exception:
+                pass
+            # Cortex viz: fire core→output pulse for this final reply.
+            self._emit_reply_output_pulse(err_msg)
+            # Local error reply — speak it too so voice-only users notice.
+            try:
+                self._speak_text(err_msg)
+            except Exception:
+                pass
+            try:
+                self._set_state(LiveApiState.LISTENING, "Ready (type a command)")
+            except Exception:
+                pass
+
+    def _send_user_text_pipeline(self, text: str) -> None:
+        """The actual router → planner → LLM pipeline. Extracted so
+        _run_send_user_text can wrap it in a single try/except. Runs on
+        a worker thread."""
+        client = self._client
+        # Client may have been torn down between dispatch and worker
+        # wake-up; bail quietly in that case.
+        if client is None or not getattr(client, "connected", False):
+            return
 
         # ---- Layer 0: deterministic router ----
         router = self._command_router
@@ -940,14 +1471,60 @@ class LiveApiManager(QObject):
                 # Handled locally by Touchless (free) — show it via the same
                 # tool_event plumbing the LLM tool calls use, then close the turn.
                 action_label = routed.intent_action or "router"
+                # Cortex viz: light up the FULL path for local-router hits.
+                # core → cap-tools → tool-<action> → core, STAGGERED so
+                # the user sees actual traveling neurons at each hop
+                # instead of a single overlapping flash.
+                from PySide6.QtCore import QTimer as _QT_router
+                def _router_path_pulses(label=action_label):
+                    try:
+                        cortex_emit.edge_pulse("core", "cap-tools",
+                                                color="orange", duration_ms=280)
+                    except Exception:
+                        pass
+                    def _step2():
+                        try:
+                            cortex_emit.edge_pulse("cap-tools", f"tool-{label}",
+                                                    color="orange", duration_ms=280)
+                        except Exception:
+                            pass
+                    def _step3():
+                        try:
+                            cortex_emit.node_activity(f"tool-{label}",
+                                                       intensity=1.0, duration_ms=400)
+                        except Exception:
+                            pass
+                    def _step4():
+                        try:
+                            cortex_emit.edge_pulse(f"tool-{label}", "core",
+                                                    color="orange", duration_ms=280)
+                        except Exception:
+                            pass
+                    try:
+                        _QT_router.singleShot(300, _step2)
+                        _QT_router.singleShot(600, _step3)
+                        _QT_router.singleShot(1000, _step4)
+                    except Exception:
+                        pass
+                _router_path_pulses()
                 self.tool_event.emit("called", {"name": f"router/{action_label}", "info": routed.message, "source": "touchless"})
                 self.tool_event.emit("completed", {"name": f"router/{action_label}", "status": "ok", "source": "touchless"})
                 if self._logger:
                     self._logger.event("routing_decision", **cost_policy.decision_record(
                         raw=text, tool=action_label, source="touchless", status="ok"))
-                self.assistant_text.emit(routed.message or "Done.")
+                spoken = routed.message or "Done."
+                self.assistant_text.emit(spoken)
+                # Local handler — realtime won't speak this. Synthesize TTS
+                # so voice_output=True users actually hear the response.
+                self._speak_text(spoken)
                 self._set_state(LiveApiState.LISTENING, "Ready (type a command)")
-                return True
+                # Cortex viz: fire core→output pulse LAST so the
+                # 'speaking' core state isn't immediately overwritten
+                # by the LISTENING set_state above. Pass the reply text
+                # so purple-speaking duration tracks how long it'll take
+                # to read/speak (longer reply = longer purple window).
+                self._emit_reply_output_pulse(spoken)
+                return
             # Matched but FAILED locally (e.g. an ambiguous app like 'paint' →
             # Paint vs Paint 3D, or 'pause' with nothing playing): DON'T show the
             # local clarification — the user can't answer it because that prompt
@@ -977,7 +1554,8 @@ class LiveApiManager(QObject):
                     if os.environ.get("TOUCHLESS_IRIS_MEMORY", "1") != "0":
                         try:
                             from .memory import MemoryManager
-                            memory = MemoryManager(logger=self._logger)
+                            memory = MemoryManager(logger=self._logger,
+                                                    project_store=self._project_store)
                         except Exception as exc:
                             if self._logger:
                                 self._logger.exception("memory_init_failed", exc)
@@ -1018,7 +1596,14 @@ class LiveApiManager(QObject):
                         self._logger.event("routing_decision", **cost_policy.decision_record(
                             raw=text, tool=step.tool, source=source,
                             status=str(out.get("status", sr.status or ""))))
-                self.assistant_text.emit(handled["message"])
+                planner_msg = handled["message"]
+                self.assistant_text.emit(planner_msg)
+                # Local planner — realtime won't speak this. Synthesize TTS
+                # so voice_output=True users actually hear the response.
+                self._speak_text(planner_msg)
+                # Cortex viz: pass reply text so purple duration tracks
+                # how long the reply takes to read/speak.
+                self._emit_reply_output_pulse(planner_msg)
                 # Realtime-session sync: tell the model what just happened so
                 # follow-ups like "send him a thank you too" can resolve the
                 # prior turn. Best-effort — never fail the user-visible reply.
@@ -1033,7 +1618,7 @@ class LiveApiManager(QObject):
                     if self._logger:
                         self._logger.exception("session_note_send_failed", exc)
                 self._set_state(LiveApiState.LISTENING, "Ready (type a command)")
-                return True
+                return
 
         # ---- Layer 2: LLM agent (planner didn't classify either) ----
         # Reset task state for this new user turn.
@@ -1063,7 +1648,7 @@ class LiveApiManager(QObject):
             ok = bool(client.send_text_message(plan_prompt))
             if ok:
                 self._request_model_response()
-            return ok
+            return
         ok = bool(client.send_text_message(text))
         if ok:
             # Track for fact-extraction on response.done. Only capture turns
@@ -1071,7 +1656,7 @@ class LiveApiManager(QObject):
             # already record themselves via the orchestrator's _record_turn.
             self._last_user_text = text
             self._request_model_response()
-        return ok
+        return
 
     def _parse_plan(self, text: str) -> list:
         """Extract the JSON task array the model returned during planning."""
@@ -1120,7 +1705,14 @@ class LiveApiManager(QObject):
                 self.tool_event.emit("called", {"name": f"touchless/{label}", "info": routed.message})
                 self.tool_event.emit("completed", {"name": f"touchless/{label}", "status": "ok"})
                 self.assistant_message_break.emit()  # fresh bubble for this reply
-                self.assistant_text.emit(routed.message or "Done.")
+                task_msg = routed.message or "Done."
+                self.assistant_text.emit(task_msg)
+                # Cortex viz: pass reply text so purple duration tracks
+                # how long the reply takes to read/speak.
+                self._emit_reply_output_pulse(task_msg)
+                # Local task handler — realtime won't speak this. Synthesize
+                # so the user hears progress on a multi-step plan.
+                self._speak_text(task_msg)
                 if self._logger:
                     self._logger.event("task_local", task=task, success=True)
                 self._feed_next_task()
@@ -1139,13 +1731,32 @@ class LiveApiManager(QObject):
         "restore", "focus", "start", "launch", "run", "create", "make", "build",
         "find", "show", "put", "summarize", "summarise", "write", "pull", "set",
         "go", "navigate", "drag",
+        # Extra verbs that previously made 2-verb prompts like 'write a haiku
+        # and add a task' miss the multistep heuristic — realtime then got
+        # the raw multi-action text with no decomposition guidance and only
+        # executed ONE of the actions.
+        "add", "remove", "delete", "remind", "schedule",
+        "send", "email", "text", "message",
+        "tell", "give", "compose", "draft", "translate", "rephrase",
+        "generate", "produce", "save", "upload", "download",
+        "ask", "fetch", "read", "list", "check", "toggle", "mute", "unmute",
+        "type", "click", "press", "scroll", "copy", "paste", "say", "answer",
     )
 
     def _looks_multistep(self, text: str) -> bool:
         low = (text or "").lower()
         seq = low.count(" then ") + low.count(" and ") + low.count(", ")
         verbs = sum(1 for v in self._ACTION_VERB_STARTS if (v + " ") in low)
-        return (seq >= 2 and verbs >= 2) or verbs >= 3 or len(text) > 160
+        # Lowered from `seq>=2 and verbs>=2` to also catch single-and 2-verb
+        # prompts ('write me a haiku and add a task to ...'). The LLM
+        # planner can still produce a 1-step plan when it decides the verbs
+        # belong to one task, so a false multistep trigger is cheap; a
+        # false single-step trigger DROPS the second action (bug C20/C19).
+        return ((seq >= 2 and verbs >= 2)
+                or verbs >= 3
+                or (verbs >= 2 and (" and " in low or " then " in low
+                                    or "; " in low))
+                or len(text) > 160)
 
     def _split_into_tasks(self, text: str) -> list:
         """Split a multi-action command into atomic sub-tasks. A new task starts
@@ -1336,8 +1947,93 @@ class LiveApiManager(QObject):
         }:
             if self._logger:
                 self._logger.event("assistant_done")
+            # Unified audio path: Realtime no longer streams PCM by
+            # default (see realtime_client._send_session_update). When
+            # the model finishes a text reply, route the accumulated
+            # turn text through the same _speak_text() pipeline that
+            # Layer-0/Layer-1 local handlers use, so every reply —
+            # router, planner, LLM — speaks with the user's configured
+            # voice (marin) through the same TTS engine.
+            #
+            # Skip when TOUCHLESS_REALTIME_AUDIO=1 is set: in that mode
+            # Realtime is already streaming audio deltas and speaking
+            # the text itself, so double-speaking must be avoided.
+            if os.environ.get("TOUCHLESS_REALTIME_AUDIO", "0") != "1":
+                spoken = (self._turn_text or "").strip()
+                if spoken:
+                    try:
+                        self._speak_text(spoken)
+                    except Exception as exc:
+                        if self._logger:
+                            try:
+                                self._logger.exception(
+                                    "realtime_text_done_tts_failed", exc)
+                            except Exception:
+                                pass
             self._set_state(LiveApiState.LISTENING, "Listening")
             return
+
+        # PCM16 audio chunks for the spoken reply. Comes as base64; decode
+        # and push to the player. Only happens when voice_output is on AND
+        # the session was started with audio in output_modalities.
+        if kind in {"response.output_audio.delta", "response.audio.delta"}:
+            b64 = str(event.get("delta") or "")
+            if not b64:
+                return
+            # Self-heal: if voice_output is on but the player got dropped
+            # (or never built — toggle race), build one on demand here so
+            # the first audio delta of a session doesn't get lost. The
+            # AudioPlayer is fully thread-safe (Queue-backed); we can
+            # construct it from the websocket reader thread.
+            player = self._audio_player
+            if player is None and self._voice_output:
+                try:
+                    from .audio_player import AudioPlayer
+                    new_player = AudioPlayer(
+                        sample_rate=self._config.audio_sample_rate,
+                        parent=self,
+                    )
+                    if new_player.is_enabled():
+                        self._audio_player = new_player
+                        player = new_player
+                        if self._logger:
+                            self._logger.event("audio_player_lazy_built")
+                    else:
+                        if self._logger:
+                            self._logger.event("audio_player_lazy_build_no_device")
+                except Exception as exc:
+                    if self._logger:
+                        self._logger.exception("audio_player_lazy_build_failed", exc)
+            if player is None:
+                # voice_output is off OR build failed — silently drop.
+                # First-drop diagnostic so we know WHY no audio.
+                if self._logger and not getattr(self, "_audio_drop_logged", False):
+                    try:
+                        self._audio_drop_logged = True
+                        self._logger.event(
+                            "audio_delta_no_player",
+                            voice_output=self._voice_output)
+                    except Exception:
+                        pass
+                return
+            try:
+                import base64 as _b64
+                player.write(_b64.b64decode(b64))
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception("audio_delta_decode_failed", exc)
+            return
+
+        if kind in {"response.output_audio.done", "response.audio.done"}:
+            # Just a marker — nothing to do; the player drains its own buffer.
+            return
+
+        # NOTE: TTS for LOCAL handlers (Layer 0 router, Layer 1 iris planner,
+        # multistep task router) lives in _speak_text() below. The realtime
+        # path above already streams PCM via response.output_audio.delta, so
+        # we MUST NOT also synthesize the matching response.text.delta — that
+        # would double-speak. Local handlers call _speak_text(...) directly
+        # right after their assistant_text.emit(...).
 
         if kind == "response.created":
             self._response_active = True
@@ -1524,18 +2220,35 @@ class LiveApiManager(QObject):
             return False
 
     def _current_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Tools sent to the model: built-ins + the *available* connectors'
-        tools, exposed DIRECTLY so a connector action is a single model turn.
+        """Tools sent to the model. Strategy:
 
-        We intentionally do NOT route through a find_capability meta-tool: at
-        this scale that added two extra model turns per action (discover →
-        load → call), each re-processing the full ~50-tool context, which
-        burned the Realtime tokens-per-minute budget and caused rate-limit
-        pauses. Direct exposure is far cheaper here. (If the catalog ever
-        grows huge — e.g. many MCP servers — revisit a lazy router.)"""
-        if self._registry is not None:
-            return self._registry.openai_tools()
-        return list(all_tool_schemas())
+        * Built-ins and hand-written API connectors → eager (direct
+          exposure, single-turn invocation). Stable, small, high-value.
+        * MCP connectors → LAZY. Each MCP server can expose dozens of
+          tools (`mcp_<server>_<tool>`); exposing them all eagerly
+          bloats context and degrades tool-call accuracy. Instead we
+          always expose `find_capability` and load matching MCP tools
+          into the live session when the model calls it.
+        * Anything already loaded mid-session via find_capability is
+          merged in so subsequent turns can call those names directly
+          without re-routing.
+        """
+        if self._registry is None:
+            return list(all_tool_schemas())
+        eager = self._registry.eager_tools()
+        names = {s.get("name") for s in eager}
+        # Always include the meta-tool so the model can reach MCP.
+        if FIND_CAPABILITY_TOOL.get("name") not in names:
+            eager.append(FIND_CAPABILITY_TOOL)
+            names.add(FIND_CAPABILITY_TOOL["name"])
+        # Merge any connector tools already loaded this session via
+        # find_capability (so a follow-up turn can call them directly).
+        for schema in self._loaded_connector_schemas:
+            n = schema.get("name")
+            if n and n not in names:
+                eager.append(schema)
+                names.add(n)
+        return eager
 
     def _handle_find_capability(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Router: match the task to an available connector, load its tools
@@ -1707,11 +2420,601 @@ class LiveApiManager(QObject):
             self.state_changed.emit(state, status_text)
         except Exception:
             pass
+        # Cortex viz: best-effort push of the core state. Silent no-op
+        # when the Cortex window isn't open (cortex_emit handles it).
+        try:
+            cortex_state, intensity = _CORTEX_STATE_MAP.get(state, ("idle", 0.4))
+            # Speaking-window guard: while _emit_reply_output_pulse has
+            # flipped the core to PURPLE (speaking) for a reply, swallow
+            # any 'listening' push that would prematurely flip it back
+            # to blue. The scheduled _return_to_listening (inside
+            # _emit_reply_output_pulse) is the single source of truth for
+            # the listening→blue transition during that window. We still
+            # let through non-'listening' states (thinking, executing,
+            # error) so genuine activity DOES interrupt the purple glow.
+            suppress_cortex_push = False
+            if (
+                cortex_state == "listening"
+                and self._cortex_speaking_until > time.time()
+            ):
+                suppress_cortex_push = True
+            if not suppress_cortex_push:
+                cortex_emit.core_state(cortex_state, intensity)
+            # Diagnostic so users can confirm state changes are flowing
+            # to the cortex viz layer (helps debug "core didn't change
+            # color" — if you see these lines but no color shift, the
+            # bus writer isn't wired; if you don't see them at all, the
+            # planner isn't transitioning states).
+            try:
+                suffix = " [suppressed: speaking window]" if suppress_cortex_push else ""
+                print(
+                    f"CORE state -> {cortex_state} (intensity={intensity:.2f}) "
+                    f"[from {state.value if hasattr(state,'value') else state}]"
+                    f"{suffix}",
+                    file=sys.stderr, flush=True,
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _emit_error(self, message: str) -> None:
         if self._logger:
             self._logger.error("session_error", message=message)
         self._set_state(LiveApiState.ERROR, f"Error: {message}")
         self.error_occurred.emit(message)
+
+    # ---- local-handler TTS -------------------------------------------------
+    # Realtime LLM responses come with their own audio. Local handlers (Layer
+    # 0 router, Layer 1 iris planner, multistep task router) only emit text,
+    # so without this they're silent even when voice_output=True. _speak_text
+    # bridges that gap: synthesize via OpenAI's REST TTS endpoint and feed
+    # the PCM straight into the existing AudioPlayer queue.
+    #
+    # Design choices:
+    #   * Cloud backend only (uses the configured OpenAI key + voice). Local
+    #     backend silently no-ops — local users opted out of cloud.
+    #   * Runs the HTTP call on a daemon worker thread so it never blocks
+    #     the websocket reader or the iris-send-user-text worker.
+    #   * Caches by exact text so repeated short replies ('Done.', 'On it.')
+    #     don't re-roundtrip / re-bill.
+    #   * Skips trivially short / empty text (single-char acks aren't worth
+    #     the latency).
+    #   * Best-effort: any failure is logged and swallowed; the text reply
+    #     still reached the UI through assistant_text.emit.
+
+    # ---- conversational-TTS rewriter --------------------------------------
+    # The raw text we synthesize to speech is usually weather lines, status
+    # lines, or planner replies that read awkwardly out loud ('82°F (feels
+    # like 71°F)', 'humidity: 28%', 'Corvallis — current: sunny'). This
+    # helper does a lightweight gpt-5-mini pass to rewrite ONLY the spoken
+    # form into natural casual English while keeping proper nouns + numbers
+    # intact. The UI still shows the original text via assistant_text —
+    # only the audio path uses the humanized version.
+    #
+    # Design:
+    #   * Skip rewrite for short text (<50 chars) — those are already
+    #     conversational and rewriting wastes latency + tokens.
+    #   * Cache by ORIGINAL text so 'The weather is sunny' rewrites once
+    #     per session.
+    #   * 0.8s urllib timeout — must be tighter than the TTS HTTP timeout
+    #     so a slow rewrite doesn't pile up behind the TTS call.
+    #   * Best-effort: any failure / timeout / empty result returns the
+    #     original text unchanged.
+    #   * Runs INSIDE _run_tts_synthesize (already on a daemon worker), so
+    #     it never blocks tool dispatch or the websocket reader.
+    _TTS_HUMANIZE_MIN_CHARS = 50
+    _TTS_HUMANIZE_MODEL = "gpt-5-mini"
+    # Bumped 0.8 → 6.0s. The old 0.8s cap timed out on every
+    # multi-sentence reply (3-day forecast etc.) — fallback returned
+    # the raw text, but on slow uplinks the SUBSEQUENT TTS call also
+    # missed its window and audio dropped entirely. 6s comfortably
+    # covers gpt-4o-mini rewrites of long replies; longer than that
+    # the user prefers silent text to a delayed voice anyway.
+    _TTS_HUMANIZE_TIMEOUT = 6.0
+
+    def _humanize_for_speech(self, text: str) -> str:
+        """Rewrite `text` into natural casual speech for TTS playback.
+
+        DISABLED by default — local handlers (weather, planner replies,
+        etc.) now produce already-conversational text, and the LLM
+        rewrite was adding 2-6 seconds of latency for marginal voice
+        quality gain. Re-enable by setting TOUCHLESS_TTS_HUMANIZE=1
+        in the environment if you want the rewrite path back.
+
+        Returns the original text unchanged on short input, missing key,
+        cache miss + network failure, timeout, or empty model response.
+        Cached by original-text to avoid double-billing repeat phrases.
+        """
+        try:
+            # Default OFF — text from local handlers is already casual.
+            # Set TOUCHLESS_TTS_HUMANIZE=1 to opt in to the LLM rewrite.
+            if os.environ.get("TOUCHLESS_TTS_HUMANIZE", "0") != "1":
+                return text
+            if not text:
+                return text
+            stripped = text.strip()
+            if len(stripped) < self._TTS_HUMANIZE_MIN_CHARS:
+                return text  # already short/conversational
+            # Cache hit avoids both LLM round-trip AND keeps TTS-bytes
+            # cache coherent (TTS cache is keyed on humanized text).
+            try:
+                with self._tts_lock:
+                    cached = self._tts_humanize_cache.get(text)
+                if isinstance(cached, str) and cached:
+                    return cached
+            except Exception:
+                pass
+
+            cfg = self._config
+            api_key = getattr(cfg, "api_key", None) if cfg is not None else None
+            if not api_key:
+                return text
+
+            import urllib.request
+            import urllib.error
+
+            system = (
+                "Rewrite the input as a casual, friendly spoken reply — like "
+                "a person texting back, NOT a formal robot. Use everyday "
+                "phrasing ('it's sunny', 'looks like', 'about 80'). "
+                "PRESERVE EVERY DETAIL from the input — don't drop the "
+                "'feels like' temp, don't drop the wind, don't drop any "
+                "number or fact. Convert technical formats spoken-style "
+                "('82°F' -> '82 degrees', '28%' -> 'low humidity' is OK "
+                "ONLY if the input is structured-stats; '3:45pm' -> 'three "
+                "forty five pm'). PRESERVE all proper nouns, person names, "
+                "place names, product names, email addresses, URLs. Output "
+                "ONLY the rewritten text — no preamble, no quotes, no "
+                "explanation. Length: aim for natural; do NOT cap word count."
+            )
+            # Bound input so a runaway long reply can't blow tokens.
+            user = f"Rewrite for natural casual speech:\n{stripped[:1500]}"
+            body = json.dumps({
+                "model": self._TTS_HUMANIZE_MODEL,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                # Bumped 200 -> 600 because the 200 cap was truncating
+                # multi-sentence replies like 3-day forecasts.
+                "max_completion_tokens": 600,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/chat/completions",
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(
+                    req, timeout=self._TTS_HUMANIZE_TIMEOUT
+                ) as resp:
+                    if getattr(resp, "status", 200) != 200:
+                        return text
+                    payload = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if self._logger:
+                    try:
+                        self._logger.event("tts_humanize_http_error",
+                                            code=getattr(exc, "code", 0))
+                    except Exception:
+                        pass
+                return text
+            except Exception as exc:
+                if self._logger:
+                    try:
+                        self._logger.event(
+                            "tts_humanize_timeout"
+                            if "timed out" in str(exc).lower()
+                            else "tts_humanize_failed",
+                            error=type(exc).__name__,
+                        )
+                    except Exception:
+                        pass
+                return text
+
+            rewritten = ((payload.get("choices") or [{}])[0]
+                         .get("message", {}).get("content") or "").strip()
+            # Defensive strip — some models wrap output in quotes despite
+            # the prompt's no-quotes instruction.
+            if rewritten.startswith(('"', "'")) and rewritten.endswith(('"', "'")):
+                rewritten = rewritten[1:-1].strip()
+            if not rewritten:
+                return text
+
+            try:
+                with self._tts_lock:
+                    if len(self._tts_humanize_cache) >= self._tts_humanize_cache_max:
+                        try:
+                            oldest = next(iter(self._tts_humanize_cache))
+                            self._tts_humanize_cache.pop(oldest, None)
+                        except StopIteration:
+                            pass
+                    self._tts_humanize_cache[text] = rewritten
+            except Exception:
+                pass
+
+            if self._logger:
+                try:
+                    self._logger.event("tts_humanize_ok",
+                                        original_len=len(text),
+                                        rewritten_len=len(rewritten))
+                except Exception:
+                    pass
+            return rewritten
+        except Exception as exc:
+            # Outer guard — under no circumstances let the rewriter break
+            # the TTS pipeline. Fall back to the original text.
+            if self._logger:
+                try:
+                    self._logger.event("tts_humanize_failed",
+                                        error=type(exc).__name__)
+                except Exception:
+                    pass
+            return text
+
+    def _emit_reply_output_pulse(self, text: str = "") -> None:
+        """Fire the FULL output path in the cortex viz after each final
+        assistant reply.
+
+        Always: core → cap-realtime → rt-output (text/multimodal output)
+        When voice on: ALSO core → cap-voice → voice-tts (audio output)
+
+        `text`, if provided, drives the purple speaking-state duration
+        so the core stays purple roughly as long as the reply takes to
+        be typed/spoken (estimated at ~150 words/minute speech rate,
+        floor 1.5s, ceiling 30s). Without text, falls back to a fixed
+        1.2s window.
+        """
+        # Schedule each leg with a delay so the user sees neurons
+        # TRAVELING through the path. Also flip core to SPEAKING
+        # (purple) at the start, then back to LISTENING (blue) after
+        # the path completes — so the core's color matches what's
+        # actually happening (delivering output).
+        from PySide6.QtCore import QTimer as _QT
+        def _later(ms, fn):
+            try:
+                _QT.singleShot(ms, fn)
+            except Exception:
+                pass
+        def _safe_pulse(a, b, color="magenta", ms=300):
+            def _do():
+                try:
+                    cortex_emit.edge_pulse(a, b, color=color, duration_ms=ms)
+                except Exception:
+                    pass
+            return _do
+        # Core → SPEAKING (purple glow) for the delivery window.
+        try:
+            cortex_emit.core_state("speaking", 1.15)
+        except Exception:
+            pass
+        # Tightened stagger 320→150ms per leg so the full path lands
+        # within ~300ms instead of 1+ second after the text. User was
+        # seeing the text appear THEN the cortex catch up; now they
+        # arrive together.
+        _safe_pulse("core", "cap-realtime", ms=180)()    # immediate
+        _later(150, _safe_pulse("cap-realtime", "rt-output", ms=180))
+        # Voice-on: parallel TTS path through cap-voice → voice-tts.
+        if self._voice_output:
+            _later(40,  _safe_pulse("core", "cap-voice", ms=180))
+            _later(200, _safe_pulse("cap-voice", "voice-tts", ms=180))
+        # Compute the purple-speaking duration from text length so the
+        # core stays purple roughly as long as the reply takes to read
+        # / be spoken. Speech rate ~150 wpm = 2.5 words/sec. Add a
+        # bit of buffer so we don't return to blue mid-syllable. Floor
+        # 1500ms (visible flash), ceiling 30000ms (don't run forever).
+        try:
+            word_count = max(1, len((text or "").split())) if text else 0
+        except Exception:
+            word_count = 0
+        if word_count > 0:
+            speak_ms = int(word_count / 2.5 * 1000) + 600
+            speak_ms = max(1500, min(30000, speak_ms))
+        else:
+            speak_ms = 1200  # legacy default when no text passed
+        # Mark the speaking window so _set_state suppresses any racing
+        # 'listening' pushes that would overwrite the purple core before
+        # _return_to_listening fires. Take the MAX with the existing
+        # value so back-to-back replies extend (not shorten) the window.
+        try:
+            new_until = time.time() + (speak_ms / 1000.0)
+            if new_until > self._cortex_speaking_until:
+                self._cortex_speaking_until = new_until
+        except Exception:
+            pass
+        def _return_to_listening():
+            try:
+                cortex_emit.core_state("listening", 0.85)
+            except Exception:
+                pass
+            # Clear the guard so subsequent legitimate LISTENING
+            # transitions push through normally. Only clear when we're
+            # actually past the window — if a longer reply extended it,
+            # leave it alone so the later _return_to_listening wins.
+            try:
+                if time.time() >= self._cortex_speaking_until:
+                    self._cortex_speaking_until = 0.0
+            except Exception:
+                pass
+        _later(speak_ms, _return_to_listening)
+
+    def _speak_text(self, text: str) -> None:
+        """Synthesize `text` to speech via OpenAI TTS and queue it for
+        playback through self._audio_player. Cloud backend + voice_output
+        only; everything else is a silent no-op. Returns immediately —
+        the HTTP request runs on a background thread.
+
+        Always active when voice_output=True and cloud backend is in use;
+        the marin voice (or its fallback) ensures local-handler replies
+        match the realtime LLM's voice. Opt-out by setting
+        TOUCHLESS_LOCAL_TTS=0 in the environment if needed."""
+        try:
+            # Diagnostic: surface why TTS skips so users can debug
+            # 'why is voice silent for some prompts but not others'.
+            def _skip(reason):
+                try:
+                    print(f"TTS skip: {reason} (text={text[:40]!r})",
+                          file=sys.stderr, flush=True)
+                except Exception:
+                    pass
+            if os.environ.get("TOUCHLESS_LOCAL_TTS", "1") == "0":
+                _skip("TOUCHLESS_LOCAL_TTS=0 env opt-out")
+                return
+            if not self._voice_output:
+                _skip("voice_output=False")
+                return
+            if self._audio_player is None:
+                _skip("audio_player=None (init failed)")
+                return
+            cfg = self._config
+            if cfg is None or not getattr(cfg, "api_key", None):
+                _skip("no api_key")
+                return
+            if (getattr(cfg, "backend", "cloud") or "cloud").strip().lower() != "cloud":
+                _skip("backend != cloud")
+                return
+            clean = (text or "").strip()
+            if len(clean) < 2:
+                _skip("text too short")
+                return
+            print(f"TTS fire: {len(clean)} chars (voice={getattr(cfg,'voice','?')})",
+                  file=sys.stderr, flush=True)
+            # OpenAI TTS hard limit is 4096 chars per request.
+            if len(clean) > 4096:
+                clean = clean[:4096]
+            worker = threading.Thread(
+                target=self._run_tts_synthesize,
+                args=(clean,),
+                name="iris-tts-synth",
+                daemon=True,
+            )
+            worker.start()
+        except Exception as exc:
+            if self._logger:
+                try:
+                    self._logger.exception("tts_dispatch_failed", exc)
+                except Exception:
+                    pass
+
+    def _run_tts_synthesize(self, text: str) -> None:
+        """Worker thread body: hit OpenAI TTS, push PCM into the player.
+        All exceptions are caught — TTS failure must NEVER take down the
+        background worker or break the chat reply."""
+        try:
+            cfg = self._config
+            api_key = getattr(cfg, "api_key", None) if cfg is not None else None
+            if not api_key:
+                return
+            # Voice may have been mutated by the picker UI since startup;
+            # read it fresh each call.
+            voice = (getattr(cfg, "voice", None) or "marin").strip() or "marin"
+            # Rewrite into natural casual speech BEFORE synthesis. UI still
+            # shows the original (assistant_text was emitted earlier); only
+            # the audio path uses the humanized form. Falls back to the
+            # original text on short input, timeout, or any error.
+            speech_text = self._humanize_for_speech(text)
+            # Cache key uses the humanized text so repeat rewrites that
+            # collapse to the same spoken form reuse the same PCM bytes.
+            cache_key = f"{voice}|{speech_text}"
+            pcm: Optional[bytes] = None
+            with self._tts_lock:
+                pcm = self._tts_cache.get(cache_key)
+            player = self._audio_player
+            if pcm is not None:
+                # Cache hit — write the full blob in one go (instant).
+                if player is None or not getattr(player, "is_enabled", lambda: False)():
+                    return
+                player.write(pcm)
+            else:
+                # Cache miss — STREAM chunks directly into the player as
+                # they arrive from OpenAI so playback can start before the
+                # full response has finished downloading. Cuts perceived
+                # latency from ~3-5s (full-response wait) to ~0.5-1s for
+                # long replies. Also accumulates bytes for caching.
+                buf = bytearray()
+                def _on_chunk(chunk: bytes) -> None:
+                    if not chunk:
+                        return
+                    buf.extend(chunk)
+                    p = self._audio_player
+                    if p is None or not getattr(p, "is_enabled", lambda: False)():
+                        return
+                    try:
+                        p.write(chunk)
+                    except Exception:
+                        pass
+                self._http_openai_tts(api_key, voice, speech_text,
+                                      on_chunk=_on_chunk)
+                if not buf:
+                    return
+                pcm = bytes(buf)
+                with self._tts_lock:
+                    if len(self._tts_cache) >= self._tts_cache_max:
+                        try:
+                            oldest = next(iter(self._tts_cache))
+                            self._tts_cache.pop(oldest, None)
+                        except StopIteration:
+                            pass
+                    self._tts_cache[cache_key] = pcm
+            if self._logger:
+                try:
+                    self._logger.event("tts_synthesized",
+                                        chars=len(text),
+                                        spoken_chars=len(speech_text),
+                                        humanized=(speech_text != text),
+                                        bytes=len(pcm),
+                                        voice=voice,
+                                        cached=False)
+                except Exception:
+                    pass
+        except Exception as exc:
+            if self._logger:
+                try:
+                    self._logger.exception("tts_synthesis_failed", exc)
+                except Exception:
+                    pass
+
+    # Fallback voice mapping for legacy TTS models (tts-1 / tts-1-hd) that
+    # don't support the 2025-era voices. Keys are 2025 voices that may 400;
+    # values are the closest tonal match available on legacy models.
+    _TTS_VOICE_FALLBACK = {
+        "marin": "sage",    # warm, conversational, female-leaning
+        "cedar": "onyx",    # deeper, masculine
+        "ballad": "sage",
+        "verse": "sage",
+        "ash": "onyx",
+    }
+
+    # Preferred TTS model. gpt-4o-mini-tts is the only model that supports
+    # marin/cedar and the `instructions` parameter; tts-1 is the legacy
+    # fallback when the new model is unavailable in the deployment region.
+    _TTS_MODEL_PRIMARY = "gpt-4o-mini-tts"
+    _TTS_MODEL_FALLBACK = "tts-1"
+
+    def _http_openai_tts(self, api_key: str, voice: str, text: str,
+                          on_chunk: Optional[Callable[[bytes], None]] = None) -> bytes:
+        """POST to /v1/audio/speech and return raw PCM16 24 kHz mono bytes.
+        Returns b'' on any error so the caller can early-exit cleanly.
+
+        When `on_chunk` is provided, the response is streamed in 8 KB
+        chunks and passed to the callback as they arrive — letting the
+        caller START PLAYBACK before the full response finishes
+        downloading. Cuts perceived audio latency dramatically for
+        long replies. With no callback, behaves as before (full read).
+
+        Strategy: try gpt-4o-mini-tts with the requested voice first; if
+        the API rejects the voice (e.g. region lag, voice not enabled),
+        retry with the mapped fallback voice; if the whole model is
+        rejected, drop to tts-1 with the fallback voice.
+
+        response_format='pcm' returns exactly the format AudioPlayer
+        consumes — 24 kHz mono signed-16 little-endian, no header — so we
+        can feed the bytes straight into .write() without decoding."""
+        # Build the attempt sequence: (model, voice) pairs in priority order.
+        fallback_voice = self._TTS_VOICE_FALLBACK.get(voice, voice)
+        attempts = [
+            (self._TTS_MODEL_PRIMARY, voice),
+        ]
+        if fallback_voice != voice:
+            attempts.append((self._TTS_MODEL_PRIMARY, fallback_voice))
+        attempts.append((self._TTS_MODEL_FALLBACK, fallback_voice))
+
+        last_err: Optional[str] = None
+        for model, attempt_voice in attempts:
+            try:
+                import urllib.request
+                import urllib.error
+                payload_dict = {
+                    "model": model,
+                    "input": text,
+                    "voice": attempt_voice,
+                    "response_format": "pcm",
+                }
+                # gpt-4o-mini-tts supports an `instructions` field that
+                # nudges delivery style. Push toward casual conversation
+                # — closer to how a person actually replies, less robotic.
+                if "gpt-4o-mini-tts" in model:
+                    payload_dict["instructions"] = (
+                        "Speak in a warm, casual, friendly conversational "
+                        "tone — like a person chatting, not reading a "
+                        "weather report. Vary intonation naturally."
+                    )
+                payload = json.dumps(payload_dict).encode("utf-8")
+                req = urllib.request.Request(
+                    "https://api.openai.com/v1/audio/speech",
+                    data=payload,
+                    method="POST",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=15.0) as resp:
+                    if getattr(resp, "status", 200) != 200:
+                        continue
+                    if on_chunk is not None:
+                        # Streaming mode — read 8 KB chunks and forward
+                        # to the callback so playback starts well before
+                        # the full response finishes downloading.
+                        buf = bytearray()
+                        while True:
+                            chunk = resp.read(8192)
+                            if not chunk:
+                                break
+                            buf.extend(chunk)
+                            try:
+                                on_chunk(chunk)
+                            except Exception:
+                                pass
+                        data = bytes(buf)
+                    else:
+                        data = resp.read() or b""
+                    if data and self._logger:
+                        try:
+                            self._logger.event("tts_http_ok",
+                                                model=model,
+                                                voice=attempt_voice,
+                                                streamed=(on_chunk is not None),
+                                                fallback=(attempt_voice != voice
+                                                          or model != self._TTS_MODEL_PRIMARY))
+                        except Exception:
+                            pass
+                    return data
+            except urllib.error.HTTPError as exc:
+                code = getattr(exc, "code", 0)
+                body = ""
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")[:300]
+                except Exception:
+                    pass
+                last_err = f"{code}: {body}"
+                if self._logger:
+                    try:
+                        self._logger.event("tts_http_error",
+                                            code=code,
+                                            body=body,
+                                            model=model,
+                                            voice=attempt_voice)
+                    except Exception:
+                        pass
+                # 400 typically means invalid voice/model — try next combo.
+                # 401/403 (auth) won't be fixed by a retry; bail.
+                if code in (401, 403):
+                    return b""
+                continue
+            except Exception as exc:
+                if self._logger:
+                    try:
+                        self._logger.exception("tts_http_failed", exc)
+                    except Exception:
+                        pass
+                last_err = str(exc)
+                continue
+        return b""
 
 # Author: Konstantin Markov

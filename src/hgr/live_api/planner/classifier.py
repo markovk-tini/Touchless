@@ -155,12 +155,167 @@ class Classifier:
                     description="compose email draft",
                 )
 
+        # ---- text generation -> local Ollama (free, instant, no realtime
+        # tokens / no OpenAI rate limit). Placed HERE (not at end of classify)
+        # so the regex-gen pattern wins over iris_lookup_contact's loose
+        # "give me ... email ..." matcher; the patterns are tight enough that
+        # they don't pre-empt earlier specific intents (volume/email/etc.).
+        # If Ollama isn't installed/running, handles_connector returns False
+        # and these steps fall through to realtime — identical to behavior
+        # before this block existed.
+
+        # (0a) Explicit prefix: 'use ollama / local model to X', 'use the
+        # local llm: X'. User EXPLICITLY asked for the cheap path — strip
+        # the routing prefix and feed the rest as the prompt.
+        m = re.search(
+            r"^\s*(?:please\s+|hey\s+)?"
+            r"(?:use|using|via|with)\s+(?:the\s+)?"
+            r"(?:ollama|local\s+model|local\s+llm|local\s+ai|"
+            r"cheap\s+model|cheap\s+path)\s*"
+            r"(?:to\s+|,\s*|:\s*)?"
+            r"(?P<task>.+)",
+            lower,
+        )
+        if m and len(m.group("task").strip()) >= 3:
+            # Pull from ORIGINAL text (case-preserving) by cutting the same
+            # number of leading chars `lower` consumed.
+            task = t[len(t) - len(m.group("task")):].strip()
+            return Step(
+                tool="ollama_generate", args={"prompt": task},
+                layer="connector",
+                description="explicit local-model route")
+        # (0b) Suffix form: 'X via ollama' / 'X with the local model'.
+        m = re.search(
+            r"^(?P<task>.+?)\s+"
+            r"(?:via|with|using)\s+(?:the\s+)?"
+            r"(?:ollama|local\s+model|local\s+llm|local\s+ai|cheap\s+model)"
+            r"\b[\s.!?]*$",
+            lower,
+        )
+        if m and len(m.group("task").strip()) >= 3:
+            task = t[: len(m.group("task"))].strip().rstrip(",.;:!?")
+            return Step(
+                tool="ollama_generate", args={"prompt": task},
+                layer="connector",
+                description="explicit local-model route")
+
+        # (1) Creative-write: 'write/give/compose a haiku/poem/tweet/joke
+        # about X'. Restricted to clearly creative text snippets so 'write
+        # code/a function/a script' falls through to realtime (which has
+        # codebase context), and 'create google doc' / 'compose email Dani
+        # saying hi' have already won above.
+        m = re.search(
+            r"^\s*(?:please\s+|hey\s+|can\s+you\s+|could\s+you\s+|"
+            r"will\s+you\s+)*"
+            r"(?:write|compose|draft|generate|create|make|give)\s+"
+            r"(?:me\s+|us\s+|out\s+)?(?:a|an|some|the|few)?\s*"
+            r"(?:short\s+|quick\s+|funny\s+|brief\s+|long\s+|silly\s+|"
+            r"serious\s+|clever\s+|nice\s+|good\s+|cool\s+|catchy\s+)?"
+            r"(?P<kind>haikus?|poems?|limericks?|sonnets?|verses?|rhymes?|"
+            r"sentences?|paragraphs?|essays?|fables?|jokes?|"
+            r"riddles?|tweets?|posts?|captions?|descriptions?|bios?|"
+            r"taglines?|slogans?|mottos?|quotes?|sayings?|puns?|"
+            r"(?:story|stories))"
+            r"\b",
+            lower,
+        )
+        if m:
+            return Step(
+                tool="ollama_generate", args={"prompt": t},
+                layer="connector",
+                description=f"generate {m.group('kind')} locally")
+
+        # (2) Regex generation: 'write/give me a regex for X', 'regex that
+        # matches X'. Self-contained — the spec is always inline. MUST sit
+        # above iris_lookup_contact, whose loose '(give me)...email' matcher
+        # would otherwise steal 'give me a regex for email addresses'.
+        if (re.search(
+                r"^\s*(?:please\s+|hey\s+)?(?:write|give|make|generate)\s+"
+                r"(?:me\s+)?(?:a|an)?\s*regex\b", lower)
+            or re.search(
+                r"^\s*regex\s+(?:for|that|to|matching)\b", lower)):
+            return Step(
+                tool="ollama_generate", args={"prompt": t},
+                layer="connector",
+                description="regex via local model")
+
+        # (3) Translate with inline source ('translate X to Spanish',
+        # 'translate to French: X'). Excludes 'translate this/that/the
+        # screen' which need screen context — fall through to realtime.
+        if (re.search(
+                r"^\s*(?:please\s+)?translate\s+"
+                r"(?!this\b|that\b|it\b|"
+                r"the\s+(?:screen|page|document|email|message|text|"
+                r"selection|highlighted)\b)"
+                r".{3,}\s+(?:to|into)\s+\w+",
+                lower)
+            or re.search(
+                r"^\s*(?:please\s+)?translate\s+(?:to|into)\s+\w+"
+                r"[\s:,]+.{3,}",
+                lower)):
+            return Step(
+                tool="ollama_generate", args={"prompt": t},
+                layer="connector",
+                description="translate locally")
+
+        # (4) Paraphrase / rephrase / proofread with inline source (quoted
+        # or colon-delimited). 'rephrase that' is excluded — needs context.
+        if re.search(
+                r"^\s*(?:please\s+)?(?:rephrase|reword|paraphrase|"
+                r"proofread|fix\s+(?:the\s+)?grammar\s+(?:of|in)|"
+                r"correct\s+(?:the\s+)?grammar\s+(?:of|in))"
+                r"\s*[:\"'].+",
+                lower):
+            return Step(
+                tool="ollama_generate", args={"prompt": t},
+                layer="connector",
+                description="rewrite locally")
+
         # ---- weather ("what's the weather", "is it raining", "weather in X")
         # Free, no-key wttr.in lookup. Auto-detects location when none given.
-        # "weather in <place>" / "weather for <place>" / "<place> weather"
+        #
+        # Order matters: TEMPORAL-phrase patterns are tried FIRST so they
+        # win over the "weather in <place>" pattern, which would otherwise
+        # greedily capture "the next three days" / "tomorrow" / "this week"
+        # as a location and then fail to geocode them. All temporal /
+        # generic phrasings route to weather_get with NO location (empty
+        # string → IP auto-detect), and weather.py's casual `summary`
+        # field becomes the user-facing reply via orchestrator._format_message.
+        #
+        # (a) Temporal-phrase forecast requests: "forecast for the next
+        #     three days", "weather for tomorrow", "forecast for this week",
+        #     "weather for the weekend", "forecast for today", etc.
+        #     These would otherwise be eaten by the location pattern below.
+        if re.search(
+            r"\b(?:weather|forecast|temperature|temp|conditions?)\s+"
+            r"(?:in|for|over|during|across|across\s+the|through|throughout)\s+"
+            r"(?:the\s+)?"
+            r"(?:next\s+(?:\d+|few|couple\s+of|several|two|three|four|five|six|seven|"
+            r"ten|fourteen|24|48|72)\s+"
+            r"(?:hour|day|night|week|weekend|morning|evening|afternoon)s?|"
+            r"today|tonight|tomorrow|yesterday|"
+            r"this\s+(?:morning|afternoon|evening|night|week|weekend)|"
+            r"the\s+(?:morning|afternoon|evening|night|week|weekend|day|coming\s+days)|"
+            r"(?:mon|tues|wednes|thurs|fri|satur|sun)day)"
+            r"\b",
+            t, flags=re.IGNORECASE,
+        ):
+            return Step(
+                tool="weather_get",
+                args={},
+                layer="touchless",
+                description="weather forecast (auto-detect location)",
+            )
+        # (b) "weather in <place>" / "weather for <place>" / "forecast in X".
+        # Negative lookahead rejects temporal phrases (today/tomorrow/next N
+        # days/this week/etc.) so they fall through to the (a) branch above
+        # rather than being mis-captured as a place name.
         m = re.search(
             r"\b(?:weather|forecast|temperature|temp)\s+"
-            r"(?:in|for|at|of|near|around)\s+(?P<loc>[A-Za-z][A-Za-z0-9 ,.\-'’]{1,80})\??$",
+            r"(?:in|for|at|of|near|around)\s+"
+            r"(?!(?:the\s+)?(?:next|today|tonight|tomorrow|yesterday|"
+            r"this|the\s+(?:morning|afternoon|evening|night|week|weekend|day|coming))\b)"
+            r"(?P<loc>[A-Za-z][A-Za-z0-9 ,.\-'’]{1,80})\??$",
             t, flags=re.IGNORECASE,
         )
         if m:
@@ -170,17 +325,29 @@ class Classifier:
                 layer="touchless",
                 description=f"weather in {m.group('loc').strip()}",
             )
-        # "what's/how's the weather", "is it raining/snowing/hot/cold",
-        # "what's the temperature", "should I bring an umbrella"
+        # (c) "what's/how's the weather", "is it raining/snowing/hot/cold",
+        # "what's the temperature", "should I bring an umbrella",
+        # "will it rain", "how hot/cold/warm is it", "any rain today".
         m = re.search(
             r"\b("
             r"(?:what(?:[’'´]?s|s'?s| is)|how(?:[’'´]?s| is)|tell\s+me|"
-            r"give\s+me)\s+(?:about\s+)?(?:the\s+)?"
-            r"(?:weather|forecast|temperature|temp|conditions?)|"
+            r"give\s+me|show\s+me)\s+(?:about\s+)?(?:the\s+)?"
+            r"(?:weather|forecast|temperature|temp|conditions?|"
+            r"high|low|highs?\s+and\s+lows?)|"
+            r"(?:what(?:'s|s| is)|how)\s+(?:the\s+)?"
+            r"(?:weather|forecast|temperature|temp)\s+(?:like|looking|looks)|"
             r"is\s+it\s+(?:raining|snowing|cold|hot|warm|chilly|nice\s+out|"
-            r"freezing|sunny|cloudy|going\s+to\s+rain|going\s+to\s+snow)|"
+            r"freezing|sunny|cloudy|humid|windy|"
+            r"going\s+to\s+(?:rain|snow|storm|be\s+(?:cold|hot|warm|nice|sunny|cloudy)))|"
+            r"will\s+it\s+(?:rain|snow|storm|be\s+(?:cold|hot|warm|nice|sunny|cloudy|"
+            r"raining|snowing))|"
+            r"(?:gonna|going\s+to)\s+(?:rain|snow|storm)|"
+            r"how\s+(?:hot|cold|warm|chilly|humid|windy)\s+(?:is\s+it|will\s+it\s+be)|"
+            r"any\s+(?:rain|snow|storms?)\s+(?:today|tonight|tomorrow|this\s+week)|"
+            r"chance\s+of\s+(?:rain|snow|storms?|precipitation)|"
             r"(?:do\s+i\s+need|should\s+i\s+(?:bring|wear|grab))\s+"
-            r"(?:an?\s+)?(?:umbrella|jacket|coat|sweater)"
+            r"(?:an?\s+)?(?:umbrella|jacket|coat|sweater|raincoat|boots|"
+            r"sunscreen|sunglasses)"
             r")\b",
             t, flags=re.IGNORECASE,
         )
@@ -290,7 +457,7 @@ class Classifier:
         # pronoun resolution and confabulates random plans.
         m = re.search(
             r"^(?:can\s+you\s+|could\s+you\s+|please\s+)*"
-            r"(?:open|show|pull\s+up|bring\s+up|view)\s+"
+            r"(?:open|show(?:\s+me)?|pull\s+up|bring\s+up|view)\s+"
             r"(?:it|that|this|the\s+(?:doc(?:ument)?|sheet|spreadsheet|"
             r"slide(?:show|s)?|presentation|deck|onenote|page|note|file|"
             r"link|thing)(?:\s+(?:you|i|we)\s+(?:just\s+)?"
@@ -304,6 +471,70 @@ class Classifier:
                 args={},
                 layer="touchless",
                 description="open the most recently created artifact",
+            )
+
+        # ---- project remove ("remove demo project", "remove the project
+        # called X", "delete the X project", "hide project Y", "forget the
+        # X project") -------------------------------------------------
+        # Route DIRECTLY to iris_remove_project so loose phrasings don't
+        # have to round-trip through the LLM (which previously didn't see
+        # iris_remove_project in its catalog and dropped these intents).
+        # MUST sit ABOVE the contact-forget block — its
+        # `(forget|delete|remove|wipe) NAME` pattern would otherwise steal
+        # 'remove demo project' (matching NAME='demo').
+        #
+        # Patterns recognized (label is captured greedily to end, then
+        # cleaned: strip trailing 'project', 'from cortex/your cortex/
+        # your brain/your world', trailing punctuation):
+        #   "remove demo project"           → label='demo'
+        #   "remove project demo project"   → label='demo'
+        #   "remove the project demo"       → label='demo'
+        #   "remove the project called X"   → label='X'
+        #   "delete the X project from your cortex" → label='X'
+        #   "hide project X"                → label='X'
+        #   "forget the project X"          → label='X'
+        _PROJECT_REMOVE_VERB = r"(?:remove|delete|hide|forget|get\s+rid\s+of)"
+        _PROJECT_TAIL_STRIP = re.compile(
+            r"\s*(?:from\s+(?:my\s+|your\s+)?(?:cortex|brain|world|memory|"
+            r"the\s+cortex|the\s+world))?\s*$",
+            re.IGNORECASE,
+        )
+        project_patterns = (
+            # "remove the project called/named/titled X"
+            rf"^{_PROJECT_REMOVE_VERB}\s+(?:the\s+|my\s+)?project\s+"
+            r"(?:called|named|titled)\s+(?P<label>.+)$",
+            # "remove project X" / "remove the project X" / "remove project: X"
+            rf"^{_PROJECT_REMOVE_VERB}\s+(?:the\s+|my\s+)?project[:\s]+"
+            r"(?P<label>.+)$",
+            # "remove the X project" / "delete X project"
+            rf"^{_PROJECT_REMOVE_VERB}\s+(?:the\s+|my\s+)?"
+            r"(?P<label>.+?)\s+project\b.*$",
+            # "remove X from (my|your) cortex/brain/world"
+            rf"^{_PROJECT_REMOVE_VERB}\s+(?:the\s+)?(?P<label>.+?)\s+"
+            r"from\s+(?:my\s+|your\s+)?(?:cortex|brain|world)\b.*$",
+        )
+        for pat in project_patterns:
+            m = re.search(pat, lower)
+            if not m:
+                continue
+            label = m.group("label").strip()
+            # Strip trailing "project" / cortex tail / punctuation.
+            label = _PROJECT_TAIL_STRIP.sub("", label)
+            label = re.sub(r"\s+project\s*$", "", label, flags=re.IGNORECASE)
+            label = label.strip().rstrip(".!?,;:").strip()
+            # Reject pronouns / non-labels.
+            _PROJ_STOP = {"", "it", "that", "this", "my", "the", "a", "an",
+                          "everything", "all", "them", "those", "these"}
+            if label.lower() in _PROJ_STOP:
+                continue
+            # Reject single-letter labels (likely a misparse).
+            if len(label) < 2:
+                continue
+            return Step(
+                tool="iris_remove_project",
+                args={"project_label": label},
+                layer="iris",
+                description=f"remove project: {label}",
             )
 
         # ---- contact forget ("forget Dani", "forget Dani's email",

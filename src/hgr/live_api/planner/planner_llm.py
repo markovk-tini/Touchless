@@ -99,6 +99,14 @@ class LLMPlanner:
             "plan should be one step: gmail_send with to='dani@mangollc.org'. "
             "This avoids unnecessary lookup calls and works around "
             "Microsoft Graph limitations on personal accounts.\n\n"
+            "MAIL-SEND ARG SHAPE (HARD): gmail_send / ms_mail_send "
+            "require `to` to be a FULL EMAIL ADDRESS — never a bare name. "
+            "If the request says 'email vesko' and the context has NO "
+            "memory fact for vesko, plan TWO steps: (1) contacts_search "
+            "for vesko, then (2) the send tool with "
+            "to={step:1.contacts[0].emails[0]}. Never pass to='vesko' or "
+            "to='vesko@example.com' / 'vesko@test.com' (placeholder "
+            "domains) — the connector rejects them.\n\n"
             "OUTPUT SHAPES of common lookup tools (so you reference fields "
             "correctly with {step:N.field...}):\n"
             "  contacts_search → {contacts: [{name, emails:[str,...], "
@@ -206,7 +214,31 @@ class LLMPlanner:
             "- type_text [iris]  Type text into the focused field.",
             "- press_hotkey [iris]  Press a key combination.",
             "- open_app [iris]  Launch any app by name (Outlook, Teams, etc.).",
-            "- open_url [iris]  Open a URL in the default browser.",
+            "- open_url [iris]  Open a URL in the default browser. "
+            "Args: url_or_query (NOT 'url'). Use to chain output of a "
+            "create step into a 'then open it' step: "
+            "url_or_query={step:N.link}.",
+            "- weather_get [iris]  Free wttr.in lookup, single API call. "
+            "Use for ANY 'weather / forecast / temperature / is it "
+            "raining / will it rain / forecast for next N days / "
+            "this week / tomorrow' request — NEVER fall back to "
+            "web_search/web_navigate for weather. For temporal phrasings "
+            "like 'forecast for the next three days' or 'weather "
+            "tomorrow', pass location=\"\" (empty) — temporal phrases "
+            "are NOT place names. Args: location (optional — empty "
+            "= auto IP geolocate). Returns: {status, location, "
+            "description, temperature, feels_like, humidity_pct, wind, "
+            "summary, forecast}. `summary` is a complete, casually "
+            "phrased human-readable sentence already prepared for the "
+            "user — when this is the FINAL step of a weather-only "
+            "request, emit {step:N.summary} VERBATIM (no rephrasing, "
+            "no shortening). When chaining weather INTO an email/"
+            "message body, also use {step:N.summary} (NOT temp_f / "
+            "weather / conditions — those don't exist).",
+            "- compose_text [iris]  Pure-template string builder (no LLM "
+            "call). Use to assemble a body from prior step outputs "
+            "without calling an LLM. Args: template (with {step:N.field} "
+            "refs), max_chars.",
             "- web_search [iris]  Structured search results "
             "(title/url/snippet) WITHOUT spinning up Chrome — Google CSE if "
             "configured, else DuckDuckGo. Use first for any 'search the web' "
@@ -225,6 +257,18 @@ class LLMPlanner:
             "- web_get_links [iris]  Return the current page's links as "
             "{index, text, url}. Same rule: requires a prior web_navigate. "
             "Args: contains, limit.",
+            "- iris_remove_project [iris]  Remove a project from Iris's "
+            "cortex / world model (also fades its node in the live viz). "
+            "Use for ANY 'remove / delete / hide / forget / get rid of "
+            "<project>' request — including loose phrasings like "
+            "'remove demo project', 'remove the project called X', "
+            "'remove project X', 'delete X from cortex', 'forget X'. "
+            "Args: project_id OR project_label (either works; matching "
+            "is case-insensitive and substring-based, so the user-typed "
+            "label like 'Demo Project' or 'demo project' is fine). "
+            "Protected: touchless-dev, touchless-website, "
+            "touchless-marketing, touchless-tracking — these will return "
+            "an error.",
         ])
         return "\n".join(lines)
 

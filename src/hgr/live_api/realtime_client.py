@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from . import cortex_emit
 from .config import LiveApiConfig
 from .live_api_logger import LiveApiLogger
 
@@ -54,13 +56,18 @@ class RealtimeClient:
         on_closed: Optional[ClosedCallback] = None,
         on_error: Optional[ErrorCallback] = None,
         text_only: bool = False,
+        voice_output: bool = False,
     ) -> None:
         self._config = config
         self._logger = logger
         self._tools = tools
         self._system_instructions = system_instructions
-        # Typed-command mode: text in/out, no mic, no audio session config.
+        # Typed-command mode: no mic, no input audio config.
         self._text_only = bool(text_only)
+        # Voice output: when True AND text_only, request text+audio out
+        # (no mic). When True AND NOT text_only, normal voice mode
+        # already includes audio output, so this is a no-op there.
+        self._voice_output = bool(voice_output)
         self._on_event = on_event
         self._on_connected = on_connected
         self._on_closed = on_closed
@@ -206,6 +213,50 @@ class RealtimeClient:
                 continue
             kind = str(event.get("type") or "<no-type>")
             self._logger.event("ws_recv", event_type=kind)
+            # Cortex viz: pulse voice-mic -> core when a user transcript
+            # arrives, and core -> voice-tts when an assistant audio reply
+            # completes. Best-effort — must NEVER break realtime dispatch.
+            try:
+                if kind == "conversation.item.input_audio_transcription.completed":
+                    cortex_emit.edge_pulse("voice-mic", "core",
+                                           color="cyan", duration_ms=100)
+                elif kind in {"response.output_audio.done",
+                              "response.audio.done",
+                              "response.output_text.done",
+                              "response.output_audio_transcript.done",
+                              "response.audio_transcript.done",
+                              "response.text.done"}:
+                    # Pick target by output modality: voice-tts when
+                    # speaking, rt-output for text-only realtime replies.
+                    # Mirrors LiveApiManager._emit_reply_output_pulse so
+                    # both code paths light up the same node.
+                    # FULL output path — matches
+                    # LiveApiManager._emit_reply_output_pulse. Always
+                    # fire core → cap-realtime → rt-output; when voice
+                    # is on, also core → cap-voice → voice-tts.
+                    try:
+                        cortex_emit.edge_pulse("core", "cap-realtime",
+                                               color="magenta", duration_ms=280)
+                    except Exception:
+                        pass
+                    try:
+                        cortex_emit.edge_pulse("cap-realtime", "rt-output",
+                                               color="magenta", duration_ms=280)
+                    except Exception:
+                        pass
+                    if self._voice_output:
+                        try:
+                            cortex_emit.edge_pulse("core", "cap-voice",
+                                                   color="magenta", duration_ms=280)
+                        except Exception:
+                            pass
+                        try:
+                            cortex_emit.edge_pulse("cap-voice", "voice-tts",
+                                                   color="magenta", duration_ms=280)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             try:
                 self._on_event(event)
             except Exception as exc:
@@ -252,30 +303,72 @@ class RealtimeClient:
             "tools": self._tools,
             "tool_choice": "auto",
         }
-        if self._text_only:
+        # Unified audio path: by default Realtime emits TEXT ONLY and the
+        # manager funnels every assistant reply (LLM, Layer-0 router,
+        # Layer-1 planner, task queue) through the local TTS pipeline
+        # (_speak_text -> _http_openai_tts) using the user's configured
+        # voice. This eliminates the prosodic mismatch between Realtime's
+        # streaming-audio voice and TTS REST's voice.
+        #
+        # Opt-out: set TOUCHLESS_REALTIME_AUDIO=1 to fall back to the
+        # legacy behaviour where the model itself streams PCM (lower
+        # latency, but inconsistent voice character across reply sources).
+        realtime_audio = os.environ.get("TOUCHLESS_REALTIME_AUDIO", "0") == "1"
+
+        if self._text_only and not self._voice_output:
+            # Typed-command, no-speech mode: text out, no mic.
             session["output_modalities"] = ["text"]
-        else:
-            # Voice path. `silence_duration_ms` is generous so multi-step
-            # spoken commands ("open vscode, then create a folder...")
-            # stay in one turn instead of being cut off on natural pauses.
-            rate = int(self._config.audio_sample_rate)
-            session["output_modalities"] = ["audio"]
-            session["audio"] = {
-                "input": {
-                    "format": {"type": "audio/pcm", "rate": rate},
-                    "transcription": {"model": "whisper-1"},
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 2500,
+        elif self._text_only and self._voice_output:
+            # Typed-command + spoken-reply. Default = text only (TTS in
+            # the manager handles speech); opt-in = legacy text+audio.
+            if realtime_audio:
+                rate = int(self._config.audio_sample_rate)
+                session["output_modalities"] = ["audio"]
+                session["audio"] = {
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": rate},
+                        "voice": getattr(self._config, "voice", "marin"),
                     },
-                },
-                "output": {
-                    "format": {"type": "audio/pcm", "rate": rate},
-                    "voice": "alloy",
-                },
-            }
+                }
+            else:
+                session["output_modalities"] = ["text"]
+        else:
+            # Normal voice path (mic input). Default = text out + TTS in
+            # the manager; opt-in = legacy text+audio streaming. The
+            # input audio config is kept either way so the user can speak.
+            rate = int(self._config.audio_sample_rate)
+            if realtime_audio:
+                session["output_modalities"] = ["audio"]
+                session["audio"] = {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": rate},
+                        "transcription": {"model": "whisper-1"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 2500,
+                        },
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcm", "rate": rate},
+                        "voice": getattr(self._config, "voice", "marin"),
+                    },
+                }
+            else:
+                session["output_modalities"] = ["text"]
+                session["audio"] = {
+                    "input": {
+                        "format": {"type": "audio/pcm", "rate": rate},
+                        "transcription": {"model": "whisper-1"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 2500,
+                        },
+                    },
+                }
         self._send({"type": "session.update", "session": session})
 
     def update_tools(self, tools: List[Dict[str, Any]]) -> bool:
