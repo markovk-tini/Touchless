@@ -217,12 +217,24 @@ class AppConfig:
     # Clip-audio capture toggles. Streamer mode: when on, the clip cache's
     # ffmpeg subprocess additionally records WASAPI loopback (system audio
     # — game/music/app sounds) and/or the user's preferred microphone,
-    # then mixes them into the saved clip with `amix`. Default off so the
-    # feature is opt-in for privacy; users who want streamer-style clips
-    # enable both. `clip_capture_microphone` reuses the existing
+    # then mixes them into the saved clip with `amix`.
+    # `clip_capture_microphone` reuses the existing
     # `preferred_microphone_name` field for device selection.
-    clip_capture_system_audio: bool = False
+    #
+    # System audio DEFAULTS ON: loopback only captures what the user is
+    # already hearing through their own speakers — same model as OBS /
+    # NVIDIA ShadowPlay defaults. Existing users with an explicit
+    # `clip_capture_system_audio: false` in their settings.json are
+    # untouched by `load_config`'s migration shim (see _MIGRATED_DEFAULTS).
+    # Mic stays opt-in for genuine privacy reasons.
+    clip_capture_system_audio: bool = True
     clip_capture_microphone: bool = False
+    # One-time migration marker: set to True the first time load_config
+    # observes a missing-or-False clip_capture_system_audio under the
+    # new default-True regime, after promoting it to True. Without
+    # this, every launch would re-promote a user's deliberate False
+    # back to True, defeating their opt-out. See load_config().
+    clip_audio_default_migrated: bool = False
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -505,6 +517,21 @@ def load_config() -> AppConfig:
             if current == legacy_default:
                 values[field_name] = SAVE_NAME_DEFAULTS[output_kind]
 
+        # Migration: clip_capture_system_audio default flipped False
+        # → True (system loopback now defaults on, matching OBS /
+        # NVIDIA ShadowPlay). Promote a persisted False that was
+        # SAVED before this migration ran — gated on the new
+        # `clip_audio_default_migrated` marker so we only flip each
+        # install once. Users who genuinely want system audio off can
+        # toggle it back via Settings → Clip Audio after the flip;
+        # the marker is set whether or not they kept the new default,
+        # so toggling back to False won't bounce on next launch.
+        # Mic stays opt-in (privacy) regardless.
+        if not data.get("clip_audio_default_migrated", False):
+            if values.get("clip_capture_system_audio") is False:
+                values["clip_capture_system_audio"] = True
+            values["clip_audio_default_migrated"] = True
+
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if
         # the user changed the value via settings, the change is preserved.
@@ -561,7 +588,50 @@ def load_config() -> AppConfig:
 
 
 def save_config(config: AppConfig) -> None:
+    """Persist `config` to disk atomically.
+
+    Write-to-temp + os.replace so the destination either reflects the
+    OLD config or the NEW one, never a truncated half. The original
+    implementation was a direct write_text which truncates the file
+    before writing — a process kill mid-write (e.g. Inno Setup's
+    `CloseApplications=force` TerminateProcess against a Touchless
+    that's mid-save) would leave config.json empty or partially-written
+    and the next launch would silently fall back to AppConfig
+    defaults, losing every user preference. The 1.1.4 audit flagged
+    this as a real corruption surface for the standalone-installer
+    upgrade path.
+
+    os.replace is atomic on the same volume on both Windows and POSIX
+    (uses MoveFileEx with MOVEFILE_REPLACE_EXISTING on Windows). The
+    temp file lives next to the destination so we stay on one volume.
+    """
+    import os as _os
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(asdict(config), indent=2), encoding="utf-8")
+    payload = json.dumps(asdict(config), indent=2)
+    tmp_path = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+    try:
+        # Write the full payload + flush + fsync the temp file before
+        # the rename, so a power-loss between write and rename leaves
+        # either old-or-new on disk, never a partial temp.
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+            fh.flush()
+            try:
+                _os.fsync(fh.fileno())
+            except (OSError, AttributeError):
+                # fsync isn't available on some Windows configs (rare);
+                # the rename below still provides atomicity vs. concurrent
+                # readers, and the write_text-style hazard is closed.
+                pass
+        _os.replace(tmp_path, CONFIG_PATH)
+    except Exception:
+        # Best-effort: if rename failed, drop the temp so it doesn't
+        # confuse the next save attempt.
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        raise
 
 # Author: Konstantin Markov

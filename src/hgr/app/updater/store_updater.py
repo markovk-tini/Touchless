@@ -27,7 +27,14 @@ from typing import Any, Optional, Tuple
 
 from PySide6.QtCore import QThread, Signal
 
-from .release_checker import ReleaseInfo, _is_newer, _strip_v_prefix, is_safe_version
+from .release_checker import (
+    ReleaseInfo,
+    _is_newer,
+    _strip_v_prefix,
+    is_safe_version,
+    _parse_app_update_zip_sha256,
+    _parse_full_installer_sha256,
+)
 from ... import __version__ as RUNNING_VERSION
 
 
@@ -88,12 +95,16 @@ class StoreUpdateChecker(QThread):
             return
 
         # Best-effort fetch the GitHub release for the same version. Gives
-        # us two things: real release notes (the Store manifest has none),
-        # and the small app-zip URL (~140 MB) so the in-app update path
-        # downloads that instead of the 1+ GB Store installer. Falls back
-        # to the Store installer URL if GitHub is unreachable or doesn't
-        # have a matching tagged release.
-        gh_body, gh_zip_url, gh_zip_size = self._fetch_github_release(version)
+        # us three things: real release notes (the Store manifest has
+        # none), the small app-zip URL (~140 MB) so the in-app update
+        # path downloads that instead of the 1+ GB Store installer, and
+        # the published SHA-256 of the asset so the Updater can verify
+        # the download before applying. Falls back to the Store installer
+        # URL if GitHub is unreachable or doesn't have a matching tagged
+        # release. The raw body (incl. markers) is preserved so we can
+        # parse markers later; gh_body is the cleaned text shown to the
+        # user.
+        gh_body, gh_body_raw, gh_zip_url, gh_zip_size = self._fetch_github_release(version)
 
         # Decide which URL the in-app Updater downloads + applies.
         # Preference: GitHub app-zip > Store installer > Store deep link.
@@ -135,6 +146,20 @@ class StoreUpdateChecker(QThread):
                 "Click **Download Update** to install it now."
             )
 
+        # Pick the SHA-256 matching the asset we actually chose to
+        # download. If we landed on the app-zip path, parse the
+        # app-update-zip marker from the GitHub body. If we fell back
+        # to the Store installer URL, parse the full-installer marker
+        # (still hosted on R2, but the hash is the same artifact). Empty
+        # string when no marker is present, in which case the Updater
+        # logs a warning and proceeds (backward compat for the 1.1.3
+        # release which pre-dates the marker convention).
+        if kind == "app-zip":
+            expected_sha256 = _parse_app_update_zip_sha256(gh_body_raw)
+        elif kind == "full-exe":
+            expected_sha256 = _parse_full_installer_sha256(gh_body_raw)
+        else:
+            expected_sha256 = ""
         info = ReleaseInfo(
             version=_strip_v_prefix(version),
             body=body,
@@ -143,6 +168,7 @@ class StoreUpdateChecker(QThread):
             size_bytes=preferred_size,
             update_kind=kind,
             fallback_url=fallback,
+            expected_sha256=expected_sha256,
         )
         self.update_available.emit(info)
 
@@ -166,12 +192,17 @@ class StoreUpdateChecker(QThread):
                 best_url = self._pick_installer_url(v.get("Installers") or [])
         return best_v, best_url
 
-    def _fetch_github_release(self, version: str) -> Tuple[str, str, int]:
+    def _fetch_github_release(self, version: str) -> Tuple[str, str, str, int]:
         """Look up the GitHub release for `version` and return
-        (release_body, app_zip_url, app_zip_size_bytes).
+        (release_body_clean, release_body_raw, app_zip_url, app_zip_size_bytes).
 
-        Best-effort. Returns ("", "", 0) on any failure — the caller falls
-        back to the Store installer URL + a generic prompt. Never raises.
+        Two body forms: the CLEAN body has the SHA/URL marker comments
+        stripped (suitable for showing the user), the RAW body is the
+        original text from GitHub (used to parse markers downstream).
+
+        Best-effort. Returns ("", "", "", 0) on any failure — the caller
+        falls back to the Store installer URL + a generic prompt.
+        Never raises.
 
         Why we fetch this even on the Store channel: the Store's manifest
         carries no changelog and only the full installer URL. By pulling
@@ -194,9 +225,17 @@ class StoreUpdateChecker(QThread):
                 payload = json.loads(resp.read().decode("utf-8", errors="replace"))
         except Exception as exc:
             self._log("github_release_fetch_failed", exc)
-            return ("", "", 0)
+            return ("", "", "", 0)
 
-        body = str((payload or {}).get("body") or "").strip()
+        body_raw = str((payload or {}).get("body") or "").strip()
+        # Strip marker comments before showing to the user — they're
+        # metadata for the Updater, not changelog content. The raw body
+        # is kept separately so downstream can parse SHA-256 markers.
+        try:
+            from .release_checker import _strip_installer_markers
+            body = _strip_installer_markers(body_raw)
+        except Exception:
+            body = body_raw
         zip_url = ""
         zip_size = 0
         # Strict prefix match — case-insensitive — so a future asset
@@ -217,7 +256,7 @@ class StoreUpdateChecker(QThread):
                 except Exception:
                     zip_size = 0
                 break
-        return (body, zip_url, zip_size)
+        return (body, body_raw, zip_url, zip_size)
 
     @staticmethod
     def _pick_installer_url(installers: list) -> str:

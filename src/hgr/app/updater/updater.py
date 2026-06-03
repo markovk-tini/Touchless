@@ -241,9 +241,49 @@ class Updater(QObject):
     def apply_update_and_exit(self, downloaded_path: str) -> bool:
         """Route to the appropriate handler based on the update kind
         the ReleaseChecker stamped on `self._info`. Returns False on
-        any setup failure so the dialog can show an error."""
+        any setup failure so the dialog can show an error.
+
+        SHA-256 + Authenticode verification gate every apply. SHA-256
+        protects against CDN corruption + MITM + a quietly-swapped
+        asset. Authenticode protects against the worst case —
+        compromised GitHub PAT lets an attacker publish both a
+        malicious URL AND a matching hash marker, but they can't
+        sign with the legitimate Konstantin Markov code-signing cert.
+        Both checks together (combined with HTTPS for the download
+        itself) make unattended-RCE on auto-update meaningfully harder.
+        """
         if self._info is None:
             return False
+        # Hash check first (cheap, doesn't need to crack the file).
+        from .verify import verify_app_zip, verify_full_installer
+        if self._info.update_kind == "app-zip":
+            ok, msg = verify_app_zip(downloaded_path, self._info.expected_sha256 or "")
+        else:
+            ok, msg = verify_full_installer(downloaded_path, self._info.expected_sha256 or "")
+        if not ok:
+            # Hard refusal — surface a precise error so the user
+            # understands this isn't a transient network blip.
+            try:
+                self.failed.emit(
+                    f"Update artifact failed verification and will NOT be applied.\n\n"
+                    f"{msg}\n\n"
+                    f"This usually means the download was corrupted, intercepted, "
+                    f"or that the release was published incorrectly. "
+                    f"Please retry — if it keeps failing, report it to "
+                    f"konstantinvmarkov@gmail.com."
+                )
+            except Exception:
+                pass
+            # Best-effort: scrub the bad download so a retry doesn't
+            # silently re-use the rejected bytes.
+            try:
+                os.unlink(downloaded_path)
+            except Exception:
+                pass
+            return False
+        # Verification passed (or was skipped for legacy releases with
+        # no published hash + still passed Authenticode for full-exe
+        # path). Proceed with apply.
         if self._info.update_kind == "app-zip":
             return self._apply_zip_and_exit(downloaded_path)
         return self.launch_installer_and_exit(downloaded_path)
@@ -433,7 +473,7 @@ class Updater(QObject):
             helper = zip_dir / "_apply_update.bat"
             content = (
                 "@echo off\r\n"
-                "rem [BUILD-MARKER: v1.1.4 — localappdata staging + DisplayVersion writeback]\r\n"
+                "rem [BUILD-MARKER: v1.1.4 — localappdata + DisplayVersion + Authenticode check]\r\n"
                 "setlocal enabledelayedexpansion\r\n"
                 f"set \"INSTALL_DIR={install_dir}\"\r\n"
                 f"set \"UPDATE_ZIP={zip_path}\"\r\n"
@@ -478,6 +518,27 @@ class Updater(QObject):
                 ")\r\n"
                 "if not exist \"%STAGING%\\Touchless.exe\" (\r\n"
                 "  echo [error] staged Touchless.exe missing after extract >> \"%LOG%\"\r\n"
+                "  goto fail\r\n"
+                ")\r\n"
+                "\r\n"
+                # Authenticode check on the staged Touchless.exe BEFORE we
+                # robocopy it over the live install. If the binary inside
+                # the zip is unsigned, or signed by an unexpected publisher,
+                # we refuse to copy. Combined with the Python-side SHA-256
+                # check on the outer zip, this gives us defense-in-depth
+                # against a release where the maintainer's GitHub account
+                # is compromised: the attacker can publish a zip + matching
+                # hash, but they can't sign Touchless.exe with the real
+                # Konstantin Markov code-signing cert.
+                "echo [info] verifying staged Touchless.exe Authenticode signature >> \"%LOG%\"\r\n"
+                "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                "\"$s = Get-AuthenticodeSignature -FilePath '%STAGING%\\Touchless.exe'; "
+                "if ($s.Status -ne 'Valid') { exit 11 }; "
+                "if ($s.SignerCertificate.Subject -notmatch 'Konstantin Markov') { exit 12 }; "
+                "exit 0\""
+                " >>\"%LOG%\" 2>&1\r\n"
+                "if errorlevel 11 (\r\n"
+                "  echo [error] staged Touchless.exe failed Authenticode verification >> \"%LOG%\"\r\n"
                 "  goto fail\r\n"
                 ")\r\n"
                 "\r\n"

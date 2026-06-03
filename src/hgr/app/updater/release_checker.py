@@ -74,11 +74,31 @@ _FULL_INSTALLER_SIZE_RE = re.compile(
     r"<!--\s*full-installer-size:\s*(\d+)\s*-->",
     re.IGNORECASE,
 )
+# SHA-256 of the artifact at the URL above. Optional but strongly
+# encouraged on every release — the Updater verifies the downloaded
+# bytes against this hash BEFORE running them, catching CDN corruption,
+# MITM attacks, and (combined with HTTPS) any tampering that doesn't
+# also compromise the release editor's account. 64 hex chars; case-
+# insensitive. Empty string in the marker means "no verification" —
+# allowed for backward compatibility with older releases but logged
+# as a warning at apply time.
+_FULL_INSTALLER_SHA256_RE = re.compile(
+    r"<!--\s*full-installer-sha256:\s*([0-9A-Fa-f]{64})\s*-->",
+    re.IGNORECASE,
+)
+# Same shape for the app-zip asset (the small in-place update path
+# website + Store users both end up on). When present, the Updater
+# refuses to run the apply bat if the downloaded zip's SHA-256
+# doesn't match.
+_APP_UPDATE_ZIP_SHA256_RE = re.compile(
+    r"<!--\s*app-update-zip-sha256:\s*([0-9A-Fa-f]{64})\s*-->",
+    re.IGNORECASE,
+)
 # Combined regex used to strip the markers from the body before
-# showing it to the user. Captures any <!-- full-installer-* ... -->
+# showing it to the user. Captures any <!-- (full-installer-*|app-update-*) ... -->
 # line, including its trailing newline if present.
 _FULL_INSTALLER_MARKER_RE = re.compile(
-    r"<!--\s*full-installer-(?:url|size):[^>]*-->\s*\n?",
+    r"<!--\s*(?:full-installer-(?:url|size|sha256)|app-update-zip-sha256):[^>]*-->\s*\n?",
     re.IGNORECASE,
 )
 
@@ -100,6 +120,24 @@ def _parse_external_full_installer(body: str) -> tuple[str, int]:
         except ValueError:
             size = 0
     return (url, size)
+
+
+def _parse_full_installer_sha256(body: str) -> str:
+    """Pull the full-installer SHA-256 marker from the release body.
+    Returns "" if no marker (legacy releases). Lowercased hex."""
+    if not body:
+        return ""
+    m = _FULL_INSTALLER_SHA256_RE.search(body)
+    return m.group(1).lower() if m else ""
+
+
+def _parse_app_update_zip_sha256(body: str) -> str:
+    """Pull the app-update-zip SHA-256 marker from the release body.
+    Returns "" if no marker. Lowercased hex."""
+    if not body:
+        return ""
+    m = _APP_UPDATE_ZIP_SHA256_RE.search(body)
+    return m.group(1).lower() if m else ""
 
 
 def _strip_installer_markers(body: str) -> str:
@@ -126,6 +164,15 @@ class ReleaseInfo:
     # fallback link in case the preferred asset fails to download or
     # extract. Empty if no fallback.
     fallback_url: str = ""
+    # SHA-256 of the artifact at download_url, lowercase hex. The
+    # Updater verifies this against the actual download bytes before
+    # invoking the apply step — defends against CDN corruption + MITM
+    # + a quietly-swapped artifact. Empty string means "no hash
+    # published" (older releases); the Updater logs a warning and
+    # proceeds. Required for the trust story on auto-update (where
+    # there's no human-in-the-loop to sanity-check), so future
+    # release scripts should always populate the marker.
+    expected_sha256: str = ""
 
 
 def _strip_v_prefix(version_str: str) -> str:
@@ -326,6 +373,17 @@ class _CheckWorker(QObject):
             )
             self.finished.emit()
             return
+        # Pull the SHA-256 marker that matches the asset we're going to
+        # download. The Updater verifies the downloaded bytes against
+        # this before invoking apply — silent corruption / MITM / a
+        # quietly-swapped asset all get rejected at this gate. Both
+        # markers are best-effort: missing markers mean "no verification"
+        # which the Updater logs but proceeds with (backward compat for
+        # legacy releases that pre-date the marker convention).
+        if kind == "app-zip":
+            expected_sha256 = _parse_app_update_zip_sha256(body_raw)
+        else:
+            expected_sha256 = _parse_full_installer_sha256(body_raw)
         info = ReleaseInfo(
             version=version_clean,
             body=body,
@@ -334,6 +392,7 @@ class _CheckWorker(QObject):
             size_bytes=preferred_size,
             update_kind=kind,
             fallback_url=fallback,
+            expected_sha256=expected_sha256,
         )
         self.update_available.emit(info)
         self.finished.emit()
