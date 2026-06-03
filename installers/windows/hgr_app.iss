@@ -85,7 +85,18 @@ DisableProgramGroupPage=yes
 ; before replacing files (otherwise the in-use .exe blocks the
 ; upgrade). /RESTARTAPPLICATIONS in the updater command line plus
 ; the [Run] entry below put Touchless back up automatically.
-CloseApplications=yes
+; CloseApplications=force tells Inno to actually kill the running
+; Touchless.exe instead of asking nicely. The default (`yes`) sends
+; WM_CLOSE / WM_ENDSESSION which Qt apps may not handle cleanly within
+; Inno's timeout, producing the "Setup was unable to automatically
+; close all applications" dialog users hit during the 1.1.3 Store
+; update. `force` skips the negotiation and just terminates the
+; process — safe here because Touchless's auto-save handlers run on
+; QApplication.quit() in the update path, and after that the .exe is
+; just a frozen-bundle wrapper with no in-flight state worth
+; preserving.
+CloseApplications=force
+CloseApplicationsFilter=*.exe,*.dll
 RestartApplications=yes
 
 [Languages]
@@ -123,7 +134,23 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDi
 [Run]
 ; b8: Microsoft Defender exclusion was removed (it was the only
 ; UAC trigger in the install). See the comment under [Tasks].
+;
+; Two Launch entries, deliberately split:
+;   1. Interactive: postinstall + skipifsilent + Description text.
+;      This is the classic Inno "Run Touchless when finished?"
+;      checkbox shown only when the user runs the installer
+;      themselves. Skipped under silent install.
+;   2. Silent: runasoriginaluser + RestartApplications behaviour.
+;      The 1.1.3 Store update finished without relaunching the app
+;      because the only Launch entry above had skipifsilent and
+;      RestartApplications=yes alone doesn't relaunch when no
+;      Touchless process was running at the start of install (the
+;      app-zip path quits the app gracefully before the helper runs).
+;      The silent entry fires unconditionally under /VERYSILENT so
+;      Store users see the app come back automatically after an
+;      update, matching the manual-install UX.
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser; Check: WizardSilent
 
 ; [UninstallRun] removed in b8 along with the install-time Defender
 ; exclusion. With nothing to undo, the uninstall is also UAC-free.

@@ -331,7 +331,8 @@ class Updater(QObject):
             _plog("FAIL: install_dir resolved to None (likely source-run, not frozen)")
             return False
 
-        helper_path = self._write_apply_helper(zip_path, install_dir)
+        new_version = (self._info.version if self._info is not None else "")
+        helper_path = self._write_apply_helper(zip_path, install_dir, new_version)
         _plog(f"helper_path={helper_path}")
         if helper_path is None:
             _plog("FAIL: _write_apply_helper returned None")
@@ -383,7 +384,18 @@ class Updater(QObject):
         except Exception:
             return None
 
-    def _write_apply_helper(self, zip_path: str, install_dir: Path) -> Optional[Path]:
+    # Inno Setup AppId for Touchless — must match `AppId` in
+    # installers/windows/hgr_app.iss. Inno appends `_is1` to form the
+    # uninstall registry key name. Writing DisplayVersion under this
+    # key after an app-zip apply keeps Add/Remove Programs accurate
+    # AND — critically for Store users — tells the Microsoft Store's
+    # version check that the install is on the new version, so the
+    # Store stops re-prompting Store users who already updated via
+    # the in-app GitHub app-zip path.
+    _INNO_APP_ID = "{2C4EE680-53F5-4D83-92A8-ADF4D2D8794E}_is1"
+
+    def _write_apply_helper(self, zip_path: str, install_dir: Path,
+                            new_version: str = "") -> Optional[Path]:
         """Write the apply-update batch helper next to the zip.
 
         Why a batch script and not Python: the user's machine has
@@ -404,7 +416,14 @@ class Updater(QObject):
              (60 retries, 1s apart) so any lingering file lock on a
              specific dependency DLL doesn't corrupt the install.
           4. Verifies Touchless.exe exists post-copy before relaunch.
-          5. Logs every step to %LOCALAPPDATA%\\Touchless\\Updates\\
+          5. Writes the new version to the Inno Setup uninstall
+             registry key's DisplayVersion field, so Microsoft Store
+             (and Windows Add/Remove Programs) see the install on
+             the new version. Without this, Store users who updated
+             via the in-app GitHub app-zip path keep getting Store
+             update prompts forever because the Store reads the
+             stale registry version.
+          6. Logs every step to %LOCALAPPDATA%\\Touchless\\Updates\\
              _apply_update.log so failures are diagnosable instead
              of silent.
         """
@@ -414,7 +433,7 @@ class Updater(QObject):
             helper = zip_dir / "_apply_update.bat"
             content = (
                 "@echo off\r\n"
-                "rem [BUILD-MARKER: v1.1.3 — localappdata staging (Norton SONAR fix)]\r\n"
+                "rem [BUILD-MARKER: v1.1.4 — localappdata staging + DisplayVersion writeback]\r\n"
                 "setlocal enabledelayedexpansion\r\n"
                 f"set \"INSTALL_DIR={install_dir}\"\r\n"
                 f"set \"UPDATE_ZIP={zip_path}\"\r\n"
@@ -475,6 +494,21 @@ class Updater(QObject):
                 "  echo [error] post-copy Touchless.exe missing >> \"%LOG%\"\r\n"
                 "  goto fail\r\n"
                 ")\r\n"
+                "\r\n"
+                # Update the Inno Setup uninstall registry entry's
+                # DisplayVersion so Microsoft Store + Windows Add/Remove
+                # Programs see the new version. Critical for Store users
+                # who updated via app-zip: without this the Store keeps
+                # re-prompting them forever because it reads the old
+                # version from this key.
+                f"reg add \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{self._INNO_APP_ID}\""
+                f" /v DisplayVersion /t REG_SZ /d \"{new_version}\" /f"
+                " >>\"%LOG%\" 2>&1\r\n"
+                # Also write under HKLM in case this is a machine-wide
+                # install (rare for Touchless but covered).
+                f"reg add \"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{self._INNO_APP_ID}\""
+                f" /v DisplayVersion /t REG_SZ /d \"{new_version}\" /f"
+                " >>\"%LOG%\" 2>&1\r\n"
                 "\r\n"
                 "echo [success] update applied, relaunching >> \"%LOG%\"\r\n"
                 "start \"\" \"%INSTALL_DIR%\\Touchless.exe\"\r\n"

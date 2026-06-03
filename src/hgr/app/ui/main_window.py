@@ -5749,6 +5749,11 @@ class MainWindow(QMainWindow):
     # marshals the (event, data) payload onto the GUI thread before we
     # touch any widgets (specifically: phone_camera_qr_status_label).
     _phone_server_status_signal = Signal(str, dict)
+    # Phone → PC text command. Fires from the phone-server asyncio
+    # thread (PhoneCameraServer._handle_command or the WebEngine
+    # _LocalServer._command). The slot runs on the GUI thread where
+    # the voice processor + UI live and the dispatch is safe.
+    _phone_text_command_signal = Signal(str)
 
     def __init__(self, config: AppConfig):
         super().__init__()
@@ -5802,6 +5807,7 @@ class MainWindow(QMainWindow):
         # phone announces itself between server.start() and the connect
         # call below.
         self._phone_server_status_signal.connect(self._on_phone_server_status_event)
+        self._phone_text_command_signal.connect(self._on_phone_text_command)
         if bool(getattr(self.config, "phone_camera_qr_paired", False)):
             try:
                 from ..debug.phone_camera import PhoneCameraServer
@@ -5810,6 +5816,13 @@ class MainWindow(QMainWindow):
                     on_status=self._forward_phone_server_status,
                 )
                 server.start()
+                # Phone text commands run through the same callback the
+                # touchless-control.com/connect flow uses below — both
+                # marshal to the GUI thread via _phone_text_command_signal.
+                try:
+                    server.set_text_command_callback(self._forward_phone_text_command)
+                except Exception:
+                    pass
                 self._phone_camera_qr_server = server
             except Exception as exc:
                 print(f"[phone-camera] auto-start failed: {type(exc).__name__}: {exc}")
@@ -5992,8 +6005,46 @@ class MainWindow(QMainWindow):
         self._clip_cache_segments: list[dict] = []
         self._clip_cache_process: subprocess.Popen | None = None
         self._clip_cache_backend = ""
+        # Wall-clock anchor recorded when ffmpeg starts so we can map
+        # its segment-relative end_time → wall-clock for voice
+        # "clip that" alignment.
+        self._clip_cache_ffmpeg_started_at: float = 0.0
         self._clip_cache_list_path: Path | None = None
         self._clip_cache_segment_pattern: Path | None = None
+        # Streamer-mode audio capture state. Set when _start_clip_cache_ffmpeg
+        # successfully attaches WASAPI loopback + mic inputs to the segment
+        # writer; the export path consults this flag to know whether the
+        # cached segments carry audio streams (so concat=v=1:a=N, atrim,
+        # [aout] mapping, and -c:a aac engage in _run_clip_export_ffmpeg).
+        # Reset to False on every cache stop so the next start re-probes
+        # afresh (user may have toggled the setting between runs).
+        self._clip_cache_has_audio: bool = False
+        # Cached result of `ffmpeg -devices` probing for `wasapi` indev.
+        # NOTE: kept only as a legacy field — no released ffmpeg has a
+        # `wasapi` indev (trac #9408 still open). System audio actually
+        # flows through the Python WASAPI bridge in wasapi_loopback.py
+        # instead. The probe method always returns False.
+        self._ffmpeg_wasapi_supported: bool | None = None
+        # Python WASAPI loopback writer + cached probe.
+        # `_wasapi_writer` owns the PortAudio stream + daemon thread
+        # that copies render-endpoint loopback PCM into the audio
+        # cache ffmpeg's stdin. Torn down by `_stop_clip_cache_audio`
+        # BEFORE that ffmpeg is reaped so the thread exits cleanly.
+        # `_wasapi_loopback_probe`: None = not probed yet,
+        # False = probed and unavailable, tuple = (device_index, rate,
+        # channels). Cached for the session so we don't pay PortAudio's
+        # ~50-200ms init on every cache restart.
+        self._wasapi_writer = None
+        self._wasapi_loopback_probe: tuple[int, int, int] | bool | None = None
+        # SEPARATE audio capture subprocess. Runs in parallel to the
+        # video cache ffmpeg so a stalled audio source (silent WASAPI
+        # loopback, USB mic re-init) can never backpressure video. The
+        # process writes its own segment ring buffer of AAC files plus
+        # its own CSV manifest. Reaped + deleted on every cache stop.
+        self._clip_cache_audio_process = None
+        self._clip_cache_audio_list_path: Path | None = None
+        self._clip_cache_audio_segment_pattern: Path | None = None
+        self._clip_cache_audio_started_at: float = 0.0
         self._clip_cache_wrap_count = max(3, int(np.ceil(self._clip_cache_max_seconds / self._clip_cache_segment_seconds)) + 1)
         self._clip_cache_timer = QTimer(self)
         self._clip_cache_timer.setInterval(int(round(1000.0 / self._clip_cache_fps)))
@@ -6125,8 +6176,36 @@ class MainWindow(QMainWindow):
             return
 
         from ..updater import Updater
-        self._update_dialog = UpdateDialog(info, parent=self)
         self._updater = Updater(parent=self)
+
+        # Auto-update fast path: when the user has opted in AND the update
+        # is an app-zip (small, in-place, no UAC dialog, no Inno install
+        # wizard), skip the UpdateDialog entirely and start downloading +
+        # applying immediately. The app will quit and relaunch on the new
+        # version with no further interaction. Manual checks never auto-
+        # apply — if the user explicitly clicked "Check for Updates" they
+        # asked to see what's available, not to have it installed under
+        # them. Full-installer / Store-fallback paths also still show the
+        # dialog because they take longer and (full-exe) can trigger a
+        # UAC prompt the user should be expecting.
+        auto = (
+            bool(getattr(self.config, "auto_update_enabled", False))
+            and getattr(info, "update_kind", "") == "app-zip"
+            and not manual
+        )
+        if auto:
+            self._updater.ready_to_launch.connect(self._on_installer_ready)
+            # No dialog wiring — failures land in the system tray notification
+            # instead so the user knows something happened, and the next
+            # launch's prompt will re-offer the update.
+            try:
+                self._show_auto_update_toast(info.version)
+            except Exception:
+                pass
+            self._updater.start_download(info)
+            return
+
+        self._update_dialog = UpdateDialog(info, parent=self)
         self._update_dialog.download_requested.connect(self._updater.start_download)
         self._update_dialog.dismissed.connect(
             lambda v=info.version: self._on_update_dismissed(v)
@@ -6143,6 +6222,31 @@ class MainWindow(QMainWindow):
         self._update_dialog.show()
         self._update_dialog.raise_()
         self._update_dialog.activateWindow()
+
+    def _show_auto_update_toast(self, version: str) -> None:
+        """Surface a non-blocking notification when the auto-update flow
+        starts. Prefer the system tray icon's built-in balloon (already
+        wired up on Touchless's tray); fall back to a brief status-bar
+        message if the tray isn't available. Never shows a modal so the
+        user can keep working while the small app-zip downloads."""
+        try:
+            tray = getattr(self, "tray_icon", None)
+            if tray is not None and hasattr(tray, "showMessage"):
+                tray.showMessage(
+                    "Touchless",
+                    f"Updating to {version} in the background. "
+                    f"Touchless will restart automatically.",
+                    msecs=4000,
+                )
+                return
+        except Exception:
+            pass
+        try:
+            sb = getattr(self, "statusBar", None)
+            if callable(sb):
+                sb().showMessage(f"Updating to {version}...", 4000)
+        except Exception:
+            pass
 
     def _on_update_dismissed(self, version: str) -> None:
         """User clicked Later. Persist the dismissed version so the
@@ -8260,12 +8364,14 @@ class MainWindow(QMainWindow):
         inner_layout.addWidget(self._build_general_handedness_section())
         inner_layout.addWidget(self._build_general_mouse_section())
         inner_layout.addWidget(self._build_general_clip_section())
+        inner_layout.addWidget(self._build_general_clip_audio_section())
         inner_layout.addWidget(self._build_general_overlay_section())
         inner_layout.addWidget(self._build_general_system_modes_section())
         inner_layout.addWidget(self._build_general_voice_upgrade_section())
         inner_layout.addWidget(self._build_general_spotify_section())
         inner_layout.addWidget(self._build_general_discord_section())
         inner_layout.addWidget(self._build_general_startup_section())
+        inner_layout.addWidget(self._build_general_updates_section())
         inner_layout.addWidget(self._build_general_diagnostics_section())
 
         # Bottom Save button removed — only the top-right one
@@ -9140,6 +9246,62 @@ class MainWindow(QMainWindow):
         self._general_controls["auto_start_on_login"] = checkbox
         return card
 
+    def _build_general_updates_section(self) -> "QFrame":
+        """Settings → General → Updates. One toggle: install updates
+        automatically. When on, the in-app update path skips the
+        UpdateDialog for app-zip updates (small, in-place) and just
+        downloads + applies + restarts. Full-installer paths still
+        prompt because they take longer and can trigger UAC."""
+        card, body = self._make_general_section(
+            "Updates",
+            "Choose whether new versions install automatically or "
+            "wait for your confirmation.",
+            details=(
+                "When enabled, Touchless downloads and applies app "
+                "updates in the background as soon as they're "
+                "detected, then restarts itself on the new version. "
+                "Only the small in-place update path runs silently — "
+                "full installer updates (rare; only used when the "
+                "in-place path can't apply for technical reasons) "
+                "still ask for your confirmation. Manual update "
+                "checks (the \"Check for Updates\" button on the "
+                "Updates tab) always show the dialog so you can read "
+                "what's new before installing."
+            ),
+        )
+        from PySide6.QtWidgets import QCheckBox
+
+        checkbox_qss = self._general_checkbox_qss()
+        current = bool(getattr(self.config, "auto_update_enabled", False))
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        checkbox = QCheckBox("Install updates automatically")
+        checkbox.setStyleSheet(checkbox_qss)
+        checkbox.setToolTip(
+            "When on, Touchless installs new versions automatically "
+            "in the background and restarts on the new version. "
+            "When off, you'll see a prompt with release notes before "
+            "anything downloads."
+        )
+        checkbox.setChecked(current)
+        self._register_general_baseline("auto_update_enabled", current)
+
+        def _on_toggled(state: int) -> None:
+            new_value = bool(state)
+            # Defer to the Save Changes flow so it batches with other
+            # General-tab edits, matching every other toggle on this
+            # tab. _on_general_control_changed handles the diff vs.
+            # baseline and Save-button enablement.
+            self._on_general_control_changed("auto_update_enabled", new_value)
+
+        checkbox.stateChanged.connect(_on_toggled)
+        row.addWidget(checkbox)
+        row.addStretch(1)
+        body.addLayout(row)
+        self._general_controls["auto_update_enabled"] = checkbox
+        return card
+
     def _build_general_diagnostics_section(self) -> "QFrame":
         """Settings → General → Diagnostics. Single toggle that
         extends the home-screen Tracking pill with the live stable
@@ -9219,6 +9381,206 @@ class MainWindow(QMainWindow):
         top_row.addStretch(1)
         body.addLayout(top_row)
         self._general_controls["show_recognizer_top_scores"] = top_checkbox
+        return card
+
+    def _build_general_clip_audio_section(self) -> "QFrame":
+        """Settings → General → Clip Audio (Streamer Mode). Two
+        independent toggles + a mic noise-reduction dropdown that
+        fold WASAPI loopback (system audio, captured in Python via
+        wasapi_loopback.py) and/or microphone capture into the clip
+        cache's ffmpeg segment writer. Both audio toggles default
+        OFF for privacy — opt-in is required. The dropdown defaults
+        to "light" so the moment a user enables their mic they get
+        keyboard/mouse click suppression."""
+        card, body = self._make_general_section(
+            "Clip Audio (Streamer Mode)",
+            "Record system audio and/or your microphone with saved clips.",
+            details=(
+                "When the buffered-clip recorder is running, Touchless "
+                "can additionally capture audio and mix it into every "
+                "exported clip — no third-party driver required. "
+                "**System audio** records whatever is currently playing "
+                "on your default output (games, music, browser, voice "
+                "chat that's coming out of your speakers). **Microphone** "
+                "records the input device you've already selected for "
+                "voice commands. **Mic noise reduction** filters out "
+                "keyboard, mouse, fan and desk-thump noise from your "
+                "voice track while leaving game and music audio "
+                "untouched — Light is recommended for most gaming "
+                "setups, Strong cuts more aggressively but may clip "
+                "the tails of soft words. "
+                "Both audio toggles are independent — enable either, "
+                "both, or neither. If you enable both, the two streams "
+                "are mixed automatically so you get game audio and your "
+                "commentary in the same clip. "
+                "Heads up: system-audio capture records EVERYTHING "
+                "playing on your speakers — including voices from "
+                "people in Discord / Zoom / etc. Make sure participants "
+                "consent before sharing clips that contain their voices. "
+                "Changes take effect the next time the clip cache "
+                "restarts (toggle the recorder off and back on, or "
+                "restart Touchless)."
+            ),
+        )
+        from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel
+        checkbox_qss = self._general_checkbox_qss()
+
+        # ---- System audio (Python WASAPI loopback bridge) ----
+        sys_current = bool(getattr(self.config, "clip_capture_system_audio", False))
+        sys_row = QHBoxLayout()
+        sys_row.setSpacing(10)
+        sys_checkbox = QCheckBox("Record system audio (game, music, app sounds)")
+        sys_checkbox.setStyleSheet(checkbox_qss)
+        sys_checkbox.setToolTip(
+            "Captures whatever is playing through your default Windows "
+            "playback device via the Python WASAPI loopback bridge. No "
+            "driver install needed. Adds a small CPU cost while clips "
+            "are buffering."
+        )
+        sys_checkbox.setChecked(sys_current)
+        self._register_general_baseline("clip_capture_system_audio", sys_current)
+
+        def _on_sys_toggled(state: int) -> None:
+            new_value = bool(state)
+            try:
+                self.config.clip_capture_system_audio = new_value
+                save_config(self.config)
+            except Exception:
+                pass
+            self._register_general_baseline("clip_capture_system_audio", new_value)
+            # Restart the cache so audio capture starts (or stops)
+            # mid-session. Without this, the user has to wait for the
+            # next cache restart (manual gesture / app restart) for
+            # their first audio-enabled clip to capture sound.
+            self._restart_clip_cache_if_running()
+
+        sys_checkbox.stateChanged.connect(_on_sys_toggled)
+        sys_row.addWidget(sys_checkbox)
+        sys_row.addStretch(1)
+        body.addLayout(sys_row)
+        self._general_controls["clip_capture_system_audio"] = sys_checkbox
+
+        # Inline status line under the system-audio checkbox. Shows a
+        # red note when the WASAPI loopback probe fails (no default
+        # playback endpoint, pyaudiowpatch missing, RDP / headless
+        # session). Without this the user enables the toggle, gets a
+        # silent clip, and has no UI hint why.
+        sys_status_label = QLabel("")
+        sys_status_label.setStyleSheet(
+            "color: #d97777; font-size: 11px; padding-left: 22px;"
+        )
+        sys_status_label.setWordWrap(True)
+        sys_status_label.hide()
+        body.addWidget(sys_status_label)
+
+        def _refresh_sys_status() -> None:
+            try:
+                fmt = self._probe_wasapi_loopback_format(force_refresh=True)
+            except Exception:
+                fmt = None
+            if sys_checkbox.isChecked() and fmt is None:
+                sys_status_label.setText(
+                    "⚠ No system-audio device detected — clips will be "
+                    "silent for system audio. Check that a playback "
+                    "device is set as default in Windows Sound settings."
+                )
+                sys_status_label.show()
+            else:
+                sys_status_label.hide()
+
+        sys_checkbox.stateChanged.connect(lambda _s: _refresh_sys_status())
+        _refresh_sys_status()
+
+        # ---- Microphone (DirectShow) ----
+        mic_current = bool(getattr(self.config, "clip_capture_microphone", False))
+        mic_row = QHBoxLayout()
+        mic_row.setSpacing(10)
+        mic_checkbox = QCheckBox("Record microphone (your voice / commentary)")
+        mic_checkbox.setStyleSheet(checkbox_qss)
+        mic_checkbox.setToolTip(
+            "Captures your preferred microphone (the same one used for "
+            "voice commands). Set the mic in the Voice tab. If you "
+            "enable both this and system audio, the two are mixed "
+            "together in the saved clip."
+        )
+        mic_checkbox.setChecked(mic_current)
+        self._register_general_baseline("clip_capture_microphone", mic_current)
+
+        def _on_mic_toggled(state: int) -> None:
+            new_value = bool(state)
+            try:
+                self.config.clip_capture_microphone = new_value
+                save_config(self.config)
+            except Exception:
+                pass
+            self._register_general_baseline("clip_capture_microphone", new_value)
+            self._restart_clip_cache_if_running()
+
+        mic_checkbox.stateChanged.connect(_on_mic_toggled)
+        mic_row.addWidget(mic_checkbox)
+        mic_row.addStretch(1)
+        body.addLayout(mic_row)
+        self._general_controls["clip_capture_microphone"] = mic_checkbox
+
+        # ---- Microphone noise reduction (dropdown) ----
+        # Saves immediately like the two sibling checkboxes — does
+        # NOT route through _general_pending (the section's existing
+        # convention is direct-save on change).
+        ns_row = QHBoxLayout()
+        ns_row.setSpacing(10)
+        # Use the panel-wide combo/label QSS so text + dropdown
+        # popup are legible against the dark settings surface.
+        # Default Qt combo on Windows renders black-on-black against
+        # this panel's dark background.
+        text_qss = self._general_text_qss()
+        ns_label = QLabel("Microphone noise reduction:")
+        ns_label.setStyleSheet(text_qss + " QLabel { padding-left: 22px; }")
+        ns_row.addWidget(ns_label)
+
+        ns_current = str(
+            getattr(self.config, "clip_mic_noise_reduction", "light") or "light"
+        ).lower()
+        if ns_current not in ("off", "light", "strong"):
+            ns_current = "light"
+
+        ns_combo = QComboBox()
+        ns_combo.setStyleSheet(text_qss)
+        ns_combo.addItem("Off — record mic as-is", "off")
+        ns_combo.addItem("Light — recommended for gaming (default)", "light")
+        ns_combo.addItem("Strong — aggressive (may clip word tails)", "strong")
+        ns_combo.setCurrentIndex(["off", "light", "strong"].index(ns_current))
+        ns_combo.setToolTip(
+            "Off: no filtering — your mic is captured verbatim, "
+            "including keyboard and mouse clicks.\n"
+            "Light: removes desk/fan rumble and silences keyboard/mouse "
+            "clicks during speaking pauses. Recommended.\n"
+            "Strong: same as Light but with a tighter noise gate. Cuts "
+            "more background noise but may chop quiet word endings."
+        )
+        ns_combo.setEnabled(mic_checkbox.isChecked())
+        self._register_general_baseline("clip_mic_noise_reduction", ns_current)
+
+        def _on_ns_changed(idx: int) -> None:
+            new_value = ns_combo.itemData(idx) or "light"
+            try:
+                self.config.clip_mic_noise_reduction = str(new_value)
+                save_config(self.config)
+            except Exception:
+                pass
+            self._register_general_baseline("clip_mic_noise_reduction", new_value)
+            self._restart_clip_cache_if_running()
+
+        ns_combo.currentIndexChanged.connect(_on_ns_changed)
+        ns_row.addWidget(ns_combo)
+        ns_row.addStretch(1)
+        body.addLayout(ns_row)
+        self._general_controls["clip_mic_noise_reduction"] = ns_combo
+
+        # Gate the dropdown on the mic checkbox — single-line lambda
+        # rather than wrapping _on_mic_toggled keeps the existing
+        # save handler untouched (Qt fires all connected slots).
+        mic_checkbox.stateChanged.connect(lambda s: ns_combo.setEnabled(bool(s)))
+
         return card
 
     def _build_general_system_modes_section(self) -> "QFrame":
@@ -12457,6 +12819,10 @@ class MainWindow(QMainWindow):
         try:
             server = WebEnginePhoneServer(on_status=self._forward_phone_server_status)
             info = server.start()
+            try:
+                server.set_text_command_callback(self._forward_phone_text_command)
+            except Exception:
+                pass
         except Exception as exc:
             TouchlessNotice.show_warn(
                 self,
@@ -12502,6 +12868,10 @@ class MainWindow(QMainWindow):
         save_config(self.config)
         try:
             server.set_status_callback(self._forward_phone_server_status)
+        except Exception:
+            pass
+        try:
+            server.set_text_command_callback(self._forward_phone_text_command)
         except Exception:
             pass
         if hasattr(self, "phone_camera_qr_disconnect_button"):
@@ -12591,6 +12961,10 @@ class MainWindow(QMainWindow):
                 self._phone_camera_qr_server.set_status_callback(self._forward_phone_server_status)
             except Exception:
                 pass
+            try:
+                self._phone_camera_qr_server.set_text_command_callback(self._forward_phone_text_command)
+            except Exception:
+                pass
         # Pull whatever the server already knows (the QR dialog may
         # have caught the phone's identity before this commit step).
         sl = getattr(self._phone_camera_qr_server, "connected_phone_label", None) if self._phone_camera_qr_server is not None else None
@@ -12622,6 +12996,97 @@ class MainWindow(QMainWindow):
             self._phone_server_status_signal.emit(event, dict(data) if data else {})
         except Exception:
             pass
+
+    # ---- Phone text-command bridge -------------------------------------
+    def _forward_phone_text_command(self, text: str) -> None:
+        """Server-thread entry point for phone → PC text commands.
+        Re-emit on the Qt signal so dispatch runs on the GUI thread
+        alongside the voice processor + UI."""
+        try:
+            self._phone_text_command_signal.emit(str(text or ""))
+        except Exception:
+            pass
+
+    def _on_phone_text_command(self, text: str) -> None:
+        """GUI-thread handler for a phone-sent text command. Runs the
+        string through the same voice processor that handles spoken
+        commands and reports the result back to the phone as an SSE
+        toast ("command_result").
+
+        TODO(iris-prompt): if the user has an active Iris paid plan
+        AND the phone tagged the message as `mode=iris` (currently
+        always voice-style), route through the Live API agent instead.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        worker = getattr(self, "_worker", None)
+        processor = getattr(worker, "voice_processor", None) if worker is not None else None
+        if processor is None:
+            self._publish_phone_command_result(False, text, "Touchless engine isn't running.", "")
+            return
+        try:
+            result = processor.execute(text)
+        except Exception as exc:
+            self._publish_phone_command_result(False, text, f"Error: {type(exc).__name__}", str(exc))
+            return
+        ok = bool(getattr(result, "success", False))
+        heard = str(getattr(result, "heard_text", "") or text)
+        info = str(getattr(result, "info_text", "") or "")
+        control = str(getattr(result, "control_text", "") or "")
+        self._publish_phone_command_result(ok, heard, control, info)
+        # Reflect in the desktop status line so it's obvious the phone
+        # is driving the app.
+        try:
+            label = "fired" if ok else "ignored"
+            self.last_action_label.setText(f"Last action: phone command {label}: {heard}")
+        except Exception:
+            pass
+
+    def _publish_phone_command_result(self, ok: bool, heard_text: str, control_text: str, info_text: str) -> None:
+        """Push a `command_result` SSE event back to every connected
+        phone so its toast can confirm what happened. Safe to call from
+        the GUI thread — publish_event marshals onto the asyncio loop.
+
+        Dispatches to BOTH phone-server kinds:
+          * QR PhoneCameraServer → publish_event("command_result", ...)
+            (the phone JS subscribes to /events and renders a toast).
+          * WebEngine WebEnginePhoneServer (Connect / pairing-code flow)
+            → publish_command_result({...}) (the hidden host page
+            subscribes to /results, forwards each event back through
+            the open WebRTC DataChannel; the website connect.html
+            renders the toast).
+
+        The same instance can occupy multiple attributes during
+        Connect adoption (`_pending_phone_server` before camera_accepted,
+        `_phone_camera_qr_server` after), so de-dup by object identity."""
+        payload = {
+            "ok": bool(ok),
+            "heard_text": str(heard_text or ""),
+            "control_text": str(control_text or ""),
+            "info_text": str(info_text or ""),
+        }
+        seen_ids: set[int] = set()
+        for attr in ("_phone_camera_qr_server", "_pending_phone_server"):
+            server = getattr(self, attr, None)
+            if server is None or id(server) in seen_ids:
+                continue
+            if not getattr(server, "is_running", False):
+                continue
+            seen_ids.add(id(server))
+            try:
+                # Connect flow surface: results go to the SSE/DataChannel
+                # relay (host page → phone).
+                if hasattr(server, "publish_command_result"):
+                    server.publish_command_result(payload)
+                # QR flow surface: results go straight to the phone's
+                # SSE EventSource. (PhoneCameraServer exposes
+                # publish_event(kind, **fields); WebEnginePhoneServer
+                # does not, so the hasattr check picks the right path.)
+                elif hasattr(server, "publish_event"):
+                    server.publish_event("command_result", **payload)
+            except Exception:
+                pass
 
     def _on_phone_server_status_event(self, event: str, data) -> None:
         """GUI-thread receiver for phone-camera server status events.
@@ -14536,6 +15001,25 @@ Admin elevation
             existing = merged.get(builtin.version)
             if existing is None or not (existing.body or "").strip():
                 merged[builtin.version] = builtin
+        # Always include the currently-installed version, even if neither
+        # GitHub nor the built-in list have it yet. Catches the gap where
+        # a fresh build ships before its GitHub release is published (or
+        # the network is down) — without this the user sees the release
+        # history skip past their own version, which reads as a bug
+        # rather than the timing artefact it is.
+        if RUNNING_VERSION and RUNNING_VERSION not in merged:
+            merged[RUNNING_VERSION] = ReleaseHistoryEntry(
+                version=RUNNING_VERSION,
+                body=(
+                    f"You are running Touchless {RUNNING_VERSION}. The full "
+                    f"changelog for this release will appear here once the "
+                    f"GitHub release is published — refresh the Updates tab "
+                    f"later to see it."
+                ),
+                published_at="",
+                html_url=f"https://github.com/markovk-tini/Touchless/releases/tag/v{RUNNING_VERSION}",
+                is_current=True,
+            )
         # Re-stamp is_current — GitHub data may be stale relative
         # to a freshly-installed build.
         results = []
@@ -21466,9 +21950,25 @@ Admin elevation
         return self._clip_cache_dir() / "segments.csv"
     def _ffmpeg_clip_segment_pattern(self) -> Path:
         return self._clip_cache_dir() / "segment_%03d.mkv"
+    def _ffmpeg_clip_audio_list_path(self) -> Path:
+        return self._clip_cache_dir() / "audio_segments.csv"
+    def _ffmpeg_clip_audio_segment_pattern(self) -> Path:
+        # ADTS AAC (.aac) — raw stream framed for direct concatenation
+        # by the segment muxer. .m4a/MP4 would require an explicit
+        # -segment_format mp4 and a moov atom per segment, which the
+        # segment muxer doesn't produce cleanly mid-stream.
+        return self._clip_cache_dir() / "audio_%03d.aac"
     def _cleanup_ffmpeg_clip_cache_files(self) -> None:
         cache_dir = self._clip_cache_dir()
-        for pattern in ("segment_*.mkv", "segments.csv", "concat_*.txt"):
+        for pattern in (
+            "segment_*.mkv",
+            "segments.csv",
+            "concat_*.txt",
+            "audio_*.aac",
+            "audio_*.m4a",  # leftover from prior builds; clean up too
+            "audio_segments.csv",
+            "audio_concat_*.txt",
+        ):
             for path in cache_dir.glob(pattern):
                 try:
                     path.unlink(missing_ok=True)
@@ -22359,6 +22859,481 @@ Admin elevation
         self._clip_cache_segments = []
         self._clip_cache_region = None
         self._clip_cache_backend = ""
+    # ---- Streamer-mode audio capture helpers --------------------------
+    def _ffmpeg_has_wasapi_support(self) -> bool:
+        """LEGACY. No released ffmpeg has a `wasapi` indev (trac
+        #9408 still open as of 2026) so this always returns False.
+        Kept only because callers outside this section may still
+        reference it. System audio is now captured in Python via
+        `wasapi_loopback.py` and piped into ffmpeg's stdin."""
+        self._ffmpeg_wasapi_supported = False
+        return False
+
+    def _default_playback_device_name(self) -> str | None:
+        """Friendly name of Windows' default playback device. Used
+        only for inline UI status text in Settings → Clip Audio
+        (e.g. "Capturing from: Speakers (Realtek)"). None if pycaw
+        / Core Audio query fails."""
+        try:
+            from pycaw.pycaw import AudioUtilities
+            try:
+                import comtypes
+                try:
+                    comtypes.CoInitialize()
+                except OSError:
+                    pass
+            except Exception:
+                pass
+            endpoint = AudioUtilities.GetSpeakers()
+            name = getattr(endpoint, "FriendlyName", None)
+            return str(name) if name else None
+        except Exception:
+            return None
+
+    def _probe_wasapi_loopback_format(
+        self, *, force_refresh: bool = False
+    ) -> tuple[int, int, int] | None:
+        """Cached probe for the default WASAPI loopback endpoint.
+        Returns (device_index, rate, channels) once per session, or
+        None if `pyaudiowpatch` is missing / no default playback
+        endpoint exists. `force_refresh=True` re-probes (used by
+        the settings panel when the user toggles the system-audio
+        checkbox to refresh inline status).
+
+        Cached on `self._wasapi_loopback_probe`:
+          None  — not probed yet
+          False — probed and unavailable
+          tuple — last probe result
+        Reused per-session so we don't pay PortAudio's ~50-200 ms
+        init on every cache restart.
+        """
+        cached = self._wasapi_loopback_probe
+        if cached is not None and not force_refresh:
+            return cached if isinstance(cached, tuple) else None
+        try:
+            from hgr.app.ui.wasapi_loopback import probe_default_loopback_format
+            fmt = probe_default_loopback_format()
+        except Exception:
+            fmt = None
+        self._wasapi_loopback_probe = fmt if fmt is not None else False
+        return fmt
+
+    def _build_clip_audio_inputs(
+        self, *, force_system_off: bool = False
+    ) -> tuple[list[str], int | None, int | None, int, tuple[int, int, int] | None]:
+        """Build the ffmpeg audio input args. Returns
+        (input_args, sys_idx, mic_idx, next_idx, sys_pcm_format).
+
+        `sys_idx` / `mic_idx` are the ffmpeg input indices for the
+        system and mic streams (None when not enabled or device
+        discovery fails). `sys_pcm_format` is (device_index, rate,
+        channels) for the pipe:0 input that the caller will spawn
+        a Python WASAPI bridge into.
+
+        Honors `clip_capture_system_audio` (Python WASAPI loopback
+        bridge — `-f s16le -ar ... -ac ... -i pipe:0`) and
+        `clip_capture_microphone` (DirectShow). `force_system_off`
+        lets the caller suppress the system-audio input on retry
+        when the bridge failed to start, without mutating config.
+        """
+        cfg = self.config
+        want_system = bool(getattr(cfg, "clip_capture_system_audio", False))
+        want_mic = bool(getattr(cfg, "clip_capture_microphone", False))
+        if force_system_off:
+            want_system = False
+        if not (want_system or want_mic):
+            return ([], None, None, 1, None)
+        input_args: list[str] = []
+        sys_idx: int | None = None
+        mic_idx: int | None = None
+        sys_pcm_format: tuple[int, int, int] | None = None
+        next_idx = 1
+        # System loopback via the Python WASAPI bridge (piped PCM).
+        # `-thread_queue_size` is CRITICAL when piping audio into a
+        # real-time video pipeline: without it, a brief stall in the
+        # PortAudio reader (e.g. PortAudio briefly starves when the
+        # render endpoint goes idle / Windows applies power-save to
+        # the audio engine) backpressures the entire ffmpeg muxer,
+        # the video stream gets queued but not muxed, and the
+        # segment writer emits segments containing only their lead
+        # keyframe — the "60-second clip frozen on two frames"
+        # symptom users see when audio is wired but silent. 1024
+        # packets at ~21ms each = ~21s of buffer per input,
+        # plenty to ride out any silence-induced PortAudio pause.
+        if want_system:
+            fmt = self._probe_wasapi_loopback_format()
+            if fmt is not None:
+                _device_idx, rate, channels = fmt
+                input_args.extend([
+                    "-thread_queue_size", "1024",
+                    "-f", "s16le",
+                    "-ar", str(rate),
+                    "-ac", str(channels),
+                    "-i", "pipe:0",
+                ])
+                sys_idx = next_idx
+                next_idx += 1
+                sys_pcm_format = fmt
+            else:
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        "[clip-audio] system-audio enabled but no WASAPI "
+                        "loopback endpoint available — system audio skipped\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+        # Microphone via DirectShow. Same -thread_queue_size buffer
+        # as system audio: dshow mic input can briefly stall on
+        # device-side buffer underruns (USB mic hub power saving,
+        # driver re-init on focus change) and we don't want those
+        # stalls to freeze the video stream.
+        if want_mic:
+            mic_name = str(getattr(cfg, "preferred_microphone_name", "") or "").strip()
+            if mic_name:
+                input_args.extend([
+                    "-thread_queue_size", "1024",
+                    "-f", "dshow",
+                    "-i", f"audio={mic_name}",
+                ])
+                mic_idx = next_idx
+                next_idx += 1
+            else:
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        "[clip-audio] mic-capture enabled but no "
+                        "preferred_microphone_name set — mic skipped\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+        return (input_args, sys_idx, mic_idx, next_idx, sys_pcm_format)
+
+    # Mic noise-reduction presets. NOTE: agate's threshold is a
+    # LINEAR amplitude (0..1) — no dB-suffix parsing in libavfilter.
+    # Reference: -20 dBFS = 0.1, -15 dBFS = 0.1778, -10 dBFS = 0.3162.
+    # Tuned for hot gaming mics where mechanical-keyboard click
+    # transients reach -18 to -22 dBFS even at 30 cm — RMS detection
+    # + low thresholds (e.g. -30 dBFS) would let the gate OPEN on
+    # each click and pass it through; peak detection + a higher
+    # threshold around -15 dBFS keeps the gate closed for clicks
+    # but opens for sustained speech which always sits above -10.
+    _CLIP_NOISE_PRESETS: dict[str, str] = {
+        "off": "anull",
+        "light": (
+            "highpass=f=80,"
+            "agate=threshold=0.1778:ratio=6:attack=5:release=100:"
+            "knee=2:makeup=1:detection=peak"
+        ),
+        "strong": (
+            "highpass=f=100,"
+            "agate=threshold=0.3162:ratio=10:attack=2:release=60:"
+            "knee=1.5:makeup=1:detection=peak"
+        ),
+    }
+
+    def _clip_audio_filter_complex(
+        self,
+        sys_idx: int | None,
+        mic_idx: int | None,
+        mode: str,
+    ) -> tuple[list[str], list[str]]:
+        """Return (filter_args, map_args) for the current audio mix
+        mode. Mic stream is filtered by `mode`; system stream is
+        always passthrough (game/music audio is what the user
+        WANTS — never strip transients from it).
+
+        Caller invokes only when at least one of sys_idx / mic_idx
+        is set; the neither-case branch is dead code retained for
+        callsite symmetry."""
+        ns = self._CLIP_NOISE_PRESETS.get(
+            str(mode or "light").lower(),
+            self._CLIP_NOISE_PRESETS["light"],
+        )
+        if sys_idx is None and mic_idx is None:
+            return ([], ["-map", "0:v"])
+        if sys_idx is not None and mic_idx is None:
+            return (
+                ["-filter_complex", f"[{sys_idx}:a]anull[aout]"],
+                ["-map", "0:v", "-map", "[aout]"],
+            )
+        if sys_idx is None and mic_idx is not None:
+            return (
+                ["-filter_complex", f"[{mic_idx}:a]{ns}[aout]"],
+                ["-map", "0:v", "-map", "[aout]"],
+            )
+        return (
+            [
+                "-filter_complex",
+                (
+                    f"[{sys_idx}:a]anull[asys];"
+                    f"[{mic_idx}:a]{ns}[amic];"
+                    "[asys][amic]amix=inputs=2:duration=longest:"
+                    "dropout_transition=0[aout]"
+                ),
+            ],
+            ["-map", "0:v", "-map", "[aout]"],
+        )
+
+    def _parse_ffmpeg_clip_audio_manifest(self) -> list[dict]:
+        """Parse the audio segment CSV — same shape as
+        `_parse_ffmpeg_clip_manifest` but for the parallel audio
+        ffmpeg's output. Used by the export to pick which audio
+        segments overlap the video time window being saved."""
+        list_path = self._clip_cache_audio_list_path
+        if list_path is None or not list_path.exists():
+            return []
+        entries: list[dict] = []
+        try:
+            with list_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.reader(handle)
+                for row in reader:
+                    if len(row) < 3:
+                        continue
+                    raw_path = (row[0] or "").strip()
+                    try:
+                        start_time = float(row[1])
+                        end_time = float(row[2])
+                    except Exception:
+                        continue
+                    path = Path(raw_path)
+                    if not path.is_absolute():
+                        path = self._clip_cache_dir() / path
+                    if not path.exists() or path.stat().st_size <= 0:
+                        continue
+                    entries.append({
+                        "path": path,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                    })
+        except Exception:
+            return []
+        return entries
+
+    def _start_clip_cache_audio(self) -> bool:
+        """Spawn a SECOND ffmpeg subprocess that captures system
+        audio (WASAPI loopback via the Python bridge) and/or the
+        mic (DirectShow), encodes to AAC, and writes its own segment
+        ring buffer. Decoupled from the video cache ffmpeg so an
+        audio stall can't backpressure or freeze video.
+
+        Returns True if the audio subprocess started AND at least
+        one audio source was actually wired up; False otherwise
+        (in which case the video cache continues, silently).
+
+        Every outcome — toggles off, probe failure, mic-name unset,
+        bridge failure, ffmpeg startup failure — also writes a short
+        line to the home debug log so users can see WHY their clips
+        have no audio without needing to read a console."""
+        def _log(msg: str) -> None:
+            try:
+                self._append_home_debug_log(f"[clip-audio] {msg}")
+            except Exception:
+                pass
+            try:
+                import sys as _sys
+                _sys.stderr.write(f"[clip-audio] {msg}\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
+        cfg = self.config
+        want_system = bool(getattr(cfg, "clip_capture_system_audio", False))
+        want_mic = bool(getattr(cfg, "clip_capture_microphone", False))
+        if not (want_system or want_mic):
+            _log("both audio toggles are off; clips will be silent")
+            return False
+        if not self._ffmpeg_ready():
+            _log("ffmpeg not ready; audio cache cannot start")
+            return False
+        # Build inputs. WASAPI loopback first (input 0) when present,
+        # then mic (input 1 or 0 depending on whether system is on).
+        # All inputs get a 1024-packet thread queue to survive brief
+        # device-side stalls.
+        input_args: list[str] = []
+        sys_idx: int | None = None
+        mic_idx: int | None = None
+        sys_pcm_format: tuple[int, int, int] | None = None
+        next_idx = 0
+        if want_system:
+            fmt = self._probe_wasapi_loopback_format()
+            if fmt is not None:
+                _dev, rate, channels = fmt
+                input_args.extend([
+                    "-thread_queue_size", "1024",
+                    "-f", "s16le",
+                    "-ar", str(rate),
+                    "-ac", str(channels),
+                    "-i", "pipe:0",
+                ])
+                sys_idx = next_idx
+                next_idx += 1
+                sys_pcm_format = fmt
+                _log(f"system audio probe ok ({rate} Hz, {channels} ch)")
+            else:
+                _log(
+                    "system audio ON but no WASAPI loopback endpoint "
+                    "found — check Windows default playback device"
+                )
+        if want_mic:
+            mic_name = str(getattr(cfg, "preferred_microphone_name", "") or "").strip()
+            if mic_name:
+                input_args.extend([
+                    "-thread_queue_size", "1024",
+                    "-f", "dshow",
+                    "-i", f"audio={mic_name}",
+                ])
+                mic_idx = next_idx
+                next_idx += 1
+                _log(f"mic configured: {mic_name!r}")
+            else:
+                _log(
+                    "mic capture ON but no preferred_microphone_name "
+                    "set — pick a mic in Settings → Voice"
+                )
+        if sys_idx is None and mic_idx is None:
+            _log("no audio sources successfully wired; clips will be silent")
+            return False
+        # Build the filter complex on the audio inputs. Mic gets the
+        # noise-reduction preset; system passes through; amix mixes
+        # both when both present. Mirrors _clip_audio_filter_complex
+        # but with input indices starting at 0 (this ffmpeg has no
+        # video input).
+        ns_mode = str(getattr(cfg, "clip_mic_noise_reduction", "light") or "light").lower()
+        if ns_mode not in self._CLIP_NOISE_PRESETS:
+            ns_mode = "light"
+        ns = self._CLIP_NOISE_PRESETS[ns_mode]
+        if sys_idx is not None and mic_idx is None:
+            filter_args = [
+                "-filter_complex", f"[{sys_idx}:a]anull[aout]",
+                "-map", "[aout]",
+            ]
+        elif sys_idx is None and mic_idx is not None:
+            filter_args = [
+                "-filter_complex", f"[{mic_idx}:a]{ns}[aout]",
+                "-map", "[aout]",
+            ]
+        else:
+            filter_args = [
+                "-filter_complex",
+                (
+                    f"[{sys_idx}:a]anull[asys];"
+                    f"[{mic_idx}:a]{ns}[amic];"
+                    "[asys][amic]amix=inputs=2:duration=longest:"
+                    "dropout_transition=0[aout]"
+                ),
+                "-map", "[aout]",
+            ]
+        # Set up the segment writer state.
+        self._clip_cache_audio_list_path = self._ffmpeg_clip_audio_list_path()
+        self._clip_cache_audio_segment_pattern = self._ffmpeg_clip_audio_segment_pattern()
+        command = [
+            self._ffmpeg_path,
+            "-hide_banner", "-loglevel", "error", "-y",
+            *input_args,
+            *filter_args,
+            "-c:a", "aac", "-b:a", "192k",
+            "-f", "segment",
+            # ADTS framing — required for raw .aac segments to be
+            # individually decodable + concat-able by the export.
+            "-segment_format", "adts",
+            "-segment_time", f"{float(self._clip_cache_segment_seconds):.3f}",
+            "-segment_wrap", str(int(self._clip_cache_wrap_count)),
+            "-segment_list", str(self._clip_cache_audio_list_path),
+            "-segment_list_type", "csv",
+            "-segment_list_size", str(int(self._clip_cache_wrap_count)),
+            "-reset_timestamps", "1",
+            str(self._clip_cache_audio_segment_pattern),
+        ]
+        _log(
+            f"starting audio cache: sys={sys_idx is not None} "
+            f"mic={mic_idx is not None} ns={ns_mode}"
+        )
+        process = self._start_ffmpeg_process(command)
+        if process is None:
+            _log(
+                "audio ffmpeg failed to start — most likely the mic "
+                "name doesn't match any DirectShow device "
+                "(check Settings → Voice for typos / unplugged devices)"
+            )
+            return False
+        # Spawn the WASAPI bridge AFTER ffmpeg is alive so it can
+        # write to a valid stdin pipe.
+        if sys_idx is not None and sys_pcm_format is not None:
+            try:
+                from hgr.app.ui.wasapi_loopback import WasapiLoopbackWriter
+                def _on_writer_err(msg: str) -> None:
+                    _log(msg)
+                dev, rate, channels = sys_pcm_format
+                writer = WasapiLoopbackWriter(
+                    process.stdin,
+                    device_index=dev,
+                    rate=rate,
+                    channels=channels,
+                    on_error=_on_writer_err,
+                )
+                if writer.start():
+                    self._wasapi_writer = writer
+                    _log("WASAPI bridge running")
+                else:
+                    # Bridge failed — kill the audio process and bail.
+                    # Video keeps running unaffected.
+                    _log("WASAPI bridge failed to start — killing audio cache")
+                    try:
+                        process.terminate()
+                    except Exception:
+                        pass
+                    return False
+            except Exception as exc:
+                _log(f"WASAPI bridge spawn failed: {exc}")
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                return False
+        self._clip_cache_audio_process = process
+        try:
+            self._clip_cache_audio_started_at = time.time()
+        except Exception:
+            self._clip_cache_audio_started_at = 0.0
+        _log("audio cache running")
+        return True
+
+    def _stop_clip_cache_audio(self, *, delete_files: bool = True) -> None:
+        """Tear down the audio cache process. Drains the WASAPI
+        bridge thread FIRST so it exits its read loop before its
+        ffmpeg stdin closes, then reaps ffmpeg. Safe to call when
+        no audio cache was running (no-op)."""
+        writer = self._wasapi_writer
+        self._wasapi_writer = None
+        if writer is not None:
+            try:
+                writer.stop()
+            except Exception:
+                pass
+        process = self._clip_cache_audio_process
+        self._clip_cache_audio_process = None
+        if process is not None:
+            self._stop_ffmpeg_process(process)
+        if delete_files:
+            self._clip_cache_audio_list_path = None
+            self._clip_cache_audio_segment_pattern = None
+            self._clip_cache_audio_started_at = 0.0
+
+    def _restart_clip_cache_if_running(self) -> None:
+        """Stop+restart the clip cache so a recent settings change
+        (audio toggle, mic name, noise preset, region change) takes
+        effect on the next-recorded segment. No-op when no cache is
+        active — typically called from a settings panel toggle
+        handler. delete_files=False so the user's current 60s of
+        cached video isn't thrown away on a mid-session toggle."""
+        process = self._clip_cache_process
+        if process is None or process.poll() is not None:
+            return
+        self._stop_clip_cache_ffmpeg(delete_files=False)
+        self._start_clip_cache_ffmpeg()
+
     def _start_clip_cache_ffmpeg(self) -> bool:
         if self._clip_cache_process is not None and self._clip_cache_process.poll() is None:
             self._clip_cache_backend = "ffmpeg"
@@ -22370,6 +23345,11 @@ Admin elevation
         self._clip_cache_region = QRect(region)
         self._clip_cache_list_path = self._ffmpeg_clip_list_path()
         self._clip_cache_segment_pattern = self._ffmpeg_clip_segment_pattern()
+        self._clip_cache_has_audio = False
+        # Video-only command. Audio capture runs in a SEPARATE ffmpeg
+        # subprocess (see _start_clip_cache_audio) so a stalled audio
+        # source can never backpressure the video pipeline and produce
+        # the "60-second clip frozen on a couple frames" symptom.
         command = [
             self._ffmpeg_path,
             "-hide_banner", "-loglevel", "error", "-y",
@@ -22391,11 +23371,37 @@ Admin elevation
             return False
         self._clip_cache_process = process
         self._clip_cache_backend = "ffmpeg"
+        # Anchor wall-clock to ffmpeg's t=0. ffmpeg's segment list CSV
+        # records start_time/end_time as RELATIVE seconds since the
+        # encoder started — when we later need to align with the voice
+        # listener's wall-clock end_ts (e.g. "clip that" anchored on
+        # VAD-end speech_end_ts), we add this anchor to convert.
+        # Without this, latest_end (small number like 24.4) and end_ts
+        # (unix epoch ~1.78e9) live on incompatible axes and the
+        # tail_to_drop math always clamps to 0, baking the 6-8s of
+        # speech-to-process latency into every voice-anchored clip.
+        try:
+            self._clip_cache_ffmpeg_started_at = time.time()
+        except Exception:
+            self._clip_cache_ffmpeg_started_at = 0.0
+        # Spawn the audio capture in a SEPARATE ffmpeg subprocess so
+        # nothing audio-side can backpressure or freeze the video
+        # pipeline. If audio toggles are off, this is a no-op. If
+        # the audio process fails, the video keeps running unaffected.
+        if self._start_clip_cache_audio():
+            self._clip_cache_has_audio = True
         return True
     def _stop_clip_cache_ffmpeg(self, *, delete_files: bool) -> None:
+        # Tear down the separate audio capture FIRST. It writes into
+        # its own ffmpeg subprocess via a WASAPI bridge thread; the
+        # bridge has to exit cleanly before ffmpeg is reaped or it
+        # spins on a broken pipe. This is a no-op when no audio
+        # toggle was on for this session.
+        self._stop_clip_cache_audio(delete_files=delete_files)
         process = self._clip_cache_process
         self._clip_cache_process = None
         self._stop_ffmpeg_process(process)
+        self._clip_cache_has_audio = False
         if delete_files:
             self._cleanup_ffmpeg_clip_cache_files()
             self._clip_cache_list_path = None
@@ -22443,13 +23449,23 @@ Admin elevation
                 cropped = cv2.resize(cropped, (expected_w, expected_h), interpolation=cv2.INTER_AREA)
             return cropped
     def _run_clip_export_ffmpeg(
-        self, duration_seconds: int, target_region: QRect
+        self, duration_seconds: int, target_region: QRect,
+        *, end_ts: float | None = None,
     ) -> tuple[bool, Path | None, float]:
         """Thread-safe variant of _export_recent_clip_ffmpeg that
         does NOT touch any QWidget or worker state — used from the
         background clip-export thread. Returns
         (success, output_path, actual_seconds_written). The GUI
-        callback handles label/save-prompt updates."""
+        callback handles label/save-prompt updates.
+
+        `end_ts` (optional wall-clock seconds) anchors the RIGHT edge
+        of the clip window. When None the clip ends at the most-recent
+        cached segment's end_time (historical behaviour). When set —
+        e.g. the voice "clip that" path passes the moment VAD detected
+        end-of-speech — `tail_to_drop` seconds are trimmed off the END
+        of the assembled concat so the saved clip lands on the
+        user's actual moment instead of N seconds later.
+        """
         was_active = (
             self._clip_cache_backend == "ffmpeg" and self._clip_cache_process is not None
         )
@@ -22459,6 +23475,49 @@ Admin elevation
             entries = self._parse_ffmpeg_clip_manifest()
             if not entries:
                 return (False, None, 0.0)
+            # Determine how much "tail" of the rolling buffer to drop.
+            # Latest segment's end_time is the buffer's right edge; if
+            # end_ts is earlier, the difference is the latency we need
+            # to compensate for. Walk back further than usual so we
+            # still cover `duration_seconds` AFTER the drop.
+            latest_end = float(entries[-1].get("end_time", 0.0)) if entries else 0.0
+            # CRITICAL: latest_end is ffmpeg-relative seconds (since the
+            # encoder started); end_ts is wall-clock unix epoch. Convert
+            # to a common axis (wall-clock) using the anchor recorded at
+            # ffmpeg-start. Without this conversion the subtraction goes
+            # massively negative and tail_to_drop clamps to 0, baking
+            # 6-8s of processing latency into every voice-anchored clip.
+            try:
+                ffmpeg_anchor = float(
+                    getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0
+                )
+            except Exception:
+                ffmpeg_anchor = 0.0
+            latest_end_wall = (
+                ffmpeg_anchor + latest_end if ffmpeg_anchor > 0 else latest_end
+            )
+            try:
+                tail_to_drop = (
+                    max(0.0, float(latest_end_wall) - float(end_ts))
+                    if end_ts is not None else 0.0
+                )
+            except (TypeError, ValueError):
+                tail_to_drop = 0.0
+            needed_walkback = float(duration_seconds) + tail_to_drop
+            try:
+                import sys as _sys, time as _time
+                _sys.stderr.write(
+                    f"[clip-anchor] ffmpeg latest_end={latest_end:.3f} "
+                    f"latest_end_wall={latest_end_wall:.3f} "
+                    f"end_ts={end_ts if end_ts is None else f'{end_ts:.3f}'} "
+                    f"tail_to_drop={tail_to_drop:.2f}s "
+                    f"duration={float(duration_seconds):.1f}s "
+                    f"needed_walkback={needed_walkback:.2f}s "
+                    f"(entries={len(entries)})\n"
+                )
+                _sys.stderr.flush()
+            except Exception:
+                pass
             selected: list[dict] = []
             covered = 0.0
             for entry in reversed(entries):
@@ -22469,7 +23528,7 @@ Admin elevation
                 )
                 selected.append(entry)
                 covered += segment_seconds
-                if covered >= float(duration_seconds):
+                if covered >= needed_walkback:
                     break
             if not selected:
                 return (False, None, 0.0)
@@ -22482,7 +23541,17 @@ Admin elevation
                 )
                 for entry in selected
             )
-            start_trim = max(0.0, total_duration - float(duration_seconds))
+            # Drop tail_to_drop seconds from the END of the assembled
+            # concat. trim filter's `duration=` only specifies what to
+            # KEEP from start; it can't shrink past available footage,
+            # so when total < duration + tail we'd silently keep
+            # everything to the end (bug: clips extend past the moment
+            # the user said "clip that"). Switch to `end=` which
+            # specifies a HARD STOP in concat-local seconds: tail is
+            # always dropped, regardless of total available footage.
+            end_trim = max(0.0, total_duration - tail_to_drop)
+            start_trim = max(0.0, end_trim - float(duration_seconds))
+            trim_duration = max(1e-3, end_trim - start_trim)
             output_path = self._clip_output_specs(duration_seconds)[0][0]
             capture_region = (
                 QRect(self._clip_cache_region)
@@ -22493,26 +23562,81 @@ Admin elevation
             for entry in selected:
                 inputs.extend(["-i", str(Path(entry["path"]).resolve())])
             n = len(selected)
-            concat_in = "".join(f"[{i}:v]" for i in range(n))
-            filter_chain = [f"{concat_in}concat=n={n}:v=1:a=0"]
+            # Audio is recorded by a separate ffmpeg subprocess into
+            # its own segment ring. Find audio segments whose wall-clock
+            # window overlaps the selected video window — and append
+            # them as additional ffmpeg inputs starting at index n.
+            audio_selected: list[dict] = []
+            if self._clip_cache_has_audio:
+                v_window_start = float(selected[0].get("start_time", 0.0))
+                v_window_end = float(selected[-1].get("end_time", 0.0))
+                v_anchor = float(getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0)
+                a_anchor = float(getattr(self, "_clip_cache_audio_started_at", 0.0) or 0.0)
+                # Re-base the video window into the audio process's
+                # local time by accounting for the difference in start
+                # wall-clocks. If video started 1.2 s before audio,
+                # the audio window is `[v_start - 1.2, v_end - 1.2]`.
+                t_shift = (v_anchor - a_anchor) if (v_anchor and a_anchor) else 0.0
+                a_window_start = v_window_start + t_shift
+                a_window_end = v_window_end + t_shift
+                audio_entries = self._parse_ffmpeg_clip_audio_manifest()
+                for entry in audio_entries:
+                    e_start = float(entry.get("start_time", 0.0))
+                    e_end = float(entry.get("end_time", 0.0))
+                    if e_end < a_window_start or e_start > a_window_end:
+                        continue
+                    audio_selected.append(entry)
+            has_audio = len(audio_selected) > 0
+            for entry in audio_selected:
+                inputs.extend(["-i", str(Path(entry["path"]).resolve())])
+            # Video chain — concat all video segments, optional crop,
+            # trim tail-to-drop seconds off the END, then keep
+            # `duration_seconds`. Each step is comma-joined into one
+            # filter expression ending at [vout].
+            concat_in_v = "".join(f"[{i}:v]" for i in range(n))
+            v_chain = [f"{concat_in_v}concat=n={n}:v=1:a=0"]
             crop_filter = self._clip_crop_filter(capture_region, target_region)
             if crop_filter:
-                filter_chain.append(crop_filter)
-            filter_chain.append(
-                f"trim=start={start_trim:.3f}:duration={float(duration_seconds):.3f}"
+                v_chain.append(crop_filter)
+            v_chain.append(
+                f"trim=start={start_trim:.3f}:duration={trim_duration:.3f}"
             )
-            filter_chain.append("setpts=PTS-STARTPTS")
-            filter_complex = ",".join(filter_chain) + "[vout]"
+            v_chain.append("setpts=PTS-STARTPTS")
+            video_complex = ",".join(v_chain) + "[vout]"
+            filter_complex = video_complex
+            if has_audio:
+                # Audio chain — concat each audio segment, then atrim
+                # to land on the same window as the video. The first
+                # audio input has ffmpeg index n (right after the
+                # last video input). Same `end_trim` math as video so
+                # the audio also actually drops its tail.
+                a_total = sum(
+                    max(1e-3, float(e.get("end_time", 0.0)) - float(e.get("start_time", 0.0)))
+                    for e in audio_selected
+                )
+                a_end_trim = max(0.0, a_total - tail_to_drop)
+                a_start_trim = max(0.0, a_end_trim - float(duration_seconds))
+                a_trim_duration = max(1e-3, a_end_trim - a_start_trim)
+                m = len(audio_selected)
+                concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
+                a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
+                a_chain.append(
+                    f"atrim=start={a_start_trim:.3f}:duration={a_trim_duration:.3f}"
+                )
+                a_chain.append("asetpts=PTS-STARTPTS")
+                audio_complex = ",".join(a_chain) + "[aout]"
+                filter_complex = video_complex + ";" + audio_complex
             command = [
                 self._ffmpeg_path,
                 "-hide_banner", "-loglevel", "error", "-y",
                 *inputs,
                 "-filter_complex", filter_complex,
                 "-map", "[vout]",
-                "-an",
+                *(["-map", "[aout]"] if has_audio else ["-an"]),
                 *self._ffmpeg_encoder_args(
                     purpose="clip_export", fps=self._clip_cache_fps
                 ),
+                *(["-c:a", "aac", "-b:a", "192k"] if has_audio else []),
                 str(output_path),
             ]
             # Capture ffmpeg's stderr instead of /dev/nulling it —
@@ -22536,7 +23660,9 @@ Admin elevation
                 and output_path.exists()
                 and output_path.stat().st_size > 1024
             ):
-                actual_seconds = min(float(duration_seconds), max(0.0, total_duration))
+                # Effective span after dropping the latency tail.
+                effective_span = max(0.0, total_duration - tail_to_drop)
+                actual_seconds = min(float(duration_seconds), effective_span)
                 return (True, output_path, actual_seconds)
             # Failure — print ffmpeg's own stderr so the diagnostic
             # survives even when the caller doesn't surface it. Tail
@@ -22578,7 +23704,8 @@ Admin elevation
                 self._start_clip_cache_ffmpeg()
 
     def _run_clip_export_opencv(
-        self, duration_seconds: int, target_region: QRect
+        self, duration_seconds: int, target_region: QRect,
+        *, end_ts: float | None = None,
     ) -> tuple[bool, Path | None, float]:
         """Thread-safe variant of _export_recent_clip_opencv. Same
         contract as _run_clip_export_ffmpeg.
@@ -22586,7 +23713,14 @@ Admin elevation
         Note: this path uses cv2.VideoCapture for reading cached
         segments, which opens a new fd per file inside the worker
         thread — fine. The output writer is also opened+closed
-        inside this method on the worker thread."""
+        inside this method on the worker thread.
+
+        `end_ts` parallels the ffmpeg backend's argument: when set,
+        the clip's right edge is anchored at `end_ts` instead of the
+        latest segment's end_time. Any segments whose START is past
+        end_ts are dropped entirely; the boundary segment that
+        STRADDLES end_ts is frame-trimmed at the tail in proportion
+        to how much of its span is past end_ts."""
         if self._clip_cache_segment_writer is not None:
             # Caller path may have an in-progress writer; rotate
             # to flush it. _rotate_clip_cache_segment is invoked
@@ -22602,7 +23736,39 @@ Admin elevation
         ]
         if not segments:
             return (False, None, 0.0)
-        selected_segments: list[tuple[dict, int]] = []
+        # When end_ts is provided, filter out segments fully past it
+        # and clamp the boundary segment by skipping tail frames.
+        # `tail_skip_by_path` maps a path → number of LATE frames to
+        # drop from THAT segment; honored in the playback loop below.
+        try:
+            end_ts_f = float(end_ts) if end_ts is not None else None
+        except (TypeError, ValueError):
+            end_ts_f = None
+        tail_skip_by_path: dict[str, int] = {}
+        if end_ts_f is not None:
+            kept: list[dict] = []
+            for meta in segments:
+                start_time = float(meta.get("start_time", 0.0) or 0.0)
+                end_time = float(meta.get("end_time", start_time) or start_time)
+                if start_time >= end_ts_f:
+                    # Entire segment is past the user's spoken moment.
+                    continue
+                if end_time > end_ts_f:
+                    # Straddles end_ts → drop the late tail frames.
+                    segment_seconds = max(1e-3, end_time - start_time)
+                    frame_count = int(meta.get("frame_count", 0) or 0)
+                    keep_ratio = max(0.0, min(1.0, (end_ts_f - start_time) / segment_seconds))
+                    keep_frames = max(1, int(round(frame_count * keep_ratio)))
+                    tail_skip_by_path[str(meta.get("path"))] = max(0, frame_count - keep_frames)
+                kept.append(meta)
+            segments = kept
+            if not segments:
+                return (False, None, 0.0)
+        # Tuples are (meta, head_skip, tail_skip). head_skip drops the
+        # earliest frames (when this is the duration-cap boundary);
+        # tail_skip drops the latest frames (when end_ts straddles
+        # this segment). Both can apply to the same segment.
+        selected_segments: list[tuple[dict, int, int]] = []
         covered_seconds = 0.0
         for meta in reversed(segments):
             frame_count = int(meta.get("frame_count", 0) or 0)
@@ -22610,24 +23776,34 @@ Admin elevation
                 continue
             start_time = float(meta.get("start_time", 0.0) or 0.0)
             end_time = float(meta.get("end_time", start_time) or start_time)
-            segment_seconds = max(1e-3, end_time - start_time)
+            tail_skip = tail_skip_by_path.get(str(meta.get("path")), 0)
+            if tail_skip and frame_count > tail_skip:
+                segment_seconds_full = max(1e-3, end_time - start_time)
+                segment_seconds = max(
+                    1e-3,
+                    segment_seconds_full * (1.0 - tail_skip / max(1, frame_count)),
+                )
+                effective_frame_count = max(1, frame_count - tail_skip)
+            else:
+                segment_seconds = max(1e-3, end_time - start_time)
+                effective_frame_count = frame_count
             if covered_seconds + segment_seconds <= float(duration_seconds):
-                selected_segments.append((meta, 0))
+                selected_segments.append((meta, 0, tail_skip))
                 covered_seconds += segment_seconds
                 continue
             needed_seconds = max(0.0, float(duration_seconds) - covered_seconds)
             keep_ratio = min(1.0, max(0.0, needed_seconds / segment_seconds))
-            keep_frames = max(1, int(round(frame_count * keep_ratio)))
-            skip_frames = max(0, frame_count - keep_frames)
-            selected_segments.append((meta, skip_frames))
+            keep_frames = max(1, int(round(effective_frame_count * keep_ratio)))
+            head_skip = max(0, effective_frame_count - keep_frames)
+            selected_segments.append((meta, head_skip, tail_skip))
             covered_seconds += min(segment_seconds, needed_seconds)
             break
         if not selected_segments:
             return (False, None, 0.0)
         selected_segments.reverse()
         estimated_frames = sum(
-            max(0, int(meta.get("frame_count", 0) or 0) - int(skip))
-            for meta, skip in selected_segments
+            max(0, int(meta.get("frame_count", 0) or 0) - int(head) - int(tail))
+            for meta, head, tail in selected_segments
         )
         output_fps = max(
             1.0,
@@ -22651,7 +23827,7 @@ Admin elevation
             return (False, None, 0.0)
         written = 0
         try:
-            for meta, skip_frames in selected_segments:
+            for meta, head_skip, tail_skip in selected_segments:
                 path = Path(meta.get("path"))
                 capture_region = (
                     meta.get("region")
@@ -22661,12 +23837,18 @@ Admin elevation
                 capture_region = QRect(capture_region)
                 cap = cv2.VideoCapture(str(path))
                 local_index = 0
+                segment_total = int(meta.get("frame_count", 0) or 0)
+                # Highest frame index we'll write: clipped at the head
+                # by head_skip and at the tail by tail_skip (drop the
+                # last tail_skip frames so end_ts trimming lands here).
+                cutoff = max(0, segment_total - int(tail_skip))
+                head = int(head_skip)
                 try:
                     while True:
                         ok, frame = cap.read()
                         if not ok or frame is None:
                             break
-                        if local_index >= int(skip_frames):
+                        if local_index >= head and local_index < cutoff:
                             cropped = self._crop_cached_frame_to_region(
                                 frame, capture_region, target_region
                             )
@@ -22674,6 +23856,8 @@ Admin elevation
                                 output_writer.write(cropped)
                                 written += 1
                         local_index += 1
+                        if local_index >= cutoff:
+                            break  # past end_ts — done with this segment
                 finally:
                     cap.release()
         finally:
@@ -22730,24 +23914,59 @@ Admin elevation
             for entry in selected:
                 inputs.extend(["-i", str(Path(entry["path"]).resolve())])
             n = len(selected)
-            concat_in = "".join(f"[{i}:v]" for i in range(n))
-            filter_chain = [f"{concat_in}concat=n={n}:v=1:a=0"]
+            # Audio segments come from the parallel audio cache.
+            audio_selected: list[dict] = []
+            if self._clip_cache_has_audio:
+                v_window_start = float(selected[0].get("start_time", 0.0))
+                v_window_end = float(selected[-1].get("end_time", 0.0))
+                v_anchor = float(getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0)
+                a_anchor = float(getattr(self, "_clip_cache_audio_started_at", 0.0) or 0.0)
+                t_shift = (v_anchor - a_anchor) if (v_anchor and a_anchor) else 0.0
+                a_window_start = v_window_start + t_shift
+                a_window_end = v_window_end + t_shift
+                for entry in self._parse_ffmpeg_clip_audio_manifest():
+                    e_start = float(entry.get("start_time", 0.0))
+                    e_end = float(entry.get("end_time", 0.0))
+                    if e_end < a_window_start or e_start > a_window_end:
+                        continue
+                    audio_selected.append(entry)
+            has_audio = len(audio_selected) > 0
+            for entry in audio_selected:
+                inputs.extend(["-i", str(Path(entry["path"]).resolve())])
+            concat_in_v = "".join(f"[{i}:v]" for i in range(n))
+            v_chain = [f"{concat_in_v}concat=n={n}:v=1:a=0"]
             crop_filter = self._clip_crop_filter(capture_region, target_region)
             if crop_filter:
-                filter_chain.append(crop_filter)
-            filter_chain.append(
+                v_chain.append(crop_filter)
+            v_chain.append(
                 f"trim=start={start_trim:.3f}:duration={float(duration_seconds):.3f}"
             )
-            filter_chain.append("setpts=PTS-STARTPTS")
-            filter_complex = ",".join(filter_chain) + "[vout]"
+            v_chain.append("setpts=PTS-STARTPTS")
+            video_complex = ",".join(v_chain) + "[vout]"
+            filter_complex = video_complex
+            if has_audio:
+                a_total = sum(
+                    max(1e-3, float(e.get("end_time", 0.0)) - float(e.get("start_time", 0.0)))
+                    for e in audio_selected
+                )
+                a_start_trim = max(0.0, a_total - float(duration_seconds))
+                m = len(audio_selected)
+                concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
+                a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
+                a_chain.append(
+                    f"atrim=start={a_start_trim:.3f}:duration={float(duration_seconds):.3f}"
+                )
+                a_chain.append("asetpts=PTS-STARTPTS")
+                filter_complex = video_complex + ";" + ",".join(a_chain) + "[aout]"
             command = [
                 self._ffmpeg_path,
                 "-hide_banner", "-loglevel", "error", "-y",
                 *inputs,
                 "-filter_complex", filter_complex,
                 "-map", "[vout]",
-                "-an",
+                *(["-map", "[aout]"] if has_audio else ["-an"]),
                 *self._ffmpeg_encoder_args(purpose="clip_export", fps=self._clip_cache_fps),
+                *(["-c:a", "aac", "-b:a", "192k"] if has_audio else []),
                 str(output_path),
             ]
             completed = subprocess.run(
@@ -22845,6 +24064,7 @@ Admin elevation
         *,
         auto_save: bool = False,
         auto_select_monitor: bool = False,
+        end_ts: float | None = None,
     ) -> bool:
         """Kick off a clip export. `auto_save=True` skips the
         post-action save-location voice prompt — the clip stays in
@@ -22853,7 +24073,18 @@ Admin elevation
         screens (matches the cache region exactly so no cropping is
         needed). Both default to False so the gesture path keeps
         its existing prompt-driven behaviour; the voice "clip that"
-        path passes True/True so the user gets a hands-off save."""
+        path passes True/True so the user gets a hands-off save.
+
+        `end_ts` (optional wall-clock time.time()) anchors the RIGHT
+        edge of the clip window. Default `None` keeps the historical
+        behaviour: the window ends at the latest cached segment's
+        end_time, which equals "right now-ish". The voice "clip that"
+        path passes the moment VAD declared end-of-speech, so the
+        saved clip ends when the user actually finished speaking —
+        not 5-15 s later after whisper inference + parse + dispatch +
+        ffmpeg startup. Without this offset the clip's tail captures
+        seconds of "after the moment they wanted", losing seconds of
+        "before the moment they wanted" off the head."""
         duration_seconds = int(max(1, duration_seconds))
         if self._utility_countdown_active or self._capture_region_selection_mode is not None:
             return False
@@ -22873,7 +24104,8 @@ Admin elevation
             # user would still see the picker overlapping the
             # processing overlay for one frame.
             self._export_clip_async(
-                duration_seconds, QRect(region), auto_save=auto_save
+                duration_seconds, QRect(region),
+                auto_save=auto_save, end_ts=end_ts,
             )
 
         if len(options) == 1 or auto_select_monitor:
@@ -23005,6 +24237,7 @@ Admin elevation
         region: QRect,
         *,
         auto_save: bool = False,
+        end_ts: float | None = None,
     ) -> None:
         # Off-main-thread clip export. The ffmpeg subprocess for a
         # 60 s concat + crop + trim + encode takes 3-8 s; running
@@ -23115,11 +24348,11 @@ Admin elevation
             try:
                 if self._ffmpeg_ready() and self._clip_cache_backend == "ffmpeg":
                     success, output_path, actual_seconds = self._run_clip_export_ffmpeg(
-                        duration_seconds, target
+                        duration_seconds, target, end_ts=end_ts,
                     )
                 else:
                     success, output_path, actual_seconds = self._run_clip_export_opencv(
-                        duration_seconds, target
+                        duration_seconds, target, end_ts=end_ts,
                     )
                 self._clip_export_result = {
                     "success": bool(success),
@@ -23960,14 +25193,55 @@ Admin elevation
             elif utility_request_action == "clip_30s_voice":
                 # Voice-triggered: skip the multi-monitor picker
                 # and the post-action save-location prompt so the
-                # clip just lands in the default folder.
+                # clip just lands in the default folder. The worker
+                # stamped `_pending_clip_voice_end_ts` at speech-end
+                # before queuing this request; threading it through
+                # `end_ts` anchors the clip window at when the user
+                # actually said "clip that" instead of "now" (which
+                # is 5-15 s later after whisper + parse + dispatch).
+                _voice_end_ts = getattr(self._worker, "_pending_clip_voice_end_ts", None) if self._worker is not None else None
+                try:
+                    import sys as _sys, time as _time
+                    _sys.stderr.write(
+                        f"[clip-anchor] main_window clip_30s_voice end_ts={_voice_end_ts} "
+                        f"(now={_time.time():.3f}, lag={(_time.time() - _voice_end_ts):.2f}s)\n"
+                        if _voice_end_ts is not None else
+                        f"[clip-anchor] main_window clip_30s_voice end_ts=None — using default 'now' anchor\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
                 utility_handled = self._export_recent_clip(
-                    30, auto_save=True, auto_select_monitor=True
+                    30, auto_save=True, auto_select_monitor=True,
+                    end_ts=_voice_end_ts,
                 )
+                try:
+                    if self._worker is not None:
+                        self._worker._pending_clip_voice_end_ts = None
+                except Exception:
+                    pass
             elif utility_request_action == "clip_1m_voice":
+                _voice_end_ts = getattr(self._worker, "_pending_clip_voice_end_ts", None) if self._worker is not None else None
+                try:
+                    import sys as _sys, time as _time
+                    _sys.stderr.write(
+                        f"[clip-anchor] main_window clip_1m_voice end_ts={_voice_end_ts} "
+                        f"(now={_time.time():.3f}, lag={(_time.time() - _voice_end_ts):.2f}s)\n"
+                        if _voice_end_ts is not None else
+                        f"[clip-anchor] main_window clip_1m_voice end_ts=None — using default 'now' anchor\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
                 utility_handled = self._export_recent_clip(
-                    60, auto_save=True, auto_select_monitor=True
+                    60, auto_save=True, auto_select_monitor=True,
+                    end_ts=_voice_end_ts,
                 )
+                try:
+                    if self._worker is not None:
+                        self._worker._pending_clip_voice_end_ts = None
+                except Exception:
+                    pass
             if utility_handled:
                 self._last_utility_request_token = utility_request_token
                 if self._worker is not None and hasattr(self._worker, "acknowledge_utility_request"):

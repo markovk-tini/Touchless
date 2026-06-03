@@ -214,6 +214,37 @@ class AppConfig:
     # entirely. Requires `diagnostic_overlay_enabled` to be on (the
     # pill is the host surface for both).
     show_recognizer_top_scores: bool = False
+    # Clip-audio capture toggles. Streamer mode: when on, the clip cache's
+    # ffmpeg subprocess additionally records WASAPI loopback (system audio
+    # — game/music/app sounds) and/or the user's preferred microphone,
+    # then mixes them into the saved clip with `amix`. Default off so the
+    # feature is opt-in for privacy; users who want streamer-style clips
+    # enable both. `clip_capture_microphone` reuses the existing
+    # `preferred_microphone_name` field for device selection.
+    clip_capture_system_audio: bool = False
+    clip_capture_microphone: bool = False
+    # Microphone noise-reduction preset for clip audio capture.
+    # Applied as an ffmpeg `filter_complex` chain on the MIC input
+    # ONLY, before amix mixes it with the system-audio stream.
+    # Game / music / app audio is NEVER filtered — only the mic.
+    # Values:
+    #   "off"    — no filter; mic recorded verbatim (use when an
+    #              upstream tool like Krisp / NVIDIA Broadcast is
+    #              already doing noise suppression).
+    #   "light"  — DEFAULT. highpass=80 Hz to kill rumble + a
+    #              gentle noise gate (peak detection, ~-15 dBFS
+    #              threshold) tuned to close during pauses and
+    #              silence mechanical keyboard + mouse clicks
+    #              without chopping speech.
+    #   "strong" — tighter gate (~-10 dBFS, ratio 10). Removes
+    #              more background noise but may clip soft word
+    #              tails. Recommended only for loud keyboards or
+    #              persistent room noise.
+    # Only takes effect when `clip_capture_microphone` is True;
+    # the UI grays the dropdown out when mic is off. Changes
+    # take effect on the next clip-cache restart. Invalid values
+    # silently fall back to "light".
+    clip_mic_noise_reduction: str = "light"
     # Discord OAuth credentials supplied by the user via the in-app
     # Discord setup wizard. Same per-user-app pattern as Spotify above,
     # but with a different motivation: Discord's `rpc` OAuth scope is
@@ -316,6 +347,18 @@ class AppConfig:
     # this version", but v1.0.8 still gets a prompt the moment it
     # ships. Empty string = no version dismissed yet.
     last_dismissed_update_version: str = ""
+    # When True, the in-app update path runs without showing the
+    # UpdateDialog: as soon as a new version is detected the app-zip
+    # download starts, the apply helper fires, and Touchless restarts
+    # itself on the new version. Off by default so the first 1.1.4 user
+    # still gets to read the release notes and consent before their app
+    # restarts unprompted; users opt in via the "Install updates
+    # automatically" checkbox on the General settings tab. The auto path
+    # only fires for the app-zip update kind (small, in-place, no UAC,
+    # no Inno dialog) — full-installer and Store-fallback paths still
+    # surface the dialog because they take noticeably longer and the
+    # user deserves to know the app is about to disappear for ~30 sec.
+    auto_update_enabled: bool = False
     # Set True once the user has installed the optional higher-accuracy
     # dictation model (ggml-medium.en.bin) via the "Voice Recognition
     # Upgrade" download. Store builds ship only small.en to stay under

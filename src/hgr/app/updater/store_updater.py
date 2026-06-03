@@ -43,6 +43,13 @@ _MANIFEST_URL = (
     "https://storeedgefd.dsx.mp.microsoft.com/v9.0/packageManifests/"
     f"{STORE_PRODUCT_ID}?Market=US"
 )
+# GitHub release endpoint — used to fetch the matching version's release notes
+# AND the small app-zip URL when available, so Store users get the same fast
+# in-app update path as website users instead of redownloading the 1.17 GB
+# installer every release.
+_GH_RELEASE_BY_TAG = (
+    "https://api.github.com/repos/markovk-tini/HGR-App/releases/tags/v{tag}"
+)
 _HTTP_TIMEOUT = 12.0
 
 
@@ -69,17 +76,63 @@ class StoreUpdateChecker(QThread):
         if not version or not _is_newer(version, RUNNING_VERSION):
             self.no_update.emit()
             return
-        info = ReleaseInfo(
-            version=_strip_v_prefix(version),
-            body=(
+
+        # Best-effort fetch the GitHub release for the same version. Gives
+        # us two things: real release notes (the Store manifest has none),
+        # and the small app-zip URL (~140 MB) so the in-app update path
+        # downloads that instead of the 1+ GB Store installer. Falls back
+        # to the Store installer URL if GitHub is unreachable or doesn't
+        # have a matching tagged release.
+        gh_body, gh_zip_url, gh_zip_size = self._fetch_github_release(version)
+
+        # Decide which URL the in-app Updater downloads + applies.
+        # Preference: GitHub app-zip > Store installer > Store deep link.
+        # The app-zip path runs without Inno Setup (no UAC, no install
+        # dialog, no full reinstall) and lands in the same per-user dir
+        # the Store installer would have written — so the result is
+        # identical from the user's perspective, just ~10x faster.
+        try:
+            from .updater import Updater
+            install_writable = Updater.is_install_dir_writable()
+        except Exception:
+            install_writable = True
+
+        if gh_zip_url and install_writable:
+            preferred_url = gh_zip_url
+            preferred_size = gh_zip_size
+            kind = "app-zip"
+            fallback = installer_url or ""
+        elif installer_url:
+            preferred_url = installer_url
+            preferred_size = 0
+            kind = "full-exe"
+            fallback = gh_zip_url or ""
+        else:
+            preferred_url = ""
+            preferred_size = 0
+            kind = "store"  # button just opens the Store page
+            fallback = ""
+
+        # Build the body shown in the in-app update dialog. Prefer the
+        # GitHub release notes (real changelog). Fall back to a short
+        # generic message when GitHub didn't have anything — same wording
+        # as before, just no longer the only option.
+        if gh_body:
+            body = gh_body
+        else:
+            body = (
                 f"Touchless {version} is available from the Microsoft Store.\n\n"
                 "Click **Download Update** to install it now."
-            ),
-            download_url=installer_url or "",
+            )
+
+        info = ReleaseInfo(
+            version=_strip_v_prefix(version),
+            body=body,
+            download_url=preferred_url,
             html_url=STORE_DEEP_LINK,
-            # With an installer URL the normal Updater applies it in-app; with
-            # none, fall back to 'store' so the button just opens the Store.
-            update_kind="full-exe" if installer_url else "store",
+            size_bytes=preferred_size,
+            update_kind=kind,
+            fallback_url=fallback,
         )
         self.update_available.emit(info)
 
@@ -102,6 +155,52 @@ class StoreUpdateChecker(QThread):
                 best_v = pv
                 best_url = self._pick_installer_url(v.get("Installers") or [])
         return best_v, best_url
+
+    def _fetch_github_release(self, version: str) -> Tuple[str, str, int]:
+        """Look up the GitHub release for `version` and return
+        (release_body, app_zip_url, app_zip_size_bytes).
+
+        Best-effort. Returns ("", "", 0) on any failure — the caller falls
+        back to the Store installer URL + a generic prompt. Never raises.
+
+        Why we fetch this even on the Store channel: the Store's manifest
+        carries no changelog and only the full installer URL. By pulling
+        the matching version's GitHub release we get the same fast app-zip
+        path website users enjoy AND the actual release notes — both of
+        which the user explicitly asked for after the 1.1.3 in-app update
+        felt like a slow generic reinstall.
+        """
+        try:
+            tag = _strip_v_prefix(version)
+            url = _GH_RELEASE_BY_TAG.format(tag=tag)
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "Touchless-Updater",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as exc:
+            self._log("github_release_fetch_failed", exc)
+            return ("", "", 0)
+
+        body = str((payload or {}).get("body") or "").strip()
+        zip_url = ""
+        zip_size = 0
+        for asset in (payload or {}).get("assets") or []:
+            name = str((asset or {}).get("name") or "")
+            # Match the same naming convention release_checker.py uses:
+            # Touchless_App_Update_<version>.zip
+            if "App_Update" in name and name.lower().endswith(".zip"):
+                zip_url = str((asset or {}).get("browser_download_url") or "")
+                try:
+                    zip_size = int((asset or {}).get("size") or 0)
+                except Exception:
+                    zip_size = 0
+                break
+        return (body, zip_url, zip_size)
 
     @staticmethod
     def _pick_installer_url(installers: list) -> str:
