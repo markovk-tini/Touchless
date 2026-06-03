@@ -1940,21 +1940,32 @@ class ToolExecutor:
         # own precise error ("Reading email needs gmail.readonly —
         # reconnect to grant the new scope") instead of falsely
         # claiming "not connected".
+        def _diag(msg: str) -> None:
+            try:
+                import sys as _sys
+                print(f"[email_summary] {msg}", file=_sys.stderr, flush=True)
+            except Exception:
+                pass
+
         def _try(connector_id: str, tool_name: str) -> tuple:
             try:
                 connector = self._registry.find_connector(connector_id)
-            except Exception:
+            except Exception as exc:
+                _diag(f"{connector_id}: find_connector raised {type(exc).__name__}: {exc}")
                 connector = None
             if connector is None:
+                _diag(f"{connector_id}: connector not found in registry")
                 return ("missing", None)
             try:
                 result = connector.execute(tool_name, dict(sub_args))
             except Exception as exc:
+                _diag(f"{connector_id}.{tool_name}: raised {type(exc).__name__}: {exc}")
                 return ("err", _result(
                     status="error",
                     error=f"{type(exc).__name__}: {exc}",
                     code="connector_failed"))
             if isinstance(result, dict) and result.get("status") == "error":
+                err_msg = str(result.get("error") or "")[:200]
                 # Distinguish "not connected at all" from "connected but
                 # the call failed for another reason" by re-checking
                 # availability AFTER the failure.
@@ -1962,9 +1973,11 @@ class ToolExecutor:
                     available_now = bool(connector.available())
                 except Exception:
                     available_now = False
-                if not available_now:
-                    return ("unavailable", result)
-                return ("err", result)
+                tag = "unavailable" if not available_now else "err"
+                _diag(f"{connector_id}.{tool_name}: status=error available={available_now} -> {tag}; err={err_msg}")
+                return (tag, result)
+            count = int((result or {}).get("count") or 0)
+            _diag(f"{connector_id}.{tool_name}: ok count={count}")
             return ("ok", result)
 
         # Per-connector state for accurate cascade messaging below.
@@ -1994,9 +2007,11 @@ class ToolExecutor:
                       and ms_res.get("status") == "error")
         if gmail_errored or ms_errored:
             parts: List[str] = []
+            actions: List[str] = []
             if gmail_errored:
                 msg = str(gmail_res.get("error") or "Gmail error.").strip()
                 parts.append(f"Gmail returned an error: {msg}")
+                actions.append("connect_gmail")
             elif gmail_state == "ok" and gmail_res is not None:
                 parts.append(
                     f"Your Gmail has {int(gmail_res.get('count') or 0)} "
@@ -2004,15 +2019,18 @@ class ToolExecutor:
             if ms_errored:
                 msg = str(ms_res.get("error") or "Microsoft error.").strip()
                 parts.append(f"Outlook returned an error: {msg}")
+                actions.append("connect_ms")
             elif ms_state == "ok" and ms_res is not None:
                 parts.append(
                     f"Outlook has {int(ms_res.get('count') or 0)} unread.")
             elif ms_state == "missing" or ms_state == "unavailable":
                 parts.append("Outlook isn't connected to Touchless.")
+                actions.append("connect_ms")
             return _result(
                 status="ok", count=0, messages=[],
                 source="error",
-                summary=" ".join(parts))
+                summary=" ".join(parts),
+                suggested_actions=actions)
 
         gmail_ok_empty = (gmail_state == "ok" and gmail_res is not None
                           and gmail_res.get("status") == "ok"
@@ -2034,7 +2052,8 @@ class ToolExecutor:
             return _result(
                 status="ok", count=0, messages=[], source="both",
                 summary=("Both your Gmail and Outlook (Graph) are showing "
-                         "no unread. " + screen_hint))
+                         "no unread. " + screen_hint),
+                suggested_actions=["read_outlook_screen"])
 
         # Exactly one connector returned 0 and the other isn't connected.
         # Name the one we checked AND say plainly that the other wasn't
@@ -2046,7 +2065,8 @@ class ToolExecutor:
                          "because your Microsoft account isn't connected "
                          "to Touchless yet — connect it in settings, or "
                          "say 'read my Outlook screen' and I'll OCR the "
-                         "inbox you have open."))
+                         "inbox you have open."),
+                suggested_actions=["connect_ms", "read_outlook_screen"])
         if ms_ok_empty and gmail_state != "ok":
             return _result(
                 status="ok", count=0, messages=[], source="microsoft",
@@ -2054,7 +2074,8 @@ class ToolExecutor:
                          "unread. I didn't check Gmail because it isn't "
                          "connected to Touchless yet — connect it in "
                          "settings, or say 'read my Outlook screen' and "
-                         "I'll OCR the inbox you have open."))
+                         "I'll OCR the inbox you have open."),
+                suggested_actions=["connect_gmail", "read_outlook_screen"])
 
         # Neither connector is wired up / available at all. Be explicit
         # about both options (connect, or screen-read).
@@ -2065,7 +2086,9 @@ class ToolExecutor:
                      "(a) connect Gmail / Microsoft in Touchless "
                      "settings, or (b) read your Outlook desktop window "
                      "directly — say 'read my Outlook screen' and I'll "
-                     "OCR it."))
+                     "OCR it."),
+            suggested_actions=["connect_gmail", "connect_ms",
+                               "read_outlook_screen"])
 
     def _t_weather_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         # Free, no-key weather via wttr.in / Open-Meteo. Auto-detects

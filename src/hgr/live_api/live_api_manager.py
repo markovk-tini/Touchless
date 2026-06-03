@@ -450,6 +450,11 @@ class LiveApiManager(QObject):
     assistant_text = Signal(str)               # assistant text deltas/snippets
     assistant_message_break = Signal()         # start a fresh assistant bubble
     tool_event = Signal(str, dict)             # ("called"/"completed", info)
+    # Action chips for the chat UI to render below the most recent
+    # assistant bubble. Payload is a list of action ids like
+    # ["connect_gmail", "connect_ms", "read_outlook_screen"]. The UI
+    # decides label + handler per id.
+    suggested_actions = Signal(list)
 
     def __init__(
         self,
@@ -527,6 +532,9 @@ class LiveApiManager(QObject):
         # tool's reply.
         self._pending_override_text: Optional[str] = None
         self._last_override_tool: str = ""
+        # Action chips to surface after the next reply (Connect Gmail
+        # button, etc.). Cleared each time we emit the signal.
+        self._pending_actions: List[str] = []
         self._last_user_text = ""     # for realtime fact-extraction observation
         # Rolling conversation buffer for the Jarvis prose renderer — the
         # last ~6 (role, text) turns so replies can naturally reference
@@ -2106,6 +2114,12 @@ class LiveApiManager(QObject):
                             except Exception:
                                 pass
                 self._record_convo_turn("assistant", override)
+                if self._pending_actions:
+                    try:
+                        self.suggested_actions.emit(list(self._pending_actions))
+                    except Exception:
+                        pass
+                    self._pending_actions = []
                 self._set_state(LiveApiState.LISTENING, "Listening")
                 return
 
@@ -2648,6 +2662,15 @@ class LiveApiManager(QObject):
                         composed = base
                     self._pending_override_text = composed or base
                     self._last_override_tool = name
+                    # Stash any suggested action chips so the chat UI can
+                    # render Connect buttons / read-screen prompts beneath
+                    # the composed reply when it fires.
+                    try:
+                        actions = output.get("suggested_actions") or []
+                        if isinstance(actions, list) and actions:
+                            self._pending_actions = list(actions)
+                    except Exception:
+                        pass
                     try:
                         import sys as _sys
                         print(f"[OVERRIDE] tool={name} chars={len(self._pending_override_text)}",
