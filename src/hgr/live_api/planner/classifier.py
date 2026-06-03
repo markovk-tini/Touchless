@@ -33,6 +33,36 @@ _NUMBER_WORDS = {
 }
 
 
+def _extract_email_account(text: str) -> Optional[str]:
+    """Pull an account-name hint out of common phrasings.
+
+    Catches: 'my gmail', 'in my work account', 'from my personal',
+    'check work email', 'summarize my school inbox', 'unread on my
+    yahoo'. Returns the matched word lowercased (substring-matched
+    against Outlook store names by the connector). Returns None if no
+    explicit account is named (caller reads across all accounts)."""
+    t = (text or "").lower()
+    # Known provider / role keywords. Order: more specific first so
+    # 'work' wins over a generic 'mail'.
+    candidates = [
+        "gmail", "outlook", "exchange", "yahoo", "icloud", "hotmail",
+        "live", "aol", "proton", "fastmail",
+        "work", "school", "personal", "main", "primary",
+    ]
+    for word in candidates:
+        # Match when the keyword is anchored as a possessive ("my X"),
+        # in/on/from ("in my X", "on my X", "from my X"), or a direct
+        # noun-phrase like "X email"/"X inbox"/"X account"/"X mail".
+        pattern = (
+            rf"\b(?:my|in\s+my|on\s+my|from\s+my|the)\s+{word}\b"
+            rf"|"
+            rf"\b{word}\s+(?:email|emails|inbox|mail|messages?|account)\b"
+        )
+        if re.search(pattern, t):
+            return word
+    return None
+
+
 def _extract_forecast_days(text: str) -> Optional[int]:
     """Parse the forecast horizon from a phrase like 'forecast for the
     next four days', '5-day forecast', 'this week', 'this weekend'. Returns
@@ -465,15 +495,35 @@ class Classifier:
             r"(?:new\s+|recent\s+)?unread\b"
             r"|"
             r"what(?:[’'´]?s|s'?s| is)\s+(?:in\s+)?my\s+(?:inbox|mail)"
+            r"|"
+            # Provider-named requests: 'summarize my gmail unread',
+            # 'check my work', 'read my personal inbox', 'show me my
+            # yahoo'. Anchored by a verb + 'my' + provider keyword.
+            r"(?:summarize|read|check|catch\s+me\s+up\s+on|show\s+me|"
+            r"give\s+me|list|any|got\s+any|do\s+i\s+have)\s+"
+            r"(?:my\s+|the\s+)?"
+            r"(?:gmail|outlook|exchange|yahoo|icloud|hotmail|live|aol|"
+            r"proton|fastmail|work|school|personal|main|primary)"
+            r"(?:\s+(?:unread|emails?|inbox|mail|messages?|account))?"
             r")\b",
             t, flags=re.IGNORECASE,
         ):
+            email_args: Dict[str, Any] = {
+                "unread_only": True, "max": 50, "include_body": False,
+            }
+            # Optional account hint — extract from common phrasings
+            # like "my gmail unread", "in my work account", "from my
+            # personal email". Routes to Outlook COM's account filter.
+            account = _extract_email_account(t)
+            desc = "summarize unread emails (connector cascade)"
+            if account:
+                email_args["account"] = account
+                desc = f"summarize unread in '{account}' (Outlook account)"
             return Step(
                 tool="email_summary",
-                args={"unread_only": True, "max": 50,
-                      "include_body": False},
+                args=email_args,
                 layer="touchless",
-                description="summarize unread emails (connector cascade)",
+                description=desc,
             )
 
         # ---- phone / SMS via Phone Link ("text X saying Y", "send a

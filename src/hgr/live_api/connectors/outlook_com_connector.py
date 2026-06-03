@@ -160,12 +160,19 @@ class OutlookComConnector(Connector):
 
     # ---- Multi-account inbox discovery -----------------------------------
 
-    def _discover_inboxes(self) -> Tuple[List[Any], List[str]]:
-        """Return (inboxes, diagnostics). Walks every Store the MAPI
-        namespace knows about and collects its "Inbox" folder if one
-        exists. Default inbox is always first. Skips duplicates by
-        EntryID. Diagnostics is a list of short per-store status
-        strings, useful for the user-facing error path.
+    def _discover_inboxes(self) -> Tuple[List[Tuple[Any, str]], List[str]]:
+        """Return ([(inbox, account_name), ...], diagnostics). Walks
+        every Store the MAPI namespace knows about and collects its
+        "Inbox" folder if one exists. Default inbox is always first.
+        Skips duplicates by EntryID. Diagnostics is a list of short
+        per-store status strings, useful for the user-facing error
+        path.
+
+        Each entry carries the OWNING ACCOUNT name (the parent Store's
+        DisplayName) so messages can be tagged with which account they
+        came from. That powers per-account replies ('your work account
+        has 3 unread, gmail has 7') and an optional `account` filter
+        on read.
 
         Cached for _INBOX_CACHE_TTL so a chatty caller doesn't re-walk
         every store on every email read."""
@@ -174,7 +181,7 @@ class OutlookComConnector(Connector):
                 now - self._inbox_cache_at < _INBOX_CACHE_TTL):
             return self._inbox_cache, ["cache hit"]
 
-        inboxes: List[Any] = []
+        inboxes: List[Tuple[Any, str]] = []
         seen_ids: set = set()
         diags: List[str] = []
 
@@ -184,10 +191,18 @@ class OutlookComConnector(Connector):
         try:
             default_inbox = self._namespace.GetDefaultFolder(_OL_FOLDER_INBOX)
             entry_id = str(getattr(default_inbox, "EntryID", "") or "")
-            inboxes.append(default_inbox)
+            # Look up the owning store's DisplayName for tagging.
+            default_account = "default"
+            try:
+                ds = default_inbox.Store
+                default_account = str(
+                    getattr(ds, "DisplayName", "") or "default")
+            except Exception:
+                pass
+            inboxes.append((default_inbox, default_account))
             if entry_id:
                 seen_ids.add(entry_id)
-            diags.append("default inbox ok")
+            diags.append(f"default inbox ok ({default_account})")
         except Exception as exc:
             diags.append(
                 f"default inbox failed: {type(exc).__name__}: {exc}")
@@ -255,7 +270,7 @@ class OutlookComConnector(Connector):
                 if entry_id and entry_id in seen_ids:
                     diags.append(f"store '{store_name}': dupe (skipped)")
                     continue
-                inboxes.append(inbox)
+                inboxes.append((inbox, store_name))
                 if entry_id:
                     seen_ids.add(entry_id)
                 diags.append(f"store '{store_name}': ok")
@@ -306,10 +321,18 @@ class OutlookComConnector(Connector):
                "configured to sync (Exchange, IMAP, Gmail-via-IMAP, "
                "Outlook.com, all of them — primary AND secondary). "
                "Returns {messages: [{id, from, from_name, subject, "
-               "received, snippet}], count, summary}. Set "
-               "unread_only=true (default) to filter to unread; max "
-               "defaults to 50; include_body=true also fetches the full "
-               "body (capped at 2 KB) inline.",
+               "received, snippet, account}], count, summary, "
+               "account_counts, available_accounts}. Each message is "
+               "tagged with its source `account` so multi-account "
+               "users see which inbox each one came from. Set "
+               "`account` to a substring of an account name to "
+               "filter to just that one (e.g. account='gmail' reads "
+               "only the Gmail account, account='work' for an "
+               "Exchange/work account). Empty `account` reads across "
+               "ALL connected Outlook accounts. Set unread_only=true "
+               "(default) to filter to unread; max defaults to 50; "
+               "include_body=true also fetches the full body (capped "
+               "at 2 KB) inline.",
                {"unread_only": {"type": "boolean",
                                 "description": "Default true. False to "
                                                "return recent regardless "
@@ -319,7 +342,12 @@ class OutlookComConnector(Connector):
                 "include_body": {"type": "boolean",
                                  "description": "Default false. True to "
                                                 "also fetch each body "
-                                                "(adds ~50 ms/msg)."}}),
+                                                "(adds ~50 ms/msg)."},
+                "account": {"type": "string",
+                            "description": "Optional substring match on "
+                                           "the Outlook account name to "
+                                           "filter results to one "
+                                           "account. Empty = read all."}}),
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -392,14 +420,19 @@ class OutlookComConnector(Connector):
         unread_only = bool(args.get("unread_only", True))
         max_n = max(1, min(50, int(args.get("max") or 50)))
         include_body = bool(args.get("include_body"))
+        # Optional account filter: case-insensitive substring match
+        # against the Store DisplayName. 'gmail' matches any account
+        # whose name contains 'gmail'. Empty = all accounts.
+        account_filter = str(args.get("account") or "").strip().lower()
 
         # Discover every account's inbox we can reach.
-        inboxes, walk_diags = self._discover_inboxes()
+        inboxes_with_names, walk_diags = self._discover_inboxes()
         _diag(
             f"libs=True dispatch=ok stores_walked={len(walk_diags)} "
-            f"inboxes={len(inboxes)} (" + "; ".join(walk_diags) + ")")
+            f"inboxes={len(inboxes_with_names)} (" +
+            "; ".join(walk_diags) + ")")
 
-        if not inboxes:
+        if not inboxes_with_names:
             return connector_result(
                 "error",
                 error=("Couldn't reach any Outlook inbox. Detail: " +
@@ -407,6 +440,29 @@ class OutlookComConnector(Connector):
                        ". The Outlook profile may not be initialized — "
                        "launch Outlook once and try again."),
                 code="connector_failed")
+
+        # Apply account filter.
+        all_account_names = [n for _, n in inboxes_with_names]
+        if account_filter:
+            inboxes_filtered = [
+                (ix, nm) for ix, nm in inboxes_with_names
+                if account_filter in nm.lower()
+            ]
+            if not inboxes_filtered:
+                # User asked for a specific account but no match.
+                # Return an actionable error listing what we DID find.
+                return connector_result(
+                    "error",
+                    error=(
+                        f"No Outlook account matching '{account_filter}'. "
+                        f"Available accounts: "
+                        f"{', '.join(all_account_names)}. Pass `account` "
+                        f"as any substring of one of those names."),
+                    code="account_not_found",
+                    available_accounts=all_account_names)
+            inboxes_with_names = inboxes_filtered
+            _diag(f"account filter='{account_filter}' -> "
+                  f"{len(inboxes_with_names)} matching")
 
         # Per-inbox: filter to unread (if requested), sort newest-first,
         # then merge across all accounts and trim to max_n.
@@ -416,12 +472,8 @@ class OutlookComConnector(Connector):
         # we then re-trim after the global sort.
         per_inbox_cap = max(max_n, 20)
 
-        for inbox in inboxes:
-            inbox_name = "?"
-            try:
-                inbox_name = str(getattr(inbox, "Name", "") or "?")
-            except Exception:
-                pass
+        for inbox, account_name in inboxes_with_names:
+            inbox_name = account_name or "?"
             try:
                 items = inbox.Items
                 # Sort BEFORE Restrict — Restrict on an unsorted
@@ -528,6 +580,7 @@ class OutlookComConnector(Connector):
                     "subject": subject,
                     "received": received_str,
                     "snippet": snippet,
+                    "account": account_name,
                 }
                 if include_body:
                     try:
@@ -554,6 +607,16 @@ class OutlookComConnector(Connector):
             entry for _rt, entry in merged_sorted[:max_n]
         ]
 
+        # Per-account count breakdown — feeds the prose renderer so it
+        # can naturally say "you've got 7 unread across Gmail and Work
+        # — Gmail has 5, Work has 2" instead of just one undifferentiated
+        # number.
+        account_counts: Dict[str, int] = {}
+        for _rt, entry in merged_sorted:
+            acc = str(entry.get("account") or "")
+            if acc:
+                account_counts[acc] = account_counts.get(acc, 0) + 1
+
         # Deterministic faithful summary built from real messages —
         # same formatter the Gmail/MS365 connectors use so the prose
         # renderer downstream sees a consistent shape.
@@ -561,8 +624,22 @@ class OutlookComConnector(Connector):
             from .gmail_connector import _format_email_summary
             summary = _format_email_summary(
                 msgs, unread_only=unread_only, max_arg=max_n)
+            # Inject a per-account intro line if there are multiple
+            # accounts represented, since _format_email_summary's
+            # headline only carries the total.
+            if len(account_counts) > 1:
+                pretty = ", ".join(
+                    f"{name}: {n}" for name, n in sorted(
+                        account_counts.items(), key=lambda kv: -kv[1])
+                )
+                summary = (
+                    f"Across your Outlook accounts ({pretty}):\n" +
+                    summary)
         except Exception:
             summary = ""
 
         return connector_result(
-            "ok", count=len(msgs), messages=msgs, summary=summary)
+            "ok", count=len(msgs), messages=msgs, summary=summary,
+            account_counts=account_counts,
+            available_accounts=all_account_names,
+            account_filter=account_filter or None)

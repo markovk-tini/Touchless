@@ -1749,6 +1749,20 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                                     "user explicitly asks for full content)."),
                     "default": False,
                 },
+                "account": {
+                    "type": "string",
+                    "description": (
+                        "Optional account-name substring to filter to a "
+                        "specific Outlook account when the user has "
+                        "multiple connected (e.g. 'gmail', 'work', "
+                        "'konstantin'). Match is case-insensitive "
+                        "substring against the Outlook store's display "
+                        "name. Empty = read across ALL connected "
+                        "accounts. Use whenever the user names a "
+                        "specific inbox ('summarize my gmail unread', "
+                        "'check my work email', 'any new mail in my "
+                        "personal account')."),
+                },
             },
             "required": [],
             "additionalProperties": False,
@@ -1780,13 +1794,74 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
             "additionalProperties": False,
         },
     },
+    {
+        # INTERNAL — filtered out of all_tool_schemas() so the realtime
+        # LLM never sees it. Only the Python-side email_summary cascade
+        # calls this (drives mail.google.com / outlook.live.com in the
+        # CDP-controlled Chrome). Kept in _TOOL_SCHEMAS so validate_args
+        # accepts it if the cascade ever routes through execute().
+        "type": "function",
+        "name": "email_read_browser",
+        "internal": True,
+        "description": (
+            "INTERNAL: browser-automation email reader, called by "
+            "email_summary as final fallback when every API connector "
+            "is unavailable. Drives Gmail web or Outlook web in the "
+            "CDP-controlled Chrome session and returns the same shape "
+            "as gmail_list. NOT for direct LLM use."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "enum": ["gmail", "outlook_web", "outlook", "auto"],
+                    "description": ("Webmail provider to scrape "
+                                    "(default 'gmail')."),
+                    "default": "gmail",
+                },
+                "max": {
+                    "type": "integer",
+                    "description": ("Max messages to return "
+                                    "(default 10, cap 25)."),
+                    "default": 10,
+                },
+                "unread_only": {
+                    "type": "boolean",
+                    "description": "Filter for unread (default true).",
+                    "default": True,
+                },
+                "include_body": {
+                    "type": "boolean",
+                    "description": ("Ignored — DOM scrape only sees "
+                                    "snippets, not full bodies."),
+                    "default": False,
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
 def all_tool_schemas() -> List[Dict[str, Any]]:
-    """Return a fresh copy of the full tool schema list."""
-    # Shallow copy is fine — callers should not mutate the inner dicts.
-    return [dict(s) for s in _TOOL_SCHEMAS]
+    """Return a fresh copy of the full tool schema list.
+
+    Schemas tagged ``"internal": True`` are EXCLUDED — they're used
+    by Python-side cascade logic (e.g. email_summary calling
+    email_read_browser) and validate_args still needs them, but the
+    realtime LLM must not see them in its tool catalogue or it would
+    start invoking them directly and bypass the cascade's ordering
+    rules. The internal flag itself is stripped from the public copy."""
+    out: List[Dict[str, Any]] = []
+    for s in _TOOL_SCHEMAS:
+        if s.get("internal"):
+            continue
+        clean = dict(s)
+        clean.pop("internal", None)
+        out.append(clean)
+    return out
 
 
 _TYPE_MAP = {

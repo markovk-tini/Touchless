@@ -1934,8 +1934,14 @@ class ToolExecutor:
         unread_only = bool(args.get("unread_only", True))
         max_n = max(1, min(50, int(args.get("max") or 50)))
         include_body = bool(args.get("include_body"))
+        # Optional account hint — "gmail", "work", "konstantin", etc.
+        # Only Outlook COM honors it (the cross-account branch); cloud
+        # connectors ignore the field since they're single-account.
+        account = str(args.get("account") or "").strip()
         sub_args = {"unread_only": unread_only, "max": max_n,
                     "include_body": include_body}
+        if account:
+            sub_args["account"] = account
 
         # _try returns a 3-state shape so the cascade can distinguish:
         #   ("missing",     None)   -> connector class isn't even wired up
@@ -2062,6 +2068,39 @@ class ToolExecutor:
         # the user can see in stderr while it works. Skipped silently
         # if any earlier connector already returned >0 (handled by the
         # early returns above).
+        #
+        # `browser_state` aggregates Gmail+Outlook attempts so the
+        # trailing fallback messaging can tell the user exactly why
+        # browser-auto didn't help ("you weren't signed in" vs "Chrome
+        # isn't installed" vs "tried and got nothing"). States:
+        #   missing      -> Chrome/CDP isn't available (no point trying)
+        #   not_connected -> page loaded but user wasn't signed in
+        #   err          -> page loaded but parse/navigation failed
+        #   ok           -> at least one provider returned (count may be 0)
+        browser_state = "missing"
+        browser_res: Optional[Dict[str, Any]] = None
+        browser_res2: Optional[Dict[str, Any]] = None
+
+        def _classify_browser(res: Optional[Dict[str, Any]]) -> str:
+            if not isinstance(res, dict):
+                return "missing"
+            if res.get("status") == "ok":
+                return "ok"
+            code = str(res.get("code") or "")
+            if code in ("cdp_unavailable", "no_web"):
+                return "missing"
+            if code == "auth_required":
+                return "not_connected"
+            return "err"
+
+        def _bump_browser_state(prev: str, new: str) -> str:
+            # Prefer the most informative state — `ok` > `not_connected`
+            # > `err` > `missing` — so an Outlook-not-signed-in followed
+            # by Gmail-Chrome-missing still surfaces "you weren't signed
+            # in" as the actionable hint.
+            rank = {"missing": 0, "err": 1, "not_connected": 2, "ok": 3}
+            return new if rank.get(new, 0) > rank.get(prev, 0) else prev
+
         _diag("trying browser-auto Gmail read...")
         try:
             browser_res = self._t_email_read_browser({
@@ -2073,6 +2112,8 @@ class ToolExecutor:
         except Exception as exc:
             _diag(f"browser gmail: raised {type(exc).__name__}: {exc}")
             browser_res = None
+        browser_state = _bump_browser_state(browser_state,
+                                            _classify_browser(browser_res))
         if (isinstance(browser_res, dict)
                 and browser_res.get("status") == "ok"
                 and int(browser_res.get("count") or 0) > 0):
@@ -2090,6 +2131,8 @@ class ToolExecutor:
         except Exception as exc:
             _diag(f"browser outlook_web: raised {type(exc).__name__}: {exc}")
             browser_res2 = None
+        browser_state = _bump_browser_state(browser_state,
+                                            _classify_browser(browser_res2))
         if (isinstance(browser_res2, dict)
                 and browser_res2.get("status") == "ok"
                 and int(browser_res2.get("count") or 0) > 0):
@@ -2124,31 +2167,30 @@ class ToolExecutor:
                 parts.append(
                     f"Outlook desktop has "
                     f"{int(outlook_res.get('count') or 0)} unread.")
-            # Gmail
+            # Gmail / Microsoft errors are surfaced for diagnostics
+            # but DON'T trigger a "Connect" chip — neither path is
+            # free-to-ship in public builds (Gmail read needs paid
+            # CASA, MS Graph needs $99/yr Partner verification +
+            # unverified-app warning otherwise). Only free chips
+            # ("Read Gmail in browser", "Read Outlook screen") are
+            # suggested.
             if gmail_errored:
                 msg = str(gmail_res.get("error") or "Gmail error.").strip()
-                parts.append(f"Gmail: {msg}")
-                if "connect_gmail" not in actions:
-                    actions.append("connect_gmail")
+                parts.append(f"Gmail (API): {msg}")
             elif gmail_state == "ok" and gmail_res is not None:
                 parts.append(
-                    f"Gmail has {int(gmail_res.get('count') or 0)} unread.")
-            elif gmail_state == "not_connected":
-                parts.append("Gmail isn't connected.")
-                actions.append("connect_gmail")
-            # Microsoft 365 / Outlook.com via Graph
+                    f"Gmail (API) has "
+                    f"{int(gmail_res.get('count') or 0)} unread.")
             if ms_errored:
                 msg = str(ms_res.get("error") or "Microsoft error.").strip()
-                parts.append(f"Microsoft: {msg}")
-                if "connect_ms" not in actions:
-                    actions.append("connect_ms")
+                parts.append(f"Microsoft (Graph): {msg}")
             elif ms_state == "ok" and ms_res is not None:
                 parts.append(
                     f"Microsoft mailbox has "
                     f"{int(ms_res.get('count') or 0)} unread.")
-            elif ms_state == "not_connected":
-                parts.append("Microsoft isn't connected.")
-                actions.append("connect_ms")
+            # Always offer the truly-free fallbacks.
+            if "read_gmail_in_browser" not in actions:
+                actions.append("read_gmail_in_browser")
             if "read_outlook_screen" not in actions:
                 actions.append("read_outlook_screen")
             return _result(
@@ -2186,27 +2228,46 @@ class ToolExecutor:
 
         # Both connectors checked, both empty — the user's main complaint
         # is that we said "no unread in Gmail" without mentioning Outlook
-        # at all, so this branch explicitly names both.
+        # at all, so this branch explicitly names both. Also mention the
+        # browser-auto path was tried so the user knows we checked
+        # Gmail / Outlook web too (and that webmail is logged in but
+        # empty, vs. logged out).
+        browser_hint = ""
+        if browser_state == "not_connected":
+            browser_hint = (" I also tried reading Gmail/Outlook in your "
+                            "browser but you weren't signed in — open "
+                            "Gmail or Outlook in your browser and stay "
+                            "logged in, then ask me again.")
+        elif browser_state == "ok":
+            browser_hint = (" I also checked Gmail/Outlook in your "
+                            "browser and they're empty too.")
         if gmail_ok_empty and ms_ok_empty:
             return _result(
                 status="ok", count=0, messages=[], source="both",
                 summary=("Both your Gmail and Outlook (Graph) are showing "
-                         "no unread. " + screen_hint),
-                suggested_actions=["read_outlook_screen"])
+                         "no unread." + browser_hint + " " + screen_hint),
+                suggested_actions=["read_gmail_in_browser",
+                                   "read_outlook_in_browser",
+                                   "read_outlook_screen"])
 
         # Exactly one connector returned 0 and the other isn't connected.
         # Name the one we checked AND say plainly that the other wasn't
         # checked — never claim "no unread emails" globally.
-        if gmail_ok_empty and ms_state in ("missing", "not_connected", "unavailable", "not_supported"):
+        if gmail_ok_empty and ms_state in ("missing", "not_connected",
+                                           "unavailable",
+                                           "unavailable_no_mailbox",
+                                           "not_supported"):
             return _result(
                 status="ok", count=0, messages=[], source="gmail",
-                summary=("Your Gmail has no unread. I didn't check Outlook "
-                         "because your Microsoft account isn't connected "
-                         "to Touchless yet — connect it in settings, or "
-                         "say 'read my Outlook screen' and I'll OCR the "
-                         "inbox you have open."),
-                suggested_actions=["connect_ms", "read_outlook_screen"])
-        if ms_ok_empty and gmail_state in ("missing", "not_connected", "unavailable", "not_supported"):
+                summary=("Your Gmail (API) has no unread. For more "
+                         "complete coverage, launch Outlook desktop and "
+                         "I'll read all your accounts there for free, "
+                         "or say 'read my Outlook screen' and I'll OCR "
+                         "the inbox you have open." + browser_hint),
+                suggested_actions=["read_outlook_in_browser",
+                                   "read_outlook_screen"])
+        if ms_ok_empty and gmail_state in ("missing", "not_connected",
+                                           "unavailable", "not_supported"):
             return _result(
                 status="ok", count=0, messages=[], source="microsoft",
                 summary=("Your Microsoft mailbox shows no unread. If "
@@ -2214,27 +2275,381 @@ class ToolExecutor:
                          "iCloud, etc.), launch Outlook desktop with "
                          "that account synced and I'll read it there, "
                          "or say 'read my Outlook screen' and I'll OCR "
-                         "whatever window you have open."),
-                suggested_actions=["read_outlook_screen"])
+                         "whatever window you have open." + browser_hint),
+                suggested_actions=["read_gmail_in_browser",
+                                   "read_outlook_screen"])
 
-        # Nothing reachable. List the actually-shippable free paths
-        # in order of likely-to-work — Outlook desktop comes first
-        # because it covers ANY account Outlook syncs (including
-        # Gmail-via-IMAP). Gmail API reads aren't in the list because
-        # they require Google's paid CASA verification and aren't
-        # shipped in public builds.
+        # Nothing reachable. List the actually-shippable free paths in
+        # order of likely-to-work — Outlook desktop comes first because
+        # it covers ANY account Outlook syncs (including Gmail-via-IMAP).
+        # Gmail API reads aren't in the list because they require
+        # Google's paid CASA verification and aren't shipped in public
+        # builds. The browser-auto path has already been tried at this
+        # point, so we tell the user explicitly what happened with it
+        # rather than offering it as an option that "might work" — if
+        # they weren't signed in, the next step is to sign in.
+        browser_final = ""
+        if browser_state == "not_connected":
+            browser_final = (
+                " I also tried opening Gmail / Outlook in your browser, "
+                "but you weren't signed in there either. (3) Sign into "
+                "Gmail or Outlook in your browser and ask me again — "
+                "I'll read whatever inbox is open.")
+        elif browser_state == "missing":
+            browser_final = (
+                " (3) The browser-auto path needs Chrome — install it "
+                "and I'll be able to read Gmail / Outlook web for free "
+                "without you connecting anything in Touchless.")
+        else:
+            browser_final = (
+                " I also tried reading Gmail / Outlook in your browser "
+                "and it didn't return anything readable.")
         return _result(
             status="ok", count=0, messages=[], source="none",
-            summary=("I can't read your email yet. Two free options: "
-                     "(1) launch Outlook desktop — once it's open, I'll "
-                     "read whatever inbox(es) you have synced there "
-                     "(Gmail via IMAP, Exchange, Outlook.com, all of "
-                     "them); (2) connect a Microsoft account in "
-                     "Touchless settings and I'll read its mailbox via "
-                     "Microsoft Graph. If you'd rather not set either "
-                     "up, say 'read my Outlook screen' and I'll OCR "
-                     "whatever window you have open."),
-            suggested_actions=["connect_ms", "read_outlook_screen"])
+            summary=("I can't read your email yet. Free options that "
+                     "don't need any sign-in dance: (1) launch Outlook "
+                     "desktop — once it's open I'll read whatever "
+                     "inbox(es) you have synced there (Gmail via IMAP, "
+                     "Exchange, Outlook.com, all of them); (2) sign "
+                     "into Gmail or Outlook web in your browser and "
+                     "I'll scrape it for you." + browser_final +
+                     " If none of those work, say 'read my Outlook "
+                     "screen' and I'll OCR whatever window you have open."),
+            suggested_actions=["read_gmail_in_browser",
+                               "read_outlook_in_browser",
+                               "read_outlook_screen"])
+
+    def _t_email_read_browser(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Browser-automation email reader. Final-stage fallback in the
+        email_summary cascade — drives the user's existing Chrome
+        session at mail.google.com or outlook.live.com, parses the
+        visible inbox DOM, and returns the same connector result shape
+        (`status`, `count`, `messages[]`, `summary`, `source`) so the
+        prose renderer / override hook just works.
+
+        Why this exists: many users have webmail open all day but never
+        connect Gmail OAuth (which needs paid CASA verification in
+        public builds anyway) or a Microsoft account in Touchless. The
+        browser scrape uses their already-authenticated browser session
+        — no new credentials change hands and no scope grants needed.
+        Slow (~3-5s cold) so the result is cached per-provider for 60s.
+
+        args:
+          provider: 'gmail' | 'outlook_web' | 'auto' (default: gmail)
+          max: max messages to return (default 10, cap 25)
+          unread_only: filter for unread (default True)
+          include_body: ignored — DOM scrape only gets snippets
+
+        Returns the same shape as gmail_list / ms_mail_list. On failure,
+        returns status='error' with a code the cascade can classify
+        ('cdp_unavailable', 'auth_required', 'no_match', etc.)."""
+        import json as _json
+        import sys as _sys
+        import time as _time
+
+        provider = str(args.get("provider") or "gmail").strip().lower()
+        if provider not in ("gmail", "outlook_web", "outlook", "auto"):
+            provider = "gmail"
+        if provider == "outlook":
+            provider = "outlook_web"
+        max_n = max(1, min(25, int(args.get("max") or 10)))
+        unread_only = bool(args.get("unread_only", True))
+
+        def _diag(msg: str) -> None:
+            try:
+                print(f"[email_read_browser] {msg}",
+                      file=_sys.stderr, flush=True)
+            except Exception:
+                pass
+
+        # 60s cache. Browser scrape is the slowest path in the cascade
+        # (cold-start ~3-5s) so repeated "show my email" / "summarize
+        # again" within a minute should reuse the previous scrape.
+        # Cache key is the provider — different providers don't share.
+        # auth_required results are NOT cached: we want the next call to
+        # retry in case the user just signed in.
+        def _cache_get(key: str) -> Optional[Dict[str, Any]]:
+            entry = self._browser_email_cache.get(key)
+            if not entry:
+                return None
+            ts = float(entry.get("__ts") or 0.0)
+            if _time.time() - ts > self._browser_email_cache_ttl_sec:
+                self._browser_email_cache.pop(key, None)
+                return None
+            cached = dict(entry)
+            cached.pop("__ts", None)
+            _diag(f"cache HIT provider={key}")
+            return cached
+
+        def _cache_put(key: str, value: Dict[str, Any]) -> None:
+            try:
+                if value.get("status") == "ok":
+                    entry = dict(value)
+                    entry["__ts"] = _time.time()
+                    self._browser_email_cache[key] = entry
+            except Exception:
+                pass
+
+        web = self._ensure_web()
+        if web is None:
+            _diag("web controller unavailable")
+            return _result(
+                status="error",
+                error=("Browser-auto email needs the Chrome controller, "
+                       "which isn't available right now."),
+                code="cdp_unavailable")
+
+        # Resolve provider ('auto' -> try Gmail first; the cascade's
+        # outer loop tries outlook_web after gmail anyway).
+        if provider == "auto":
+            provider = "gmail"
+
+        cached = _cache_get(provider)
+        if cached is not None:
+            return cached
+
+        if provider == "gmail":
+            url = "https://mail.google.com/mail/u/0/#inbox"
+            wait_q = "Inbox"
+            sign_in_markers = ("Sign in", "Use your Google Account",
+                               "Choose an account")
+            display = "Gmail"
+            source = "browser_gmail"
+        else:
+            url = "https://outlook.live.com/mail/0/inbox"
+            wait_q = "Inbox"
+            sign_in_markers = ("Sign in", "Sign in to your account")
+            display = "Outlook web"
+            source = "browser_outlook"
+
+        _diag(f"navigating to {display}: {url}")
+        nav = web.navigate(url)
+        if not isinstance(nav, dict) or nav.get("status") != "ok":
+            err_msg = (nav.get("error") if isinstance(nav, dict)
+                       else "navigation failed")
+            code = (nav.get("code") if isinstance(nav, dict)
+                    else "navigate_failed")
+            _diag(f"navigate failed: {err_msg!r} code={code!r}")
+            return _result(status="error",
+                           error=f"{display} navigation failed: {err_msg}",
+                           code=code or "navigate_failed")
+
+        # Give the inbox a chance to render. Don't insist on the literal
+        # word "Inbox" being present (Gmail's basic-HTML mode uses
+        # different chrome) — a short hard wait is enough.
+        try:
+            web.wait_for(wait_q, timeout_sec=8.0)
+        except Exception:
+            pass
+        _time.sleep(0.8)
+
+        # Sign-in detection. If the page redirected to a sign-in screen
+        # or shows a chooser, return a structured auth_required error
+        # so the cascade can mention "open Gmail/Outlook and stay signed
+        # in" in the final fallback message.
+        try:
+            text_probe = web.get_text(max_chars=1500)
+            probe_text = str((text_probe or {}).get("text") or "")
+        except Exception:
+            probe_text = ""
+        if probe_text:
+            lowered = probe_text.lower()
+            for marker in sign_in_markers:
+                if marker.lower() in lowered:
+                    # Heuristic — Gmail's normal inbox also contains
+                    # "Sign in" inside account chooser links. Require
+                    # that the URL is on the sign-in host OR the
+                    # marker is prominent.
+                    cur_url = str(nav.get("url") or "")
+                    if ("signin" in cur_url.lower()
+                            or "login" in cur_url.lower()
+                            or "accounts.google.com" in cur_url.lower()
+                            or marker == "Choose an account"):
+                        _diag(f"sign-in marker {marker!r} at {cur_url!r}")
+                        return _result(
+                            status="error",
+                            error=(f"You're not signed into {display} in "
+                                   "your browser. Open it, sign in, then "
+                                   "ask me again."),
+                            code="auth_required")
+                    break
+
+        # DOM extraction. Try structured selectors first; fall back to
+        # text-parse on the visible inbox text if selectors break (Gmail
+        # / Outlook web ship UI updates frequently, so resilience is
+        # critical — the cascade's whole point is to gracefully degrade).
+        msgs: List[Dict[str, Any]] = []
+        if provider == "gmail":
+            # Gmail full-app DOM: rows are <tr class="zA"> (read) or
+            # "zA zE" (unread). Sender text is in .yX > .yW span; subject
+            # is in .y6 > span (first <span>); snippet is in .y2.
+            # Filter for unread when requested (class contains "zE").
+            js = (
+                "(function(){"
+                "var rows=Array.from(document.querySelectorAll('tr.zA'));"
+                "var unreadOnly=" + ("true" if unread_only else "false") + ";"
+                "if(unreadOnly){"
+                "  rows=rows.filter(function(r){"
+                "    return (r.className||'').indexOf('zE')!==-1;});"
+                "}"
+                "rows=rows.slice(0," + str(max_n) + ");"
+                "return JSON.stringify(rows.map(function(r){"
+                "  var sender='';var senderEl=r.querySelector("
+                "    '.yX .yW span, .yX span, [email]');"
+                "  if(senderEl){sender=(senderEl.getAttribute('email')||"
+                "    senderEl.innerText||'').trim();}"
+                "  var subj='';var subjEl=r.querySelector('.y6 span, .bog');"
+                "  if(subjEl){subj=(subjEl.innerText||'').trim();}"
+                "  var snip='';var snipEl=r.querySelector('.y2');"
+                "  if(snipEl){snip=(snipEl.innerText||'').trim()"
+                "    .replace(/^[\\s\\-\\u2013]+/, '');}"
+                "  var dateEl=r.querySelector('.xW span, .xY span');"
+                "  var date=dateEl?(dateEl.getAttribute('title')||"
+                "    dateEl.innerText||''):'';"
+                "  return {sender:sender,subject:subj,"
+                "    snippet:snip.substring(0,200),date:date};"
+                "}));"
+                "})()")
+            try:
+                ev = web.evaluate(js)
+                raw = (ev or {}).get("result") if isinstance(ev, dict) else None
+                if isinstance(raw, str):
+                    parsed = _json.loads(raw)
+                    if isinstance(parsed, list):
+                        for i, row in enumerate(parsed):
+                            if not isinstance(row, dict):
+                                continue
+                            subj = str(row.get("subject") or "").strip()
+                            sender = str(row.get("sender") or "").strip()
+                            if not subj and not sender:
+                                continue
+                            msgs.append({
+                                "id": f"browser_gmail_{i}",
+                                "from": sender,
+                                "from_name": sender,
+                                "subject": subj or "(no subject)",
+                                "received": str(row.get("date") or ""),
+                                "preview": str(row.get("snippet") or ""),
+                            })
+            except Exception as exc:
+                _diag(f"gmail DOM eval failed: {exc}")
+
+        elif provider == "outlook_web":
+            # Outlook web: rows are [role='option'] inside the message
+            # list. Subject/sender/snippet are in nested ariaLabel-rich
+            # spans. Filter unread by aria-label containing "Unread".
+            js = (
+                "(function(){"
+                "var rows=Array.from(document.querySelectorAll("
+                "  \"[role='option'][aria-label],div[role='listitem']\"));"
+                "var unreadOnly=" + ("true" if unread_only else "false") + ";"
+                "if(unreadOnly){"
+                "  rows=rows.filter(function(r){"
+                "    var al=(r.getAttribute('aria-label')||'').toLowerCase();"
+                "    return al.indexOf('unread')!==-1;});"
+                "}"
+                "rows=rows.slice(0," + str(max_n) + ");"
+                "return JSON.stringify(rows.map(function(r){"
+                "  var text=(r.innerText||'').split('\\n')"
+                "    .map(function(s){return s.trim();})"
+                "    .filter(function(s){return s.length>0;});"
+                "  var sender=text[0]||'';"
+                "  var subject=text[1]||'';"
+                "  var snippet=text.slice(2,4).join(' ');"
+                "  return {sender:sender,subject:subject,"
+                "    snippet:snippet.substring(0,200)};"
+                "}));"
+                "})()")
+            try:
+                ev = web.evaluate(js)
+                raw = (ev or {}).get("result") if isinstance(ev, dict) else None
+                if isinstance(raw, str):
+                    parsed = _json.loads(raw)
+                    if isinstance(parsed, list):
+                        for i, row in enumerate(parsed):
+                            if not isinstance(row, dict):
+                                continue
+                            subj = str(row.get("subject") or "").strip()
+                            sender = str(row.get("sender") or "").strip()
+                            if not subj and not sender:
+                                continue
+                            msgs.append({
+                                "id": f"browser_outlook_{i}",
+                                "from": sender,
+                                "from_name": sender,
+                                "subject": subj or "(no subject)",
+                                "received": "",
+                                "preview": str(row.get("snippet") or ""),
+                            })
+            except Exception as exc:
+                _diag(f"outlook DOM eval failed: {exc}")
+
+        # Selector fallback: if structured extraction returned nothing,
+        # fall back to a text-parse on get_text(). This is brittle but
+        # survives UI iterations that break the selectors above.
+        if not msgs:
+            try:
+                txt_res = web.get_text(max_chars=8000)
+                txt = str((txt_res or {}).get("text") or "")
+            except Exception:
+                txt = ""
+            if txt:
+                lines = [l.strip() for l in txt.split("\n") if l.strip()]
+                # Skip the header / nav chrome — start looking after the
+                # first short line that contains "Inbox".
+                start = 0
+                for i, ln in enumerate(lines):
+                    if "inbox" in ln.lower() and len(ln) < 30:
+                        start = i + 1
+                        break
+                # Heuristic: a message row is 2-3 consecutive lines —
+                # sender, subject, snippet. Skip nav chrome lines.
+                i = start
+                while i < len(lines) and len(msgs) < max_n:
+                    sender = lines[i]
+                    subject = lines[i + 1] if i + 1 < len(lines) else ""
+                    snippet = lines[i + 2] if i + 2 < len(lines) else ""
+                    if (len(sender) > 60 or not sender or
+                            sender.lower().startswith(("compose",
+                                                       "inbox",
+                                                       "starred",
+                                                       "snoozed",
+                                                       "sent",
+                                                       "drafts",
+                                                       "more"))):
+                        i += 1
+                        continue
+                    msgs.append({
+                        "id": f"browser_{provider}_text_{len(msgs)}",
+                        "from": sender,
+                        "from_name": sender,
+                        "subject": subject or "(no subject)",
+                        "received": "",
+                        "preview": snippet[:200],
+                    })
+                    i += 3
+
+        # Deterministic faithful summary built from the real DOM read,
+        # mirroring gmail_list / ms_mail_list. The LLM has fabricated
+        # email content in the past, so we render the reply in code and
+        # tell the model to emit it verbatim.
+        try:
+            from .connectors.gmail_connector import _format_email_summary
+            summary = _format_email_summary(
+                msgs, unread_only=unread_only, max_arg=max_n)
+        except Exception:
+            summary = ""
+
+        _diag(f"{provider}: extracted {len(msgs)} message(s)")
+        result = _result(
+            status="ok",
+            count=len(msgs),
+            messages=msgs,
+            summary=summary,
+            source=source,
+        )
+        _cache_put(provider, result)
+        return result
 
     def _t_weather_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         # Free, no-key weather via wttr.in / Open-Meteo. Auto-detects
