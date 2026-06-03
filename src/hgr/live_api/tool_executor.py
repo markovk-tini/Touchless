@@ -21,6 +21,7 @@ import ctypes
 from ctypes import wintypes
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -276,6 +277,15 @@ class ToolExecutor:
         # last built against — lets us auto-invalidate when the assistant
         # window swaps in fresh data.
         self._iris_world_cache_rich_id: Optional[int] = None
+
+        # 60-second cache for email_read_browser. The browser scrape
+        # spins up CDP, navigates, waits for load, parses DOM — 3-5
+        # seconds cold. A repeat "show my email" / "summarize again"
+        # within a minute reuses this so the user isn't stuck waiting.
+        # Keyed by provider ('gmail'|'outlook_web'); value is the full
+        # result dict returned by _t_email_read_browser.
+        self._browser_email_cache: Dict[str, Dict[str, Any]] = {}
+        self._browser_email_cache_ttl_sec = 60.0
 
     # ---- public ----
 
@@ -540,6 +550,7 @@ class ToolExecutor:
             "compose_text": self._t_compose_text,
             "weather_get": self._t_weather_get,
             "email_summary": self._t_email_summary,
+            "email_read_browser": self._t_email_read_browser,
             "web_search": self._t_web_search,
             "web_navigate": self._t_web_navigate,
             "web_get_links": self._t_web_get_links,
@@ -2022,6 +2033,68 @@ class ToolExecutor:
                     and int(ms_res.get("count") or 0) > 0):
                 ms_res["source"] = "microsoft"
                 return ms_res
+            # MSA-without-mailbox guard. The ms365 connector flags
+            # `mailbox_not_provisioned=True` when count==0 AND the
+            # connected userPrincipalName is on a non-Microsoft domain
+            # (gmail.com, yahoo.com, icloud.com, etc.) — those personal
+            # MSAs typically have NO outlook.com mailbox at all, so
+            # /me/mailFolders/inbox returns 200 with an empty value
+            # array (indistinguishable from "mailbox just happens to be
+            # empty"). If that flag is set, reclassify the MS leg as
+            # `unavailable_no_mailbox` so the downstream "Your Microsoft
+            # mailbox shows no unread" branch doesn't fire on a mailbox
+            # that doesn't exist — fall through to browser-auto instead.
+            if ms_res.get("mailbox_not_provisioned"):
+                _diag(
+                    "[email_summary] MS mailbox empty but user is on "
+                    f"non-MS domain (upn={ms_res.get('upn')!r}) — likely "
+                    "no Outlook mailbox provisioned; continuing cascade.")
+                ms_state = "unavailable_no_mailbox"
+                ms_res = None
+
+        # THIRD STAGE: browser-automation fallback. If every API-backed
+        # connector struck out (not connected / no scope / 0 unread /
+        # not supported), try driving the user's existing Chrome session
+        # at mail.google.com or outlook.live.com. This rescues users
+        # who are logged into webmail but haven't connected any OAuth
+        # account in Touchless — the most common "but I DO have email"
+        # complaint. Browser scrape is 3-5s cold so emit a diagnostic
+        # the user can see in stderr while it works. Skipped silently
+        # if any earlier connector already returned >0 (handled by the
+        # early returns above).
+        _diag("trying browser-auto Gmail read...")
+        try:
+            browser_res = self._t_email_read_browser({
+                "provider": "gmail",
+                "unread_only": unread_only,
+                "max": min(max_n, 25),
+                "include_body": False,
+            })
+        except Exception as exc:
+            _diag(f"browser gmail: raised {type(exc).__name__}: {exc}")
+            browser_res = None
+        if (isinstance(browser_res, dict)
+                and browser_res.get("status") == "ok"
+                and int(browser_res.get("count") or 0) > 0):
+            browser_res["source"] = "browser_gmail"
+            return browser_res
+
+        _diag("trying browser-auto Outlook web read...")
+        try:
+            browser_res2 = self._t_email_read_browser({
+                "provider": "outlook_web",
+                "unread_only": unread_only,
+                "max": min(max_n, 25),
+                "include_body": False,
+            })
+        except Exception as exc:
+            _diag(f"browser outlook_web: raised {type(exc).__name__}: {exc}")
+            browser_res2 = None
+        if (isinstance(browser_res2, dict)
+                and browser_res2.get("status") == "ok"
+                and int(browser_res2.get("count") or 0) > 0):
+            browser_res2["source"] = "browser_outlook"
+            return browser_res2
 
         # Surface connector-level hard errors verbatim so the user sees
         # the REAL failure instead of "no email accounts connected" when

@@ -392,8 +392,67 @@ class Microsoft365Connector(Connector):
                 )
             except Exception:
                 summary = ""
+            # MSA-without-mailbox detection. Microsoft happily grants
+            # Mail.ReadWrite scope for personal MSAs even when those
+            # accounts have NO outlook.com mailbox provisioned (this
+            # is common for MSAs whose username is a Gmail / Yahoo
+            # address — the user signed UP with Microsoft using a
+            # non-MS email, never set up an Outlook mailbox, so
+            # /me/mailFolders/inbox/messages returns HTTP 200 with an
+            # empty `value` array — indistinguishable from "your
+            # mailbox just happens to be empty"). When count==0 we
+            # peek at /me to fetch userPrincipalName + mail; if the
+            # UPN/mail looks like a non-MS domain (gmail.com,
+            # yahoo.com, icloud.com, etc.) we flag
+            # `mailbox_not_provisioned` so the cascade in
+            # tool_executor knows to continue rather than declare
+            # "you're all caught up" on a mailbox that doesn't exist.
+            mailbox_not_provisioned = False
+            upn = ""
+            if len(msgs) == 0:
+                try:
+                    me_data, me_err = self._graph(
+                        "GET", "/me?$select=userPrincipalName,mail")
+                    if not me_err and isinstance(me_data, dict):
+                        upn = str(me_data.get("userPrincipalName")
+                                  or me_data.get("mail") or "").lower()
+                        # MS-managed mailbox UPNs end in @<tenant>.onmicrosoft.com,
+                        # @outlook.com, @hotmail.com, @live.com, @msn.com — or
+                        # a custom Exchange tenant domain. MSAs that signed up
+                        # with a Gmail / Yahoo / iCloud / AOL / GMX address keep
+                        # that as their UPN AND typically don't have a cloud
+                        # mailbox. Treat those as probable-no-mailbox.
+                        msa_no_box_domains = (
+                            "@gmail.com", "@googlemail.com",
+                            "@yahoo.com", "@yahoo.co.uk", "@ymail.com",
+                            "@icloud.com", "@me.com", "@mac.com",
+                            "@aol.com", "@gmx.com", "@gmx.de",
+                            "@protonmail.com", "@proton.me",
+                            "@fastmail.com", "@zoho.com",
+                        )
+                        if upn and any(upn.endswith(d)
+                                       for d in msa_no_box_domains):
+                            mailbox_not_provisioned = True
+                            try:
+                                import sys as _sys
+                                print(
+                                    f"[ms_mail_list] MSA account {upn} "
+                                    "does not appear to have an outlook.com "
+                                    "mailbox provisioned (UPN is on a "
+                                    "non-Microsoft domain and inbox is "
+                                    "empty); cascade will continue.",
+                                    file=_sys.stderr, flush=True)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            extra: Dict[str, Any] = {}
+            if mailbox_not_provisioned:
+                extra["mailbox_not_provisioned"] = True
+                extra["upn"] = upn
             return connector_result("ok", count=len(msgs),
-                                    messages=msgs, summary=summary)
+                                    messages=msgs, summary=summary,
+                                    **extra)
 
         if name == "ms_mail_search":
             q = str(args.get("query") or "").strip()
