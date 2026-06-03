@@ -359,6 +359,21 @@ class AppConfig:
     # surface the dialog because they take noticeably longer and the
     # user deserves to know the app is about to disappear for ~30 sec.
     auto_update_enabled: bool = False
+    # Rate-limiter sentinel for the auto-update path. Written before the
+    # download starts, cleared on successful apply (in _on_installer_ready)
+    # or on failure (in _on_auto_update_failed). If a launch starts and
+    # finds this still equals the freshly-detected update version, it
+    # means a prior auto-attempt for that exact version didn't reach
+    # apply — we fall back to the manual dialog so the user can see what's
+    # going on instead of silently re-downloading 140 MB every launch.
+    auto_update_attempted_version: str = ""
+    # Set to the running __version__ once the in-app self-heal has
+    # written DisplayVersion to the Inno uninstall registry key. Without
+    # this sentinel, 1.1.3 users (whose .bat had no reg-add) would never
+    # get their registry patched because the 1.1.3 → 1.1.4 hop runs OLD
+    # bat code. The self-heal at app startup closes that gap so Microsoft
+    # Store reads the right version on its next check.
+    registry_display_version_patched_for: str = ""
     # Set True once the user has installed the optional higher-accuracy
     # dictation model (ggml-medium.en.bin) via the "Voice Recognition
     # Upgrade" download. Store builds ship only small.en to stay under

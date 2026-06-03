@@ -6091,7 +6091,80 @@ class MainWindow(QMainWindow):
         self._update_checker = None
         self._update_dialog = None
         self._updater = None
+        # Self-heal DisplayVersion in the Inno uninstall registry key.
+        # Critical for the 1.1.3 → 1.1.4 cohort: their .bat helper was
+        # written by 1.1.3 code (no reg-add), so without this, Microsoft
+        # Store keeps re-prompting them on every poll because it reads
+        # the stale 1.1.3 from the registry. Runs once per version then
+        # latches via a config sentinel.
+        QTimer.singleShot(500, self._self_heal_display_version_registry)
         QTimer.singleShot(3000, self._kick_off_update_check)
+
+    def _self_heal_display_version_registry(self) -> None:
+        """One-shot: write the running __version__ to the Inno Setup
+        uninstall registry key's DisplayVersion field if it's not
+        already there. Closes the 1.1.3 → 1.1.4 gap where the running
+        process is on the old code path that doesn't reg-add after
+        apply, so the registry would otherwise stay stamped at the
+        prior version forever. Latches via
+        registry_display_version_patched_for so it only runs once per
+        version per install.
+
+        No-ops gracefully when:
+          - Not frozen (source runs don't have an installed registry key)
+          - Already patched for this version
+          - Registry write fails for any reason (rare on per-user HKCU)
+        """
+        try:
+            from ... import __version__ as RUNNING_VERSION
+            if not getattr(sys, "frozen", False):
+                return
+            already = str(
+                getattr(self.config, "registry_display_version_patched_for", "")
+                or ""
+            ).strip()
+            if already == RUNNING_VERSION:
+                return
+            # Use the same AppId Updater hardcodes (drift risk noted in
+            # the workflow review — worth a future pytest cross-check
+            # against hgr_app.iss).
+            from ..updater.updater import Updater
+            key_suffix = Updater._INNO_APP_ID  # e.g. {2C4EE680-...}_is1
+            from ...utils.subprocess_utils import hidden_subprocess_kwargs
+            import subprocess as _sp
+            for hive in ("HKCU", "HKLM"):
+                try:
+                    _sp.run(
+                        [
+                            "reg", "add",
+                            f"{hive}\\Software\\Microsoft\\Windows\\"
+                            f"CurrentVersion\\Uninstall\\{key_suffix}",
+                            "/v", "DisplayVersion",
+                            "/t", "REG_SZ",
+                            "/d", RUNNING_VERSION,
+                            "/f",
+                        ],
+                        check=False,
+                        capture_output=True,
+                        timeout=5,
+                        **hidden_subprocess_kwargs(),
+                    )
+                except Exception:
+                    # HKLM write will fail unelevated; that's fine —
+                    # per-user installs use HKCU only. The HKLM attempt
+                    # is for the rare elevated-install path where the
+                    # Inno key sits in HKLM. Either succeeds or no-ops.
+                    pass
+            try:
+                self.config.registry_display_version_patched_for = RUNNING_VERSION
+                save_config(self.config)
+            except Exception:
+                pass
+        except Exception:
+            # Self-heal must never crash the app — it's a best-effort
+            # cleanup, the worst case is the Store keeps re-prompting
+            # which is exactly the status quo without this fix.
+            pass
 
     def _kick_off_update_check(self) -> None:
         # Store builds delegate updates to the Microsoft Store — never
@@ -6194,16 +6267,45 @@ class MainWindow(QMainWindow):
             and not manual
         )
         if auto:
-            self._updater.ready_to_launch.connect(self._on_installer_ready)
-            # No dialog wiring — failures land in the system tray notification
-            # instead so the user knows something happened, and the next
-            # launch's prompt will re-offer the update.
-            try:
-                self._show_auto_update_toast(info.version)
-            except Exception:
-                pass
-            self._updater.start_download(info)
-            return
+            # Rate-limiter: if the same version was auto-attempted on a
+            # previous launch and didn't reach ready_to_launch (we never
+            # cleared the sentinel), bail. Without this, a reproducible
+            # failure (Norton quarantine of %LOCALAPPDATA%\Updates\, disk
+            # full, broken DNS to the GH CDN, install dir locked by
+            # OneDrive sync) would re-download ~140 MB on every launch
+            # forever, invisible to the user because of bug #2 below.
+            # Clearing the sentinel on ready_to_launch means a success
+            # path doesn't poison the next genuinely-new version.
+            attempted = str(getattr(self.config, "auto_update_attempted_version", "") or "").strip()
+            if attempted == info.version:
+                # Already tried this version and didn't make it to apply.
+                # Fall back to the manual dialog so the user actually sees
+                # what's happening instead of silently retrying.
+                pass  # fall through to dialog path below
+            else:
+                self._updater.ready_to_launch.connect(self._on_installer_ready)
+                # Wire failed AND progress signals so the user gets a real
+                # signal on every failure mode (network, OS error, AV
+                # quarantine, etc.). Without these the auto path is silent
+                # end-to-end — the 4-sec toast vanishes and nothing else
+                # surfaces. Recovery on failure: clear the sentinel after
+                # a small delay so the user can retry via the manual
+                # dialog on the next poll without restarting the app.
+                self._updater.failed.connect(self._on_auto_update_failed)
+                # Persist the attempted version BEFORE start_download so a
+                # crash mid-download doesn't bypass the rate-limiter on
+                # the next launch.
+                try:
+                    self.config.auto_update_attempted_version = info.version
+                    save_config(self.config)
+                except Exception:
+                    pass
+                try:
+                    self._show_auto_update_toast(info.version)
+                except Exception:
+                    pass
+                self._updater.start_download(info)
+                return
 
         self._update_dialog = UpdateDialog(info, parent=self)
         self._update_dialog.download_requested.connect(self._updater.start_download)
@@ -6227,10 +6329,12 @@ class MainWindow(QMainWindow):
         """Surface a non-blocking notification when the auto-update flow
         starts. Prefer the system tray icon's built-in balloon (already
         wired up on Touchless's tray); fall back to a brief status-bar
-        message if the tray isn't available. Never shows a modal so the
-        user can keep working while the small app-zip downloads."""
+        message if the tray isn't available."""
+        # NOTE: the attribute is `_tray_icon` everywhere else in this file
+        # (search hits at 5880, 5892, 20218+); using `tray_icon` here
+        # silently returned None and the toast never fired in 1.1.4-dev.
         try:
-            tray = getattr(self, "tray_icon", None)
+            tray = getattr(self, "_tray_icon", None)
             if tray is not None and hasattr(tray, "showMessage"):
                 tray.showMessage(
                     "Touchless",
@@ -6245,6 +6349,37 @@ class MainWindow(QMainWindow):
             sb = getattr(self, "statusBar", None)
             if callable(sb):
                 sb().showMessage(f"Updating to {version}...", 4000)
+        except Exception:
+            pass
+
+    def _on_auto_update_failed(self, reason: str) -> None:
+        """Surface auto-update failures via the tray balloon (sticky-ish,
+        10 sec). Without this, the auto path was end-to-end silent on
+        failure — a Norton quarantine of the staging dir, a flaky
+        network, a full disk, or a OneDrive-locked install dir all
+        produced zero user-visible signal.
+
+        Also clears auto_update_attempted_version so the user can retry
+        manually (the next poll will show the dialog as a fallback;
+        without clearing, the rate-limiter would keep them stuck).
+        """
+        try:
+            tray = getattr(self, "_tray_icon", None)
+            if tray is not None and hasattr(tray, "showMessage"):
+                tray.showMessage(
+                    "Touchless — update failed",
+                    f"Auto-update couldn't complete: {reason}\n"
+                    "You'll see a manual update prompt on the next check.",
+                    msecs=10000,
+                )
+        except Exception:
+            pass
+        # Don't keep the sentinel — clearing it lets the next update
+        # check fall back to the manual dialog where the user can read
+        # the error and decide to retry / dismiss.
+        try:
+            self.config.auto_update_attempted_version = ""
+            save_config(self.config)
         except Exception:
             pass
 
@@ -6263,11 +6398,32 @@ class MainWindow(QMainWindow):
         # (full installer vs app-only zip) the ReleaseChecker tagged
         # on the ReleaseInfo. Both paths exit the app on success.
         ok = self._updater.apply_update_and_exit(path) if self._updater else False
+        if ok:
+            # Clear the auto-update rate-limiter sentinel now that the
+            # apply step has been handed off to the bat helper. The
+            # helper writes DisplayVersion in its success branch (and
+            # the running app will be gone by the time it does), so the
+            # next launch's sentinel-check sees an empty value.
+            try:
+                self.config.auto_update_attempted_version = ""
+                save_config(self.config)
+            except Exception:
+                pass
         if not ok and self._update_dialog is not None:
             self._update_dialog.set_failure(
-                "Couldn't apply the update. Try running the installer manually "
-                "from your Downloads or temp folder."
+                "Couldn't apply the update. Check the log under "
+                "%LOCALAPPDATA%\\Touchless\\Updates\\_apply_update.log "
+                "for details."
             )
+        elif not ok:
+            # Auto-update path: no dialog to show the error in, surface
+            # via tray so the user knows something happened.
+            try:
+                self._on_auto_update_failed(
+                    "Apply step failed before launch."
+                )
+            except Exception:
+                pass
 
     def _build_ui(self) -> None:
         outer = QWidget()

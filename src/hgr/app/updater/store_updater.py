@@ -27,7 +27,7 @@ from typing import Any, Optional, Tuple
 
 from PySide6.QtCore import QThread, Signal
 
-from .release_checker import ReleaseInfo, _is_newer, _strip_v_prefix
+from .release_checker import ReleaseInfo, _is_newer, _strip_v_prefix, is_safe_version
 from ... import __version__ as RUNNING_VERSION
 
 
@@ -74,6 +74,16 @@ class StoreUpdateChecker(QThread):
             self.check_failed.emit("Couldn't reach the Microsoft Store.")
             return
         if not version or not _is_newer(version, RUNNING_VERSION):
+            self.no_update.emit()
+            return
+
+        version_clean = _strip_v_prefix(version)
+        if not is_safe_version(version_clean):
+            # Same trust-boundary guard the website ReleaseChecker uses.
+            # The Store manifest version is interpolated into a bat
+            # helper and a registry key, so we refuse anything that
+            # can't be safely shell-escaped. Pretend there's no update.
+            self._log("store_unsafe_version", None)
             self.no_update.emit()
             return
 
@@ -189,11 +199,18 @@ class StoreUpdateChecker(QThread):
         body = str((payload or {}).get("body") or "").strip()
         zip_url = ""
         zip_size = 0
+        # Strict prefix match — case-insensitive — so a future asset
+        # like "Touchless_App_Update_Symbols_<ver>.zip" or any other
+        # name that happens to contain "App_Update" doesn't get picked
+        # up by accident. The earlier substring match was flagged in
+        # the 1.1.4 audit as a real footgun (wrong-asset selection
+        # leaves the user on the OLD Touchless.exe after the apply bat
+        # fails on a missing staged Touchless.exe).
+        prefix = "touchless_app_update_"
         for asset in (payload or {}).get("assets") or []:
             name = str((asset or {}).get("name") or "")
-            # Match the same naming convention release_checker.py uses:
-            # Touchless_App_Update_<version>.zip
-            if "App_Update" in name and name.lower().endswith(".zip"):
+            lname = name.lower()
+            if lname.startswith(prefix) and lname.endswith(".zip"):
                 zip_url = str((asset or {}).get("browser_download_url") or "")
                 try:
                     zip_size = int((asset or {}).get("size") or 0)

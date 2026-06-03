@@ -60,8 +60,14 @@ HTTP_TIMEOUT_SECONDS = 8.0
 # user-facing release notes on GitHub and in the in-app Updates
 # panel. The size is optional — if omitted, the dialog shows
 # "Full update available" without a MB figure.
+# HTTPS only — a release-body typo / compromised release editor that
+# slipped `http://` in here would otherwise route every auto-updater
+# through cleartext, and combined with the lack of digest verification
+# downstream that's an unattended-RCE surface. Reviewers flagged this
+# in the 1.1.4 audit as high-severity even though the cohort impact
+# starts small (only ops who edit release bodies can trip it).
 _FULL_INSTALLER_URL_RE = re.compile(
-    r"<!--\s*full-installer-url:\s*(https?://\S+?)\s*-->",
+    r"<!--\s*full-installer-url:\s*(https://\S+?)\s*-->",
     re.IGNORECASE,
 )
 _FULL_INSTALLER_SIZE_RE = re.compile(
@@ -125,6 +131,27 @@ class ReleaseInfo:
 def _strip_v_prefix(version_str: str) -> str:
     """Strip leading 'v' so 'v1.2.3' and '1.2.3' compare equal."""
     return re.sub(r"^v", "", str(version_str or "").strip(), flags=re.IGNORECASE)
+
+
+# Charset for a "safe" version string we're willing to interpolate into
+# bat-helper command lines, registry values, and filesystem paths. Must
+# start with a digit; the only allowed punctuation is `.`, `-`, `+` and
+# alphanumerics. Hard-capped at 64 chars to bound any downstream buffer.
+# Anything outside this charset is rejected at ReleaseInfo construction
+# (and in StoreUpdateChecker for the Store path) so a tag like
+# "v1.1.4\" /v Bad" or "v1.1.4 & calc.exe" can't reach a shell.
+_SAFE_VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z.+\-]{0,63}$")
+
+
+def is_safe_version(version_str: str) -> bool:
+    """True iff `version_str` matches our hardened version charset.
+    Used as a guard at the trust boundary where remote tag data first
+    becomes a ReleaseInfo. The auto-updater interpolates the result
+    into shell + registry + filename contexts and is too critical a
+    path to leave that interpolation unchecked."""
+    if not version_str:
+        return False
+    return bool(_SAFE_VERSION_RE.match(version_str))
 
 
 def _parse_version_tuple(version_str: str) -> tuple[int, ...]:
@@ -288,8 +315,19 @@ class _CheckWorker(QObject):
             kind = "full-exe"
             fallback = ""
 
+        version_clean = re.sub(r"^v", "", tag, flags=re.IGNORECASE)
+        if not is_safe_version(version_clean):
+            # Refuse to ship a tag we can't safely interpolate downstream.
+            # See is_safe_version() for the trust-boundary argument. The
+            # user just sees "no update available", which is correct —
+            # we have no safe way to apply this one.
+            self.check_failed.emit(
+                f"unsafe version string from release tag: {version_clean!r}"
+            )
+            self.finished.emit()
+            return
         info = ReleaseInfo(
-            version=re.sub(r"^v", "", tag, flags=re.IGNORECASE),
+            version=version_clean,
             body=body,
             download_url=preferred_url,
             html_url=html_url,
