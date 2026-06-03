@@ -69,8 +69,11 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     from .drive_connector import DriveConnector
     from .directions_connector import DirectionsConnector
     from .ms365_connector import Microsoft365Connector
+    from .outlook_com_connector import OutlookComConnector
     from .kicad_cli_connector import KiCadCliConnector
     from .phone_link_connector import PhoneLinkConnector
+    from .ollama_connector import OllamaConnector
+    from .notion_connector import NotionConnector
 
     _add(lambda: VolumeConnector())
     _add(lambda: MediaConnector())
@@ -87,9 +90,22 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     _add(lambda: DriveConnector())
     _add(lambda: DirectionsConnector())
     _add(lambda: Microsoft365Connector())
+    # FREE email reading path — talks to Outlook desktop directly via
+    # COM, no OAuth, no API quotas, no Google verification fees. Wins
+    # for the common case of "user has Outlook open with their email"
+    # which is most of our actual users (their email accounts live in
+    # Outlook regardless of provider).
+    _add(lambda: OutlookComConnector())
     _add(lambda: KiCadCliConnector())
     _add(lambda: PhoneLinkConnector(executor=executor))
     _add(lambda: SpotifyConnector(setup_only=True))
+    _add(lambda: OllamaConnector())
+    # NotionConnector demoted to setup_only: tools() returns [] so it doesn't
+    # compete with web_search for 'my X' phrases (the user doesn't write into
+    # Notion as a primary second-brain). setup_self() is still reachable via
+    # 'set up notion' / iris_setup_tool — flip to setup_only=False the day
+    # Notion becomes an active second brain.
+    _add(lambda: NotionConnector(setup_only=True))
 
     # MCP servers (breadth for everything not hand-written). Each configured
     # server becomes a connector whose tools the search router can discover.
@@ -121,6 +137,7 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
         "drive": "Google Drive upload save file list cloud storage",
         "directions": "directions route navigation distance drive travel time map between places",
         "ms365": "Microsoft 365 Outlook email send read search Microsoft calendar event OneDrive upload Teams message chat Excel spreadsheet cell To Do task reminder OneNote note Contacts Office Copilot",
+        "outlook_com": "Outlook desktop email inbox unread mail message read summarize via COM (works for Exchange Gmail-via-IMAP any account Outlook is connected to — zero setup, no auth)",
     }
     for c in reg._connectors:
         if not getattr(c, "description", ""):

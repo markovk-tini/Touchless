@@ -3,7 +3,7 @@
 
 import os
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_dynamic_libs, collect_data_files
 
 ROOT = Path.cwd()
 SRC = ROOT / "src"
@@ -71,13 +71,77 @@ hiddenimports += [
     "sounddevice",
     "comtypes",
     "pycaw",
+    # WASAPI loopback bridge for clip-cache system-audio capture.
+    # See src/hgr/app/ui/wasapi_loopback.py — no released ffmpeg
+    # has a `wasapi` indev, so we capture render-endpoint output
+    # in Python and pipe raw PCM into ffmpeg's stdin.
+    "pyaudiowpatch",
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
+    # ---- Iris ambient-tools deps (zero-setup for end users) ----------
+    # Each is optional at runtime (graceful degrade), but we want them
+    # PRESENT in the build so a shipped user gets toast / per-app volume
+    # / SMTC media / UIA selection / clipboard WITHOUT any pip install.
+    # Listed here even though Iris itself is excluded today; ready for
+    # when the exclude flips. collect_all() below pulls submodules too.
+    "uiautomation",
+    "win11toast",
+    "winsdk",
+    "winsdk.windows.ui.notifications",
+    "winsdk.windows.media.control",
+    "winsdk.windows.data.xml.dom",
+    "winrt",
+    "win32clipboard",
+    "win32process",
+    "win32api",
+    "win32con",
+    # Outlook desktop COM bridge — free email reading without any
+    # OAuth / API verification fees. See
+    # src/hgr/live_api/connectors/outlook_com_connector.py.
+    "win32com",
+    "win32com.client",
+    "pythoncom",
+    "pywintypes",
+    "mcp",  # MCP bridge core SDK
+    "mcp.client",
+    "mcp.client.stdio",
 ]
+# Pull every submodule of the listed optional deps so dynamic / lazy
+# imports inside them work in a frozen build (winsdk in particular has
+# a huge surface area of generated submodules).
+for _opt in ("winsdk", "winrt", "uiautomation", "win11toast", "mcp"):
+    try:
+        hiddenimports += collect_submodules(_opt)
+    except Exception:
+        # Missing on this dev machine = the build channel will pick it
+        # up later. Don't fail the spec.
+        pass
 hiddenimports = list(dict.fromkeys(hiddenimports))
+
+# PyAudioWPatch bundles its own PortAudio DLL (libportaudio64bit.dll
+# and a _portaudio*.pyd extension module) under the wheel. Hidden-
+# import alone is not enough — PyInstaller's automatic dynamic-lib
+# detection misses the package-relative DLLs, so explicitly collect
+# both binaries and data files. Without this the frozen app's
+# `import pyaudiowpatch` works on the dev box (because pip site-
+# packages is on sys.path) but fails on a clean install with a
+# cryptic "_portaudio not found" message — and our WASAPI loopback
+# bridge silently degrades to "system audio skipped" with no UI
+# feedback. Wrapped in try/except matching the existing
+# collect_submodules pattern above: if pyaudiowpatch isn't installed
+# on this build machine, the build still succeeds and the runtime
+# falls back to no-system-audio.
+try:
+    binaries += collect_dynamic_libs("pyaudiowpatch")
+except Exception:
+    pass
+try:
+    datas += collect_data_files("pyaudiowpatch")
+except Exception:
+    pass
 
 for source_path, target_name in (
     (ASSETS, "assets"),

@@ -1980,6 +1980,19 @@ class ToolExecutor:
             _diag(f"{connector_id}.{tool_name}: ok count={count}")
             return ("ok", result)
 
+        # FREE-FIRST cascade. Try Outlook desktop COM before any cloud
+        # API: it's zero-auth, reads whatever account(s) Outlook is
+        # actually syncing (Exchange, IMAP, Gmail-via-IMAP, anything),
+        # is faster than HTTP for an inbox the user already has open,
+        # and costs nothing. Falls through to Gmail/MS Graph only if
+        # Outlook desktop isn't installed or has no unread.
+        outlook_state, outlook_res = _try("outlook_com", "outlook_com_list")
+        if outlook_state == "ok" and outlook_res is not None:
+            if (outlook_res.get("status") == "ok"
+                    and int(outlook_res.get("count") or 0) > 0):
+                outlook_res["source"] = "outlook_desktop"
+                return outlook_res
+
         # Per-connector state for accurate cascade messaging below.
         gmail_state, gmail_res = _try("gmail", "gmail_list")
         if gmail_state == "ok" and gmail_res is not None:
@@ -2038,6 +2051,20 @@ class ToolExecutor:
         ms_ok_empty = (ms_state == "ok" and ms_res is not None
                        and ms_res.get("status") == "ok"
                        and int(ms_res.get("count") or 0) == 0)
+        outlook_ok_empty = (outlook_state == "ok"
+                            and outlook_res is not None
+                            and outlook_res.get("status") == "ok"
+                            and int(outlook_res.get("count") or 0) == 0)
+
+        # Strongest case: Outlook desktop returned 0 unread. That IS
+        # the user's actual inbox in nearly every case (whichever
+        # provider, Outlook is what they see). Trust it.
+        if outlook_ok_empty:
+            return _result(
+                status="ok", count=0, messages=[],
+                source="outlook_desktop",
+                summary=("You're all caught up — nothing unread in "
+                         "your Outlook inbox."))
 
         screen_hint = ("If you have an inbox open in Outlook desktop that "
                        "the connectors can't see (e.g. an IMAP/Exchange "
