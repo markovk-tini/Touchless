@@ -461,6 +461,9 @@ class Classifier:
             r"(?:summarize|read|check|catch\s+me\s+up\s+on|show\s+me)\s+"
             r"(?:my\s+)?(?:unread|inbox|mail|emails?)"
             r"|"
+            r"(?:do\s+i\s+have|got|any)\s+(?:any\s+)?"
+            r"(?:new\s+|recent\s+)?unread\b"
+            r"|"
             r"what(?:[’'´]?s|s'?s| is)\s+(?:in\s+)?my\s+(?:inbox|mail)"
             r")\b",
             t, flags=re.IGNORECASE,

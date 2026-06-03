@@ -1926,69 +1926,108 @@ class ToolExecutor:
         sub_args = {"unread_only": unread_only, "max": max_n,
                     "include_body": include_body}
 
-        def _try(connector_id: str, tool_name: str) -> Optional[Dict[str, Any]]:
+        # _try returns a 3-state shape so the cascade can distinguish:
+        #   ("missing",     None)   -> connector class isn't even wired up
+        #   ("unavailable", None)   -> connector exists but available()=False
+        #                             (user hasn't connected/authenticated)
+        #   ("ok",          result) -> connector ran; result is the dict
+        # Without this 3-state, the old code couldn't tell "Outlook wasn't
+        # checked" from "Outlook has 0 unread" — which produced the
+        # infamous 'No unread emails in your Gmail account' message even
+        # when the user has tons of unread in Outlook desktop.
+        def _try(connector_id: str, tool_name: str) -> tuple:
             try:
                 connector = self._registry.find_connector(connector_id)
             except Exception:
                 connector = None
             if connector is None:
-                return None
+                return ("missing", None)
             try:
                 if not connector.available():
-                    return None
+                    return ("unavailable", None)
             except Exception:
-                return None
+                return ("unavailable", None)
             try:
-                return connector.execute(tool_name, dict(sub_args))
+                return ("ok", connector.execute(tool_name, dict(sub_args)))
             except Exception as exc:
-                return _result(status="error",
-                               error=f"{type(exc).__name__}: {exc}",
-                               code="connector_failed")
+                return ("ok", _result(
+                    status="error",
+                    error=f"{type(exc).__name__}: {exc}",
+                    code="connector_failed"))
 
-        attempts: List[tuple] = []
+        # Per-connector state for accurate cascade messaging below.
+        gmail_state, gmail_res = _try("gmail", "gmail_list")
+        if gmail_state == "ok" and gmail_res is not None:
+            if (gmail_res.get("status") == "ok"
+                    and int(gmail_res.get("count") or 0) > 0):
+                gmail_res["source"] = "gmail"
+                return gmail_res
 
-        # 1) Gmail first if connected
-        gmail = _try("gmail", "gmail_list")
-        if gmail is not None:
-            attempts.append(("gmail", gmail))
-            if (gmail.get("status") == "ok"
-                    and int(gmail.get("count") or 0) > 0):
-                gmail["source"] = "gmail"
-                return gmail
+        ms_state, ms_res = _try("ms365", "ms_mail_list")
+        if ms_state == "ok" and ms_res is not None:
+            if (ms_res.get("status") == "ok"
+                    and int(ms_res.get("count") or 0) > 0):
+                ms_res["source"] = "microsoft"
+                return ms_res
 
-        # 2) Microsoft (Outlook / Exchange) — common case the user has
-        #    real unread that aren't in their Gmail account.
-        ms = _try("ms365", "ms_mail_list")
-        if ms is not None:
-            attempts.append(("microsoft", ms))
-            if (ms.get("status") == "ok"
-                    and int(ms.get("count") or 0) > 0):
-                ms["source"] = "microsoft"
-                return ms
+        # Surface a connector-level hard error verbatim so the user sees the
+        # real failure instead of a misleading "no unread" message.
+        for state, res in ((gmail_state, gmail_res), (ms_state, ms_res)):
+            if state == "ok" and res is not None and res.get("status") != "ok":
+                return res
 
-        # 3) Both empty (or only one connected and it returned 0). Surface
-        #    a helpful summary so the model emits the right next step
-        #    (offer to open Outlook + read_screen).
-        sources_tried = [s for s, _ in attempts]
-        if not sources_tried:
+        gmail_ok_empty = (gmail_state == "ok" and gmail_res is not None
+                          and gmail_res.get("status") == "ok"
+                          and int(gmail_res.get("count") or 0) == 0)
+        ms_ok_empty = (ms_state == "ok" and ms_res is not None
+                       and ms_res.get("status") == "ok"
+                       and int(ms_res.get("count") or 0) == 0)
+
+        screen_hint = ("If you have an inbox open in Outlook desktop that "
+                       "the connectors can't see (e.g. an IMAP/Exchange "
+                       "account that's not connected to Touchless yet), "
+                       "say 'read my Outlook screen' and I'll OCR the "
+                       "inbox you have open.")
+
+        # Both connectors checked, both empty — the user's main complaint
+        # is that we said "no unread in Gmail" without mentioning Outlook
+        # at all, so this branch explicitly names both.
+        if gmail_ok_empty and ms_ok_empty:
             return _result(
-                status="ok", count=0, messages=[], source="none",
-                summary=("No email connector is wired up — connect Gmail "
-                         "or your Microsoft account in Touchless settings "
-                         "to summarize your inbox. Or open Outlook and "
-                         "I can read what's on screen."))
-        last = attempts[-1][1]
-        if last.get("status") != "ok":
-            return last  # surface the connector error verbatim
-        readable = " and ".join(sources_tried)
+                status="ok", count=0, messages=[], source="both",
+                summary=("Both your Gmail and Outlook (Graph) are showing "
+                         "no unread. " + screen_hint))
+
+        # Exactly one connector returned 0 and the other isn't connected.
+        # Name the one we checked AND say plainly that the other wasn't
+        # checked — never claim "no unread emails" globally.
+        if gmail_ok_empty and ms_state != "ok":
+            return _result(
+                status="ok", count=0, messages=[], source="gmail",
+                summary=("Your Gmail has no unread. I didn't check Outlook "
+                         "because your Microsoft account isn't connected "
+                         "to Touchless yet — connect it in settings, or "
+                         "say 'read my Outlook screen' and I'll OCR the "
+                         "inbox you have open."))
+        if ms_ok_empty and gmail_state != "ok":
+            return _result(
+                status="ok", count=0, messages=[], source="microsoft",
+                summary=("Your Outlook (via Microsoft Graph) has no "
+                         "unread. I didn't check Gmail because it isn't "
+                         "connected to Touchless yet — connect it in "
+                         "settings, or say 'read my Outlook screen' and "
+                         "I'll OCR the inbox you have open."))
+
+        # Neither connector is wired up / available at all. Be explicit
+        # about both options (connect, or screen-read).
         return _result(
-            status="ok", count=0, messages=[],
-            source=sources_tried[-1],
-            summary=(f"No unread emails in your {readable} account"
-                     + ("s" if len(sources_tried) > 1 else "")
-                     + ". If your inbox lives in Outlook on the desktop "
-                     "and you want me to summarize what's open there, "
-                     "say 'read my Outlook screen'."))
+            status="ok", count=0, messages=[], source="none",
+            summary=("I don't have Gmail or Outlook connected via the "
+                     "connectors. To summarize your inbox I can either "
+                     "(a) connect Gmail / Microsoft in Touchless "
+                     "settings, or (b) read your Outlook desktop window "
+                     "directly — say 'read my Outlook screen' and I'll "
+                     "OCR it."))
 
     def _t_weather_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         # Free, no-key weather via wttr.in / Open-Meteo. Auto-detects

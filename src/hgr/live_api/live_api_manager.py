@@ -241,15 +241,21 @@ def build_system_instructions() -> str:
         "fold (a long inbox/doc), call read_screen with scroll_passes (e.g. "
         "6) so it scrolls and reads ALL of it — don't say items may be "
         "hidden, just scroll.\n"
-        "EMAIL READS / SUMMARIES (HARD RULE — connector first, screen-read "
-        "last): for ANY 'read/summarize/check/show my email(s) / inbox / "
-        "unread' request, ALWAYS call find_capability('summarize unread "
-        "emails') FIRST. It loads the fast API tool — gmail_list when Gmail "
-        "is connected, ms_mail_list for Microsoft accounts. Call it with "
-        "unread_only=true AND max=50 AND include_body=true so you actually "
-        "get every unread message (default max is 10, which would silently "
-        "truncate a real inbox). FINAL REPLY: gmail_list and ms_mail_list "
-        "BOTH return a `summary` field containing a faithful, "
+        "EMAIL READS / SUMMARIES (HARD RULE — email_summary FIRST, "
+        "screen-read last): for ANY 'read/summarize/check/show my "
+        "email(s) / inbox / unread' request, ALWAYS call email_summary "
+        "FIRST — it is the PRIMARY tool for this. It auto-cascades "
+        "Gmail → Microsoft (Outlook) → helpful fallback, so it always "
+        "finds the user's real inbox whether it lives in Gmail or "
+        "Outlook. Call it with unread_only=true AND max=50 (the cap) "
+        "so you get every unread message. DO NOT call gmail_list or "
+        "ms_mail_list directly for general 'summarize my unread' "
+        "requests — they only check ONE account and will return 0 if "
+        "the user's real inbox lives in the other account. Use "
+        "gmail_list / ms_mail_list ONLY for account-specific SEARCHES "
+        "with a query (e.g. 'emails from boss@example.com', 'find my "
+        "Gmail message about the invoice'). FINAL REPLY: email_summary "
+        "returns a `summary` field containing a faithful, "
         "deterministically-rendered summary of the real messages (built "
         "directly from the message array — every sender, subject, and "
         "snippet is real). EMIT `result.summary` VERBATIM as your reply — "
@@ -260,14 +266,14 @@ def build_system_instructions() -> str:
         "in the past when given that freedom. Only if `result.summary` "
         "is missing or empty, fall back to summarizing from "
         "`result.messages` and quote sender/subject/snippet fields "
-        "VERBATIM. If `result.count` is 0, the user has no unread. "
-        "Only if find_capability returns NOTHING (no email connector "
-        "wired) fall back to open_app('outlook') + read_screen. Do NOT "
-        "default to opening Outlook + read_screen when a connector is "
-        "available. Do NOT compose a new email when asked to READ one. "
-        "To read ONE email's full body via the connector pass "
-        "include_body=true on the list call (or gmail_read with the id) "
-        "instead of clicking into the message in a window.\n"
+        "VERBATIM. If `result.count` is 0 and `result.source` is "
+        "'none', no email connector is wired — fall back to "
+        "open_app('outlook') + read_screen. Do NOT default to opening "
+        "Outlook + read_screen when a connector is available. Do NOT "
+        "compose a new email when asked to READ one. To read ONE "
+        "email's full body via the connector pass include_body=true on "
+        "email_summary (or gmail_read with the id) instead of clicking "
+        "into the message in a window.\n"
         "PERSONAL TEAMS / APPS WITH NO API: teams_send/teams_channel_post work "
         "only for work/school Microsoft accounts. For a PERSONAL Teams account "
         "(or any app the connectors don't cover), DRIVE THE APP BY SCREEN: "
@@ -507,6 +513,20 @@ class LiveApiManager(QObject):
         self._nudge_count = 0
         self._nudge_max = 6
         self._turn_text = ""          # assistant text accumulated this response
+        # ---- deterministic-summary override ----
+        # When a tool in DETERMINISTIC_SUMMARY_TOOLS returns a dict with a
+        # non-empty top-level 'summary' string, we OVERRIDE the LLM's
+        # rephrased reply with that exact summary. The realtime model would
+        # otherwise paraphrase weather/email summaries — losing precision
+        # and burning tokens. The override is set in _dispatch_function_call
+        # after the tool runs, then consumed in the response.text.done
+        # handler (which skips speaking the LLM text and lets the override
+        # path own the reply). _last_override_tool tracks the most recent
+        # summary tool so chained tool calls (e.g. weather_get THEN
+        # gmail_send) don't apply the first tool's override to the second
+        # tool's reply.
+        self._pending_override_text: Optional[str] = None
+        self._last_override_tool: str = ""
         self._last_user_text = ""     # for realtime fact-extraction observation
         self._memory_summary_sent = False  # send memory note once per session
         self._failed_retries = 0      # retries used for a failed response turn
@@ -2004,6 +2024,57 @@ class LiveApiManager(QObject):
             # Skip when TOUCHLESS_REALTIME_AUDIO=1 is set: in that mode
             # Realtime is already streaming audio deltas and speaking
             # the text itself, so double-speaking must be avoided.
+            # ---- deterministic-summary override consumption ----
+            # If a summary tool armed an override during this turn, REPLACE
+            # the LLM's accumulated reply with the override text in BOTH
+            # the chat bubble (via assistant_text.emit) and the spoken
+            # audio (via _speak_text). The LLM may have already streamed
+            # text into the bubble — we emit the override as a follow-up
+            # so the displayed reply and spoken reply match the
+            # deterministic summary. After consuming, clear the override
+            # so the next turn starts clean.
+            override = self._pending_override_text
+            self._pending_override_text = None
+            self._last_override_tool = ""
+            if override:
+                try:
+                    import sys as _sys
+                    print(f"[OVERRIDE] fired chars={len(override)}",
+                          file=_sys.stderr, flush=True)
+                except Exception:
+                    pass
+                if self._logger:
+                    try:
+                        self._logger.event(
+                            "deterministic_summary_override_fired",
+                            chars=len(override))
+                    except Exception:
+                        pass
+                try:
+                    # Start a fresh bubble so the override replaces the
+                    # LLM's (possibly already-streamed) paraphrase rather
+                    # than appending to it.
+                    self.assistant_message_break.emit()
+                    self.assistant_text.emit(override)
+                except Exception:
+                    pass
+                try:
+                    self._emit_reply_output_pulse(override)
+                except Exception:
+                    pass
+                if os.environ.get("TOUCHLESS_REALTIME_AUDIO", "0") != "1":
+                    try:
+                        self._speak_text(override)
+                    except Exception as exc:
+                        if self._logger:
+                            try:
+                                self._logger.exception(
+                                    "override_speak_failed", exc)
+                            except Exception:
+                                pass
+                self._set_state(LiveApiState.LISTENING, "Listening")
+                return
+
             if os.environ.get("TOUCHLESS_REALTIME_AUDIO", "0") != "1":
                 spoken = (self._turn_text or "").strip()
                 if spoken:
@@ -2084,6 +2155,11 @@ class LiveApiManager(QObject):
         if kind == "response.created":
             self._response_active = True
             self._turn_text = ""  # reset per-response assistant text
+            # Defensive: clear any stale summary override that didn't get
+            # consumed on the prior response (shouldn't happen in normal
+            # flow, but a malformed event stream could leave one set).
+            self._pending_override_text = None
+            self._last_override_tool = ""
             # Each new response is a NEW reply — start a fresh chat bubble so
             # replies don't concatenate into one growing box.
             self.assistant_message_break.emit()
@@ -2096,6 +2172,57 @@ class LiveApiManager(QObject):
             output_kinds = [str(item.get("type") or "") for item in output if isinstance(item, dict)]
             status = str(resp.get("status") or "")
             status_details = resp.get("status_details")
+            # ---- deterministic-summary override (cancel fallback) ----
+            # When we cancelled the LLM mid-reply to save tokens (an
+            # override was armed), response.text.done may NOT fire — the
+            # response ends as status="cancelled" instead. Consume the
+            # override HERE so the summary still reaches the user. If a
+            # normal "completed" response landed and text.done already
+            # consumed the override, _pending_override_text is already
+            # None and this block is a no-op.
+            override = self._pending_override_text
+            if override and status in ("cancelled", "incomplete"):
+                self._pending_override_text = None
+                self._last_override_tool = ""
+                try:
+                    import sys as _sys
+                    print(f"[OVERRIDE] fired (cancelled) chars={len(override)}",
+                          file=_sys.stderr, flush=True)
+                except Exception:
+                    pass
+                if self._logger:
+                    try:
+                        self._logger.event(
+                            "deterministic_summary_override_fired_cancelled",
+                            chars=len(override), status=status)
+                    except Exception:
+                        pass
+                try:
+                    self.assistant_message_break.emit()
+                    self.assistant_text.emit(override)
+                except Exception:
+                    pass
+                try:
+                    self._emit_reply_output_pulse(override)
+                except Exception:
+                    pass
+                if os.environ.get("TOUCHLESS_REALTIME_AUDIO", "0") != "1":
+                    try:
+                        self._speak_text(override)
+                    except Exception as exc:
+                        if self._logger:
+                            try:
+                                self._logger.exception(
+                                    "override_speak_failed", exc)
+                            except Exception:
+                                pass
+                # Treat cancelled-with-override as a successful turn so
+                # we don't fall into the retry / TPM-error path below.
+                self._response_active = False
+                self._failed_retries = 0
+                self._set_state(LiveApiState.LISTENING, "Listening")
+                self._drain_pending()
+                return
             if self._logger:
                 self._logger.event(
                     "response_done_summary",
@@ -2237,6 +2364,18 @@ class LiveApiManager(QObject):
     # by the user before they run (sending email, etc.).
     _CONFIRM_BEFORE_TOOLS = {"gmail_send", "email_send", "ms_mail_send", "teams_send",
                              "teams_channel_post"}
+
+    # Tools whose JSON result contains a deterministic, pre-formatted
+    # `summary` string that we want the user to hear/see VERBATIM — the
+    # realtime model is NOT allowed to rephrase, truncate, or reorder
+    # weather forecasts and email digests. When the tool returns a dict
+    # with a non-empty top-level `summary` field AND its name is in this
+    # set, _dispatch_function_call sets self._pending_override_text and
+    # cancels the LLM's in-flight reply. The response.text.done handler
+    # then short-circuits the LLM text and emits/speaks the summary.
+    _DETERMINISTIC_SUMMARY_TOOLS = {
+        "weather_get", "gmail_list", "ms_mail_list", "email_summary",
+    }
 
     def _confirm_connector_action(self, name: str, args: Dict[str, Any]) -> bool:
         """Ask the user before an irreversible connector action. Returns True
@@ -2427,6 +2566,80 @@ class LiveApiManager(QObject):
                 tool=name, source=source, status=str(output.get("status", "")),
                 call_id=call_id))
         self.tool_event.emit("completed", {"name": name, "call_id": call_id, "status": output.get("status"), "source": source})
+
+        # ---- deterministic-summary override ----
+        # Weather/email "summary" tools return a pre-formatted string that
+        # the realtime model is NOT allowed to rephrase. If THIS tool is
+        # one of those AND it returned a non-empty top-level `summary`,
+        # stash it; response.text.done will replace the LLM's reply with
+        # this exact text. Chained-tool safety: we always OVERWRITE the
+        # pending override here (later summary tools win), and clear it if
+        # a non-summary tool fired most recently — so 'send me an email
+        # with today's weather' speaks the gmail_send result, not the
+        # weather summary captured earlier.
+        try:
+            if isinstance(output, dict) and name in self._DETERMINISTIC_SUMMARY_TOOLS:
+                summary_val = output.get("summary")
+                if isinstance(summary_val, str) and summary_val.strip():
+                    self._pending_override_text = summary_val.strip()
+                    self._last_override_tool = name
+                    try:
+                        import sys as _sys
+                        print(f"[OVERRIDE] tool={name} chars={len(self._pending_override_text)}",
+                              file=_sys.stderr, flush=True)
+                    except Exception:
+                        pass
+                    if self._logger:
+                        try:
+                            self._logger.event(
+                                "deterministic_summary_override_armed",
+                                tool=name, chars=len(self._pending_override_text))
+                        except Exception:
+                            pass
+                    # Cancel the LLM's in-flight reply so we don't pay
+                    # tokens for text we'll discard. Safe even if the
+                    # model has not yet started streaming text: the server
+                    # treats response.cancel as a no-op when no response
+                    # is active.
+                    try:
+                        cancel_fn = getattr(client, "cancel_response", None)
+                        if callable(cancel_fn):
+                            cancel_fn()
+                    except Exception as exc:
+                        if self._logger:
+                            try:
+                                self._logger.exception(
+                                    "override_cancel_failed", exc)
+                            except Exception:
+                                pass
+                    # Surface override in the tool-event stream for UI/debug.
+                    try:
+                        self.tool_event.emit("override", {
+                            "name": name, "call_id": call_id,
+                            "chars": len(self._pending_override_text),
+                        })
+                    except Exception:
+                        pass
+            elif name not in self._DETERMINISTIC_SUMMARY_TOOLS:
+                # A non-override tool ran AFTER (or instead of) a summary
+                # tool — its reply should NOT be hijacked by a stale
+                # override from earlier in the same response cycle.
+                if self._pending_override_text is not None:
+                    if self._logger:
+                        try:
+                            self._logger.event(
+                                "deterministic_summary_override_cleared",
+                                cleared_by=name, prior_tool=self._last_override_tool)
+                        except Exception:
+                            pass
+                    self._pending_override_text = None
+                self._last_override_tool = ""
+        except Exception as exc:  # never let override logic break the loop
+            if self._logger:
+                try:
+                    self._logger.exception("override_detect_failed", exc)
+                except Exception:
+                    pass
 
         # Always submit the tool output (conversation.item.create is allowed
         # even mid-response). The follow-up response.create is GATED: if the

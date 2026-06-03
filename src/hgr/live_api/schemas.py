@@ -1708,6 +1708,54 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "email_summary",
+        "description": (
+            "PRIMARY tool for ANY 'summarize / read / check / show my "
+            "unread emails / inbox' request. AUTO-CASCADES across "
+            "accounts: tries Gmail first, falls back to Microsoft "
+            "(Outlook) if Gmail is empty or not connected, and surfaces "
+            "a helpful pointer to open Outlook + read_screen if neither "
+            "account is wired. DO NOT call gmail_list or ms_mail_list "
+            "directly for general 'summarize my unread' requests — they "
+            "only see ONE account and miss the user's real inbox if it "
+            "lives elsewhere. Returns the same shape as gmail_list / "
+            "ms_mail_list (status, count, messages[], summary, source) "
+            "with a pre-rendered, deterministically-built `summary` "
+            "field. EMIT result.summary VERBATIM as your reply — do not "
+            "rephrase, do not re-summarize, do not invent senders or "
+            "subjects. Use gmail_list / ms_mail_list ONLY for "
+            "account-specific SEARCHES (e.g. 'emails from "
+            "boss@example.com', 'show my Gmail messages from last "
+            "Tuesday')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "unread_only": {
+                    "type": "boolean",
+                    "description": "Limit to unread messages (default true).",
+                    "default": True,
+                },
+                "max": {
+                    "type": "integer",
+                    "description": ("Max messages to summarize per account "
+                                    "(default 50, capped at 50)."),
+                    "default": 50,
+                },
+                "include_body": {
+                    "type": "boolean",
+                    "description": ("Include message bodies in the summary "
+                                    "(default false; set true only if the "
+                                    "user explicitly asks for full content)."),
+                    "default": False,
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "type": "function",
         "name": "clipboard_transform",
         "description": (
             "Read the clipboard, run an instruction over its text via "

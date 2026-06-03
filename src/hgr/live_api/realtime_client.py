@@ -460,6 +460,12 @@ class RealtimeClient:
     def request_response(self) -> bool:
         return self._send({"type": "response.create"})
 
+    def cancel_response(self) -> bool:
+        """Cancel the in-flight response. Used when the manager has chosen
+        to override the model's reply with a deterministic tool summary, so
+        we don't pay tokens to generate text we'll discard."""
+        return self._send({"type": "response.cancel"})
+
     # ---- internal ----
 
     def _fire_error(self, message: str) -> None:
