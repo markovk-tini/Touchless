@@ -1931,10 +1931,15 @@ class ToolExecutor:
         #   ("unavailable", None)   -> connector exists but available()=False
         #                             (user hasn't connected/authenticated)
         #   ("ok",          result) -> connector ran; result is the dict
-        # Without this 3-state, the old code couldn't tell "Outlook wasn't
-        # checked" from "Outlook has 0 unread" — which produced the
-        # infamous 'No unread emails in your Gmail account' message even
-        # when the user has tons of unread in Outlook desktop.
+        #   ("err",         result) -> connector ran but returned status=error
+        #                             (e.g. wrong scope on the OAuth token)
+        # We do NOT pre-check available() because connectors lie: Gmail's
+        # ready() can return False when the user IS connected but
+        # granted the compose-only scope, missing gmail.readonly for
+        # reads. Letting execute() run lets the connector surface its
+        # own precise error ("Reading email needs gmail.readonly —
+        # reconnect to grant the new scope") instead of falsely
+        # claiming "not connected".
         def _try(connector_id: str, tool_name: str) -> tuple:
             try:
                 connector = self._registry.find_connector(connector_id)
@@ -1943,17 +1948,24 @@ class ToolExecutor:
             if connector is None:
                 return ("missing", None)
             try:
-                if not connector.available():
-                    return ("unavailable", None)
-            except Exception:
-                return ("unavailable", None)
-            try:
-                return ("ok", connector.execute(tool_name, dict(sub_args)))
+                result = connector.execute(tool_name, dict(sub_args))
             except Exception as exc:
-                return ("ok", _result(
+                return ("err", _result(
                     status="error",
                     error=f"{type(exc).__name__}: {exc}",
                     code="connector_failed"))
+            if isinstance(result, dict) and result.get("status") == "error":
+                # Distinguish "not connected at all" from "connected but
+                # the call failed for another reason" by re-checking
+                # availability AFTER the failure.
+                try:
+                    available_now = bool(connector.available())
+                except Exception:
+                    available_now = False
+                if not available_now:
+                    return ("unavailable", result)
+                return ("err", result)
+            return ("ok", result)
 
         # Per-connector state for accurate cascade messaging below.
         gmail_state, gmail_res = _try("gmail", "gmail_list")
@@ -1970,11 +1982,37 @@ class ToolExecutor:
                 ms_res["source"] = "microsoft"
                 return ms_res
 
-        # Surface a connector-level hard error verbatim so the user sees the
-        # real failure instead of a misleading "no unread" message.
-        for state, res in ((gmail_state, gmail_res), (ms_state, ms_res)):
-            if state == "ok" and res is not None and res.get("status") != "ok":
-                return res
+        # Surface connector-level hard errors verbatim so the user sees
+        # the REAL failure instead of "no email accounts connected" when
+        # actually Gmail is connected but the OAuth grant is missing
+        # gmail.readonly scope. The connector's own error message tells
+        # the user exactly how to fix it. Wrap it in a friendly summary
+        # so the prose renderer + override hook display it well.
+        gmail_errored = (gmail_state == "err" and gmail_res is not None
+                         and gmail_res.get("status") == "error")
+        ms_errored = (ms_state == "err" and ms_res is not None
+                      and ms_res.get("status") == "error")
+        if gmail_errored or ms_errored:
+            parts: List[str] = []
+            if gmail_errored:
+                msg = str(gmail_res.get("error") or "Gmail error.").strip()
+                parts.append(f"Gmail returned an error: {msg}")
+            elif gmail_state == "ok" and gmail_res is not None:
+                parts.append(
+                    f"Your Gmail has {int(gmail_res.get('count') or 0)} "
+                    f"unread.")
+            if ms_errored:
+                msg = str(ms_res.get("error") or "Microsoft error.").strip()
+                parts.append(f"Outlook returned an error: {msg}")
+            elif ms_state == "ok" and ms_res is not None:
+                parts.append(
+                    f"Outlook has {int(ms_res.get('count') or 0)} unread.")
+            elif ms_state == "missing" or ms_state == "unavailable":
+                parts.append("Outlook isn't connected to Touchless.")
+            return _result(
+                status="ok", count=0, messages=[],
+                source="error",
+                summary=" ".join(parts))
 
         gmail_ok_empty = (gmail_state == "ok" and gmail_res is not None
                           and gmail_res.get("status") == "ok"

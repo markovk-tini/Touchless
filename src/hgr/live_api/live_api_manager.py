@@ -2383,6 +2383,19 @@ class LiveApiManager(QObject):
             message = str(err.get("message") or err)
             code = str(err.get("code") or err.get("type") or "")
             param = str(err.get("param") or "")
+            # Benign races we should NOT spam the user with:
+            #  - response_cancel_not_active: we tried to cancel but the
+            #    response already completed naturally. Harmless; happens
+            #    by design when the deterministic-summary override
+            #    arrives just after the LLM's text.done.
+            #  - response.cancel-related conversation_already_has_active_response:
+            #    similar lifecycle race during fast back-to-back tool calls.
+            _benign_codes = {
+                "response_cancel_not_active",
+                "conversation_already_has_active_response",
+            }
+            if code in _benign_codes:
+                return
             details = message
             if code:
                 details = f"[{code}] {details}"
@@ -2649,21 +2662,22 @@ class LiveApiManager(QObject):
                         except Exception:
                             pass
                     # Cancel the LLM's in-flight reply so we don't pay
-                    # tokens for text we'll discard. Safe even if the
-                    # model has not yet started streaming text: the server
-                    # treats response.cancel as a no-op when no response
-                    # is active.
-                    try:
-                        cancel_fn = getattr(client, "cancel_response", None)
-                        if callable(cancel_fn):
-                            cancel_fn()
-                    except Exception as exc:
-                        if self._logger:
-                            try:
-                                self._logger.exception(
-                                    "override_cancel_failed", exc)
-                            except Exception:
-                                pass
+                    # tokens for text we'll discard. Only fire when a
+                    # response is actually active — calling cancel
+                    # otherwise produces a benign but user-visible
+                    # `response_cancel_not_active` error event.
+                    if self._response_active:
+                        try:
+                            cancel_fn = getattr(client, "cancel_response", None)
+                            if callable(cancel_fn):
+                                cancel_fn()
+                        except Exception as exc:
+                            if self._logger:
+                                try:
+                                    self._logger.exception(
+                                        "override_cancel_failed", exc)
+                                except Exception:
+                                    pass
                     # Surface override in the tool-event stream for UI/debug.
                     try:
                         self.tool_event.emit("override", {
