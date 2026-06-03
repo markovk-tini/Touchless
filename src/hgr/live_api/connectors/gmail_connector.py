@@ -132,14 +132,22 @@ class GmailConnector(Connector):
             fn("gmail_list",
                "List recent Gmail inbox messages. Set unread_only=true for "
                "INBOX + UNREAD only. Returns {messages: [{id, from, "
-               "from_name, subject, received, snippet}], count}. Set "
-               "include_body=true to ALSO fetch each full body (HTML "
-               "stripped, capped at 2 KB) inline as body_text — pair with "
-               "final='synthesize' for a real 'read my emails' briefing. "
-               "Works for the user's actual Gmail inbox; prefer this over "
-               "ms_mail_list when the connected MS account is a personal "
-               "MSA (Graph contacts/inbox are incomplete on those).",
-               {"max": {"type": "integer", "description": "Max messages (default 10)."},
+               "from_name, subject, received, snippet}], count}. `count` is "
+               "the EXACT number of messages returned — quote it directly, "
+               "never round or guess. Set include_body=true to ALSO fetch "
+               "each full body (HTML stripped, capped at 2 KB) inline as "
+               "body_text — required for any real 'summarize/read my "
+               "emails' request so the reply has substance. Set max=50 "
+               "(the cap) for any 'summarize ALL my unread' request; the "
+               "default of 10 silently truncates a real inbox. NEVER "
+               "invent message content not in the returned array — if "
+               "count=0, say there are no unread emails. Works for the "
+               "user's actual Gmail inbox; prefer this over ms_mail_list "
+               "when the connected MS account is a personal MSA (Graph "
+               "contacts/inbox are incomplete on those).",
+               {"max": {"type": "integer",
+                        "description": "Max messages 1-50 (default 10). "
+                                       "Use 50 for 'summarize unread'."},
                 "unread_only": {"type": "boolean", "default": False},
                 "query": {"type": "string",
                           "description": "Optional Gmail-style search query "
