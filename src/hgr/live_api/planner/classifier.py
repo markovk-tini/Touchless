@@ -355,6 +355,39 @@ class Classifier:
                 layer="touchless",
                 description="weather forecast (auto-detect location)",
             )
+        # (a.2) "[N] day forecast" / "[N]-day forecast" / "4 day weather" —
+        # the prepositionless form. "show me the forecast", "give me the
+        # forecast", "today's forecast" also land here. All deterministic.
+        if re.search(
+            r"\b(?:"
+            # "4 day forecast", "four day forecast", "4-day forecast"
+            r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)"
+            r"[-\s]+day[-\s]+(?:forecast|weather|outlook)|"
+            # "forecast for today", "today's forecast", "todays forecast"
+            r"(?:today(?:[’'´]?s)?|tomorrow(?:[’'´]?s)?|tonight(?:[’'´]?s)?|"
+            r"this\s+(?:week|weekend|morning|evening|afternoon|night)|"
+            r"the\s+(?:week|weekend))"
+            r"[\s'’]*forecast|"
+            # "show / give / tell me the forecast"
+            r"(?:show|give|tell|read)\s+me\s+(?:the\s+)?"
+            r"(?:forecast|weather|temperature|temp|conditions?)|"
+            # bare "forecast" / "the forecast" at start of utterance
+            r"^(?:the\s+)?(?:weather\s+)?forecast\??$|"
+            # "weather outlook", "5-day outlook"
+            r"weather\s+outlook"
+            r")\b",
+            t, flags=re.IGNORECASE,
+        ):
+            args = {}
+            days = _extract_forecast_days(t)
+            if days:
+                args["days"] = days
+            return Step(
+                tool="weather_get",
+                args=args,
+                layer="touchless",
+                description="weather forecast (auto-detect location)",
+            )
         # (b) "weather in <place>" / "weather for <place>" / "forecast in X".
         # Negative lookahead rejects temporal phrases (today/tomorrow/next N
         # days/this week/etc.) so they fall through to the (a) branch above
@@ -406,6 +439,38 @@ class Classifier:
                 args={},
                 layer="touchless",
                 description="local weather",
+            )
+
+        # ---- email reads ("summarize my unread emails", "what's in my
+        # inbox", "any new mail", "show me my unread", "read my emails")
+        # -----------------------------------------------------------------
+        # Routes through Layer 1 so the connector's deterministic
+        # `summary` field is what the user sees — bypassing the LLM,
+        # which has been caught fabricating demo emails when handed the
+        # raw messages array. The orchestrator picks gmail_list if Gmail
+        # is connected, then cascades to ms_mail_list, then Outlook +
+        # read_screen if both are empty.
+        if re.search(
+            r"\b("
+            r"(?:summarize|summary\s+of|read|check|show|list|give\s+me|"
+            r"tell\s+me\s+about|what(?:[’'´]?s|s'?s| is|\s+are)|"
+            r"any|got\s+any|do\s+i\s+have)\s+"
+            r"(?:my\s+|the\s+|new\s+|recent\s+)?(?:unread\s+)?"
+            r"(?:emails?|messages?|mail|inbox|in[-\s]?box)"
+            r"|"
+            r"(?:summarize|read|check|catch\s+me\s+up\s+on|show\s+me)\s+"
+            r"(?:my\s+)?(?:unread|inbox|mail|emails?)"
+            r"|"
+            r"what(?:[’'´]?s|s'?s| is)\s+(?:in\s+)?my\s+(?:inbox|mail)"
+            r")\b",
+            t, flags=re.IGNORECASE,
+        ):
+            return Step(
+                tool="email_summary",
+                args={"unread_only": True, "max": 50,
+                      "include_body": False},
+                layer="touchless",
+                description="summarize unread emails (connector cascade)",
             )
 
         # ---- phone / SMS via Phone Link ("text X saying Y", "send a

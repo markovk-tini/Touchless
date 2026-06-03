@@ -127,7 +127,8 @@ def _format_email_summary(msgs: List[Dict[str, Any]], *,
                   or str(m.get("from") or "").strip()
                   or "unknown sender")
         subject = str(m.get("subject") or "").strip() or "(no subject)"
-        snippet = str(m.get("snippet") or m.get("body_text") or "").strip()
+        snippet = str(m.get("snippet") or m.get("preview")
+                      or m.get("body_text") or "").strip()
         if snippet:
             snippet = " ".join(snippet.replace("\r", " ")
                                .replace("\n", " ").split())

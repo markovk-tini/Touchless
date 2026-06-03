@@ -11,8 +11,9 @@ from __future__ import annotations
 import io
 import json
 import os
-import urllib.error
 import re
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -240,17 +241,112 @@ class Microsoft365Connector(Connector):
             to = str(args.get("to") or "").strip()
             if not to:
                 return connector_result("error", error="'to' is required")
+            # Guard against bare names ('vesko') and obvious placeholders
+            # ('vesko@example.com'). Graph returns 202 Accepted for both,
+            # so without this check the connector reports OK even when no
+            # mail can possibly be delivered — the user sees '2/2 done'
+            # but their Sent folder stays empty.
+            if "@" not in to or "." not in to.split("@", 1)[1]:
+                return connector_result(
+                    "error",
+                    error=(f"'to' must be a full email address (got "
+                           f"{to!r}). Resolve the recipient first "
+                           "(contacts_search or memory lookup) and pass "
+                           "the email."))
+            if to.lower().endswith(("@example.com", "@example.org",
+                                     "@test.com", "@placeholder.com")):
+                return connector_result(
+                    "error",
+                    error=(f"Refusing to send to placeholder domain {to!r}. "
+                           "Save a real address for this contact "
+                           "('<name>'s email is <real@addr>') and retry."))
+            # Find which account actually owns this send — useful when the
+            # user has multiple Microsoft accounts and is checking the wrong
+            # Sent folder ('but I don't see it!').
+            account_email = ""
+            try:
+                for a in self._client.list_accounts():
+                    if a.get("active"):
+                        account_email = str(a.get("username") or "")
+                        break
+            except Exception:
+                pass
+            subject = str(args.get("subject") or "")
+            body_text = str(args.get("body") or "")
             msg = {
                 "message": {
-                    "subject": str(args.get("subject") or ""),
-                    "body": {"contentType": "Text", "content": str(args.get("body") or "")},
+                    "subject": subject,
+                    "body": {"contentType": "Text", "content": body_text},
                     "toRecipients": [{"emailAddress": {"address": to}}],
                 },
                 "saveToSentItems": True,
             }
             _, err = self._graph("POST", "/me/sendMail", body=msg)
-            return connector_result("error" if err else "ok",
-                                    error=err, sent=(err is None), to=to)
+            if err:
+                return connector_result(
+                    "error", error=err, sent=False, to=to,
+                    from_account=account_email, subject=subject)
+            # Graph returns 202 Accepted instantly, but the message is
+            # actually written to Sent asynchronously and 'ok' here is NOT
+            # proof of delivery (this is exactly the silent-success bug
+            # the user keeps hitting). Poll Sent for ~6s and verify the
+            # message actually landed; surface a clear partial-error if
+            # not. Worst case (sent OK but Graph is slow) the verify
+            # times out and we report a soft warning instead of 'ok'.
+            verified = False
+            verify_error: Optional[str] = None
+            actual_from = ""
+            sent_msg_id = ""
+            web_link = ""
+            for _ in range(6):
+                time.sleep(1.0)
+                data, verr = self._graph(
+                    "GET",
+                    "/me/mailFolders/sentitems/messages?"
+                    "$top=5&$orderby=sentDateTime desc"
+                    "&$select=id,subject,toRecipients,sentDateTime,"
+                    "from,webLink")
+                if verr:
+                    verify_error = verr
+                    break
+                for m in (data.get("value") or []):
+                    if (m.get("subject") or "").strip() != subject.strip():
+                        continue
+                    recips = [(r.get("emailAddress") or {}).get(
+                        "address", "").lower()
+                              for r in (m.get("toRecipients") or [])]
+                    if to.lower() not in recips:
+                        continue
+                    verified = True
+                    sent_msg_id = m.get("id") or ""
+                    web_link = m.get("webLink") or ""
+                    actual_from = ((m.get("from") or {}).get(
+                        "emailAddress") or {}).get("address", "")
+                    break
+                if verified:
+                    break
+            if not verified:
+                # Graph accepted the request (202) but the message is NOT
+                # in Sent after 6s. Either the actual delivery failed
+                # server-side, the token is missing a needed scope, or
+                # the recipient is being filtered/blocked.
+                return connector_result(
+                    "error", sent=False, to=to,
+                    from_account=account_email, subject=subject,
+                    error=("Microsoft accepted the request (202) but the "
+                           "message hasn't appeared in Sent Items after "
+                           "6s. Likely causes: (a) recipient address "
+                           "rejected silently, (b) Mail.Send scope not "
+                           "actually granted (try reconnecting Microsoft), "
+                           "(c) tenant policy blocked the send. Check "
+                           "your inbox for an NDR bounce."
+                           + (f" Verify probe error: {verify_error}"
+                              if verify_error else "")))
+            return connector_result(
+                "ok", sent=True, to=to,
+                from_account=account_email or actual_from,
+                sender_address=actual_from, subject=subject,
+                message_id=sent_msg_id, web_link=web_link)
 
         if name == "ms_mail_list":
             max_n = max(1, min(50, int(args.get("max") or 10)))
@@ -283,7 +379,21 @@ class Microsoft365Connector(Connector):
                         text = _strip_html(text)
                     msg["body_text"] = text[:2000]
                 msgs.append(msg)
-            return connector_result("ok", count=len(msgs), messages=msgs)
+            # Deterministic faithful summary built from the real Graph
+            # response — the LLM has fabricated email content in the
+            # past, so we render the reply in code and tell the model
+            # to emit it verbatim.
+            try:
+                from .gmail_connector import _format_email_summary
+                summary = _format_email_summary(
+                    msgs,
+                    unread_only=bool(args.get("unread_only")),
+                    max_arg=max_n,
+                )
+            except Exception:
+                summary = ""
+            return connector_result("ok", count=len(msgs),
+                                    messages=msgs, summary=summary)
 
         if name == "ms_mail_search":
             q = str(args.get("query") or "").strip()

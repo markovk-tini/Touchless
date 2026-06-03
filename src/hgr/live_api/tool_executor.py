@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import cortex_emit
 from .action_classifier import classify_tool_action
@@ -539,6 +539,7 @@ class ToolExecutor:
             "ask_user_confirmation": self._t_ask_user_confirmation,
             "compose_text": self._t_compose_text,
             "weather_get": self._t_weather_get,
+            "email_summary": self._t_email_summary,
             "web_search": self._t_web_search,
             "web_navigate": self._t_web_navigate,
             "web_get_links": self._t_web_get_links,
@@ -1907,6 +1908,87 @@ class ToolExecutor:
             inputs=args.get("inputs"),
             max_tokens=int(args.get("max_tokens") or 500),
         )
+
+    def _t_email_summary(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Cascade Gmail → Microsoft → screen-read fallback for 'summarize
+        my unread emails' style requests. The LLM has been caught
+        fabricating demo emails when it touches mail data directly, so
+        Layer 1 runs this deterministic cascade and emits the
+        connector's pre-rendered `summary` field verbatim.
+
+        Returns the SAME shape as gmail_list / ms_mail_list so the
+        orchestrator's existing _format_email_list path applies. Adds a
+        `source` field indicating which connector answered ('gmail',
+        'microsoft', or 'none')."""
+        unread_only = bool(args.get("unread_only", True))
+        max_n = max(1, min(50, int(args.get("max") or 50)))
+        include_body = bool(args.get("include_body"))
+        sub_args = {"unread_only": unread_only, "max": max_n,
+                    "include_body": include_body}
+
+        def _try(connector_id: str, tool_name: str) -> Optional[Dict[str, Any]]:
+            try:
+                connector = self._registry.find_connector(connector_id)
+            except Exception:
+                connector = None
+            if connector is None:
+                return None
+            try:
+                if not connector.available():
+                    return None
+            except Exception:
+                return None
+            try:
+                return connector.execute(tool_name, dict(sub_args))
+            except Exception as exc:
+                return _result(status="error",
+                               error=f"{type(exc).__name__}: {exc}",
+                               code="connector_failed")
+
+        attempts: List[tuple] = []
+
+        # 1) Gmail first if connected
+        gmail = _try("gmail", "gmail_list")
+        if gmail is not None:
+            attempts.append(("gmail", gmail))
+            if (gmail.get("status") == "ok"
+                    and int(gmail.get("count") or 0) > 0):
+                gmail["source"] = "gmail"
+                return gmail
+
+        # 2) Microsoft (Outlook / Exchange) — common case the user has
+        #    real unread that aren't in their Gmail account.
+        ms = _try("ms365", "ms_mail_list")
+        if ms is not None:
+            attempts.append(("microsoft", ms))
+            if (ms.get("status") == "ok"
+                    and int(ms.get("count") or 0) > 0):
+                ms["source"] = "microsoft"
+                return ms
+
+        # 3) Both empty (or only one connected and it returned 0). Surface
+        #    a helpful summary so the model emits the right next step
+        #    (offer to open Outlook + read_screen).
+        sources_tried = [s for s, _ in attempts]
+        if not sources_tried:
+            return _result(
+                status="ok", count=0, messages=[], source="none",
+                summary=("No email connector is wired up — connect Gmail "
+                         "or your Microsoft account in Touchless settings "
+                         "to summarize your inbox. Or open Outlook and "
+                         "I can read what's on screen."))
+        last = attempts[-1][1]
+        if last.get("status") != "ok":
+            return last  # surface the connector error verbatim
+        readable = " and ".join(sources_tried)
+        return _result(
+            status="ok", count=0, messages=[],
+            source=sources_tried[-1],
+            summary=(f"No unread emails in your {readable} account"
+                     + ("s" if len(sources_tried) > 1 else "")
+                     + ". If your inbox lives in Outlook on the desktop "
+                     "and you want me to summarize what's open there, "
+                     "say 'read my Outlook screen'."))
 
     def _t_weather_get(self, args: Dict[str, Any]) -> Dict[str, Any]:
         # Free, no-key weather via wttr.in / Open-Meteo. Auto-detects

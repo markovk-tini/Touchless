@@ -811,12 +811,19 @@ class IrisPlanner:
         if tool == "weather_get":
             # weather.py already pre-renders the human-readable summary.
             return str(result.get("summary") or "").strip() or f"Done ({tool})."
-        if tool in ("gmail_list", "ms_mail_list"):
+        if tool in ("gmail_list", "ms_mail_list", "email_summary"):
             # Format the reply DETERMINISTICALLY from the actual tool
             # result so the LLM never gets a chance to hallucinate
             # sender names, subjects, or counts. The model has been
             # caught inventing canonical-looking demo emails (Carl,
             # Sarah, Mark, etc.) instead of reading the real array.
+            # If the connector pre-rendered a summary (cascading
+            # email_summary, gmail_list with summary), prefer that
+            # — it carries source-specific context like "no unread in
+            # your Gmail account; check Outlook".
+            pre = str(result.get("summary") or "").strip()
+            if pre:
+                return pre
             return Orchestrator._format_email_list(result, args)
         if tool == "ollama_generate":
             # The generated text IS the user-facing response. Without this,
