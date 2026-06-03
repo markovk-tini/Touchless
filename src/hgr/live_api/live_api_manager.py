@@ -3305,9 +3305,12 @@ class LiveApiManager(QObject):
                         "smart friend sitting next to the listener would "
                         "read this aloud: natural sentences, contractions, "
                         "small pauses at commas, slight smile when it fits, "
-                        "no flat monotone, no robotic list-reading. Don't "
-                        "spell out URLs or dates digit by digit; phrase "
-                        "them naturally."
+                        "no flat monotone, no robotic list-reading. If "
+                        "the text contains a URL, do NOT read the URL — "
+                        "say 'I've got the link' or skip it entirely. "
+                        "Read dates as 'tomorrow' / 'Thursday', never "
+                        "spell digits. If two values are obviously the "
+                        "same ('65 feels like 65'), say it once."
                     )
                 payload = json.dumps(payload_dict).encode("utf-8")
                 req = urllib.request.Request(
