@@ -23751,8 +23751,22 @@ Admin elevation
             fmt = self._probe_wasapi_loopback_format()
             if fmt is not None:
                 _dev, rate, channels = fmt
+                # -use_wallclock_as_timestamps + aresample=async=1
+                # (applied in the filter chain below) is the standard
+                # fix for PyAudioWPatch's WASAPI loopback rate drift.
+                # The bridge can deliver samples at 85-95% of nominal
+                # rate when the device is multi-channel or the mix
+                # format requires Int16 conversion. Without this,
+                # bytes are encoded as if they represent the full
+                # 192 KB/s but actually represent ~170 KB/s of wall
+                # time, so playback finishes 5-10% short — the
+                # symptom: "audio is 5-8 seconds behind video".
+                # use_wallclock_as_timestamps stamps each chunk by
+                # arrival time so aresample async can resample to
+                # match wall-clock duration.
                 input_args.extend([
                     "-thread_queue_size", "1024",
+                    "-use_wallclock_as_timestamps", "1",
                     "-f", "s16le",
                     "-ar", str(rate),
                     "-ac", str(channels),
@@ -23883,6 +23897,7 @@ Admin elevation
                         self._clip_mic_tcp_acceptor = acceptor
                         input_args.extend([
                             "-thread_queue_size", "1024",
+                            "-use_wallclock_as_timestamps", "1",
                             "-f", "s16le",
                             "-ar", str(mic_rate),
                             "-ac", str(mic_channels),
@@ -23898,6 +23913,7 @@ Admin elevation
                 else:
                     input_args.extend([
                         "-thread_queue_size", "1024",
+                        "-use_wallclock_as_timestamps", "1",
                         "-f", "s16le",
                         "-ar", str(mic_rate),
                         "-ac", str(mic_channels),
@@ -23928,39 +23944,32 @@ Admin elevation
         if ns_mode not in self._CLIP_NOISE_PRESETS:
             ns_mode = "light"
         ns = self._CLIP_NOISE_PRESETS[ns_mode]
-        # PRINCIPLE: mic should be IDENTICAL to what the voice
-        # command listener captures (same device, same gain, NO
-        # filter chain unless the user explicitly opted into
-        # 'light'/'strong'). Voice commands work perfectly with raw
-        # audio; treating the clip mic differently was the source of
-        # the user's "no mic audio in clip" report (the previous
-        # 'light' noise gate at -15 dBFS was set higher than the
-        # user's normal speaking peak of ~-23 dBFS, so the gate
-        # stayed closed for every word).
-        #
-        # NO aresample=async=1: that filter aggressively reacts to
-        # PortAudio's bursty chunk delivery (chunks arrive in groups,
-        # not at perfect 21ms intervals), producing the 8-second
-        # jump-back-then-forward glitch the user reported. Drift is
-        # better fixed at CAPTURE TIME by opening WASAPI loopback at
-        # native channel count (so PortAudio's downmixer doesn't
-        # lose samples), which is handled separately in the probe.
+        # aresample=async=1 on each input: paired with
+        # -use_wallclock_as_timestamps above, this lets ffmpeg
+        # resample to fill in the gap when an input produces samples
+        # at slightly less than its declared rate. WASAPI loopback
+        # commonly underruns at 85-95% of nominal on multi-channel
+        # endpoints, so without async resampling the encoded audio
+        # ends up shorter than wall-clock duration → playback drifts
+        # behind the visuals by exactly the underrun delta.
         if sys_idx is not None and mic_idx is None:
             filter_args = [
-                "-filter_complex", f"[{sys_idx}:a]anull[aout]",
+                "-filter_complex",
+                f"[{sys_idx}:a]aresample=async=1[aout]",
                 "-map", "[aout]",
             ]
         elif sys_idx is None and mic_idx is not None:
             filter_args = [
-                "-filter_complex", f"[{mic_idx}:a]{ns}[aout]",
+                "-filter_complex",
+                f"[{mic_idx}:a]{ns},aresample=async=1[aout]",
                 "-map", "[aout]",
             ]
         else:
             filter_args = [
                 "-filter_complex",
                 (
-                    f"[{sys_idx}:a]anull[asys];"
-                    f"[{mic_idx}:a]{ns}[amic];"
+                    f"[{sys_idx}:a]aresample=async=1[asys];"
+                    f"[{mic_idx}:a]{ns},aresample=async=1[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
                     "dropout_transition=0[aout]"
                 ),
