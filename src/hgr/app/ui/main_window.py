@@ -9598,9 +9598,11 @@ class MainWindow(QMainWindow):
 
         def _on_sys_toggled(state: int) -> None:
             new_value = bool(state)
+            saved_ok = False
             try:
                 self.config.clip_capture_system_audio = new_value
                 save_config(self.config)
+                saved_ok = True
             except Exception:
                 pass
             self._register_general_baseline("clip_capture_system_audio", new_value)
@@ -9608,7 +9610,25 @@ class MainWindow(QMainWindow):
             # mid-session. Without this, the user has to wait for the
             # next cache restart (manual gesture / app restart) for
             # their first audio-enabled clip to capture sound.
+            cache_was_running = (
+                self._clip_cache_process is not None
+                and self._clip_cache_process.poll() is None
+            )
             self._restart_clip_cache_if_running()
+            # Surface what just happened to the Detailed Log so the
+            # user can verify the click registered without reading
+            # source. Settings in this section save IMMEDIATELY (the
+            # global Save Changes button never lights up for them
+            # because the baseline is updated in place) — that's a
+            # well-known confusion point.
+            try:
+                self._append_home_debug_log(
+                    f"[clip-audio] system audio = {new_value} "
+                    f"(saved={saved_ok}, cache restart="
+                    f"{'fired' if cache_was_running else 'deferred — will pick up new value on next worker start'})"
+                )
+            except Exception:
+                pass
 
         sys_checkbox.stateChanged.connect(_on_sys_toggled)
         sys_row.addWidget(sys_checkbox)
@@ -9664,13 +9684,27 @@ class MainWindow(QMainWindow):
 
         def _on_mic_toggled(state: int) -> None:
             new_value = bool(state)
+            saved_ok = False
             try:
                 self.config.clip_capture_microphone = new_value
                 save_config(self.config)
+                saved_ok = True
             except Exception:
                 pass
             self._register_general_baseline("clip_capture_microphone", new_value)
+            cache_was_running = (
+                self._clip_cache_process is not None
+                and self._clip_cache_process.poll() is None
+            )
             self._restart_clip_cache_if_running()
+            try:
+                self._append_home_debug_log(
+                    f"[clip-audio] microphone = {new_value} "
+                    f"(saved={saved_ok}, cache restart="
+                    f"{'fired' if cache_was_running else 'deferred — will pick up new value on next worker start'})"
+                )
+            except Exception:
+                pass
 
         mic_checkbox.stateChanged.connect(_on_mic_toggled)
         mic_row.addWidget(mic_checkbox)
@@ -13738,6 +13772,28 @@ class MainWindow(QMainWindow):
         self.microphone_combo.setObjectName("settingsMicrophoneCombo")
         self.microphone_combo.currentIndexChanged.connect(self._on_microphone_settings_selection_changed)
         box_layout.addWidget(self.microphone_combo)
+        # Auto-detected mic-class badge below the dropdown. Updates on
+        # every device change to show what class the listener picked
+        # (Webcam / Headset / USB Studio Mic / etc.) and which
+        # tuning profile is in effect — so users on a Razer Kiyo Pro
+        # see "Webcam mic — auto-boosted to 3.0×" instead of having
+        # to read source.
+        self.microphone_class_badge = QLabel("")
+        self.microphone_class_badge.setObjectName("micClassBadge")
+        self.microphone_class_badge.setWordWrap(True)
+        self.microphone_class_badge.setStyleSheet(
+            "QLabel#micClassBadge { color: rgba(232, 246, 255, 0.75); "
+            "background: rgba(30, 41, 59, 0.55); border-radius: 6px; "
+            "padding: 6px 10px; font-size: 11px; margin-top: 4px; }"
+        )
+        self.microphone_class_badge.setVisible(False)
+        box_layout.addWidget(self.microphone_class_badge)
+        # Initial badge update; refresh whenever the selection changes
+        # via the existing handler at _on_microphone_settings_selection_changed.
+        try:
+            self._refresh_microphone_class_badge()
+        except Exception:
+            pass
 
         # ============================================================
         # PHONE MICROPHONE (QR)
@@ -13955,6 +14011,40 @@ class MainWindow(QMainWindow):
         self._mic_test_gain = gain
         if hasattr(self, "mic_test_gain_value_label"):
             self.mic_test_gain_value_label.setText(f"{gain:.1f}x")
+        # Live-push to the running voice listener(s) so the slider
+        # actually changes voice-command recognition as the user
+        # drags — set_input_gain() also flips input_gain_auto → False
+        # so the next mic-change doesn't silently override their
+        # manual tuning.
+        worker = getattr(self, "_worker", None)
+        listener = getattr(worker, "voice_listener", None) if worker is not None else None
+        if listener is not None:
+            try:
+                listener.set_input_gain(gain)
+            except Exception:
+                pass
+        tutorial = getattr(self, "tutorial_window", None)
+        tut_listener = getattr(tutorial, "_voice_listener", None) if tutorial is not None else None
+        if tut_listener is not None:
+            try:
+                tut_listener.set_input_gain(gain)
+            except Exception:
+                pass
+        # Persist that the user explicitly touched the slider so the
+        # auto-suggested-gain logic stays out of their way across
+        # restarts. Save lazily — the existing settings-save flow
+        # bundles this with the dropdown change.
+        try:
+            if getattr(self.config, "mic_input_gain_auto", True):
+                self.config.mic_input_gain_auto = False
+        except Exception:
+            pass
+        # Update the class badge so the "auto vs manual" note tracks
+        # the slider state in real time.
+        try:
+            self._refresh_microphone_class_badge()
+        except Exception:
+            pass
         self._refresh_microphone_settings_save_state()
 
     def _selected_mic_test_device(self):
@@ -14040,8 +14130,19 @@ class MainWindow(QMainWindow):
                     mono = np.asarray(mono, dtype=np.float32) * float(self._mic_test_gain)
                     peak = float(np.max(np.abs(mono))) if mono.size else 0.0
                     self._mic_test_level_value = min(1.0, peak)
+                    # Track peak (un-clipped) so a CLIPPING indicator
+                    # can show — previously we hid clipping by
+                    # clamping to ±1.0 here, which made high gain
+                    # settings look "healthy" in the test bar even
+                    # when the real recording was distorted.
+                    if peak > getattr(self, "_mic_test_peak_unclipped", 0.0):
+                        self._mic_test_peak_unclipped = peak
                     if self._mic_test_is_recording:
-                        self._mic_test_recorded_chunks.append(np.clip(mono, -1.0, 1.0).copy())
+                        # Keep the recording UN-clipped so playback
+                        # sounds the way whisper will hear it. If the
+                        # signal clips, the playback will sound
+                        # distorted — that's the correct feedback.
+                        self._mic_test_recorded_chunks.append(np.asarray(mono).copy())
                 except Exception:
                     pass
             self._mic_test_input_stream = sd.InputStream(
@@ -18816,6 +18917,65 @@ Admin elevation
 
     def _on_microphone_settings_selection_changed(self, _index: int) -> None:
         self._refresh_microphone_settings_save_state()
+        try:
+            self._refresh_microphone_class_badge()
+        except Exception:
+            pass
+
+    def _refresh_microphone_class_badge(self) -> None:
+        """Update the auto-detected mic-class label below the
+        microphone dropdown. Classifies the currently-selected device
+        via `mic_profile.classify_mic` and shows a one-line summary."""
+        badge = getattr(self, "microphone_class_badge", None)
+        combo = getattr(self, "microphone_combo", None)
+        if badge is None or combo is None:
+            return
+        device_name = ""
+        try:
+            device_name = (combo.currentText() or "").strip()
+        except Exception:
+            device_name = ""
+        if not device_name or device_name.startswith("("):
+            badge.setVisible(False)
+            return
+        try:
+            from hgr.debug.mic_profile import classify_mic
+        except Exception:
+            badge.setVisible(False)
+            return
+        # Pull the device's metadata so the classifier can promote
+        # low-rate devices to BLUETOOTH even without name keywords.
+        sr = None
+        max_ch = None
+        try:
+            import sounddevice as _sd
+            for dev in _sd.query_devices():
+                if str(dev.get("name", "")).strip() == device_name:
+                    sr = int(dev.get("default_samplerate") or 0) or None
+                    max_ch = int(dev.get("max_input_channels") or 0) or None
+                    break
+        except Exception:
+            pass
+        try:
+            profile = classify_mic(
+                device_name,
+                sample_rate=sr,
+                max_input_channels=max_ch,
+            )
+        except Exception:
+            badge.setVisible(False)
+            return
+        auto_mode = bool(getattr(self.config, "mic_input_gain_auto", True))
+        if auto_mode:
+            gain_note = f"auto-boosted to {profile.suggested_gain:.1f}×"
+        else:
+            try:
+                current_gain = float(getattr(self.config, "mic_input_gain", 1.0) or 1.0)
+            except Exception:
+                current_gain = 1.0
+            gain_note = f"manual gain {current_gain:.1f}× (auto would be {profile.suggested_gain:.1f}×)"
+        badge.setText(f"Detected: {profile.display_label} — {gain_note}")
+        badge.setVisible(True)
 
     def _refresh_microphone_labels(self) -> None:
         # Plural alias kept for backwards compat with existing callers
@@ -19921,6 +20081,11 @@ Admin elevation
             if hasattr(self._worker, "open_touchless_requested"):
                 try:
                     self._worker.open_touchless_requested.connect(self._on_open_touchless_requested)
+                except Exception:
+                    pass
+            if hasattr(self._worker, "instant_clip_requested"):
+                try:
+                    self._worker.instant_clip_requested.connect(self._on_instant_clip_requested)
                 except Exception:
                     pass
             if hasattr(self._worker, "drawing_overlay_toggle_requested"):
@@ -21037,6 +21202,36 @@ Admin elevation
 
         return row, ts_label
 
+    def _on_instant_clip_requested(self) -> None:
+        """Trigger an instant clip in response to the `instant_clip`
+        gesture binding (default: right_one). Same effect as the voice
+        "clip that" command but bound to a single gesture for fully
+        hands-only operation. No save prompt, no monitor picker —
+        just save the configured duration ending at the current
+        moment into clips_save_dir.
+        """
+        # Snapshot the click moment so the export trims the right edge
+        # to "now" (matches the click), not the latest segment end
+        # which can be 2-3 s later by the time export completes.
+        end_ts_now = time.time()
+        # Configured default duration (60s typical) — same setting the
+        # voice "clip that" command uses.
+        try:
+            duration = int(
+                getattr(self.config, "clip_default_duration_seconds", 60) or 60
+            )
+        except Exception:
+            duration = 60
+        try:
+            self._export_recent_clip(
+                duration_seconds=duration,
+                auto_save=True,
+                auto_select_monitor=True,
+                end_ts=end_ts_now,
+            )
+        except Exception:
+            pass
+
     def _on_open_touchless_requested(self) -> None:
         """Bring the Touchless main window to the foreground in
         response to the open_touchless gesture binding (default:
@@ -22114,8 +22309,121 @@ Admin elevation
         # -segment_format mp4 and a moov atom per segment, which the
         # segment muxer doesn't produce cleanly mid-stream.
         return self._clip_cache_dir() / "audio_%03d.aac"
-    def _cleanup_ffmpeg_clip_cache_files(self) -> None:
+    def _kill_orphan_ffmpeg_for_clip_cache(self) -> int:
+        """Find and kill any ffmpeg.exe processes that are using
+        files in our clip cache directory. These are zombies from
+        previous Touchless sessions that didn't shut down cleanly
+        (force-quit, crash, taskkill). Without this kill, the
+        zombie ffmpeg keeps writing to the same segment files
+        while the new session's ffmpeg ALSO writes to them — the
+        ring buffers fight each other and produce clips with
+        looped / duplicated audio content from the zombie's
+        4-hour timeline. Symptom that surfaced this bug in the
+        debug log: audio CSV entry times of 15960-16030s during
+        a Touchless session that only started 30s prior.
+
+        Returns the number of zombie processes killed."""
+        killed = 0
+        try:
+            import psutil
+        except Exception:
+            return 0
         cache_dir = self._clip_cache_dir()
+        try:
+            cache_dir_resolved = str(cache_dir.resolve()).lower()
+        except Exception:
+            cache_dir_resolved = str(cache_dir).lower()
+        try:
+            own_pid = subprocess.os.getpid() if hasattr(subprocess, "os") else None
+        except Exception:
+            own_pid = None
+        try:
+            import os as _os
+            own_pid = _os.getpid()
+        except Exception:
+            pass
+        live_pids: set[int] = set()
+        # Don't kill processes WE just spawned this session.
+        for attr in ("_clip_cache_process", "_clip_cache_audio_process"):
+            proc = getattr(self, attr, None)
+            try:
+                if proc is not None and proc.pid is not None:
+                    live_pids.add(int(proc.pid))
+            except Exception:
+                pass
+        try:
+            for p in psutil.process_iter(["pid", "name", "exe"]):
+                try:
+                    name = (p.info.get("name") or "").lower()
+                    if name not in ("ffmpeg.exe", "ffmpeg"):
+                        continue
+                    pid = int(p.info.get("pid") or 0)
+                    if not pid or pid == own_pid or pid in live_pids:
+                        continue
+                    # Check if this ffmpeg has any open files inside our
+                    # cache directory. open_files() is the source of
+                    # truth — much better than guessing from cmdline,
+                    # which won't show stdin-piped processes.
+                    try:
+                        open_files = p.open_files()
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        continue
+                    uses_our_cache = False
+                    for f in open_files:
+                        try:
+                            if cache_dir_resolved in str(f.path).lower():
+                                uses_our_cache = True
+                                break
+                        except Exception:
+                            continue
+                    if not uses_our_cache:
+                        continue
+                    # Found a zombie — kill it. terminate() first for a
+                    # graceful exit, kill() if it ignores us. Wait briefly
+                    # so file handles are released before our cleanup
+                    # tries to delete the files.
+                    try:
+                        p.terminate()
+                        try:
+                            p.wait(timeout=2.0)
+                        except psutil.TimeoutExpired:
+                            p.kill()
+                            try:
+                                p.wait(timeout=2.0)
+                            except psutil.TimeoutExpired:
+                                pass
+                        killed += 1
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        continue
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            return killed
+        if killed:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[clip-cache] killed {killed} orphan ffmpeg process(es) "
+                    f"holding handles in {cache_dir}\n"
+                )
+                _sys.stderr.flush()
+            except Exception:
+                pass
+        return killed
+
+    def _cleanup_ffmpeg_clip_cache_files(self) -> None:
+        # Reap zombies BEFORE deleting files — a running ffmpeg keeps
+        # an open handle to its segment files, which on Windows
+        # blocks unlink() with a permission error. The error is
+        # currently swallowed silently, so a zombie from a prior
+        # session keeps writing alongside the new session's ffmpeg
+        # and the clip audio comes out looped / duplicated.
+        try:
+            self._kill_orphan_ffmpeg_for_clip_cache()
+        except Exception:
+            pass
+        cache_dir = self._clip_cache_dir()
+        failed: list[Path] = []
         for pattern in (
             "segment_*.mkv",
             "segments.csv",
@@ -22129,7 +22437,18 @@ Admin elevation
                 try:
                     path.unlink(missing_ok=True)
                 except Exception:
-                    pass
+                    failed.append(path)
+        if failed:
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[clip-cache] WARNING — failed to delete "
+                    f"{len(failed)} cache file(s) (still locked by "
+                    f"another process?): {[p.name for p in failed[:5]]}\n"
+                )
+                _sys.stderr.flush()
+            except Exception:
+                pass
     def _parse_ffmpeg_clip_manifest(self) -> list[dict]:
         list_path = self._clip_cache_list_path
         if list_path is None or not list_path.exists():
@@ -22160,7 +22479,23 @@ Admin elevation
                     })
         except Exception:
             return []
-        return entries
+        # Deduplicate by file path, keeping the LATEST entry per path.
+        # When -segment_wrap N rolls over, ffmpeg reuses filenames
+        # (segment_000.mkv, segment_001.mkv, ...) but the CSV may
+        # carry an older entry for the same filename briefly before
+        # being rewritten. Reading both entries and concat-ing both
+        # files plays the SAME (latest) file content twice — which
+        # manifests to the user as "the last N seconds played twice
+        # back-to-back". Keep the entry with the larger end_time per
+        # path so concat is fed unique files in chronological order.
+        latest_by_path: dict[str, dict] = {}
+        for entry in entries:
+            key = str(entry["path"])
+            prior = latest_by_path.get(key)
+            if prior is None or entry["end_time"] > prior["end_time"]:
+                latest_by_path[key] = entry
+        deduped = sorted(latest_by_path.values(), key=lambda e: e["end_time"])
+        return deduped
     def _build_clip_concat_file(self, segments: list[dict]) -> Path | None:
         if not segments:
             return None
@@ -23266,7 +23601,18 @@ Admin elevation
                     })
         except Exception:
             return []
-        return entries
+        # Dedupe by path — same rationale as the video manifest
+        # parser: -segment_wrap reuses filenames after the ring
+        # rolls over, so the same audio_NNN.aac may briefly appear
+        # twice in the CSV with different times, and feeding both
+        # to concat would play the same (latest) bytes twice.
+        latest_by_path: dict[str, dict] = {}
+        for entry in entries:
+            key = str(entry["path"])
+            prior = latest_by_path.get(key)
+            if prior is None or entry["end_time"] > prior["end_time"]:
+                latest_by_path[key] = entry
+        return sorted(latest_by_path.values(), key=lambda e: e["end_time"])
 
     def _start_clip_cache_audio(self) -> bool:
         """Spawn a SECOND ffmpeg subprocess that captures system
@@ -23298,7 +23644,20 @@ Admin elevation
         want_system = bool(getattr(cfg, "clip_capture_system_audio", False))
         want_mic = bool(getattr(cfg, "clip_capture_microphone", False))
         if not (want_system or want_mic):
-            _log("both audio toggles are off; clips will be silent")
+            try:
+                from hgr.config.app_config import CONFIG_PATH as _cfg_path
+                _log(
+                    f"both audio toggles are off; clips will be silent. "
+                    f"Settings file ({_cfg_path}) currently has "
+                    f"clip_capture_system_audio={want_system} "
+                    f"clip_capture_microphone={want_mic}. "
+                    f"Enable: Settings → General → Clip Audio."
+                )
+            except Exception:
+                _log(
+                    "both audio toggles are off; clips will be silent. "
+                    "Enable: Settings → General → Clip Audio."
+                )
             return False
         if not self._ffmpeg_ready():
             _log("ffmpeg not ready; audio cache cannot start")
@@ -23334,6 +23693,29 @@ Admin elevation
                 )
         if want_mic:
             mic_name = str(getattr(cfg, "preferred_microphone_name", "") or "").strip()
+            # FALLBACK: when the user never explicitly picked a mic in
+            # Settings → Voice but the voice-command listener is happily
+            # using one (PortAudio's default WASAPI input, or a mic
+            # selected through a different code path), reuse THAT name
+            # for clip recording. Otherwise the clip recorder defaults
+            # to Windows MMSystem default, which on many machines is a
+            # different device than what Touchless's commands hear from
+            # — exactly the symptom the user reported ("Windows says
+            # it's connected to a mic that's not even plugged in").
+            if not mic_name:
+                try:
+                    if (self._worker is not None
+                            and getattr(self._worker, "voice_listener", None)
+                            is not None):
+                        listener_mic = self._worker.voice_listener.input_device_name()
+                        if listener_mic:
+                            mic_name = str(listener_mic).strip()
+                            _log(
+                                "mic fallback: voice listener's resolved "
+                                f"mic = {mic_name!r}"
+                            )
+                except Exception as exc:
+                    _log(f"mic fallback lookup failed: {exc}")
             if mic_name:
                 input_args.extend([
                     "-thread_queue_size", "1024",
@@ -23345,8 +23727,9 @@ Admin elevation
                 _log(f"mic configured: {mic_name!r}")
             else:
                 _log(
-                    "mic capture ON but no preferred_microphone_name "
-                    "set — pick a mic in Settings → Voice"
+                    "mic capture ON but no microphone resolved — pick "
+                    "one in Settings → Voice OR set Touchless's mic via "
+                    "the voice-listener setup"
                 )
         if sys_idx is None and mic_idx is None:
             _log("no audio sources successfully wired; clips will be silent")
@@ -23449,10 +23832,48 @@ Admin elevation
                     pass
                 return False
         self._clip_cache_audio_process = process
+        # Anchor audio start time. Default to wall clock here, then
+        # OVERRIDE with the WASAPI bridge's true first-sample time once
+        # it arrives (when system audio is involved). Without that
+        # override, the spawn timestamp is ~200ms-2s EARLIER than the
+        # actual first audio sample, and the export aligner ends up
+        # pushing audio later in the clip timeline — the user-visible
+        # symptom is "audio is ~10s out of sync with video".
         try:
-            self._clip_cache_audio_started_at = time.time()
+            spawn_time = time.time()
+            self._clip_cache_audio_started_at = spawn_time
         except Exception:
+            spawn_time = 0.0
             self._clip_cache_audio_started_at = 0.0
+        if self._wasapi_writer is not None:
+            # Brief wait for the bridge to start producing audio so
+            # `first_sample_at` is populated. We CAP the wait so a hung
+            # bridge can't block clip-cache startup forever; the spawn
+            # time fallback is still in place if the bridge never
+            # reports a sample (the symptom is just less-precise a/v
+            # alignment, not a broken cache).
+            try:
+                writer = self._wasapi_writer
+                deadline = spawn_time + 2.5
+                while (writer is not None
+                       and writer.first_sample_at is None
+                       and time.time() < deadline):
+                    time.sleep(0.01)
+                actual = getattr(writer, "first_sample_at", None)
+                if actual is not None:
+                    skew_ms = (actual - spawn_time) * 1000.0
+                    self._clip_cache_audio_started_at = float(actual)
+                    _log(
+                        "audio anchor: using WASAPI first-sample "
+                        f"(skew vs spawn = {skew_ms:.0f}ms)"
+                    )
+                else:
+                    _log(
+                        "audio anchor: WASAPI bridge produced no sample "
+                        "within 2.5s — falling back to spawn time"
+                    )
+            except Exception as exc:
+                _log(f"audio anchor measurement failed: {exc}")
         _log("audio cache running")
         return True
 
@@ -23625,6 +24046,19 @@ Admin elevation
         was_active = (
             self._clip_cache_backend == "ffmpeg" and self._clip_cache_process is not None
         )
+        # Snapshot BEFORE we stop the cache — `_stop_clip_cache_ffmpeg`
+        # unconditionally resets `_clip_cache_has_audio` to False
+        # (and clears `_clip_cache_audio_process`), so checking the
+        # live attribute later in this function would always report
+        # "no audio" even though the audio segment files are still
+        # on disk (delete_files=False keeps them). Use the snapshot
+        # whenever this function needs to decide whether audio
+        # capture was running at the time of clip-take.
+        had_audio_at_export = bool(getattr(self, "_clip_cache_has_audio", False))
+        audio_list_path_snapshot = getattr(self, "_clip_cache_audio_list_path", None)
+        audio_anchor_snapshot = float(
+            getattr(self, "_clip_cache_audio_started_at", 0.0) or 0.0
+        )
         if was_active:
             self._stop_clip_cache_ffmpeg(delete_files=False)
         try:
@@ -23697,17 +24131,38 @@ Admin elevation
                 )
                 for entry in selected
             )
-            # Drop tail_to_drop seconds from the END of the assembled
-            # concat. trim filter's `duration=` only specifies what to
-            # KEEP from start; it can't shrink past available footage,
-            # so when total < duration + tail we'd silently keep
-            # everything to the end (bug: clips extend past the moment
-            # the user said "clip that"). Switch to `end=` which
-            # specifies a HARD STOP in concat-local seconds: tail is
-            # always dropped, regardless of total available footage.
+            # End-anchored trim. The clip must ALWAYS end at end_ts
+            # (the moment the user said "clip that") regardless of
+            # how much cache is available. Switching from a fixed
+            # `duration=duration_seconds` parameter to an explicit
+            # end-of-window (`end_trim`) drops the tail correctly
+            # even when the cache hasn't yet filled (in which case
+            # the clip is naturally shorter than requested rather
+            # than overrunning past end_ts by tail_to_drop seconds).
             end_trim = max(0.0, total_duration - tail_to_drop)
             start_trim = max(0.0, end_trim - float(duration_seconds))
             trim_duration = max(1e-3, end_trim - start_trim)
+            # Surface selected segment paths so a "clip plays the
+            # same N seconds twice" report can be diagnosed by
+            # checking whether selected has duplicate paths after a
+            # cache wrap.
+            try:
+                import sys as _sys
+                _paths = [str(Path(e.get("path", "")).name) for e in selected]
+                diag_sel = (
+                    f"[clip-export] selected_segments n={len(selected)} "
+                    f"total_duration={total_duration:.2f}s tail_to_drop={tail_to_drop:.2f}s "
+                    f"trim_duration={trim_duration:.2f}s start_trim={start_trim:.2f}s "
+                    f"paths={_paths}"
+                )
+                _sys.stderr.write(diag_sel + "\n")
+                _sys.stderr.flush()
+                try:
+                    self._append_home_debug_log(diag_sel)
+                except Exception:
+                    pass
+            except Exception:
+                pass
             output_path = self._clip_output_specs(duration_seconds)[0][0]
             capture_region = (
                 QRect(self._clip_cache_region)
@@ -23723,26 +24178,86 @@ Admin elevation
             # window overlaps the selected video window — and append
             # them as additional ffmpeg inputs starting at index n.
             audio_selected: list[dict] = []
-            if self._clip_cache_has_audio:
+            audio_entries: list[dict] = []
+            a_window_start = 0.0
+            a_window_end = 0.0
+            t_shift = 0.0
+            window_fallback_used = False
+            if had_audio_at_export:
                 v_window_start = float(selected[0].get("start_time", 0.0))
                 v_window_end = float(selected[-1].get("end_time", 0.0))
                 v_anchor = float(getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0)
-                a_anchor = float(getattr(self, "_clip_cache_audio_started_at", 0.0) or 0.0)
-                # Re-base the video window into the audio process's
-                # local time by accounting for the difference in start
-                # wall-clocks. If video started 1.2 s before audio,
-                # the audio window is `[v_start - 1.2, v_end - 1.2]`.
+                a_anchor = audio_anchor_snapshot
                 t_shift = (v_anchor - a_anchor) if (v_anchor and a_anchor) else 0.0
                 a_window_start = v_window_start + t_shift
                 a_window_end = v_window_end + t_shift
-                audio_entries = self._parse_ffmpeg_clip_audio_manifest()
+                _saved_audio_list_path = self._clip_cache_audio_list_path
+                if audio_list_path_snapshot is not None:
+                    self._clip_cache_audio_list_path = audio_list_path_snapshot
+                try:
+                    audio_entries = self._parse_ffmpeg_clip_audio_manifest()
+                finally:
+                    self._clip_cache_audio_list_path = _saved_audio_list_path
                 for entry in audio_entries:
                     e_start = float(entry.get("start_time", 0.0))
                     e_end = float(entry.get("end_time", 0.0))
                     if e_end < a_window_start or e_start > a_window_end:
                         continue
                     audio_selected.append(entry)
+                # FALLBACK: if strict wall-clock window matching
+                # selected nothing but the manifest has entries, the
+                # audio PTS clock has drifted from wall-clock (common
+                # cause: PortAudio loopback delivers samples slower
+                # than real-time during silence-heavy periods, so the
+                # audio process's PTS lags video by tens of seconds).
+                # Instead of producing a silent clip, take the most
+                # recent video-count's worth of audio segments —
+                # "recent audio ≈ correct audio". ffmpeg's atrim will
+                # cut both to the same target duration so video and
+                # audio length still match.
+                if not audio_selected and audio_entries:
+                    audio_selected = list(audio_entries[-len(selected):])
+                    window_fallback_used = True
             has_audio = len(audio_selected) > 0
+            # Diagnostic: log to BOTH stderr (so it appears in the
+            # console / build log capture) AND home debug log (so it
+            # appears in the UI). Tells us in one line whether the
+            # flag is on, whether the audio manifest has entries,
+            # and whether window matching selected any of them.
+            try:
+                list_path = audio_list_path_snapshot
+                list_exists = bool(list_path is not None and list_path.exists())
+                if had_audio_at_export:
+                    _entry_times = [
+                        f"[{float(e.get('start_time', 0)):.1f},{float(e.get('end_time', 0)):.1f}]"
+                        for e in audio_entries
+                    ]
+                    diag = (
+                        f"[clip-export] audio mux: had_audio_at_export=True "
+                        f"manifest_path={list_path} exists={list_exists} "
+                        f"entries_total={len(audio_entries)} selected={len(audio_selected)} "
+                        f"window_fallback_used={window_fallback_used} "
+                        f"t_shift={t_shift:.2f}s "
+                        f"a_window=[{a_window_start:.2f},{a_window_end:.2f}] "
+                        f"entry_times={_entry_times}"
+                    )
+                else:
+                    diag = (
+                        f"[clip-export] audio mux: had_audio_at_export=False "
+                        f"(manifest_path={list_path} exists={list_exists})"
+                    )
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(diag + "\n")
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    self._append_home_debug_log(diag)
+                except Exception:
+                    pass
+            except Exception:
+                pass
             for entry in audio_selected:
                 inputs.extend(["-i", str(Path(entry["path"]).resolve())])
             # Video chain — concat all video segments, optional crop,
@@ -23761,11 +24276,10 @@ Admin elevation
             video_complex = ",".join(v_chain) + "[vout]"
             filter_complex = video_complex
             if has_audio:
-                # Audio chain — concat each audio segment, then atrim
-                # to land on the same window as the video. The first
-                # audio input has ffmpeg index n (right after the
-                # last video input). Same `end_trim` math as video so
-                # the audio also actually drops its tail.
+                # Audio chain — same end-anchored math as the video
+                # path so audio + video cut points line up exactly.
+                # The first audio input has ffmpeg index n (right
+                # after the last video input).
                 a_total = sum(
                     max(1e-3, float(e.get("end_time", 0.0)) - float(e.get("start_time", 0.0)))
                     for e in audio_selected
@@ -23773,6 +24287,23 @@ Admin elevation
                 a_end_trim = max(0.0, a_total - tail_to_drop)
                 a_start_trim = max(0.0, a_end_trim - float(duration_seconds))
                 a_trim_duration = max(1e-3, a_end_trim - a_start_trim)
+                # Alignment delay: pad the beginning of the audio
+                # output with silence so audio ENDS at the same
+                # moment video ends. Without this, both audio and
+                # video get PTS=0 after asetpts and play "together"
+                # at clip_T=0 — but audio's first sample was
+                # captured AFTER video's first sample (because audio
+                # capture is shorter than video capture: the audio
+                # cache hasn't accumulated as many seconds as the
+                # video cache, or PortAudio bridge_delay shifted the
+                # audio later in wall clock). Result: audio plays
+                # ahead of video by exactly (video_dur - audio_dur)
+                # seconds. The adelay below pushes the audio start
+                # to clip_T=(video_dur - audio_dur) so both end at
+                # the same point and the visible-but-silent prefix
+                # is at the start (matches what the user is doing
+                # before the 'clip that' command anyway).
+                audio_align_delay_ms = max(0, int(round((trim_duration - a_trim_duration) * 1000)))
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
@@ -23780,8 +24311,22 @@ Admin elevation
                     f"atrim=start={a_start_trim:.3f}:duration={a_trim_duration:.3f}"
                 )
                 a_chain.append("asetpts=PTS-STARTPTS")
+                if audio_align_delay_ms > 0:
+                    a_chain.append(f"adelay={audio_align_delay_ms}:all=1")
                 audio_complex = ",".join(a_chain) + "[aout]"
                 filter_complex = video_complex + ";" + audio_complex
+                # Surface the alignment numbers so any future "audio
+                # is N seconds off" report is diagnosable from the log.
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[clip-export] audio alignment: video_trim={trim_duration:.2f}s "
+                        f"audio_trim={a_trim_duration:.2f}s "
+                        f"delay_applied={audio_align_delay_ms}ms\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
             command = [
                 self._ffmpeg_path,
                 "-hide_banner", "-loglevel", "error", "-y",
@@ -23811,6 +24356,34 @@ Admin elevation
                 stderr=subprocess.PIPE,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            # When audio was wired in but the export still succeeded,
+            # surface ffmpeg's stderr to the Detailed Log anyway —
+            # ffmpeg sometimes succeeds with WARNINGS about audio
+            # streams (e.g., "no audio data found", filter mismatches)
+            # that produce a silent output. Without this we'd never
+            # see those warnings.
+            if has_audio:
+                try:
+                    stderr_text = (completed.stderr or b"").decode("utf-8", errors="replace")
+                    tail = stderr_text[-1500:] if stderr_text else "(empty stderr)"
+                    diag_rc = (
+                        f"[clip-export] ffmpeg rc={completed.returncode} "
+                        f"audio_inputs={len(audio_selected)} "
+                        f"output_size={(output_path.stat().st_size if output_path.exists() else 0)} "
+                        f"stderr_tail={tail!r}"
+                    )
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(diag_rc + "\n")
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+                    try:
+                        self._append_home_debug_log(diag_rc)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             if (
                 completed.returncode == 0
                 and output_path.exists()
@@ -24031,7 +24604,26 @@ Admin elevation
         return (False, None, 0.0)
 
     def _export_recent_clip_ffmpeg(self, duration_seconds: int, target_region: QRect) -> bool:
+        # Anchor the clip's right edge to the wall-clock moment the
+        # user clicked (= "now"), so cache segments completed AFTER
+        # the click but BEFORE the export finishes its setup don't
+        # leak into the saved clip as "extra footage past the moment
+        # I clicked". Without this, the gesture-triggered clip
+        # includes 2-3 s of post-click recording because the cache
+        # keeps writing until `_stop_clip_cache_ffmpeg` lands a few
+        # ticks later.
+        gesture_click_ts = time.time()
         was_active = self._clip_cache_backend == "ffmpeg" and self._clip_cache_process is not None
+        # Snapshot BEFORE the cache stop — `_stop_clip_cache_ffmpeg`
+        # resets `_clip_cache_has_audio = False` unconditionally, so
+        # reading the live attribute below would wrongly skip the
+        # audio mux even though audio segment files are still on
+        # disk. Same fix as `_run_clip_export_ffmpeg`.
+        had_audio_at_export = bool(getattr(self, "_clip_cache_has_audio", False))
+        audio_list_path_snapshot = getattr(self, "_clip_cache_audio_list_path", None)
+        audio_anchor_snapshot = float(
+            getattr(self, "_clip_cache_audio_started_at", 0.0) or 0.0
+        )
         if was_active:
             self._stop_clip_cache_ffmpeg(delete_files=False)
         try:
@@ -24050,7 +24642,49 @@ Admin elevation
                 return False
             selected.reverse()
             total_duration = sum(max(1e-3, float(entry.get("end_time", 0.0)) - float(entry.get("start_time", 0.0))) for entry in selected)
-            start_trim = max(0.0, total_duration - float(duration_seconds))
+            # End-anchored trim, anchored to the GESTURE CLICK time
+            # (recorded at the top of this function). Same shape as
+            # the voice-clip path: compute tail_to_drop = (latest
+            # video segment's wall-clock end) - (click moment), then
+            # subtract that from the trim window. Without this the
+            # exported clip would include 2-3 s of post-click footage
+            # because the cache kept writing during export setup.
+            try:
+                latest_end_relative = float(selected[-1].get("end_time", 0.0))
+            except Exception:
+                latest_end_relative = 0.0
+            try:
+                ffmpeg_anchor = float(
+                    getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0
+                )
+            except Exception:
+                ffmpeg_anchor = 0.0
+            latest_end_wall = (
+                ffmpeg_anchor + latest_end_relative if ffmpeg_anchor > 0 else latest_end_relative
+            )
+            tail_to_drop = max(0.0, float(latest_end_wall) - float(gesture_click_ts)) if ffmpeg_anchor > 0 else 0.0
+            end_trim = max(0.0, total_duration - tail_to_drop)
+            start_trim = max(0.0, end_trim - float(duration_seconds))
+            trim_duration = max(1e-3, end_trim - start_trim)
+            # Surface segment paths once so a "clip plays the same N
+            # seconds twice" report can be diagnosed by inspecting
+            # whether selected contains duplicate paths.
+            try:
+                import sys as _sys
+                _paths = [str(Path(e.get("path", "")).name) for e in selected]
+                diag_sel = (
+                    f"[clip-export-2] selected_segments n={len(selected)} "
+                    f"total_duration={total_duration:.2f}s trim_duration={trim_duration:.2f}s "
+                    f"start_trim={start_trim:.2f}s paths={_paths}"
+                )
+                _sys.stderr.write(diag_sel + "\n")
+                _sys.stderr.flush()
+                try:
+                    self._append_home_debug_log(diag_sel)
+                except Exception:
+                    pass
+            except Exception:
+                pass
             output_path = self._clip_output_specs(duration_seconds)[0][0]
             capture_region = QRect(self._clip_cache_region) if self._clip_cache_region is not None else QRect(self._screens_union_geometry())
             # Use the concat *filter* instead of the concat demuxer.
@@ -24072,21 +24706,71 @@ Admin elevation
             n = len(selected)
             # Audio segments come from the parallel audio cache.
             audio_selected: list[dict] = []
-            if self._clip_cache_has_audio:
+            audio_entries: list[dict] = []
+            a_window_start = 0.0
+            a_window_end = 0.0
+            t_shift = 0.0
+            window_fallback_used = False
+            if had_audio_at_export:
                 v_window_start = float(selected[0].get("start_time", 0.0))
                 v_window_end = float(selected[-1].get("end_time", 0.0))
                 v_anchor = float(getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0)
-                a_anchor = float(getattr(self, "_clip_cache_audio_started_at", 0.0) or 0.0)
+                a_anchor = audio_anchor_snapshot
                 t_shift = (v_anchor - a_anchor) if (v_anchor and a_anchor) else 0.0
                 a_window_start = v_window_start + t_shift
                 a_window_end = v_window_end + t_shift
-                for entry in self._parse_ffmpeg_clip_audio_manifest():
+                _saved_audio_list_path = self._clip_cache_audio_list_path
+                if audio_list_path_snapshot is not None:
+                    self._clip_cache_audio_list_path = audio_list_path_snapshot
+                try:
+                    audio_entries = self._parse_ffmpeg_clip_audio_manifest()
+                finally:
+                    self._clip_cache_audio_list_path = _saved_audio_list_path
+                for entry in audio_entries:
                     e_start = float(entry.get("start_time", 0.0))
                     e_end = float(entry.get("end_time", 0.0))
                     if e_end < a_window_start or e_start > a_window_end:
                         continue
                     audio_selected.append(entry)
+                # FALLBACK: see _run_clip_export_ffmpeg comment.
+                if not audio_selected and audio_entries:
+                    audio_selected = list(audio_entries[-len(selected):])
+                    window_fallback_used = True
             has_audio = len(audio_selected) > 0
+            try:
+                list_path = audio_list_path_snapshot
+                list_exists = bool(list_path is not None and list_path.exists())
+                if had_audio_at_export:
+                    _entry_times = [
+                        f"[{float(e.get('start_time', 0)):.1f},{float(e.get('end_time', 0)):.1f}]"
+                        for e in audio_entries
+                    ]
+                    diag2 = (
+                        f"[clip-export-2] audio mux: had_audio_at_export=True "
+                        f"manifest_path={list_path} exists={list_exists} "
+                        f"entries_total={len(audio_entries)} selected={len(audio_selected)} "
+                        f"window_fallback_used={window_fallback_used} "
+                        f"t_shift={t_shift:.2f}s "
+                        f"a_window=[{a_window_start:.2f},{a_window_end:.2f}] "
+                        f"entry_times={_entry_times}"
+                    )
+                else:
+                    diag2 = (
+                        f"[clip-export-2] audio mux: had_audio_at_export=False "
+                        f"(manifest_path={list_path} exists={list_exists})"
+                    )
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(diag2 + "\n")
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    self._append_home_debug_log(diag2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
             for entry in audio_selected:
                 inputs.extend(["-i", str(Path(entry["path"]).resolve())])
             concat_in_v = "".join(f"[{i}:v]" for i in range(n))
@@ -24095,7 +24779,7 @@ Admin elevation
             if crop_filter:
                 v_chain.append(crop_filter)
             v_chain.append(
-                f"trim=start={start_trim:.3f}:duration={float(duration_seconds):.3f}"
+                f"trim=start={start_trim:.3f}:duration={trim_duration:.3f}"
             )
             v_chain.append("setpts=PTS-STARTPTS")
             video_complex = ",".join(v_chain) + "[vout]"
@@ -24105,14 +24789,21 @@ Admin elevation
                     max(1e-3, float(e.get("end_time", 0.0)) - float(e.get("start_time", 0.0)))
                     for e in audio_selected
                 )
-                a_start_trim = max(0.0, a_total - float(duration_seconds))
+                a_end_trim = max(0.0, a_total)
+                a_start_trim = max(0.0, a_end_trim - float(duration_seconds))
+                a_trim_duration = max(1e-3, a_end_trim - a_start_trim)
+                # Same end-alignment as the voice-anchored path. See
+                # the matching comment in _run_clip_export_ffmpeg.
+                audio_align_delay_ms = max(0, int(round((trim_duration - a_trim_duration) * 1000)))
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
                 a_chain.append(
-                    f"atrim=start={a_start_trim:.3f}:duration={float(duration_seconds):.3f}"
+                    f"atrim=start={a_start_trim:.3f}:duration={a_trim_duration:.3f}"
                 )
                 a_chain.append("asetpts=PTS-STARTPTS")
+                if audio_align_delay_ms > 0:
+                    a_chain.append(f"adelay={audio_align_delay_ms}:all=1")
                 filter_complex = video_complex + ";" + ",".join(a_chain) + "[aout]"
             command = [
                 self._ffmpeg_path,
