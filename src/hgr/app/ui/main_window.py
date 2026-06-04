@@ -24189,11 +24189,20 @@ Admin elevation
                     time.sleep(0.01)
                 actual = getattr(writer, "first_sample_at", None)
                 if actual is not None:
-                    skew_ms = (actual - spawn_time) * 1000.0
+                    # Offset can be NEGATIVE: the WASAPI writer thread
+                    # is launched BEFORE this measurement runs (via
+                    # writer.start() higher up), so first_sample_at
+                    # often lands a few seconds BEFORE spawn_time. The
+                    # absolute value `actual` IS the correct audio
+                    # anchor; the offset is just informational.
+                    offset_ms = (actual - spawn_time) * 1000.0
                     self._clip_cache_audio_started_at = float(actual)
+                    direction = "before" if offset_ms < 0 else "after"
                     _log(
-                        "audio anchor: using WASAPI first-sample "
-                        f"(skew vs spawn = {skew_ms:.0f}ms)"
+                        "audio anchor: using WASAPI first-sample at "
+                        f"{actual:.3f} "
+                        f"({abs(offset_ms):.0f}ms {direction} spawn — "
+                        "informational, not an error)"
                     )
                 else:
                     _log(
@@ -24512,9 +24521,73 @@ Admin elevation
                 if self._clip_cache_region is not None
                 else QRect(self._screens_union_geometry())
             )
+            # HOT-SEGMENT SAFETY: the most-recent selected segment may
+            # still be open for write by the video cache ffmpeg. Reading
+            # an MKV file mid-cluster yields the corruption the user
+            # saw ('Element at X exceeds containing master element',
+            # H264 'co located POCs unavailable', pixelation + freezing).
+            # Detect a hot segment by its mtime (modified within the
+            # last 1.5 s = ffmpeg still writing) and snapshot it to a
+            # temp copy. The OS filesystem copy gives us a consistent
+            # view of whatever bytes existed AT COPY TIME — the export
+            # then concats the temp instead of racing the live writer.
+            # Any unfinished cluster at the tail is harmless: MKV is
+            # cluster-streaming and ffmpeg's concat demuxer tolerates a
+            # truncated final cluster cleanly (it just stops at the
+            # last completed frame). No footage is lost vs the
+            # speech_end_ts anchor — we just stop a few frames sooner.
+            hot_copies: list[Path] = []
+            now_ts = time.time()
+            input_paths: list[Path] = []
+            try:
+                import shutil as _shutil
+            except Exception:
+                _shutil = None
+            for i, entry in enumerate(selected):
+                src = Path(entry["path"]).resolve()
+                input_paths.append(src)
+                # Only the LAST selected segment can be the hot one
+                # (segments are chronological after sort).
+                if i != len(selected) - 1 or _shutil is None:
+                    continue
+                try:
+                    mtime_age = now_ts - src.stat().st_mtime
+                except Exception:
+                    mtime_age = 999.0
+                if mtime_age > 1.5:
+                    continue
+                # Snapshot to a temp copy.
+                try:
+                    snap = (self._clip_cache_dir()
+                            / f"hot_snapshot_{time.time_ns()}.mkv")
+                    _shutil.copyfile(str(src), str(snap))
+                    if snap.stat().st_size > 0:
+                        input_paths[-1] = snap
+                        hot_copies.append(snap)
+                        try:
+                            _sys = __import__("sys")
+                            _sys.stderr.write(
+                                f"[clip-export] hot-segment snapshot: "
+                                f"{src.name} (mtime_age={mtime_age:.2f}s) "
+                                f"-> {snap.name} ({snap.stat().st_size} B)\n"
+                            )
+                            _sys.stderr.flush()
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    try:
+                        _sys = __import__("sys")
+                        _sys.stderr.write(
+                            f"[clip-export] hot-segment snapshot failed: "
+                            f"{type(exc).__name__}: {exc} — using live "
+                            f"file (may corrupt)\n"
+                        )
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
             inputs: list[str] = []
-            for entry in selected:
-                inputs.extend(["-i", str(Path(entry["path"]).resolve())])
+            for p in input_paths:
+                inputs.extend(["-i", str(p)])
             n = len(selected)
             # Audio is recorded by a separate ffmpeg subprocess into
             # its own segment ring. Find audio segments whose wall-clock
@@ -24815,6 +24888,14 @@ Admin elevation
                 # Effective span after dropping the latency tail.
                 effective_span = max(0.0, total_duration - tail_to_drop)
                 actual_seconds = min(float(duration_seconds), effective_span)
+                # Clean up any hot-segment snapshots; the export is done
+                # with them. Best-effort — leaving a stray .mkv in the
+                # cache dir isn't fatal, the next clip-cache start sweeps.
+                for snap in hot_copies:
+                    try:
+                        snap.unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 return (True, output_path, actual_seconds)
             # Failure — print ffmpeg's own stderr so the diagnostic
             # survives even when the caller doesn't surface it. Tail

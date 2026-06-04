@@ -161,6 +161,17 @@ class WasapiLoopbackWriter:
         stream = self._stream
         stdin = self._stdin
         import time as _time
+        # Sample-count tracking so a "running but silent" bridge is
+        # visible in the log. Without this, a bridge that opens the
+        # device successfully but never produces audio (driver muted,
+        # endpoint switched out, exclusive-mode lock by another app,
+        # or — for the TCP mic path — ffmpeg never connected to dial
+        # back) sits permanently in "running" state and the user gets
+        # a silent clip with no diagnostic trail.
+        bytes_total = 0
+        start_t = _time.time()
+        next_log_at = start_t + 0.5  # first heartbeat after 500ms
+        silence_warned = False
         try:
             while not self._stop.is_set():
                 try:
@@ -168,7 +179,24 @@ class WasapiLoopbackWriter:
                 except Exception as exc:
                     self._on_error(f"WASAPI read error: {exc}")
                     break
+                now_t = _time.time()
                 if not data:
+                    # Empty read — count, and warn once if it lasts
+                    # past the first second so the user sees the bridge
+                    # opened the device but the device is producing no
+                    # audio (muted endpoint, exclusive-mode lock, etc.).
+                    if (not silence_warned
+                            and (now_t - start_t) > 1.0
+                            and bytes_total == 0):
+                        self._on_error(
+                            f"{self._label}: device opened OK but produced "
+                            "ZERO samples in the first 1.0s — the endpoint "
+                            "may be muted, locked by another app in "
+                            "exclusive mode, or not actually playing audio. "
+                            "Loopback captures only what reaches the "
+                            "selected render endpoint."
+                        )
+                        silence_warned = True
                     continue
                 if self.first_sample_at is None:
                     # Stamp first-sample arrival exactly once. Used by
@@ -176,6 +204,27 @@ class WasapiLoopbackWriter:
                     # the moment audio actually started flowing, not at
                     # the (earlier) moment ffmpeg's process spawned.
                     self.first_sample_at = _time.time()
+                bytes_total += len(data)
+                if now_t >= next_log_at:
+                    # Heartbeat: first one at 500ms, then every 5s. A
+                    # stalled bridge will stop printing, which is the
+                    # ONE clear failure signal we need to debug
+                    # "running but silent" reports.
+                    try:
+                        import sys as _sys
+                        kb = bytes_total // 1024
+                        _sys.stderr.write(
+                            f"[wasapi-bridge] {self._label}: "
+                            f"{kb} KB ({bytes_total} B) since start "
+                            f"(elapsed={now_t - start_t:.1f}s, "
+                            f"first_sample_at_offset="
+                            f"{(self.first_sample_at - start_t) * 1000:.0f}ms)\n"
+                        )
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+                    # Schedule next heartbeat 5s out.
+                    next_log_at = now_t + 5.0
                 try:
                     stdin.write(data)
                 except (BrokenPipeError, OSError, ValueError):
