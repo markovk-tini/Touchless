@@ -24752,34 +24752,72 @@ Admin elevation
             video_complex = ",".join(v_chain) + "[vout]"
             filter_complex = video_complex
             if has_audio:
-                # Audio chain — same end-anchored math as the video
-                # path so audio + video cut points line up exactly.
-                # The first audio input has ffmpeg index n (right
-                # after the last video input).
+                # WALL-CLOCK-ANCHORED audio chain.
+                #
+                # Old math assumed audio's last sample lines up with
+                # video's last sample, so any duration mismatch was
+                # "audio cache started later" → pad silence at START
+                # via adelay. That's wrong when audio's MOST RECENT
+                # segment is still being written (the in-progress
+                # audio_segment_*.aac doesn't appear in the manifest
+                # until it rotates, so the latest entry's wall_end
+                # is up to one segment-time SHORTER than end_ts).
+                # In that case audio is short at the END, not the
+                # START, and padding at START shifts the audio
+                # 4-6 seconds earlier than video — exactly the
+                # symptom the user just reported.
+                #
+                # Correct alignment: place each end of the audio at
+                # the corresponding end of the requested video
+                # window in WALL CLOCK. Pad whichever end the
+                # available audio doesn't cover. This handles both
+                # "audio late-start" and "audio short-end" cleanly.
                 a_total = sum(
                     max(1e-3, float(e.get("end_time", 0.0)) - float(e.get("start_time", 0.0)))
                     for e in audio_selected
                 )
-                a_end_trim = max(0.0, a_total - tail_to_drop)
-                a_start_trim = max(0.0, a_end_trim - float(duration_seconds))
-                a_trim_duration = max(1e-3, a_end_trim - a_start_trim)
-                # Alignment delay: pad the beginning of the audio
-                # output with silence so audio ENDS at the same
-                # moment video ends. Without this, both audio and
-                # video get PTS=0 after asetpts and play "together"
-                # at clip_T=0 — but audio's first sample was
-                # captured AFTER video's first sample (because audio
-                # capture is shorter than video capture: the audio
-                # cache hasn't accumulated as many seconds as the
-                # video cache, or PortAudio bridge_delay shifted the
-                # audio later in wall clock). Result: audio plays
-                # ahead of video by exactly (video_dur - audio_dur)
-                # seconds. The adelay below pushes the audio start
-                # to clip_T=(video_dur - audio_dur) so both end at
-                # the same point and the visible-but-silent prefix
-                # is at the start (matches what the user is doing
-                # before the 'clip that' command anyway).
-                audio_align_delay_ms = max(0, int(round((trim_duration - a_trim_duration) * 1000)))
+                # Wall-clock window the video covers AFTER trim.
+                v_clip_wall_end = (
+                    v_anchor + float(selected[-1].get("end_time", 0.0)) - tail_to_drop
+                    if v_anchor > 0 else 0.0
+                )
+                v_clip_wall_start = v_clip_wall_end - float(duration_seconds)
+                # Wall-clock window the SELECTED audio entries cover.
+                a_seg_wall_start = float(audio_selected[0].get("wall_start", 0.0))
+                a_seg_wall_end = float(audio_selected[-1].get("wall_end", 0.0))
+                if a_seg_wall_start <= 0.0 or v_clip_wall_end <= 0.0:
+                    # Degenerate (no wall anchor) — fall back to the
+                    # legacy end-aligned math. Better than nothing.
+                    a_end_trim = max(0.0, a_total - tail_to_drop)
+                    a_start_trim = max(0.0, a_end_trim - float(duration_seconds))
+                    a_trim_duration = max(1e-3, a_end_trim - a_start_trim)
+                    audio_align_delay_ms = max(0, int(round((trim_duration - a_trim_duration) * 1000)))
+                    audio_apad_ms = 0
+                else:
+                    # Overlap of available audio with the video clip
+                    # window, in wall clock.
+                    overlap_wall_start = max(a_seg_wall_start, v_clip_wall_start)
+                    overlap_wall_end = min(a_seg_wall_end, v_clip_wall_end)
+                    overlap_duration = max(0.0, overlap_wall_end - overlap_wall_start)
+                    # atrim positions inside the concatenated audio
+                    # stream (which starts at wall a_seg_wall_start
+                    # at concat_t=0).
+                    a_start_trim = max(0.0, overlap_wall_start - a_seg_wall_start)
+                    a_trim_duration = max(1e-3, overlap_duration)
+                    a_end_trim = a_start_trim + a_trim_duration
+                    # Silence padding. If overlap starts AFTER the
+                    # video clip's start, audio is missing at the
+                    # FRONT → adelay. If overlap ends BEFORE the
+                    # video clip's end, audio is missing at the BACK
+                    # → apad. Both are positive ms.
+                    audio_align_delay_ms = max(
+                        0,
+                        int(round((overlap_wall_start - v_clip_wall_start) * 1000))
+                    )
+                    audio_apad_ms = max(
+                        0,
+                        int(round((v_clip_wall_end - overlap_wall_end) * 1000))
+                    )
                 # User-tunable fine-shift on the audio relative to video.
                 # NEGATIVE pulls audio EARLIER in the clip (use when
                 # audio plays N ms LATE relative to video), POSITIVE
@@ -24808,6 +24846,16 @@ Admin elevation
                 a_chain.append("asetpts=PTS-STARTPTS")
                 if audio_align_delay_ms > 0:
                     a_chain.append(f"adelay={audio_align_delay_ms}:all=1")
+                # apad: silence at the END when audio's available
+                # window is shorter than the video window on the
+                # END side (most-recent audio segment still being
+                # written / not yet in manifest). Without this the
+                # whole audio stream gets shifted earlier in the
+                # clip, mismatching the visuals by audio_apad_ms.
+                if audio_apad_ms > 0:
+                    a_chain.append(
+                        f"apad=pad_dur={audio_apad_ms / 1000.0:.3f}"
+                    )
                 audio_complex = ",".join(a_chain) + "[aout]"
                 filter_complex = video_complex + ";" + audio_complex
                 # Surface the alignment numbers so any future "audio
@@ -24817,7 +24865,8 @@ Admin elevation
                     _sys.stderr.write(
                         f"[clip-export] audio alignment: video_trim={trim_duration:.2f}s "
                         f"audio_trim={a_trim_duration:.2f}s "
-                        f"delay_applied={audio_align_delay_ms}ms "
+                        f"adelay_ms={audio_align_delay_ms} "
+                        f"apad_ms={audio_apad_ms} "
                         f"user_offset_ms={user_offset_ms}\n"
                     )
                     _sys.stderr.flush()
@@ -25335,18 +25384,43 @@ Admin elevation
             video_complex = ",".join(v_chain) + "[vout]"
             filter_complex = video_complex
             if has_audio:
+                # Wall-clock-anchored alignment — see the matching
+                # block in _run_clip_export_ffmpeg for the full
+                # rationale. Handles both "audio short at the back"
+                # (most-recent audio segment not yet in manifest) and
+                # "audio short at the front" (audio cache started
+                # later than video cache) symmetrically.
                 a_total = sum(
                     max(1e-3, float(e.get("end_time", 0.0)) - float(e.get("start_time", 0.0)))
                     for e in audio_selected
                 )
-                a_end_trim = max(0.0, a_total)
-                a_start_trim = max(0.0, a_end_trim - float(duration_seconds))
-                a_trim_duration = max(1e-3, a_end_trim - a_start_trim)
-                # Same end-alignment as the voice-anchored path. See
-                # the matching comment in _run_clip_export_ffmpeg.
-                audio_align_delay_ms = max(0, int(round((trim_duration - a_trim_duration) * 1000)))
-                # Mirror voice-anchored path: optional user-tunable
-                # audio offset (NEGATIVE = audio earlier, POSITIVE = later).
+                v_clip_wall_end = (
+                    v_anchor + float(selected[-1].get("end_time", 0.0))
+                    if v_anchor > 0 else 0.0
+                )
+                v_clip_wall_start = v_clip_wall_end - float(duration_seconds)
+                a_seg_wall_start = float(audio_selected[0].get("wall_start", 0.0))
+                a_seg_wall_end = float(audio_selected[-1].get("wall_end", 0.0))
+                if a_seg_wall_start <= 0.0 or v_clip_wall_end <= 0.0:
+                    a_end_trim = max(0.0, a_total)
+                    a_start_trim = max(0.0, a_end_trim - float(duration_seconds))
+                    a_trim_duration = max(1e-3, a_end_trim - a_start_trim)
+                    audio_align_delay_ms = max(0, int(round((trim_duration - a_trim_duration) * 1000)))
+                    audio_apad_ms = 0
+                else:
+                    overlap_wall_start = max(a_seg_wall_start, v_clip_wall_start)
+                    overlap_wall_end = min(a_seg_wall_end, v_clip_wall_end)
+                    overlap_duration = max(0.0, overlap_wall_end - overlap_wall_start)
+                    a_start_trim = max(0.0, overlap_wall_start - a_seg_wall_start)
+                    a_trim_duration = max(1e-3, overlap_duration)
+                    audio_align_delay_ms = max(
+                        0,
+                        int(round((overlap_wall_start - v_clip_wall_start) * 1000))
+                    )
+                    audio_apad_ms = max(
+                        0,
+                        int(round((v_clip_wall_end - overlap_wall_end) * 1000))
+                    )
                 try:
                     user_offset_ms = int(
                         getattr(self.config, "clip_audio_offset_ms", 0) or 0)
@@ -25362,6 +25436,10 @@ Admin elevation
                     f"atrim=start={shifted_start:.3f}:duration={a_trim_duration:.3f}"
                 )
                 a_chain.append("asetpts=PTS-STARTPTS")
+                if audio_apad_ms > 0:
+                    a_chain.append(
+                        f"apad=pad_dur={audio_apad_ms / 1000.0:.3f}"
+                    )
                 if audio_align_delay_ms > 0:
                     a_chain.append(f"adelay={audio_align_delay_ms}:all=1")
                 filter_complex = video_complex + ";" + ",".join(a_chain) + "[aout]"
