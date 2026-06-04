@@ -23576,24 +23576,28 @@ Admin elevation
 
     # Mic noise-reduction presets. NOTE: agate's threshold is a
     # LINEAR amplitude (0..1) — no dB-suffix parsing in libavfilter.
-    # Reference: -20 dBFS = 0.1, -15 dBFS = 0.1778, -10 dBFS = 0.3162.
-    # Tuned for hot gaming mics where mechanical-keyboard click
-    # transients reach -18 to -22 dBFS even at 30 cm — RMS detection
-    # + low thresholds (e.g. -30 dBFS) would let the gate OPEN on
-    # each click and pass it through; peak detection + a higher
-    # threshold around -15 dBFS keeps the gate closed for clicks
-    # but opens for sustained speech which always sits above -10.
+    # Reference: -30 dBFS = 0.0316, -25 dBFS = 0.0562,
+    # -20 dBFS = 0.1, -15 dBFS = 0.1778, -10 dBFS = 0.3162.
+    # CALIBRATION: typical webcam mic at 30-60 cm produces speech
+    # PEAKS around -18 to -25 dBFS — the previous -15 dBFS threshold
+    # ("light") was HIGHER than speech peaks, so the gate stayed
+    # CLOSED for normal speaking and clips came out with zero mic
+    # audio. Verified against the user's voice command log:
+    # max_rms_seen=0.0706 (-23 dBFS) for "Clip that" — a deliberate
+    # voice command — sits well below the old threshold. Lowered
+    # "light" to -28 dBFS so normal speech passes. "Strong" stays
+    # tighter at -22 dBFS for noisy environments.
     _CLIP_NOISE_PRESETS: dict[str, str] = {
         "off": "anull",
         "light": (
             "highpass=f=80,"
-            "agate=threshold=0.1778:ratio=6:attack=5:release=100:"
-            "knee=2:makeup=1:detection=peak"
+            "agate=threshold=0.04:ratio=4:attack=10:release=200:"
+            "knee=4:makeup=1:detection=rms"
         ),
         "strong": (
             "highpass=f=100,"
-            "agate=threshold=0.3162:ratio=10:attack=2:release=60:"
-            "knee=1.5:makeup=1:detection=peak"
+            "agate=threshold=0.08:ratio=8:attack=5:release=120:"
+            "knee=2:makeup=1:detection=rms"
         ),
     }
 
@@ -23747,8 +23751,22 @@ Admin elevation
             fmt = self._probe_wasapi_loopback_format()
             if fmt is not None:
                 _dev, rate, channels = fmt
+                # -use_wallclock_as_timestamps + aresample=async=1
+                # (applied in the filter chain below) is the standard
+                # fix for PyAudioWPatch's WASAPI loopback rate drift.
+                # The bridge can deliver samples at 85-95% of nominal
+                # rate when the device is multi-channel or the mix
+                # format requires Int16 conversion. Without this,
+                # bytes are encoded as if they represent the full
+                # 192 KB/s but actually represent ~170 KB/s of wall
+                # time, so playback finishes 5-10% short — the
+                # symptom: "audio is 5-8 seconds behind video".
+                # use_wallclock_as_timestamps stamps each chunk by
+                # arrival time so aresample async can resample to
+                # match wall-clock duration.
                 input_args.extend([
                     "-thread_queue_size", "1024",
+                    "-use_wallclock_as_timestamps", "1",
                     "-f", "s16le",
                     "-ar", str(rate),
                     "-ac", str(channels),
@@ -23879,6 +23897,7 @@ Admin elevation
                         self._clip_mic_tcp_acceptor = acceptor
                         input_args.extend([
                             "-thread_queue_size", "1024",
+                            "-use_wallclock_as_timestamps", "1",
                             "-f", "s16le",
                             "-ar", str(mic_rate),
                             "-ac", str(mic_channels),
@@ -23894,6 +23913,7 @@ Admin elevation
                 else:
                     input_args.extend([
                         "-thread_queue_size", "1024",
+                        "-use_wallclock_as_timestamps", "1",
                         "-f", "s16le",
                         "-ar", str(mic_rate),
                         "-ac", str(mic_channels),
@@ -23924,22 +23944,32 @@ Admin elevation
         if ns_mode not in self._CLIP_NOISE_PRESETS:
             ns_mode = "light"
         ns = self._CLIP_NOISE_PRESETS[ns_mode]
+        # aresample=async=1 on each input: paired with
+        # -use_wallclock_as_timestamps above, this lets ffmpeg
+        # resample to fill in the gap when an input produces samples
+        # at slightly less than its declared rate. WASAPI loopback
+        # commonly underruns at 85-95% of nominal on multi-channel
+        # endpoints, so without async resampling the encoded audio
+        # ends up shorter than wall-clock duration → playback drifts
+        # behind the visuals by exactly the underrun delta.
         if sys_idx is not None and mic_idx is None:
             filter_args = [
-                "-filter_complex", f"[{sys_idx}:a]anull[aout]",
+                "-filter_complex",
+                f"[{sys_idx}:a]aresample=async=1[aout]",
                 "-map", "[aout]",
             ]
         elif sys_idx is None and mic_idx is not None:
             filter_args = [
-                "-filter_complex", f"[{mic_idx}:a]{ns}[aout]",
+                "-filter_complex",
+                f"[{mic_idx}:a]{ns},aresample=async=1[aout]",
                 "-map", "[aout]",
             ]
         else:
             filter_args = [
                 "-filter_complex",
                 (
-                    f"[{sys_idx}:a]anull[asys];"
-                    f"[{mic_idx}:a]{ns}[amic];"
+                    f"[{sys_idx}:a]aresample=async=1[asys];"
+                    f"[{mic_idx}:a]{ns},aresample=async=1[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
                     "dropout_transition=0[aout]"
                 ),
