@@ -24654,6 +24654,97 @@ Admin elevation
                     audio_entries = self._parse_ffmpeg_clip_audio_manifest()
                 finally:
                     self._clip_cache_audio_list_path = _saved_audio_list_path
+                # AUDIO HOT-SNAPSHOT: the in-progress audio_NNN.aac
+                # (currently being written by the audio cache ffmpeg)
+                # doesn't appear in the manifest CSV until it rotates,
+                # so without this the most-recent ~5-10s of audio is
+                # missing from every clip — perceived as "audio cuts
+                # out N seconds before video ends" / "audio behind".
+                # Scan the cache dir for any audio_*.aac that's NOT
+                # in the manifest AND was modified within the last 2s
+                # (ffmpeg still writing it). Snapshot via shutil.copy
+                # (OS gives a consistent point-in-time view; ADTS-AAC
+                # framing means the partial file is decodable up to
+                # the last complete frame). Synthesize a manifest
+                # entry: start_time = where the last completed entry
+                # ended, end_time = (now - a_anchor) so the wall_end
+                # covers the in-progress segment. ffmpeg's concat
+                # demuxer tolerates the truncated tail cleanly.
+                audio_hot_copies: list[Path] = []
+                try:
+                    import shutil as _ashutil
+                    aac_pat = self._clip_cache_audio_segment_pattern
+                    if (aac_pat is not None and a_anchor > 0):
+                        cache_dir = aac_pat.parent
+                        manifest_paths = {
+                            str(Path(e.get("path", "")).resolve())
+                            for e in audio_entries
+                        }
+                        now_ts_a = time.time()
+                        hot_candidates: list = []
+                        try:
+                            for cand in cache_dir.glob("audio_*.aac"):
+                                try:
+                                    if str(cand.resolve()) in manifest_paths:
+                                        continue
+                                    age = now_ts_a - cand.stat().st_mtime
+                                    size = cand.stat().st_size
+                                except Exception:
+                                    continue
+                                if age <= 2.0 and size > 1024:
+                                    hot_candidates.append((cand, age, size))
+                        except Exception:
+                            hot_candidates = []
+                        if hot_candidates:
+                            hot_candidates.sort(key=lambda c: c[1])
+                            cand, cand_age, cand_size = hot_candidates[0]
+                            try:
+                                snap = (cache_dir /
+                                        f"hot_audio_{time.time_ns()}.aac")
+                                _ashutil.copyfile(str(cand), str(snap))
+                                if snap.exists() and snap.stat().st_size > 0:
+                                    audio_hot_copies.append(snap)
+                                    if audio_entries:
+                                        snap_start = max(
+                                            float(e.get("end_time", 0.0))
+                                            for e in audio_entries
+                                        )
+                                    else:
+                                        snap_start = 0.0
+                                    snap_end = max(
+                                        snap_start + 0.5,
+                                        now_ts_a - a_anchor)
+                                    audio_entries.append({
+                                        "path": snap,
+                                        "start_time": snap_start,
+                                        "end_time": snap_end,
+                                    })
+                                    try:
+                                        import sys as _sys
+                                        _sys.stderr.write(
+                                            f"[clip-export] audio hot-snapshot: "
+                                            f"{cand.name} -> {snap.name} "
+                                            f"(age={cand_age:.2f}s, "
+                                            f"size={cand_size} B, "
+                                            f"synth_range=[{snap_start:.2f},"
+                                            f"{snap_end:.2f}])\n"
+                                        )
+                                        _sys.stderr.flush()
+                                    except Exception:
+                                        pass
+                            except Exception as exc:
+                                try:
+                                    import sys as _sys
+                                    _sys.stderr.write(
+                                        f"[clip-export] audio hot-snapshot "
+                                        f"copy failed: "
+                                        f"{type(exc).__name__}: {exc}\n"
+                                    )
+                                    _sys.stderr.flush()
+                                except Exception:
+                                    pass
+                except Exception:
+                    audio_hot_copies = []
                 # Convert every audio entry's relative times to
                 # wall-clock once so logging and selection share one
                 # source of truth.
@@ -24945,13 +25036,22 @@ Admin elevation
                 effective_span = max(0.0, total_duration - tail_to_drop)
                 actual_seconds = min(float(duration_seconds), effective_span)
                 # Clean up any hot-segment snapshots; the export is done
-                # with them. Best-effort — leaving a stray .mkv in the
-                # cache dir isn't fatal, the next clip-cache start sweeps.
+                # with them. Best-effort — leaving a stray .mkv/.aac in
+                # the cache dir isn't fatal, the next clip-cache start
+                # sweeps.
                 for snap in hot_copies:
                     try:
                         snap.unlink(missing_ok=True)
                     except Exception:
                         pass
+                try:
+                    for snap in audio_hot_copies:
+                        try:
+                            snap.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                except NameError:
+                    pass  # no-audio-at-export path
                 return (True, output_path, actual_seconds)
             # Failure — print ffmpeg's own stderr so the diagnostic
             # survives even when the caller doesn't surface it. Tail
