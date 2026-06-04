@@ -24805,7 +24805,41 @@ Admin elevation
                 v_clip_wall_start = v_clip_wall_end - float(duration_seconds)
                 # Wall-clock window the SELECTED audio entries cover.
                 a_seg_wall_start = float(audio_selected[0].get("wall_start", 0.0))
-                a_seg_wall_end = float(audio_selected[-1].get("wall_end", 0.0))
+                a_seg_wall_end_nominal = float(
+                    audio_selected[-1].get("wall_end", 0.0))
+                # WASAPI rate-drift correction. PyAudioWPatch can deliver
+                # samples at 85-95% of nominal on certain endpoints, so
+                # encoded AAC plays back 5-15% faster than wall clock.
+                # We compute atempo_ratio here (BEFORE the overlap math)
+                # so we can also scale a_seg_wall_end to reflect ACTUAL
+                # wall content captured (not nominal AAC duration).
+                # Without this scaling, the overlap math thinks audio
+                # is short and apad pads 5-6s of silence at the end —
+                # exactly the user's reported "audio 5-6s behind"
+                # symptom.
+                sys_atempo_ratio = 1.0
+                try:
+                    sys_writer = getattr(self, "_wasapi_writer", None)
+                    if sys_writer is not None:
+                        meas = sys_writer.actual_rate_hz()
+                        nominal = float(getattr(sys_writer, "rate", 0) or 0)
+                        if meas and nominal > 0:
+                            r = meas / nominal
+                            if 0.50 <= r <= 1.50 and abs(r - 1.0) > 0.02:
+                                sys_atempo_ratio = r
+                except Exception:
+                    sys_atempo_ratio = 1.0
+                # Scale the nominal AAC wall_end by 1/ratio so it
+                # reflects the actual wall time the captured content
+                # represents (which is what post-atempo audio will
+                # cover).
+                if sys_atempo_ratio < 0.999:
+                    actual_a_duration = (
+                        (a_seg_wall_end_nominal - a_seg_wall_start)
+                        / sys_atempo_ratio)
+                    a_seg_wall_end = a_seg_wall_start + actual_a_duration
+                else:
+                    a_seg_wall_end = a_seg_wall_end_nominal
                 if a_seg_wall_start <= 0.0 or v_clip_wall_end <= 0.0:
                     # Degenerate (no wall anchor) — fall back to the
                     # legacy end-aligned math. Better than nothing.
@@ -24816,13 +24850,20 @@ Admin elevation
                     audio_apad_ms = 0
                 else:
                     # Overlap of available audio with the video clip
-                    # window, in wall clock.
+                    # window, in wall clock. With the scaled
+                    # a_seg_wall_end above, overlap_wall_end honors
+                    # actual captured wall content, not under-counted
+                    # nominal AAC duration.
                     overlap_wall_start = max(a_seg_wall_start, v_clip_wall_start)
                     overlap_wall_end = min(a_seg_wall_end, v_clip_wall_end)
                     overlap_duration = max(0.0, overlap_wall_end - overlap_wall_start)
                     # atrim positions inside the concatenated audio
-                    # stream (which starts at wall a_seg_wall_start
-                    # at concat_t=0).
+                    # stream POST-atempo (which starts at wall
+                    # a_seg_wall_start at concat_t=0 and runs at wall
+                    # rate). Pre-atempo, the same N wall seconds
+                    # would correspond to N×ratio nominal seconds —
+                    # but we apply atempo FIRST in the filter chain
+                    # so atrim values stay in wall time.
                     a_start_trim = max(0.0, overlap_wall_start - a_seg_wall_start)
                     a_trim_duration = max(1e-3, overlap_duration)
                     a_end_trim = a_start_trim + a_trim_duration
@@ -24851,35 +24892,8 @@ Admin elevation
                 except Exception:
                     user_offset_ms = 0
                 user_offset_ms = max(-2000, min(2000, user_offset_ms))
-                # WASAPI rate-drift correction. PyAudioWPatch can
-                # deliver samples at 85-95% of the nominal rate on
-                # certain endpoints (multi-channel, exotic mix
-                # formats). The encoded AAC then plays back 5-15%
-                # faster than wall clock — audio drifts AHEAD of
-                # video across the clip. Measure the bridge's actual
-                # rate vs nominal, and if the drift is >2% apply
-                # `atempo=ratio` (atempo<1 slows playback without
-                # changing pitch) so the audio's wall-clock duration
-                # matches what was actually captured. Threshold of 2%
-                # avoids unnecessary atempo on healthy captures.
-                sys_atempo_ratio = 1.0
-                try:
-                    sys_writer = getattr(self, "_wasapi_writer", None)
-                    if sys_writer is not None:
-                        meas = sys_writer.actual_rate_hz()
-                        nominal = float(getattr(sys_writer, "rate", 0) or 0)
-                        if meas and nominal > 0:
-                            r = meas / nominal
-                            if 0.50 <= r <= 1.50 and abs(r - 1.0) > 0.02:
-                                sys_atempo_ratio = r
-                except Exception:
-                    sys_atempo_ratio = 1.0
-                # Mic bridge typically stays within 1-2% of nominal,
-                # but check too. atempo can only be applied to the
-                # full mixed track here (capture already amix'd both
-                # inputs into one AAC stream), so we use the LARGER
-                # drift between the two — system audio dominates the
-                # perceptual sync.
+                # sys_atempo_ratio already computed above (BEFORE the
+                # overlap math, so it could scale a_seg_wall_end).
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
