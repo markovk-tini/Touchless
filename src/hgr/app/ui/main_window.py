@@ -24851,45 +24851,9 @@ Admin elevation
                 except Exception:
                     user_offset_ms = 0
                 user_offset_ms = max(-2000, min(2000, user_offset_ms))
-                # WASAPI rate-drift correction. PyAudioWPatch can
-                # deliver samples at 85-95% of the nominal rate on
-                # certain endpoints (multi-channel, exotic mix
-                # formats). The encoded AAC then plays back 5-15%
-                # faster than wall clock — audio drifts AHEAD of
-                # video across the clip. Measure the bridge's actual
-                # rate vs nominal, and if the drift is >2% apply
-                # `atempo=ratio` (atempo<1 slows playback without
-                # changing pitch) so the audio's wall-clock duration
-                # matches what was actually captured. Threshold of 2%
-                # avoids unnecessary atempo on healthy captures.
-                sys_atempo_ratio = 1.0
-                try:
-                    sys_writer = getattr(self, "_wasapi_writer", None)
-                    if sys_writer is not None:
-                        meas = sys_writer.actual_rate_hz()
-                        nominal = float(getattr(sys_writer, "rate", 0) or 0)
-                        if meas and nominal > 0:
-                            r = meas / nominal
-                            if 0.50 <= r <= 1.50 and abs(r - 1.0) > 0.02:
-                                sys_atempo_ratio = r
-                except Exception:
-                    sys_atempo_ratio = 1.0
-                # Mic bridge typically stays within 1-2% of nominal,
-                # but check too. atempo can only be applied to the
-                # full mixed track here (capture already amix'd both
-                # inputs into one AAC stream), so we use the LARGER
-                # drift between the two — system audio dominates the
-                # perceptual sync.
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
-                # Insert atempo FIRST (operates on raw concat output),
-                # then everything downstream operates in post-atempo
-                # time which (after correction) matches wall clock.
-                # That means atrim/adelay/apad with wall-time values
-                # work as written.
-                if abs(sys_atempo_ratio - 1.0) > 0.001:
-                    a_chain.append(f"atempo={sys_atempo_ratio:.4f}")
                 # Bias the trim start by the user offset BEFORE atrim,
                 # so a negative offset pulls EARLIER audio samples into
                 # the window (which makes audio play sooner in the
@@ -24924,7 +24888,6 @@ Admin elevation
                         f"audio_trim={a_trim_duration:.2f}s "
                         f"adelay_ms={audio_align_delay_ms} "
                         f"apad_ms={audio_apad_ms} "
-                        f"atempo={sys_atempo_ratio:.4f} "
                         f"user_offset_ms={user_offset_ms}\n"
                     )
                     _sys.stderr.flush()
@@ -25487,26 +25450,9 @@ Admin elevation
                 user_offset_ms = max(-2000, min(2000, user_offset_ms))
                 offset_seconds = user_offset_ms / 1000.0
                 shifted_start = max(0.0, a_start_trim - offset_seconds)
-                # Mirror the WASAPI rate-drift correction from the
-                # voice-anchored path. See that path's comment for
-                # the full rationale.
-                sys_atempo_ratio = 1.0
-                try:
-                    sys_writer = getattr(self, "_wasapi_writer", None)
-                    if sys_writer is not None:
-                        meas = sys_writer.actual_rate_hz()
-                        nominal = float(getattr(sys_writer, "rate", 0) or 0)
-                        if meas and nominal > 0:
-                            r = meas / nominal
-                            if 0.50 <= r <= 1.50 and abs(r - 1.0) > 0.02:
-                                sys_atempo_ratio = r
-                except Exception:
-                    sys_atempo_ratio = 1.0
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
-                if abs(sys_atempo_ratio - 1.0) > 0.001:
-                    a_chain.append(f"atempo={sys_atempo_ratio:.4f}")
                 a_chain.append(
                     f"atrim=start={shifted_start:.3f}:duration={a_trim_duration:.3f}"
                 )

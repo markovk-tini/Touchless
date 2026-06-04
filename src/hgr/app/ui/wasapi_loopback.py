@@ -110,12 +110,6 @@ class WasapiLoopbackWriter:
         # later than video in the exported clip. None until the bridge
         # has actually read its first sample.
         self.first_sample_at: Optional[float] = None
-        # Running byte count of audio actually delivered by PortAudio.
-        # Used by actual_rate_hz() to detect WASAPI loopback rate drift
-        # (multi-channel endpoints in shared mode can deliver at 85-95%
-        # of the device's declared rate, which would otherwise show up
-        # as audio playing 5-15% faster than wall clock in the clip).
-        self._bytes_total = 0
 
     def start(self) -> bool:
         """Open the loopback stream + spawn the writer thread.
@@ -163,33 +157,6 @@ class WasapiLoopbackWriter:
         self._thread.start()
         return True
 
-    def actual_rate_hz(self) -> Optional[float]:
-        """Measured sample rate (samples/sec) the device has actually
-        produced since first_sample_at, derived from the running
-        byte counter. Returns None when not enough data has flowed
-        yet (under ~250 ms) so callers can fall back to nominal.
-
-        Use case: WASAPI loopback in PortAudio shared mode can deliver
-        samples at 85-95% of the declared rate on multi-channel
-        endpoints. Without correction the encoded AAC plays back
-        5-15% faster than wall clock and audio drifts ahead of video
-        across a long clip. The clip-export aligner divides this
-        measured rate by the declared rate to compute an `atempo`
-        ratio that stretches the audio back to true wall-clock
-        duration."""
-        if self.first_sample_at is None:
-            return None
-        try:
-            import time as _time
-            elapsed = _time.time() - float(self.first_sample_at)
-        except Exception:
-            return None
-        if elapsed < 0.25:
-            return None
-        bytes_per_frame = max(1, int(self.channels) * 2)  # paInt16 → 2 B/sample
-        bytes_per_sec = self._bytes_total / elapsed
-        return bytes_per_sec / bytes_per_frame
-
     def _run(self) -> None:
         stream = self._stream
         stdin = self._stdin
@@ -201,10 +168,6 @@ class WasapiLoopbackWriter:
         # or — for the TCP mic path — ffmpeg never connected to dial
         # back) sits permanently in "running" state and the user gets
         # a silent clip with no diagnostic trail.
-        # bytes_total mirrors self._bytes_total for the heartbeat log;
-        # the instance attribute is the canonical counter so external
-        # callers (clip export) can query actual_rate_hz() at any time
-        # without sharing locals with this thread.
         bytes_total = 0
         start_t = _time.time()
         next_log_at = start_t + 0.5  # first heartbeat after 500ms
@@ -242,10 +205,6 @@ class WasapiLoopbackWriter:
                     # the (earlier) moment ffmpeg's process spawned.
                     self.first_sample_at = _time.time()
                 bytes_total += len(data)
-                # Mirror to the instance attr so actual_rate_hz() can
-                # read it from any thread. int writes are atomic in
-                # CPython so no lock is needed.
-                self._bytes_total = bytes_total
                 if now_t >= next_log_at:
                     # Heartbeat: first one at 500ms, then every 5s. A
                     # stalled bridge will stop printing, which is the
