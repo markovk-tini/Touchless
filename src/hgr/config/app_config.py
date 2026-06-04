@@ -246,6 +246,9 @@ class AppConfig:
     # (False → True). Latched True after load_config has run the
     # one-time promotion exactly once.
     clip_mic_default_migrated: bool = False
+    # Parallel marker for clip_mic_noise_reduction default flip
+    # ('light' → 'off'). Latched True after the one-time promotion.
+    clip_mic_filter_default_migrated: bool = False
     # Audio-vs-video offset applied at clip export time as ffmpeg
     # -itsoffset on every audio input. NEGATIVE shifts audio EARLIER
     # in the clip (audio plays before the corresponding video frame
@@ -278,7 +281,15 @@ class AppConfig:
     # the UI grays the dropdown out when mic is off. Changes
     # take effect on the next clip-cache restart. Invalid values
     # silently fall back to "light".
-    clip_mic_noise_reduction: str = "light"
+    # 'off' by default per the user's clip-mic spec:
+    # "use the same audio levels and everything as voice commands".
+    # Voice commands run raw with no gate; the prior 'light' default
+    # had agate threshold=0.1778 (-15 dBFS) — higher than typical
+    # webcam-mic speech peaks (~-23 dBFS measured) — which gated
+    # most words and produced the "garbled mic" report. Users with
+    # noisy environments can still pick 'light' or 'strong' in
+    # Settings → Clip Audio.
+    clip_mic_noise_reduction: str = "off"
     # Discord OAuth credentials supplied by the user via the in-app
     # Discord setup wizard. Same per-user-app pattern as Spotify above,
     # but with a different motivation: Discord's `rpc` OAuth scope is
@@ -577,6 +588,14 @@ def load_config() -> AppConfig:
             if values.get("clip_capture_microphone") is False:
                 values["clip_capture_microphone"] = True
             values["clip_mic_default_migrated"] = True
+
+        # Parallel: flip clip_mic_noise_reduction 'light' (old default)
+        # → 'off' for upgraded installs. Only the EXACT old default
+        # gets promoted; deliberate 'strong' picks survive.
+        if not data.get("clip_mic_filter_default_migrated", False):
+            if values.get("clip_mic_noise_reduction") == "light":
+                values["clip_mic_noise_reduction"] = "off"
+            values["clip_mic_filter_default_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if

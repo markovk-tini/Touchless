@@ -24081,9 +24081,16 @@ Admin elevation
                     # ffmpeg should be connecting RIGHT NOW (it was
                     # spawned with -i tcp://127.0.0.1:PORT and our
                     # startup-liveness check already passed). Block up
-                    # to 5s for the accept, more than enough for the
-                    # connection to land.
-                    sock_file = self._clip_mic_tcp_acceptor.accept(timeout=5.0)
+                    # to 30s for the accept. The previous 5s window
+                    # was too tight: on some Windows machines ffmpeg
+                    # process creation + input-format negotiation
+                    # takes 6-15s, the accept times out, the listener
+                    # closes, and ffmpeg's eventual TCP connect fails
+                    # with `Error number -138 occurred` (the symptom
+                    # the user just reported). 30s is generous enough
+                    # to survive antivirus-slow process spawn without
+                    # hanging the clip-cache start UX forever.
+                    sock_file = self._clip_mic_tcp_acceptor.accept(timeout=30.0)
                     if sock_file is None:
                         _log(
                             "mic TCP listener never received an ffmpeg "
