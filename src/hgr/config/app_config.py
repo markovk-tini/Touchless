@@ -242,6 +242,21 @@ class AppConfig:
     # this, every launch would re-promote a user's deliberate False
     # back to True, defeating their opt-out. See load_config().
     clip_audio_default_migrated: bool = False
+    # Parallel marker for clip_capture_microphone default flip
+    # (False → True). Latched True after load_config has run the
+    # one-time promotion exactly once.
+    clip_mic_default_migrated: bool = False
+    # Audio-vs-video offset applied at clip export time as ffmpeg
+    # -itsoffset on every audio input. NEGATIVE shifts audio EARLIER
+    # in the clip (audio plays before the corresponding video frame
+    # by that many ms — useful when the user reports audio is N ms
+    # LATE relative to video). POSITIVE shifts audio LATER.
+    # Default 0 — most users won't need this. The WASAPI first-sample
+    # anchor already nails alignment within ~100 ms on healthy
+    # drivers; this is the user-tunable knob for hardware that drifts
+    # further (some Realtek + Atmos / Dolby DACs can carry 200-500 ms
+    # of internal latency).
+    clip_audio_offset_ms: int = 0
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -549,6 +564,19 @@ def load_config() -> AppConfig:
             if values.get("clip_capture_system_audio") is False:
                 values["clip_capture_system_audio"] = True
             values["clip_audio_default_migrated"] = True
+
+        # Parallel migration: clip_capture_microphone default flipped
+        # False → True (mic is now in clips by default — same WASAPI
+        # device the user already exposes for voice commands, so no
+        # incremental privacy surface). Promote a persisted False ONLY
+        # on existing installs that never explicitly toggled the mic;
+        # gated on its own marker so we run it exactly once per install
+        # and a deliberate "turn mic off in clips" choice is preserved
+        # going forward.
+        if not data.get("clip_mic_default_migrated", False):
+            if values.get("clip_capture_microphone") is False:
+                values["clip_capture_microphone"] = True
+            values["clip_mic_default_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if

@@ -23786,11 +23786,18 @@ Admin elevation
             # — exactly the symptom the user reported ("Windows says
             # it's connected to a mic that's not even plugged in").
             listener_index: int | None = None
-            if not mic_name:
-                try:
-                    if (self._worker is not None
-                            and getattr(self._worker, "voice_listener", None)
-                            is not None):
+            # ALWAYS try to grab the listener's index — even when the
+            # user DID set a preferred_microphone_name. Index-based
+            # resolution is more robust than name-based (sounddevice
+            # and PyAudioWPatch share the PortAudio backend but their
+            # default-input pickers differ; passing the listener's
+            # resolved index makes the clip recorder use the exact
+            # same physical device the voice listener uses).
+            try:
+                if (self._worker is not None
+                        and getattr(self._worker, "voice_listener", None)
+                        is not None):
+                    if not mic_name:
                         listener_mic = self._worker.voice_listener.input_device_name()
                         if listener_mic:
                             mic_name = str(listener_mic).strip()
@@ -23798,27 +23805,57 @@ Admin elevation
                                 "mic fallback: voice listener's resolved "
                                 f"mic = {mic_name!r}"
                             )
+                    try:
+                        listener_index = (
+                            self._worker.voice_listener.input_device_index()
+                        )
+                    except Exception:
+                        listener_index = None
+                    # Last-resort index fallback: when the listener has
+                    # no explicit device set, its index is None but
+                    # sounddevice (PortAudio) still has a real WASAPI
+                    # default it would resolve to at runtime. Query
+                    # sounddevice directly so we pin to the SAME
+                    # device the listener will end up using, not
+                    # PyAudioWPatch's MME default (which on many
+                    # machines is a different — often unplugged —
+                    # device).
+                    if listener_index is None:
                         try:
-                            listener_index = (
-                                self._worker.voice_listener.input_device_index()
-                            )
+                            import sounddevice as _sd
+                            default_pair = _sd.default.device
+                            if isinstance(default_pair, (tuple, list)) and default_pair:
+                                cand = default_pair[0]
+                                if isinstance(cand, int) and cand >= 0:
+                                    listener_index = int(cand)
+                                    _log(
+                                        "mic fallback: sounddevice default "
+                                        f"WASAPI input idx = {listener_index}"
+                                    )
                         except Exception:
-                            listener_index = None
-                except Exception as exc:
-                    _log(f"mic fallback lookup failed: {exc}")
+                            pass
+            except Exception as exc:
+                _log(f"mic fallback lookup failed: {exc}")
             # Resolve to a PyAudioWPatch (PortAudio) device index +
-            # format. probe_input_device_format does the name-to-index
-            # walk over WASAPI inputs; if the name doesn't match it
-            # falls back to PortAudio's default WASAPI input — same
-            # device the voice listener uses when its preferred-mic
-            # field is empty. This is the path that REPLACES dshow.
+            # format. We pass BOTH the resolved listener_index AND the
+            # name — the probe prefers index (PortAudio backend is
+            # shared between sounddevice and PyAudioWPatch, so the
+            # index is cross-compatible) and falls back to name → WASAPI
+            # default if no index is available.
             try:
                 from hgr.app.ui.wasapi_loopback import probe_input_device_format
                 mic_pcm_format = probe_input_device_format(
                     mic_name or None,
+                    device_index=listener_index,
                     fallback_rate=48000,
                     max_channels=1,
                 )
+                if mic_pcm_format is not None:
+                    _log(
+                        f"mic probe -> idx={mic_pcm_format[0]} "
+                        f"rate={mic_pcm_format[1]} ch={mic_pcm_format[2]} "
+                        f"(name hint={mic_name!r}, listener_idx={listener_index})"
+                    )
             except Exception as exc:
                 _log(f"mic probe failed: {exc}")
                 mic_pcm_format = None
@@ -24670,11 +24707,30 @@ Admin elevation
                 # is at the start (matches what the user is doing
                 # before the 'clip that' command anyway).
                 audio_align_delay_ms = max(0, int(round((trim_duration - a_trim_duration) * 1000)))
+                # User-tunable fine-shift on the audio relative to video.
+                # NEGATIVE pulls audio EARLIER in the clip (use when
+                # audio plays N ms LATE relative to video), POSITIVE
+                # pushes audio LATER. Applied AFTER the auto end-align
+                # math so it nudges the result without breaking the
+                # existing alignment.
+                try:
+                    user_offset_ms = int(
+                        getattr(self.config, "clip_audio_offset_ms", 0) or 0)
+                except Exception:
+                    user_offset_ms = 0
+                user_offset_ms = max(-2000, min(2000, user_offset_ms))
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
+                # Bias the trim start by the user offset BEFORE atrim,
+                # so a negative offset pulls EARLIER audio samples into
+                # the window (which makes audio play sooner in the
+                # exported clip). Clamp so we never atrim past 0 or
+                # past the available concat duration.
+                offset_seconds = user_offset_ms / 1000.0
+                shifted_start = max(0.0, a_start_trim - offset_seconds)
                 a_chain.append(
-                    f"atrim=start={a_start_trim:.3f}:duration={a_trim_duration:.3f}"
+                    f"atrim=start={shifted_start:.3f}:duration={a_trim_duration:.3f}"
                 )
                 a_chain.append("asetpts=PTS-STARTPTS")
                 if audio_align_delay_ms > 0:
@@ -24688,7 +24744,8 @@ Admin elevation
                     _sys.stderr.write(
                         f"[clip-export] audio alignment: video_trim={trim_duration:.2f}s "
                         f"audio_trim={a_trim_duration:.2f}s "
-                        f"delay_applied={audio_align_delay_ms}ms\n"
+                        f"delay_applied={audio_align_delay_ms}ms "
+                        f"user_offset_ms={user_offset_ms}\n"
                     )
                     _sys.stderr.flush()
                 except Exception:
@@ -25207,11 +25264,21 @@ Admin elevation
                 # Same end-alignment as the voice-anchored path. See
                 # the matching comment in _run_clip_export_ffmpeg.
                 audio_align_delay_ms = max(0, int(round((trim_duration - a_trim_duration) * 1000)))
+                # Mirror voice-anchored path: optional user-tunable
+                # audio offset (NEGATIVE = audio earlier, POSITIVE = later).
+                try:
+                    user_offset_ms = int(
+                        getattr(self.config, "clip_audio_offset_ms", 0) or 0)
+                except Exception:
+                    user_offset_ms = 0
+                user_offset_ms = max(-2000, min(2000, user_offset_ms))
+                offset_seconds = user_offset_ms / 1000.0
+                shifted_start = max(0.0, a_start_trim - offset_seconds)
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
                 a_chain.append(
-                    f"atrim=start={a_start_trim:.3f}:duration={a_trim_duration:.3f}"
+                    f"atrim=start={shifted_start:.3f}:duration={a_trim_duration:.3f}"
                 )
                 a_chain.append("asetpts=PTS-STARTPTS")
                 if audio_align_delay_ms > 0:

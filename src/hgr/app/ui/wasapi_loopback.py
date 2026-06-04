@@ -219,6 +219,7 @@ class WasapiLoopbackWriter:
 def probe_input_device_format(
     device_name: Optional[str] = None,
     *,
+    device_index: Optional[int] = None,
     fallback_rate: int = 48000,
     max_channels: int = 1,
 ) -> Optional[tuple[int, int, int]]:
@@ -247,6 +248,27 @@ def probe_input_device_format(
     p = None
     try:
         p = pa.PyAudio()
+        # PRIORITY 1: caller passed an explicit device_index (typically
+        # the voice listener's resolved sounddevice index). Both
+        # sounddevice and PyAudioWPatch wrap the SAME PortAudio backend
+        # and enumerate devices in the SAME order, so the index is
+        # cross-compatible — the safest resolution path because it
+        # bypasses every name-format quirk between the two libraries.
+        # PortAudio's "default input" can also be wrong on Windows
+        # (PyAudioWPatch returns MME default, not WASAPI default — they
+        # can be different physical devices), so this path also avoids
+        # the bug where the fallback picks an unplugged headset.
+        if device_index is not None:
+            try:
+                info = p.get_device_info_by_index(int(device_index))
+                if int(info.get("maxInputChannels", 0) or 0) > 0:
+                    rate = int(info.get("defaultSampleRate", fallback_rate)
+                               or fallback_rate)
+                    ch = min(max_channels, int(
+                        info.get("maxInputChannels", 1) or 1))
+                    return (int(device_index), rate, max(1, ch))
+            except Exception:
+                pass  # fall through to name / default resolution
         # Resolve the WASAPI host API index. Inputs from other host
         # APIs (MME, DirectSound) have different latency and worse
         # driver behavior; we want WASAPI to match the rest of the
