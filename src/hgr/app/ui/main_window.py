@@ -24647,107 +24647,6 @@ Admin elevation
                     audio_entries = self._parse_ffmpeg_clip_audio_manifest()
                 finally:
                     self._clip_cache_audio_list_path = _saved_audio_list_path
-                # AUDIO HOT-SNAPSHOT: the in-progress audio segment
-                # (audio_NNN.aac currently being written by the audio
-                # cache ffmpeg) doesn't appear in the manifest until
-                # it rotates, so without this the most recent ~10s
-                # of audio is missing from the export — exactly the
-                # "audio cuts out 5-8s before video ends" behavior
-                # the user reported as "audio behind". Mirror the
-                # video hot-segment snapshot from a084f65: find the
-                # currently-being-written audio file via mtime, copy
-                # it to a temp snapshot, synthesize a manifest entry
-                # for it with wall_end = now() so the wall-clock
-                # selector includes it.
-                audio_hot_copies: list[Path] = []
-                try:
-                    import shutil as _shutil
-                    import time as _time
-                    aac_pattern = self._clip_cache_audio_segment_pattern
-                    if aac_pattern is not None and a_anchor > 0:
-                        cache_dir = aac_pattern.parent
-                        # Find every audio_NNN.aac file in the dir.
-                        # mtime within 1.5s = ffmpeg still writing it.
-                        manifest_paths = {
-                            str(Path(e.get("path", "")).resolve())
-                            for e in audio_entries
-                        }
-                        now_ts = _time.time()
-                        for cand in sorted(
-                                cache_dir.glob("audio_*.aac")):
-                            try:
-                                cand_resolved = str(cand.resolve())
-                                if cand_resolved in manifest_paths:
-                                    continue  # already in manifest
-                                mtime_age = now_ts - cand.stat().st_mtime
-                                if mtime_age > 1.5 or cand.stat().st_size < 256:
-                                    continue
-                                snap = (cache_dir
-                                        / f"hot_audio_snapshot_"
-                                          f"{_time.time_ns()}.aac")
-                                _shutil.copyfile(str(cand), str(snap))
-                                if snap.stat().st_size > 0:
-                                    audio_hot_copies.append(snap)
-                                    # Synthesize manifest entry. Use
-                                    # bytes / nominal byte-rate to
-                                    # estimate nominal duration.
-                                    sys_w = getattr(
-                                        self, "_wasapi_writer", None)
-                                    rate = (int(getattr(sys_w, "rate", 48000))
-                                            if sys_w else 48000)
-                                    ch = (int(getattr(sys_w, "channels", 2))
-                                          if sys_w else 2)
-                                    # AAC is compressed — fall back to
-                                    # wall-clock based duration estimate:
-                                    # last_completed_end_rel → now_rel.
-                                    if audio_entries:
-                                        prior_end_rel = max(
-                                            float(e.get("end_time", 0.0))
-                                            for e in audio_entries
-                                        )
-                                    else:
-                                        prior_end_rel = 0.0
-                                    # End-wall = now (live writing time).
-                                    snap_end_wall = now_ts
-                                    snap_start_wall = (
-                                        a_anchor + prior_end_rel
-                                    )
-                                    snap_start_rel = (
-                                        snap_start_wall - a_anchor)
-                                    snap_end_rel = (
-                                        snap_end_wall - a_anchor)
-                                    audio_entries.append({
-                                        "path": snap,
-                                        "start_time": max(0.0,
-                                                          snap_start_rel),
-                                        "end_time": max(snap_start_rel + 0.1,
-                                                        snap_end_rel),
-                                    })
-                                    try:
-                                        import sys as _sys
-                                        _sys.stderr.write(
-                                            f"[clip-export] audio hot-snapshot: "
-                                            f"{cand.name} -> {snap.name} "
-                                            f"(mtime_age={mtime_age:.2f}s, "
-                                            f"size={snap.stat().st_size} B, "
-                                            f"wall=[{snap_start_wall:.2f},"
-                                            f"{snap_end_wall:.2f}])\n"
-                                        )
-                                        _sys.stderr.flush()
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                continue
-                except Exception as exc:
-                    try:
-                        import sys as _sys
-                        _sys.stderr.write(
-                            f"[clip-export] audio hot-snapshot scan "
-                            f"failed: {type(exc).__name__}: {exc}\n"
-                        )
-                        _sys.stderr.flush()
-                    except Exception:
-                        pass
                 # Convert every audio entry's relative times to
                 # wall-clock once so logging and selection share one
                 # source of truth.
@@ -25039,22 +24938,13 @@ Admin elevation
                 effective_span = max(0.0, total_duration - tail_to_drop)
                 actual_seconds = min(float(duration_seconds), effective_span)
                 # Clean up any hot-segment snapshots; the export is done
-                # with them. Best-effort — leaving a stray .mkv/.aac
-                # in the cache dir isn't fatal, the next clip-cache
-                # start sweeps.
+                # with them. Best-effort — leaving a stray .mkv in the
+                # cache dir isn't fatal, the next clip-cache start sweeps.
                 for snap in hot_copies:
                     try:
                         snap.unlink(missing_ok=True)
                     except Exception:
                         pass
-                try:
-                    for snap in audio_hot_copies:
-                        try:
-                            snap.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-                except NameError:
-                    pass  # had_audio_at_export=False path
                 return (True, output_path, actual_seconds)
             # Failure — print ffmpeg's own stderr so the diagnostic
             # survives even when the caller doesn't surface it. Tail

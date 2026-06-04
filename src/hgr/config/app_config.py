@@ -246,9 +246,6 @@ class AppConfig:
     # (False → True). Latched True after load_config has run the
     # one-time promotion exactly once.
     clip_mic_default_migrated: bool = False
-    # Parallel marker for clip_mic_noise_reduction default flip
-    # ('light' → 'off'). Latched True after the one-time promotion.
-    clip_mic_filter_default_migrated: bool = False
     # Audio-vs-video offset applied at clip export time as ffmpeg
     # -itsoffset on every audio input. NEGATIVE shifts audio EARLIER
     # in the clip (audio plays before the corresponding video frame
@@ -281,15 +278,7 @@ class AppConfig:
     # the UI grays the dropdown out when mic is off. Changes
     # take effect on the next clip-cache restart. Invalid values
     # silently fall back to "light".
-    # Default OFF: per user spec for clip mic, "use the same audio
-    # levels and everything as voice commands". Voice commands run
-    # the mic stream raw (no gate, no filter), so the clip mic does
-    # too. The prior default 'light' had agate threshold=0.1778
-    # (-15 dBFS) tuned for hot gaming mics, well ABOVE typical
-    # speech peaks on a webcam mic (~-23 dBFS) — it silenced every
-    # word in the clip's mic channel. Users with noisy environments
-    # can still pick 'light' or 'strong' in Settings → Clip Audio.
-    clip_mic_noise_reduction: str = "off"
+    clip_mic_noise_reduction: str = "light"
     # Discord OAuth credentials supplied by the user via the in-app
     # Discord setup wizard. Same per-user-app pattern as Spotify above,
     # but with a different motivation: Discord's `rpc` OAuth scope is
@@ -588,17 +577,6 @@ def load_config() -> AppConfig:
             if values.get("clip_capture_microphone") is False:
                 values["clip_capture_microphone"] = True
             values["clip_mic_default_migrated"] = True
-
-        # Parallel migration: clip_mic_noise_reduction default flipped
-        # 'light' → 'off' (per user spec, clip mic should mirror voice
-        # commands which run raw). The prior 'light' agate threshold
-        # silenced typical webcam-mic speech. Promote ONLY the exact
-        # old default value 'light' to the new 'off' so deliberate
-        # 'strong' picks survive.
-        if not data.get("clip_mic_filter_default_migrated", False):
-            if values.get("clip_mic_noise_reduction") == "light":
-                values["clip_mic_noise_reduction"] = "off"
-            values["clip_mic_filter_default_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if
