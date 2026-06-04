@@ -257,6 +257,12 @@ class AppConfig:
     # further (some Realtek + Atmos / Dolby DACs can carry 200-500 ms
     # of internal latency).
     clip_audio_offset_ms: int = 0
+    # One-time migration marker — flips a saved 'light' (the old
+    # default) to 'off' for existing installs, since the old default
+    # had a noise gate threshold that silenced typical speech. Users
+    # who deliberately picked 'light' or 'strong' in settings keep
+    # their choice via the value-check below.
+    clip_mic_filter_default_migrated: bool = False
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -278,7 +284,14 @@ class AppConfig:
     # the UI grays the dropdown out when mic is off. Changes
     # take effect on the next clip-cache restart. Invalid values
     # silently fall back to "light".
-    clip_mic_noise_reduction: str = "light"
+    # Default OFF: the user's spec for clip mic capture is "literally
+    # use the same audio levels and everything as voice commands" —
+    # voice commands run no filter, so neither does the default
+    # clip mic. Users who genuinely want noise reduction can pick
+    # 'light' or 'strong' in Settings → Clip Audio. The prior
+    # default of 'light' had a noise gate that was TUNED ABOVE
+    # typical speech peaks and silenced every word in the clip.
+    clip_mic_noise_reduction: str = "off"
     # Discord OAuth credentials supplied by the user via the in-app
     # Discord setup wizard. Same per-user-app pattern as Spotify above,
     # but with a different motivation: Discord's `rpc` OAuth scope is
@@ -577,6 +590,19 @@ def load_config() -> AppConfig:
             if values.get("clip_capture_microphone") is False:
                 values["clip_capture_microphone"] = True
             values["clip_mic_default_migrated"] = True
+
+        # Parallel migration: clip_mic_noise_reduction default flipped
+        # 'light' → 'off' because the old 'light' agate threshold was
+        # set ABOVE typical speech peaks (-15 dBFS gate vs -23 dBFS
+        # voice command), silencing every word in the clip's mic
+        # channel. Promote a persisted 'light' (the old default) to
+        # 'off' ONCE; users who deliberately picked 'light' or
+        # 'strong' after seeing the option keep their choice (we
+        # only flip the EXACT old default value).
+        if not data.get("clip_mic_filter_default_migrated", False):
+            if values.get("clip_mic_noise_reduction") == "light":
+                values["clip_mic_noise_reduction"] = "off"
+            values["clip_mic_filter_default_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if
