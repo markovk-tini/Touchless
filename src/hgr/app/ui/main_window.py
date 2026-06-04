@@ -23945,6 +23945,16 @@ Admin elevation
         # better fixed at CAPTURE TIME by opening WASAPI loopback at
         # native channel count (so PortAudio's downmixer doesn't
         # lose samples), which is handled separately in the probe.
+        # Mic glitching fix: boost mic level via `volume` filter so
+        # it isn't buried under system audio in the amix output.
+        # User reported "mic audio low and glitchy". The "low" half
+        # is just the raw mic level being mixed equally with music;
+        # the glitchy half is amix consuming samples unevenly when
+        # the two inputs have different effective rates. Boosting mic
+        # +6 dB (linear 2.0) gives the user's voice clearly audible
+        # presence in the mix without distorting the music side.
+        # weights= on amix gives the same effect more cleanly than
+        # a volume filter per input, so use that.
         if sys_idx is not None and mic_idx is None:
             filter_args = [
                 "-filter_complex", f"[{sys_idx}:a]anull[aout]",
@@ -23961,8 +23971,15 @@ Admin elevation
                 (
                     f"[{sys_idx}:a]anull[asys];"
                     f"[{mic_idx}:a]{ns}[amic];"
+                    # weights="1 2": mic input weighted 2x system
+                    # audio in the final mix so voice is clearly
+                    # audible above music/game sounds. amix
+                    # normalizes by sum-of-weights (=3), so
+                    # effectively sys is 1/3 and mic is 2/3 — voice
+                    # forward, music bedded. Mirrors how OBS /
+                    # ShadowPlay mix gameplay clips.
                     "[asys][amic]amix=inputs=2:duration=longest:"
-                    "dropout_transition=0[aout]"
+                    "dropout_transition=0:weights=1 2[aout]"
                 ),
                 "-map", "[aout]",
             ]
