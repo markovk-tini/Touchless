@@ -226,9 +226,16 @@ class AppConfig:
     # NVIDIA ShadowPlay defaults. Existing users with an explicit
     # `clip_capture_system_audio: false` in their settings.json are
     # untouched by `load_config`'s migration shim (see _MIGRATED_DEFAULTS).
-    # Mic stays opt-in for genuine privacy reasons.
+    #
+    # Mic ALSO defaults ON now: the mic input is the same device the user
+    # already exposes to Touchless's voice commands and dictation, so
+    # there's no incremental privacy surface beyond what they already
+    # opted into. Clips finally include the user's voice without them
+    # having to dig through Settings → General → Clip Audio to find the
+    # toggle. Users who genuinely don't want mic in clips can still
+    # disable it there; the toggle is preserved.
     clip_capture_system_audio: bool = True
-    clip_capture_microphone: bool = False
+    clip_capture_microphone: bool = True
     # One-time migration marker: set to True the first time load_config
     # observes a missing-or-False clip_capture_system_audio under the
     # new default-True regime, after promoting it to True. Without
@@ -331,6 +338,17 @@ class AppConfig:
     low_fps_auto: bool = False
     force_ten_fps_test_mode: bool = False
     mic_input_gain: float = 1.0
+    # When True (default for new installs), the voice listener applies
+    # the per-mic-class suggested_gain from `mic_profile.classify_mic`
+    # so a fresh install on a Razer Kiyo Pro auto-boosts to ~3.0×, a
+    # USB Yeti auto-attenuates to ~0.6×, etc. — without the user
+    # having to know about the gain slider. Flipped to False the
+    # moment the user touches the mic-input-gain slider, so manual
+    # tunings are preserved across sessions. Mic-profile changes
+    # still update the listener's per-class thresholds (trigger
+    # floor, AGC target, end-silence window) regardless of this
+    # flag — only the gain multiplier is auto-vs-manual.
+    mic_input_gain_auto: bool = True
     phone_camera_enabled: bool = False
     phone_camera_url: str = ""
     # Phone-camera-via-QR state. Two orthogonal flags so the user can

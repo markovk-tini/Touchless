@@ -6035,6 +6035,19 @@ class MainWindow(QMainWindow):
         # channels). Cached for the session so we don't pay PortAudio's
         # ~50-200ms init on every cache restart.
         self._wasapi_writer = None
+        # Second WASAPI bridge for the MIC input. Mirrors `_wasapi_writer`
+        # but targets a WASAPI INPUT endpoint (microphone) instead of a
+        # loopback (system audio). The dshow path was removed because
+        # the DirectShow device-name format differs from WASAPI's, and
+        # the mismatch produced silent clips with no diagnostic. Both
+        # writers share the SAME audio-cache ffmpeg subprocess: the
+        # loopback writer pipes into `pipe:0` (stdin) and the mic
+        # writer pipes into an accepted localhost TCP connection that
+        # ffmpeg dials back via `-i tcp://127.0.0.1:PORT`. When system
+        # audio is disabled, the mic uses `pipe:0` directly and there
+        # is no TCP listener.
+        self._wasapi_mic_writer = None
+        self._clip_mic_tcp_acceptor = None
         self._wasapi_loopback_probe: tuple[int, int, int] | bool | None = None
         # SEPARATE audio capture subprocess. Runs in parallel to the
         # video cache ffmpeg so a stalled audio source (silent WASAPI
@@ -22266,6 +22279,65 @@ Admin elevation
             return None
         except Exception:
             return process
+    def _spawn_ffmpeg_stderr_drain(
+        self, process: subprocess.Popen | None, tag: str
+    ) -> None:
+        """Drain `process.stderr` in a background daemon thread, forwarding
+        each line to the home debug log (and stderr) tagged with `tag`.
+
+        Why: `_start_ffmpeg_process` opens stderr=PIPE and only reads it
+        on early exit. For long-running processes (audio cache, screen
+        record) any error that fires AFTER the 150ms liveness window
+        gets buffered in the PIPE until the 64 KB Windows buffer fills,
+        at which point ffmpeg's write blocks and the process effectively
+        stalls. Worse: failures specific to ONE input (mic device not
+        found, format negotiation failure, device handle revoked mid-
+        capture) never surface to the user because the buffer never
+        gets read. Draining here means those errors land in the debug
+        log where users can see them, AND the pipe stays clear so
+        ffmpeg keeps muxing the surviving inputs.
+
+        Thread is daemon so it dies with the process. No join — the
+        thread exits naturally when stderr EOFs on ffmpeg's exit.
+        """
+        if process is None or process.stderr is None:
+            return
+
+        def _drain() -> None:
+            try:
+                while True:
+                    line = process.stderr.readline()
+                    if not line:
+                        break
+                    try:
+                        text = line.decode("utf-8", errors="replace").rstrip()
+                    except Exception:
+                        text = repr(line)
+                    if not text:
+                        continue
+                    try:
+                        self._append_home_debug_log(f"[{tag}] ffmpeg: {text}")
+                    except Exception:
+                        pass
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(f"[{tag}] ffmpeg: {text}\n")
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            t = threading.Thread(
+                target=_drain,
+                name=f"ffmpeg-stderr-{tag}",
+                daemon=True,
+            )
+            t.start()
+        except Exception:
+            pass
+
     def _stop_ffmpeg_process(self, process: subprocess.Popen | None, *, timeout: float = 8.0) -> None:
         if process is None:
             return
@@ -23691,6 +23763,17 @@ Admin elevation
                     "system audio ON but no WASAPI loopback endpoint "
                     "found — check Windows default playback device"
                 )
+        # Mic capture goes through a SECOND WASAPI bridge instead of
+        # ffmpeg's DirectShow indev. Reason: WASAPI / PortAudio and
+        # DirectShow use incompatible device-name formats — WASAPI says
+        # "USB Audio Device", DirectShow wants "Microphone (USB Audio
+        # Device)" — and a mismatch does NOT crash ffmpeg, it just
+        # produces a silent audio stream. The user-visible symptom is
+        # "clips have no mic" with nothing in the log. By going through
+        # PortAudio for the mic too, we resolve by device index (which
+        # the voice-command listener has already done), bypassing the
+        # name-format translation problem entirely.
+        mic_pcm_format: tuple[int, int, int] | None = None
         if want_mic:
             mic_name = str(getattr(cfg, "preferred_microphone_name", "") or "").strip()
             # FALLBACK: when the user never explicitly picked a mic in
@@ -23702,6 +23785,7 @@ Admin elevation
             # different device than what Touchless's commands hear from
             # — exactly the symptom the user reported ("Windows says
             # it's connected to a mic that's not even plugged in").
+            listener_index: int | None = None
             if not mic_name:
                 try:
                     if (self._worker is not None
@@ -23714,22 +23798,82 @@ Admin elevation
                                 "mic fallback: voice listener's resolved "
                                 f"mic = {mic_name!r}"
                             )
+                        try:
+                            listener_index = (
+                                self._worker.voice_listener.input_device_index()
+                            )
+                        except Exception:
+                            listener_index = None
                 except Exception as exc:
                     _log(f"mic fallback lookup failed: {exc}")
-            if mic_name:
-                input_args.extend([
-                    "-thread_queue_size", "1024",
-                    "-f", "dshow",
-                    "-i", f"audio={mic_name}",
-                ])
-                mic_idx = next_idx
-                next_idx += 1
-                _log(f"mic configured: {mic_name!r}")
+            # Resolve to a PyAudioWPatch (PortAudio) device index +
+            # format. probe_input_device_format does the name-to-index
+            # walk over WASAPI inputs; if the name doesn't match it
+            # falls back to PortAudio's default WASAPI input — same
+            # device the voice listener uses when its preferred-mic
+            # field is empty. This is the path that REPLACES dshow.
+            try:
+                from hgr.app.ui.wasapi_loopback import probe_input_device_format
+                mic_pcm_format = probe_input_device_format(
+                    mic_name or None,
+                    fallback_rate=48000,
+                    max_channels=1,
+                )
+            except Exception as exc:
+                _log(f"mic probe failed: {exc}")
+                mic_pcm_format = None
+            if mic_pcm_format is not None:
+                _dev, mic_rate, mic_channels = mic_pcm_format
+                # Mic input is raw PCM. If system audio is ALSO enabled
+                # it owns `pipe:0`, so the mic gets a localhost TCP
+                # connection — ffmpeg dials in and reads PCM off it as
+                # a second input. When system audio is OFF, the mic
+                # uses `pipe:0` directly (no TCP overhead).
+                if sys_idx is not None:
+                    from hgr.app.ui.wasapi_loopback import TcpPcmAcceptor
+                    acceptor = TcpPcmAcceptor()
+                    if not acceptor.bind():
+                        _log(
+                            "mic TCP listener failed to bind on localhost — "
+                            "mic capture disabled this session"
+                        )
+                        mic_pcm_format = None
+                    else:
+                        self._clip_mic_tcp_acceptor = acceptor
+                        input_args.extend([
+                            "-thread_queue_size", "1024",
+                            "-f", "s16le",
+                            "-ar", str(mic_rate),
+                            "-ac", str(mic_channels),
+                            "-i", f"tcp://127.0.0.1:{acceptor.port}",
+                        ])
+                        mic_idx = next_idx
+                        next_idx += 1
+                        _log(
+                            f"mic configured: {mic_name!r} "
+                            f"(WASAPI idx={_dev}, {mic_rate} Hz, "
+                            f"{mic_channels} ch, via tcp:{acceptor.port})"
+                        )
+                else:
+                    input_args.extend([
+                        "-thread_queue_size", "1024",
+                        "-f", "s16le",
+                        "-ar", str(mic_rate),
+                        "-ac", str(mic_channels),
+                        "-i", "pipe:0",
+                    ])
+                    mic_idx = next_idx
+                    next_idx += 1
+                    _log(
+                        f"mic configured: {mic_name!r} "
+                        f"(WASAPI idx={_dev}, {mic_rate} Hz, "
+                        f"{mic_channels} ch, via pipe:0)"
+                    )
             else:
                 _log(
-                    "mic capture ON but no microphone resolved — pick "
-                    "one in Settings → Voice OR set Touchless's mic via "
-                    "the voice-listener setup"
+                    "mic capture ON but no WASAPI input endpoint "
+                    "resolved — pick one in Settings → Voice OR "
+                    "check that a microphone is plugged in"
                 )
         if sys_idx is None and mic_idx is None:
             _log("no audio sources successfully wired; clips will be silent")
@@ -23792,18 +23936,57 @@ Admin elevation
         process = self._start_ffmpeg_process(command)
         if process is None:
             _log(
-                "audio ffmpeg failed to start — most likely the mic "
-                "name doesn't match any DirectShow device "
-                "(check Settings → Voice for typos / unplugged devices)"
+                "audio ffmpeg failed to start — check stderr above for "
+                "the actual cause (codec, format, or device-binding error)"
             )
+            # Free the TCP listener if we bound one — ffmpeg never
+            # connected so the dangling listener would leak.
+            if self._clip_mic_tcp_acceptor is not None:
+                try:
+                    self._clip_mic_tcp_acceptor.close()
+                except Exception:
+                    pass
+                self._clip_mic_tcp_acceptor = None
             return False
-        # Spawn the WASAPI bridge AFTER ffmpeg is alive so it can
+        # Drain ffmpeg's stderr in a daemon thread. Without this, dshow
+        # device-mismatch / format-negotiation errors that occur AFTER
+        # the 150ms startup window get buffered in the PIPE until the
+        # 64 KB Windows pipe buffer fills, ffmpeg blocks on the write,
+        # and the audio cache silently stalls. With drainage, errors
+        # land in the home debug log where the user can actually see
+        # them, and the pipe never fills.
+        self._spawn_ffmpeg_stderr_drain(process, "clip-audio")
+        # Spawn the WASAPI bridges AFTER ffmpeg is alive so it can
         # write to a valid stdin pipe.
+        # WasapiLoopbackWriter is shared between the loopback (system)
+        # and mic paths; the only difference is which device index it
+        # opens and whether it writes to ffmpeg's stdin or to an
+        # accepted TCP socket.
+        try:
+            from hgr.app.ui.wasapi_loopback import WasapiLoopbackWriter
+        except Exception as exc:
+            _log(f"WASAPI bridge import failed: {exc}")
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            return False
+
+        def _on_writer_err(msg: str) -> None:
+            _log(msg)
+
+        # Track which writer (if any) owns the stdin pipe so only it
+        # closes stdin on exit. When system audio is on, the loopback
+        # writer owns stdin; otherwise the mic writer owns it.
+        loopback_owns_stdin = sys_idx is not None
+        mic_owns_stdin = (
+            mic_idx is not None
+            and sys_idx is None
+            and mic_pcm_format is not None
+        )
+
         if sys_idx is not None and sys_pcm_format is not None:
             try:
-                from hgr.app.ui.wasapi_loopback import WasapiLoopbackWriter
-                def _on_writer_err(msg: str) -> None:
-                    _log(msg)
                 dev, rate, channels = sys_pcm_format
                 writer = WasapiLoopbackWriter(
                     process.stdin,
@@ -23811,26 +23994,127 @@ Admin elevation
                     rate=rate,
                     channels=channels,
                     on_error=_on_writer_err,
+                    is_loopback=True,
+                    label="WasapiSysLoopback",
+                    close_stdin_on_exit=loopback_owns_stdin,
                 )
                 if writer.start():
                     self._wasapi_writer = writer
-                    _log("WASAPI bridge running")
+                    _log("WASAPI loopback bridge running")
                 else:
                     # Bridge failed — kill the audio process and bail.
                     # Video keeps running unaffected.
-                    _log("WASAPI bridge failed to start — killing audio cache")
+                    _log(
+                        "WASAPI loopback bridge failed to start — "
+                        "killing audio cache"
+                    )
                     try:
                         process.terminate()
                     except Exception:
                         pass
+                    if self._clip_mic_tcp_acceptor is not None:
+                        try:
+                            self._clip_mic_tcp_acceptor.close()
+                        except Exception:
+                            pass
+                        self._clip_mic_tcp_acceptor = None
                     return False
             except Exception as exc:
-                _log(f"WASAPI bridge spawn failed: {exc}")
+                _log(f"WASAPI loopback spawn failed: {exc}")
                 try:
                     process.terminate()
                 except Exception:
                     pass
+                if self._clip_mic_tcp_acceptor is not None:
+                    try:
+                        self._clip_mic_tcp_acceptor.close()
+                    except Exception:
+                        pass
+                    self._clip_mic_tcp_acceptor = None
                 return False
+
+        # Mic writer. When sharing the audio ffmpeg with system audio,
+        # the mic writer waits for ffmpeg to dial back over TCP and
+        # writes to that accepted socket. When mic is the ONLY input,
+        # it writes to `pipe:0` directly.
+        if mic_idx is not None and mic_pcm_format is not None:
+            try:
+                mic_dev, mic_rate, mic_channels = mic_pcm_format
+                if self._clip_mic_tcp_acceptor is not None:
+                    # ffmpeg should be connecting RIGHT NOW (it was
+                    # spawned with -i tcp://127.0.0.1:PORT and our
+                    # startup-liveness check already passed). Block up
+                    # to 5s for the accept, more than enough for the
+                    # connection to land.
+                    sock_file = self._clip_mic_tcp_acceptor.accept(timeout=5.0)
+                    if sock_file is None:
+                        _log(
+                            "mic TCP listener never received an ffmpeg "
+                            "connection — mic capture disabled, system "
+                            "audio continues"
+                        )
+                        self._clip_mic_tcp_acceptor = None
+                    else:
+                        mic_writer = WasapiLoopbackWriter(
+                            sock_file,
+                            device_index=mic_dev,
+                            rate=mic_rate,
+                            channels=mic_channels,
+                            on_error=_on_writer_err,
+                            is_loopback=False,
+                            label="WasapiMicInput",
+                            close_stdin_on_exit=True,
+                        )
+                        if mic_writer.start():
+                            self._wasapi_mic_writer = mic_writer
+                            _log("WASAPI mic bridge running (via TCP)")
+                        else:
+                            _log(
+                                "WASAPI mic bridge failed to start — "
+                                "mic capture disabled, system audio continues"
+                            )
+                            try:
+                                sock_file.close()
+                            except Exception:
+                                pass
+                else:
+                    # Mic owns pipe:0 (no system audio enabled).
+                    mic_writer = WasapiLoopbackWriter(
+                        process.stdin,
+                        device_index=mic_dev,
+                        rate=mic_rate,
+                        channels=mic_channels,
+                        on_error=_on_writer_err,
+                        is_loopback=False,
+                        label="WasapiMicInput",
+                        close_stdin_on_exit=mic_owns_stdin,
+                    )
+                    if mic_writer.start():
+                        self._wasapi_mic_writer = mic_writer
+                        _log("WASAPI mic bridge running (via pipe:0)")
+                    else:
+                        # Mic was the only input — if it failed, the
+                        # whole audio cache is pointless.
+                        _log(
+                            "WASAPI mic bridge failed to start — "
+                            "killing audio cache"
+                        )
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+                        return False
+            except Exception as exc:
+                _log(f"WASAPI mic bridge spawn failed: {exc}")
+                # Don't kill ffmpeg just because mic failed — system
+                # audio (if any) keeps running. The user will hear
+                # game audio in the clip, just no voice.
+                if self._clip_mic_tcp_acceptor is not None:
+                    try:
+                        self._clip_mic_tcp_acceptor.close()
+                    except Exception:
+                        pass
+                    self._clip_mic_tcp_acceptor = None
         self._clip_cache_audio_process = process
         # Anchor audio start time. Default to wall clock here, then
         # OVERRIDE with the WASAPI bridge's true first-sample time once
@@ -23845,7 +24129,14 @@ Admin elevation
         except Exception:
             spawn_time = 0.0
             self._clip_cache_audio_started_at = 0.0
-        if self._wasapi_writer is not None:
+        # Pick the anchor writer: prefer the system-loopback writer
+        # because that's the source most likely to align with the
+        # user's perception of "when the clip's audio started" (it
+        # mirrors what they're hearing). If system is OFF and only
+        # mic is on, anchor off the mic bridge instead. Same code
+        # path either way — we just look at whichever writer exists.
+        anchor_writer = self._wasapi_writer or self._wasapi_mic_writer
+        if anchor_writer is not None:
             # Brief wait for the bridge to start producing audio so
             # `first_sample_at` is populated. We CAP the wait so a hung
             # bridge can't block clip-cache startup forever; the spawn
@@ -23853,7 +24144,7 @@ Admin elevation
             # reports a sample (the symptom is just less-precise a/v
             # alignment, not a broken cache).
             try:
-                writer = self._wasapi_writer
+                writer = anchor_writer
                 deadline = spawn_time + 2.5
                 while (writer is not None
                        and writer.first_sample_at is None
@@ -23878,15 +24169,30 @@ Admin elevation
         return True
 
     def _stop_clip_cache_audio(self, *, delete_files: bool = True) -> None:
-        """Tear down the audio cache process. Drains the WASAPI
-        bridge thread FIRST so it exits its read loop before its
-        ffmpeg stdin closes, then reaps ffmpeg. Safe to call when
-        no audio cache was running (no-op)."""
+        """Tear down the audio cache process. Drains BOTH WASAPI
+        bridge threads (system loopback + mic) FIRST so they exit
+        their read loops before ffmpeg's stdin / TCP socket closes,
+        then reaps ffmpeg. Safe to call when no audio cache was
+        running (no-op)."""
         writer = self._wasapi_writer
         self._wasapi_writer = None
         if writer is not None:
             try:
                 writer.stop()
+            except Exception:
+                pass
+        mic_writer = self._wasapi_mic_writer
+        self._wasapi_mic_writer = None
+        if mic_writer is not None:
+            try:
+                mic_writer.stop()
+            except Exception:
+                pass
+        acceptor = self._clip_mic_tcp_acceptor
+        self._clip_mic_tcp_acceptor = None
+        if acceptor is not None:
+            try:
+                acceptor.close()
             except Exception:
                 pass
         process = self._clip_cache_audio_process
@@ -24179,18 +24485,51 @@ Admin elevation
             # them as additional ffmpeg inputs starting at index n.
             audio_selected: list[dict] = []
             audio_entries: list[dict] = []
-            a_window_start = 0.0
-            a_window_end = 0.0
-            t_shift = 0.0
+            # Wall-clock window we WANT for the clip's audio. Both
+            # video and audio segment CSVs hold times RELATIVE to
+            # their own ffmpeg's spawn moment (because each process
+            # uses `-reset_timestamps 1`). To match them honestly we
+            # convert BOTH to wall-clock by adding the per-process
+            # anchor, then overlap-test in wall-clock space. Falling
+            # back to "take the last N audio segments" is reserved
+            # for the truly degenerate case (no anchor / no entries
+            # at all) — using it in the normal path was the bug that
+            # made clips replay stale music from before the pause.
+            a_window_wall_start = 0.0
+            a_window_wall_end = 0.0
+            audio_entries_wall: list[dict] = []
             window_fallback_used = False
+            v_anchor = float(getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0)
+            a_anchor = audio_anchor_snapshot
             if had_audio_at_export:
-                v_window_start = float(selected[0].get("start_time", 0.0))
-                v_window_end = float(selected[-1].get("end_time", 0.0))
-                v_anchor = float(getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0)
-                a_anchor = audio_anchor_snapshot
-                t_shift = (v_anchor - a_anchor) if (v_anchor and a_anchor) else 0.0
-                a_window_start = v_window_start + t_shift
-                a_window_end = v_window_end + t_shift
+                # Selected video range in wall-clock. The clip we're
+                # exporting will hold video covering [v_window_wall_end -
+                # trim_duration, v_window_wall_end] AFTER trimming —
+                # request audio for that exact range (plus a small slop
+                # so segment boundaries aren't dropped).
+                v_window_rel_start = float(selected[0].get("start_time", 0.0))
+                v_window_rel_end = float(selected[-1].get("end_time", 0.0))
+                v_window_wall_start = (
+                    v_anchor + v_window_rel_start if v_anchor > 0 else v_window_rel_start
+                )
+                v_window_wall_end = (
+                    v_anchor + v_window_rel_end if v_anchor > 0 else v_window_rel_end
+                )
+                # Right edge of the clip in wall-clock: prefer end_ts
+                # (the moment the user said "clip that"), else fall
+                # back to the latest video segment's wall-clock end.
+                try:
+                    requested_end_wall = (
+                        float(end_ts) if end_ts is not None else v_window_wall_end
+                    )
+                except (TypeError, ValueError):
+                    requested_end_wall = v_window_wall_end
+                requested_start_wall = requested_end_wall - float(duration_seconds)
+                # Small slop on both sides so boundary segments that
+                # only partially overlap aren't excluded.
+                slop = max(0.5, float(self._clip_cache_segment_seconds))
+                a_window_wall_start = requested_start_wall - slop
+                a_window_wall_end = requested_end_wall + slop
                 _saved_audio_list_path = self._clip_cache_audio_list_path
                 if audio_list_path_snapshot is not None:
                     self._clip_cache_audio_list_path = audio_list_path_snapshot
@@ -24198,62 +24537,89 @@ Admin elevation
                     audio_entries = self._parse_ffmpeg_clip_audio_manifest()
                 finally:
                     self._clip_cache_audio_list_path = _saved_audio_list_path
+                # Convert every audio entry's relative times to
+                # wall-clock once so logging and selection share one
+                # source of truth.
                 for entry in audio_entries:
-                    e_start = float(entry.get("start_time", 0.0))
-                    e_end = float(entry.get("end_time", 0.0))
-                    if e_end < a_window_start or e_start > a_window_end:
+                    e_start_rel = float(entry.get("start_time", 0.0))
+                    e_end_rel = float(entry.get("end_time", 0.0))
+                    if a_anchor > 0:
+                        e_start_wall = a_anchor + e_start_rel
+                        e_end_wall = a_anchor + e_end_rel
+                    else:
+                        e_start_wall = e_start_rel
+                        e_end_wall = e_end_rel
+                    audio_entries_wall.append({
+                        **entry,
+                        "wall_start": e_start_wall,
+                        "wall_end": e_end_wall,
+                    })
+                for entry in audio_entries_wall:
+                    if (entry["wall_end"] < a_window_wall_start
+                            or entry["wall_start"] > a_window_wall_end):
                         continue
                     audio_selected.append(entry)
-                # FALLBACK: if strict wall-clock window matching
-                # selected nothing but the manifest has entries, the
-                # audio PTS clock has drifted from wall-clock (common
-                # cause: PortAudio loopback delivers samples slower
-                # than real-time during silence-heavy periods, so the
-                # audio process's PTS lags video by tens of seconds).
-                # Instead of producing a silent clip, take the most
-                # recent video-count's worth of audio segments —
-                # "recent audio ≈ correct audio". ffmpeg's atrim will
-                # cut both to the same target duration so video and
-                # audio length still match.
-                if not audio_selected and audio_entries:
-                    audio_selected = list(audio_entries[-len(selected):])
+                # FALLBACK: only when wall-clock matching produced
+                # nothing AND we can't trust the anchors (one of them
+                # is zero), drop back to "take the last N entries".
+                # In the healthy path this branch never fires — the
+                # bug it used to mask (stale music playing in a clip
+                # after the source had paused) was caused by always
+                # taking the last N entries regardless of whether
+                # they actually overlapped the requested window.
+                if not audio_selected and audio_entries and (
+                    v_anchor <= 0 or a_anchor <= 0
+                ):
+                    audio_selected = list(audio_entries_wall[-len(selected):])
                     window_fallback_used = True
             has_audio = len(audio_selected) > 0
             # Diagnostic: log to BOTH stderr (so it appears in the
             # console / build log capture) AND home debug log (so it
             # appears in the UI). Tells us in one line whether the
             # flag is on, whether the audio manifest has entries,
-            # and whether window matching selected any of them.
+            # whether window matching selected any of them, and the
+            # actual wall-clock ranges considered.
             try:
                 list_path = audio_list_path_snapshot
                 list_exists = bool(list_path is not None and list_path.exists())
                 if had_audio_at_export:
                     _entry_times = [
-                        f"[{float(e.get('start_time', 0)):.1f},{float(e.get('end_time', 0)):.1f}]"
-                        for e in audio_entries
+                        f"[{float(e.get('wall_start', 0)):.1f},{float(e.get('wall_end', 0)):.1f}]"
+                        for e in audio_entries_wall
+                    ]
+                    _sel_times = [
+                        f"[{float(e.get('wall_start', 0)):.1f},{float(e.get('wall_end', 0)):.1f}]"
+                        for e in audio_selected
                     ]
                     diag = (
+                        f"[clip-export] audio window: requested "
+                        f"[{a_window_wall_start:.2f},{a_window_wall_end:.2f}] "
+                        f"got_segments={_sel_times}"
+                    )
+                    diag_full = (
                         f"[clip-export] audio mux: had_audio_at_export=True "
                         f"manifest_path={list_path} exists={list_exists} "
                         f"entries_total={len(audio_entries)} selected={len(audio_selected)} "
                         f"window_fallback_used={window_fallback_used} "
-                        f"t_shift={t_shift:.2f}s "
-                        f"a_window=[{a_window_start:.2f},{a_window_end:.2f}] "
-                        f"entry_times={_entry_times}"
+                        f"v_anchor={v_anchor:.2f} a_anchor={a_anchor:.2f} "
+                        f"a_window_wall=[{a_window_wall_start:.2f},{a_window_wall_end:.2f}] "
+                        f"entry_wall_times={_entry_times}"
                     )
                 else:
                     diag = (
                         f"[clip-export] audio mux: had_audio_at_export=False "
                         f"(manifest_path={list_path} exists={list_exists})"
                     )
+                    diag_full = diag
                 try:
                     import sys as _sys
                     _sys.stderr.write(diag + "\n")
+                    _sys.stderr.write(diag_full + "\n")
                     _sys.stderr.flush()
                 except Exception:
                     pass
                 try:
-                    self._append_home_debug_log(diag)
+                    self._append_home_debug_log(diag_full)
                 except Exception:
                     pass
             except Exception:
@@ -24705,20 +25071,36 @@ Admin elevation
                 inputs.extend(["-i", str(Path(entry["path"]).resolve())])
             n = len(selected)
             # Audio segments come from the parallel audio cache.
+            # Same wall-clock conversion as _run_clip_export_ffmpeg —
+            # see the long comment there for rationale.
             audio_selected: list[dict] = []
             audio_entries: list[dict] = []
-            a_window_start = 0.0
-            a_window_end = 0.0
-            t_shift = 0.0
+            audio_entries_wall: list[dict] = []
+            a_window_wall_start = 0.0
+            a_window_wall_end = 0.0
             window_fallback_used = False
+            v_anchor = float(getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0)
+            a_anchor = audio_anchor_snapshot
             if had_audio_at_export:
-                v_window_start = float(selected[0].get("start_time", 0.0))
-                v_window_end = float(selected[-1].get("end_time", 0.0))
-                v_anchor = float(getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0)
-                a_anchor = audio_anchor_snapshot
-                t_shift = (v_anchor - a_anchor) if (v_anchor and a_anchor) else 0.0
-                a_window_start = v_window_start + t_shift
-                a_window_end = v_window_end + t_shift
+                v_window_rel_start = float(selected[0].get("start_time", 0.0))
+                v_window_rel_end = float(selected[-1].get("end_time", 0.0))
+                v_window_wall_start = (
+                    v_anchor + v_window_rel_start if v_anchor > 0 else v_window_rel_start
+                )
+                v_window_wall_end = (
+                    v_anchor + v_window_rel_end if v_anchor > 0 else v_window_rel_end
+                )
+                # Gesture-anchored path: right edge is the click moment.
+                try:
+                    requested_end_wall = float(gesture_click_ts)
+                except (TypeError, ValueError, NameError):
+                    requested_end_wall = v_window_wall_end
+                if requested_end_wall <= 0:
+                    requested_end_wall = v_window_wall_end
+                requested_start_wall = requested_end_wall - float(duration_seconds)
+                slop = max(0.5, float(self._clip_cache_segment_seconds))
+                a_window_wall_start = requested_start_wall - slop
+                a_window_wall_end = requested_end_wall + slop
                 _saved_audio_list_path = self._clip_cache_audio_list_path
                 if audio_list_path_snapshot is not None:
                     self._clip_cache_audio_list_path = audio_list_path_snapshot
@@ -24727,14 +25109,29 @@ Admin elevation
                 finally:
                     self._clip_cache_audio_list_path = _saved_audio_list_path
                 for entry in audio_entries:
-                    e_start = float(entry.get("start_time", 0.0))
-                    e_end = float(entry.get("end_time", 0.0))
-                    if e_end < a_window_start or e_start > a_window_end:
+                    e_start_rel = float(entry.get("start_time", 0.0))
+                    e_end_rel = float(entry.get("end_time", 0.0))
+                    if a_anchor > 0:
+                        e_start_wall = a_anchor + e_start_rel
+                        e_end_wall = a_anchor + e_end_rel
+                    else:
+                        e_start_wall = e_start_rel
+                        e_end_wall = e_end_rel
+                    audio_entries_wall.append({
+                        **entry,
+                        "wall_start": e_start_wall,
+                        "wall_end": e_end_wall,
+                    })
+                for entry in audio_entries_wall:
+                    if (entry["wall_end"] < a_window_wall_start
+                            or entry["wall_start"] > a_window_wall_end):
                         continue
                     audio_selected.append(entry)
-                # FALLBACK: see _run_clip_export_ffmpeg comment.
-                if not audio_selected and audio_entries:
-                    audio_selected = list(audio_entries[-len(selected):])
+                # FALLBACK only when wall-clock anchors are unknown.
+                if not audio_selected and audio_entries and (
+                    v_anchor <= 0 or a_anchor <= 0
+                ):
+                    audio_selected = list(audio_entries_wall[-len(selected):])
                     window_fallback_used = True
             has_audio = len(audio_selected) > 0
             try:
@@ -24742,17 +25139,32 @@ Admin elevation
                 list_exists = bool(list_path is not None and list_path.exists())
                 if had_audio_at_export:
                     _entry_times = [
-                        f"[{float(e.get('start_time', 0)):.1f},{float(e.get('end_time', 0)):.1f}]"
-                        for e in audio_entries
+                        f"[{float(e.get('wall_start', 0)):.1f},{float(e.get('wall_end', 0)):.1f}]"
+                        for e in audio_entries_wall
                     ]
+                    _sel_times = [
+                        f"[{float(e.get('wall_start', 0)):.1f},{float(e.get('wall_end', 0)):.1f}]"
+                        for e in audio_selected
+                    ]
+                    diag2_window = (
+                        f"[clip-export-2] audio window: requested "
+                        f"[{a_window_wall_start:.2f},{a_window_wall_end:.2f}] "
+                        f"got_segments={_sel_times}"
+                    )
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(diag2_window + "\n")
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
                     diag2 = (
                         f"[clip-export-2] audio mux: had_audio_at_export=True "
                         f"manifest_path={list_path} exists={list_exists} "
                         f"entries_total={len(audio_entries)} selected={len(audio_selected)} "
                         f"window_fallback_used={window_fallback_used} "
-                        f"t_shift={t_shift:.2f}s "
-                        f"a_window=[{a_window_start:.2f},{a_window_end:.2f}] "
-                        f"entry_times={_entry_times}"
+                        f"v_anchor={v_anchor:.2f} a_anchor={a_anchor:.2f} "
+                        f"a_window_wall=[{a_window_wall_start:.2f},{a_window_wall_end:.2f}] "
+                        f"entry_wall_times={_entry_times}"
                     )
                 else:
                     diag2 = (
@@ -25104,6 +25516,23 @@ Admin elevation
         if self._clip_export_thread is not None and self._clip_export_thread.is_alive():
             self.last_action_label.setText("Last action: clip already exporting")
             return
+        # Required diagnostic per scout fix: when the caller supplied a
+        # speech_end anchor (voice "clip that" path), log the skew
+        # between speech-end and dispatch-now so the lag the anchor is
+        # actually compensating for is visible in one line. UI / hotkey
+        # callers pass end_ts=None and we stay quiet (no anchor in
+        # play). time.time() here = dispatch moment (this function is
+        # entered straight off the utility-request signal).
+        if end_ts is not None:
+            try:
+                import sys as _sys, time as _time
+                _skew = _time.time() - float(end_ts)
+                _sys.stderr.write(
+                    f"[clip-export] using speech_end anchor: skew vs dispatch = {_skew:.1f}s\n"
+                )
+                _sys.stderr.flush()
+            except Exception:
+                pass
         target = self._normalized_record_region(region)
         if target.isNull() or target.width() <= 1 or target.height() <= 1:
             self.last_action_label.setText("Last action: clip canceled")

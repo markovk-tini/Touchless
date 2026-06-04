@@ -53,6 +53,10 @@ from ...voice.dictation import DictationProcessor
 from ...voice.grammar_corrector import CorrectionResult, GrammarCorrector
 from ...voice.llama_server import LlamaServer
 from ...voice.whisper_refiner import RefinementResult, WhisperRefiner
+# Single source of truth for whether streaming live-dictation hypotheses are on
+# (env HGR_DICTATION_HYPOTHESES). Used to keep the refiner mutually exclusive
+# with live typing — see _start_voice_capture.
+from ...voice.whisper_stream import _HYP_ENABLED as _DICTATION_HYP_ENABLED
 from ..camera.camera_utils import open_camera_by_index, open_phone_camera_url, open_preferred_or_first_available
 from ..camera.ffmpeg_capture import FfmpegMjpegCapture, open_ffmpeg_cap_with_fps_fallback, resolve_dshow_device_for_index
 
@@ -148,6 +152,102 @@ def _collapse_repeated_sentences(text: str) -> str:
         out.append(part)
         last_norm = norm
     return "".join(out).strip()
+
+
+def _norm_token(tok: str) -> str:
+    # Case/punctuation-insensitive word key used to reconcile the rough
+    # live-typed dictation prefix against the high-accuracy final.
+    return tok.lower().strip(".,!?;:\"'")
+
+
+def _reconcile_final_edit(committed: str, committed_chars: int, final_text: str) -> tuple[int, str, int]:
+    """Diff a dictation final against the live-typed `committed` prefix.
+
+    Returns ``(backspace_chars, to_type, common_chars)``:
+      * ``backspace_chars`` — chars to delete from the END of the on-screen live
+        text to drop the divergent/over-long tail. Always within
+        ``[0, committed_chars]`` so it can never reach past this utterance's own
+        live text into prior committed finals or pre-dictation user text.
+      * ``to_type`` — text to insert after the agreed prefix; includes the
+        leading separator space (when a non-empty agreed prefix precedes it) and
+        a trailing separator space.
+      * ``common_chars`` — chars of the agreed prefix left untouched on screen.
+
+    The comparison is by WORD, case/punctuation-insensitively: greedy live
+    partials and the beam final frequently differ only in casing/punctuation, so
+    a char-exact ``startswith`` would treat the whole final as new and re-type it
+    on top of the live text (duplication). Keeping the agreed prefix and only
+    re-typing the divergent tail prevents that. Commit-only callers pass
+    ``committed=""`` / ``committed_chars=0`` and get back ``(0, final+" ", 0)`` —
+    i.e. the entire final, exactly the pre-streaming behaviour.
+    """
+    cw = committed.split()
+    fw = final_text.split()
+    k = 0
+    while k < len(cw) and k < len(fw) and _norm_token(cw[k]) == _norm_token(fw[k]):
+        k += 1
+    common_chars = len(" ".join(cw[:k]))  # agreed prefix, no trailing space
+    backspace_chars = max(0, committed_chars - common_chars)
+    tail = " ".join(fw[k:])
+    if tail:
+        to_type = ("" if k == 0 else " ") + tail + " "
+    else:
+        # final equals / is a prefix of the live text -> just terminate with a
+        # separator space (any over-long live tail was backspaced above).
+        to_type = " "
+    return backspace_chars, to_type, common_chars
+
+
+# Common words that should stay lowercase mid-sentence. whisper capitalizes the
+# first word of EACH utterance, so when the user pauses mid-sentence the next
+# utterance's first word comes back wrongly capitalized ("plenty of [pause] free"
+# -> "Free"). We only ever de-capitalize words in this set, never acronyms or
+# proper nouns, so "pushed it to [pause] GitHub" keeps "GitHub" and "[pause] API"
+# keeps "API".
+_SEAM_LOWERCASE_WORDS = frozenset({
+    "a", "an", "and", "the", "but", "so", "or", "nor", "for", "yet",
+    "we", "it", "they", "he", "she", "you", "that", "this", "these", "those",
+    "of", "in", "on", "at", "to", "by", "with", "from", "as", "if", "when",
+    "then", "than", "one", "two", "free", "need", "just", "also", "actually",
+    "okay", "well", "is", "are", "was", "were", "be", "been", "do", "does",
+    "did", "can", "could", "should", "would", "will", "not", "no", "yes",
+    "my", "our", "your", "their", "its", "because", "while", "after", "before",
+    "since", "until", "though", "although", "however", "maybe", "really",
+    "even", "still", "about", "into", "over", "under", "out", "up", "down",
+})
+
+# Chars after which a new utterance does NOT need a leading separator space.
+_SEAM_NO_LEAD_AFTER = (" ", "\n", "\t", "(", "[", "{", "“", '"', "-", "/")
+
+
+def _seam_normalize(text: str, prev_display: str, last_char: str) -> tuple[str, str]:
+    """Normalize the FIRST content of a new utterance where it joins the
+    running transcript. Returns ``(lead_space, cased_text)``:
+
+      * ``lead_space`` — "" or " ". A single separator space is needed only when
+        there is prior text AND the previously-typed char isn't already a
+        separator/opening bracket. In the normal case the prior final left a
+        trailing space (last_char == " "), so this is "" and nothing doubles; it
+        only fills in a space that some path dropped ("ofFree" -> "of free").
+      * ``cased_text`` — ``text`` with its first letter re-cased: capitalized at a
+        sentence start (prev ended with . ! ? : ; or newline, or there's no prior
+        text), else lowercased IFF the first word is a common lowercase word
+        (undoing whisper's per-utterance initial cap without touching proper
+        nouns/acronyms). Length is unchanged, so caller char-bookkeeping is safe.
+    """
+    if not text:
+        return "", text
+    prev = (prev_display or "").rstrip()
+    sentence_start = (not prev) or prev.endswith((".", "!", "?", ":", ";", "\n"))
+    cased = text
+    if cased[0].isalpha():
+        first_word = cased.split(" ", 1)[0]
+        if sentence_start:
+            cased = cased[0].upper() + cased[1:]
+        elif not first_word.isupper() and _norm_token(first_word) in _SEAM_LOWERCASE_WORDS:
+            cased = cased[0].lower() + cased[1:]
+    lead = " " if (prev_display and last_char and last_char not in _SEAM_NO_LEAD_AFTER) else ""
+    return lead, cased
 
 
 def _redecode_overlap(prev_text: str, new_text: str) -> bool:
@@ -488,6 +588,13 @@ class GestureWorker(QObject):
     # so the user can hand-gesture-summon Touchless back to focus
     # without alt-tabbing.
     open_touchless_requested = Signal()
+    # Fired when the instant_clip gesture binding triggers. Main
+    # window connects a slot that immediately exports the configured
+    # clip duration ending at the current moment, saved to
+    # clips_save_dir with a timestamped filename — NO prompt, NO
+    # confirmation dialog. Same as the voice "clip that" command,
+    # but bound to a single gesture for hands-only operation.
+    instant_clip_requested = Signal()
     # Decoupled display path. Emitted from `_tick` immediately after
     # the camera read + flip + prepare step, BEFORE the engine
     # dispatch. Receivers connect to this for the live-view paint
@@ -891,6 +998,7 @@ class GestureWorker(QObject):
         self.voice_listener = VoiceCommandListener(
             preferred_input_device=getattr(config, "preferred_microphone_name", None),
             input_gain=getattr(config, "mic_input_gain", 1.0),
+            input_gain_auto=bool(getattr(config, "mic_input_gain_auto", True)),
         )
         self.voice_processor = VoiceCommandProcessor(
             chrome_controller=self.chrome_controller,
@@ -1467,6 +1575,19 @@ class GestureWorker(QObject):
         with self._corrector_lock:
             if self.grammar_corrector.is_chunk_stale():
                 print(f"[grammar] skipping apply: chunk stale after lock")
+                return
+            # Don't apply a correction while live hypotheses are mid-utterance:
+            # the diff-based replace_text assumes the dictated tail on screen is
+            # stable, but a hypothesis could be appending to it concurrently. The
+            # corrector fires on ~10s idle so this is rare, but the guard makes it
+            # safe (the next idle pass re-corrects once typing has settled).
+            state = self._dictation_state
+            if state is not None and (
+                state.get("committed")
+                or state.get("stream_hyp_chars")
+                or state.get("pending_final_text")
+            ):
+                print(f"[grammar] skipping apply: live typing in progress")
                 return
             tail = self.grammar_corrector.snapshot_tail()
             previous = original + tail
@@ -5681,6 +5802,19 @@ class GestureWorker(QObject):
                     fired = True
                 except Exception:
                     fired = False
+            elif action_id == "instant_clip":
+                # Fire-and-forget: emit signal, main window does the
+                # actual export on a worker thread. No prompts, no
+                # save dialog — just save to clips_save_dir.
+                try:
+                    self.instant_clip_requested.emit()
+                    fired = True
+                    try:
+                        self.command_detected.emit("Instant clip saved")
+                    except Exception:
+                        pass
+                except Exception:
+                    fired = False
             elif action_id == "system_mute_toggle":
                 try:
                     toggled = self.volume_controller.toggle_mute()
@@ -8513,13 +8647,21 @@ class GestureWorker(QObject):
             stop_event = self._voice_stop_event
             self.grammar_corrector.set_callback(self._apply_grammar_correction)
             self.grammar_corrector.start()
-            if self.whisper_refiner is not None:
+            # The refiner and streaming hypotheses are MUTUALLY EXCLUSIVE: both
+            # re-type the just-finalized text, and the refiner opens a SECOND
+            # mic InputStream (two simultaneous captures on one device = dropped
+            # frames). With live hypotheses on, the high-quality final decode +
+            # grammar pass already cover what the refiner did, so we keep it off
+            # to avoid the race/duplication and the extra mic stream.
+            if self.whisper_refiner is not None and not _DICTATION_HYP_ENABLED:
                 try:
                     self.whisper_refiner.set_callback(self._apply_refinement)
                     started = self.whisper_refiner.start()
                     print(f"[hgr] whisper_refiner.start -> {started} ({self.whisper_refiner.message})")
                 except Exception as exc:
                     print(f"[hgr] whisper_refiner start failed: {exc}")
+            elif self.whisper_refiner is not None:
+                print("[hgr] whisper_refiner: skipped (streaming hypotheses enabled)")
             self.voice_status_overlay.show_processing("Preparing Dictation Mode")
             self.command_detected.emit(self._voice_control_text)
             self._emit_status("dictation active")
@@ -8527,7 +8669,14 @@ class GestureWorker(QObject):
             def _dictation_worker() -> None:
                 final_message = "dictation stopped"
                 hold_back = 2
-                _PENDING_WINDOW_SECONDS = 2.5
+                # Trailing-latency knob. With live hypotheses now typing the
+                # bulk of each utterance as it is spoken, the final only needs
+                # to land fast enough to reconcile the held-back tail; it no
+                # longer has to be the primary latency buffer. Lowered 2.5 -> 1.0.
+                # (A new utterance's first hypothesis also flushes any still-
+                # pending previous final immediately, so cross-utterance
+                # reconciliation does not depend on this window.)
+                _PENDING_WINDOW_SECONDS = 1.0
                 state = {
                     "committed": "",
                     "last_words": [],
@@ -8542,6 +8691,11 @@ class GestureWorker(QObject):
                     "pending_final_text": None,
                     "pending_final_timer": None,
                     "last_hypothesis_time": 0.0,
+                    # Last char physically typed into the target window. Drives the
+                    # utterance-seam leading-space decision in _seam_normalize so a
+                    # dropped boundary space ("ofFree") is filled in without ever
+                    # doubling a space in the normal (trailing-space-present) case.
+                    "last_char": "",
                 }
                 pending_lock = threading.Lock()
                 self._dictation_state = state
@@ -8558,109 +8712,158 @@ class GestureWorker(QObject):
                 def _commit_final(text: str) -> None:
                     normalized = " ".join(text.lower().split())
                     now = time.monotonic()
-                    prev_final_text = state.get("last_final_text", "")
-                    last_final_time = state.get("last_final_time", 0.0)
-                    time_gap = (now - last_final_time) if last_final_time > 0 else 999.0
-                    no_new_audio = last_final_time > 0 and time_gap < 2.0
-                    if (
-                        normalized
-                        and normalized in state["recent_finals"]
-                        and no_new_audio
-                    ):
-                        print(f"[dictation] commit: dropped re-emission (gap={time_gap:.1f}s) {text!r}")
-                        state["committed"] = ""
-                        state["last_words"] = []
-                        state["stream_hyp_chars"] = 0
-                        return
-                    redecode_done = False
-                    overlap_hit = bool(prev_final_text) and _redecode_overlap(prev_final_text, text)
-                    print(f"[dictation] commit: text={text!r} prev={prev_final_text!r} gap={time_gap:.2f}s overlap={overlap_hit}")
-                    if (
-                        prev_final_text
-                        and time_gap < 10.0
-                        and overlap_hit
-                    ):
-                        revert_chars = state.get("last_final_typed_len", 0) + state.get("stream_hyp_chars", 0)
-                        if 0 < revert_chars <= 300:
-                            to_type = text + " "
-                            with self._corrector_lock:
+                    payload = None
+                    # The ENTIRE body runs under _corrector_lock so every read and
+                    # write of the shared char-bookkeeping (committed,
+                    # stream_hyp_chars, last_final_typed_len, recent_finals) is
+                    # atomic against a concurrent hypothesis on the stream thread.
+                    # _commit_final is only ever called WITHOUT the lock held
+                    # (the pending Timer, or _flush_pending from the stream/command/
+                    # stop paths), so this single acquisition is safe for the
+                    # non-reentrant lock — no nested re-acquisition anywhere below.
+                    with self._corrector_lock:
+                        prev_final_text = state.get("last_final_text", "")
+                        last_final_time = state.get("last_final_time", 0.0)
+                        time_gap = (now - last_final_time) if last_final_time > 0 else 999.0
+                        no_new_audio = last_final_time > 0 and time_gap < 2.0
+                        if (
+                            normalized
+                            and normalized in state["recent_finals"]
+                            and no_new_audio
+                        ):
+                            print(f"[dictation] commit: dropped re-emission (gap={time_gap:.1f}s) {text!r}")
+                            state["committed"] = ""
+                            state["last_words"] = []
+                            state["stream_hyp_chars"] = 0
+                            return
+                        redecode_done = False
+                        overlap_hit = bool(prev_final_text) and _redecode_overlap(prev_final_text, text)
+                        print(f"[dictation] commit: text={text!r} prev={prev_final_text!r} gap={time_gap:.2f}s overlap={overlap_hit}")
+                        # Cross-utterance re-decode/overlap revert: only valid when
+                        # NO live hypotheses typed the current utterance (its revert
+                        # count assumes the previous final is the only thing on
+                        # screen). If hypotheses live-typed this utterance, the
+                        # within-utterance reconciliation below owns the seam.
+                        if (
+                            prev_final_text
+                            and time_gap < 10.0
+                            and overlap_hit
+                            and state.get("stream_hyp_chars", 0) == 0
+                        ):
+                            # stream_hyp_chars is 0 here (gate above), so the revert
+                            # count is exactly the previous final's typed length.
+                            revert_chars = state.get("last_final_typed_len", 0)
+                            if 0 < revert_chars <= 300:
+                                to_type = text + " "
                                 removed = self.text_input_controller.remove_text(revert_chars)
                                 if removed:
-                                    inserted = self.text_input_controller.insert_text(to_type)
+                                    inserted = self.text_input_controller.insert_text(to_type, prefer_paste=False)
                                     if inserted:
                                         self.grammar_corrector.sync_replace(revert_chars, to_type)
                                         print(f"[dictation] re-decode replace: -{revert_chars} +{len(to_type)} chars")
                                         redecode_done = True
 
-                    if redecode_done:
-                        current_display = state["final_display"] or ""
-                        prev_norm = " ".join(prev_final_text.lower().split())
-                        if prev_norm and current_display.lower().endswith(prev_norm):
-                            current_display = current_display[: len(current_display) - len(prev_final_text)].rstrip()
-                        state["final_display"] = (current_display + " " + text).strip() if current_display else text
-                        state["last_final_text"] = text
-                        state["last_final_typed_len"] = len(text + " ")
-                        state["last_final_time"] = now
-                        state["last_final_refined"] = False
-                        state["stream_hyp_chars"] = 0
-                        state["committed"] = ""
-                        state["last_words"] = []
-                        state["last_final"] = normalized
-                        if state["recent_finals"]:
-                            state["recent_finals"][-1] = normalized
+                        if redecode_done:
+                            current_display = state["final_display"] or ""
+                            prev_norm = " ".join(prev_final_text.lower().split())
+                            if prev_norm and current_display.lower().endswith(prev_norm):
+                                current_display = current_display[: len(current_display) - len(prev_final_text)].rstrip()
+                            state["final_display"] = (current_display + " " + text).strip() if current_display else text
+                            state["last_final_text"] = text
+                            state["last_final_typed_len"] = len(text + " ")
+                            state["last_final_time"] = now
+                            state["last_final_refined"] = False
+                            state["stream_hyp_chars"] = 0
+                            state["committed"] = ""
+                            state["last_words"] = []
+                            state["last_char"] = " "  # to_type ended with a space
+                            state["last_final"] = normalized
+                            if state["recent_finals"]:
+                                state["recent_finals"][-1] = normalized
+                            else:
+                                state["recent_finals"].append(normalized)
                         else:
-                            state["recent_finals"].append(normalized)
-                        self._voice_queue.put(
-                            (
-                                request_id,
-                                {
-                                    "event": "dictation_chunk",
-                                    "success": True,
-                                    "heard_text": text,
-                                    "control_text": "dictation typing",
-                                    "display_text": state["final_display"],
-                                    "partial": False,
-                                },
+                            # --- reconcile the high-accuracy final against the text
+                            # live hypotheses already typed for THIS utterance -----
+                            # `committed` is the running prefix the hypothesis path
+                            # typed (no trailing space); `committed_chars` (==
+                            # stream_hyp_chars) is exactly how many chars landed on
+                            # screen. We compare by WORD, case/punctuation-
+                            # insensitively: greedy partials and the beam final often
+                            # differ in casing/punctuation, and a char-exact
+                            # `startswith` would treat the whole final as new and
+                            # RE-TYPE it on top of the live text (duplication).
+                            # Instead: keep the agreed prefix, backspace any
+                            # divergent/over-long live tail, type only the final's
+                            # clean remainder.
+                            committed = state["committed"]
+                            committed_chars = state.get("stream_hyp_chars", 0)
+                            backspace_chars, to_type, common_chars = _reconcile_final_edit(
+                                committed, committed_chars, text
                             )
-                        )
-                        return
-
-                    committed = state["committed"]
-                    committed_chars = state.get("stream_hyp_chars", 0)
-                    if text.startswith(committed):
-                        remainder = text[len(committed):]
-                    else:
-                        remainder = text
-                    to_type = remainder + " "
-                    with self._corrector_lock:
-                        self.text_input_controller.insert_text(to_type)
-                        self.grammar_corrector.append(to_type)
-                    current_display = state["final_display"] or ""
-                    state["final_display"] = (current_display + " " + text).strip() if current_display else text
-                    state["last_final_text"] = text
-                    state["last_final_typed_len"] = committed_chars + len(to_type)
-                    state["last_final_time"] = now
-                    state["last_final_refined"] = False
-                    state["stream_hyp_chars"] = 0
-                    state["committed"] = ""
-                    state["last_words"] = []
-                    state["last_final"] = normalized
-                    state["recent_finals"].append(normalized)
-                    if len(state["recent_finals"]) > 4:
-                        state["recent_finals"] = state["recent_finals"][-4:]
-                    self._voice_queue.put(
-                        (
-                            request_id,
-                            {
-                                "event": "dictation_chunk",
-                                "success": True,
-                                "heard_text": text,
-                                "control_text": "dictation typing",
-                                "display_text": state["final_display"],
-                                "partial": False,
-                            },
-                        )
-                    )
+                            lead = ""
+                            if committed == "":
+                                # Commit-only path (no live hypotheses typed this
+                                # utterance) -> this is the utterance's first content,
+                                # so fix the seam: re-case the leading word and fill a
+                                # dropped boundary space. to_type was "text " (k==0).
+                                # `lead` is a separator and is NOT counted in
+                                # typed_chars / last_final_typed_len.
+                                lead, cased = _seam_normalize(
+                                    text, state.get("final_display", ""), state.get("last_char", "")
+                                )
+                                to_type = cased + " "
+                            ok = True
+                            if backspace_chars > 0:
+                                # divergent or over-long live tail -> remove it so the
+                                # authoritative final wins the seam (no duplication).
+                                ok = self.text_input_controller.remove_text(backspace_chars)
+                                if ok:
+                                    self.grammar_corrector.sync_replace(backspace_chars, "")
+                            typed_chars = 0
+                            if ok:
+                                # Commit-only path keeps clipboard PASTE unchanged;
+                                # streaming remainders are short and use SendInput so
+                                # we never clobber the clipboard.
+                                use_paste = committed == ""
+                                inserted = self.text_input_controller.insert_text(lead + to_type, prefer_paste=use_paste)
+                                if not inserted and backspace_chars > 0:
+                                    # We already removed the live tail; retry the
+                                    # insert once so a transient focus blip between
+                                    # the backspace and the insert can't drop the word.
+                                    inserted = self.text_input_controller.insert_text(lead + to_type, prefer_paste=use_paste)
+                                if inserted:
+                                    self.grammar_corrector.append(lead + to_type)
+                                    typed_chars = len(to_type)
+                                    state["last_char"] = to_type[-1] if to_type else state.get("last_char", "")
+                                else:
+                                    ok = False
+                            current_display = state["final_display"] or ""
+                            state["final_display"] = (current_display + " " + text).strip() if current_display else text
+                            state["last_final_text"] = text
+                            # Only count chars that actually landed. If focus was lost
+                            # mid-commit, keep the typed-len at a safe value so a later
+                            # refinement/re-decode never backspaces phantom characters.
+                            state["last_final_typed_len"] = (common_chars + typed_chars) if ok else 0
+                            state["last_final_time"] = now
+                            state["last_final_refined"] = False
+                            state["stream_hyp_chars"] = 0
+                            state["committed"] = ""
+                            state["last_words"] = []
+                            state["last_final"] = normalized
+                            state["recent_finals"].append(normalized)
+                            if len(state["recent_finals"]) > 4:
+                                state["recent_finals"] = state["recent_finals"][-4:]
+                        payload = {
+                            "event": "dictation_chunk",
+                            "success": True,
+                            "heard_text": text,
+                            "control_text": "dictation typing",
+                            "display_text": state["final_display"],
+                            "partial": False,
+                        }
+                    if payload is not None:
+                        self._voice_queue.put((request_id, payload))
 
                 def _flush_pending() -> None:
                     with pending_lock:
@@ -8729,6 +8932,46 @@ class GestureWorker(QObject):
 
                 state["_flush_pending"] = _flush_pending
 
+                def _terminate_live_utterance() -> None:
+                    # The whole-utterance final decode stripped to nothing
+                    # (trailing-silence hallucination / no-speech), but live
+                    # hypotheses may already have typed LocalAgreement-stable words
+                    # for this utterance. Keep that confirmed text — it was real
+                    # speech — but terminate it with a separator space and RESTORE
+                    # the bookkeeping invariant (stream_hyp_chars == len(committed)
+                    # == 0). Without zeroing stream_hyp_chars here, the next
+                    # utterance's reconciler would read a stale-high count and
+                    # backspace into previously-committed text.
+                    #
+                    # First flush any still-pending PREVIOUS final: a very short
+                    # utterance (too brief for partials) can reach here while the
+                    # prior utterance's final is still buffered, in which case
+                    # `committed` below would still hold the PRIOR utterance's live
+                    # text. Committing it first (outside the lock; _flush_pending
+                    # re-takes it) resets committed/stream_hyp_chars so we never
+                    # steal it and then double-commit it when its timer fires.
+                    if state.get("pending_final_text"):
+                        _flush_pending()
+                    with self._corrector_lock:
+                        committed = state.get("committed", "")
+                        hyp_chars = state.get("stream_hyp_chars", 0)
+                        if hyp_chars > 0:
+                            inserted = self.text_input_controller.insert_text(" ", prefer_paste=False)
+                            if inserted:
+                                self.grammar_corrector.append(" ")
+                                state["last_char"] = " "
+                            current_display = state["final_display"] or ""
+                            state["final_display"] = (
+                                (current_display + " " + committed).strip() if current_display else committed
+                            )
+                            state["last_final_text"] = committed
+                            state["last_final_typed_len"] = hyp_chars + (1 if inserted else 0)
+                            state["last_final_time"] = time.monotonic()
+                            state["last_final_refined"] = False
+                        state["committed"] = ""
+                        state["last_words"] = []
+                        state["stream_hyp_chars"] = 0
+
                 def _handle(event: LiveDictationEvent) -> None:
                     try:
                         name = event.event
@@ -8746,34 +8989,68 @@ class GestureWorker(QObject):
                         if name == "hypothesis":
                             if not text:
                                 return
-                            state["last_hypothesis_time"] = time.monotonic()
-                            words = text.split()
-                            stable = _common_prefix(state["last_words"], words)
-                            state["last_words"] = words
-                            commit_words = stable[:-hold_back] if len(stable) > hold_back else []
-                            if not commit_words:
+                            # Drop deterministic whisper hallucinations BEFORE they
+                            # can be live-typed. The final/rejected branch already
+                            # strips these; the live path must too, or a low-signal
+                            # partial types 'Thank you.'/'you' into the document.
+                            # temperature=0 makes hallucinations repeat identically,
+                            # so LocalAgreement-2 would otherwise happily commit them.
+                            text = _strip_whisper_hallucinations(text)
+                            if not text:
                                 return
-                            commit_text = " ".join(commit_words)
-                            committed = state["committed"]
-                            if commit_text.startswith(committed) and len(commit_text) > len(committed):
-                                suffix = commit_text[len(committed):]
-                                with self._corrector_lock:
-                                    inserted = self.text_input_controller.insert_text(suffix)
+                            # A hypothesis arriving while a previous utterance's
+                            # final is still buffered means a NEW utterance has
+                            # begun (the streamer emits one final per utterance,
+                            # then resets). Commit the previous one now — reconciling
+                            # its live text — so this utterance's prefix bookkeeping
+                            # (committed / stream_hyp_chars / last_words) starts clean.
+                            # Done OUTSIDE the lock; _flush_pending re-takes it.
+                            if state.get("pending_final_text"):
+                                _flush_pending()
+                            state["last_hypothesis_time"] = time.monotonic()
+                            # The whole read-compute-type-write section is under
+                            # _corrector_lock so a concurrent _commit_final (timer
+                            # thread) can't interleave the shared char bookkeeping.
+                            with self._corrector_lock:
+                                words = text.split()
+                                stable = _common_prefix(state["last_words"], words)
+                                state["last_words"] = words
+                                commit_words = stable[:-hold_back] if len(stable) > hold_back else []
+                                if not commit_words:
+                                    return
+                                commit_text = " ".join(commit_words)
+                                committed = state["committed"]
+                                if commit_text.startswith(committed) and len(commit_text) > len(committed):
+                                    suffix = commit_text[len(committed):]
+                                    # On the FIRST insert of a new utterance, fix the
+                                    # seam: re-case the leading word (whisper caps each
+                                    # utterance's first word) and fill a dropped
+                                    # boundary space. `cased` is length-preserving so
+                                    # the char bookkeeping (stream_hyp_chars ==
+                                    # len(committed)) is untouched; the lead space is a
+                                    # separator and is deliberately NOT counted.
+                                    lead, cased = "", suffix
+                                    if committed == "":
+                                        lead, cased = _seam_normalize(
+                                            suffix, state.get("final_display", ""), state.get("last_char", "")
+                                        )
+                                    # SendInput (prefer_paste=False): live suffixes
+                                    # are short and fire ~1.5x/sec — pasting each one
+                                    # would clobber the user's clipboard continuously.
+                                    inserted = self.text_input_controller.insert_text(lead + cased, prefer_paste=False)
                                     if inserted:
-                                        self.grammar_corrector.append(suffix)
-                                if inserted:
-                                    state["committed"] = commit_text
-                                    state["stream_hyp_chars"] = state.get("stream_hyp_chars", 0) + len(suffix)
+                                        self.grammar_corrector.append(lead + cased)
+                                        state["committed"] = commit_text
+                                        state["stream_hyp_chars"] = state.get("stream_hyp_chars", 0) + len(cased)
+                                        state["last_char"] = cased[-1] if cased else state.get("last_char", "")
                             return
                         if name in ("final", "rejected"):
                             if not text:
-                                state["committed"] = ""
-                                state["last_words"] = []
+                                _terminate_live_utterance()
                                 return
                             text = _strip_whisper_hallucinations(text)
                             if not text:
-                                state["committed"] = ""
-                                state["last_words"] = []
+                                _terminate_live_utterance()
                                 return
                             command = _parse_dictation_command(text)
                             if command is not None:
@@ -8785,6 +9062,7 @@ class GestureWorker(QObject):
                                     )
                                     if inserted:
                                         self.grammar_corrector.append(newline_text)
+                                        state["last_char"] = "\n"
                                 print(f"[dictation] command: {command} inserted={inserted} text={text!r}")
                                 state["committed"] = ""
                                 state["last_words"] = []
@@ -8804,10 +9082,17 @@ class GestureWorker(QObject):
                     while True:
                         if stop_event is not None and stop_event.is_set():
                             break
+                        # Flush any still-pending final BEFORE clearing the live
+                        # prefix state, so a stream restart can't strand chars the
+                        # hypothesis path already typed (which a later reconcile
+                        # would then backspace against the wrong position).
+                        if state.get("pending_final_text"):
+                            _flush_pending()
                         # Reset per-utterance commit state so a fresh stream
                         # doesn't try to diff against stale words.
                         state["committed"] = ""
                         state["last_words"] = []
+                        state["stream_hyp_chars"] = 0
                         ok = streamer.stream(stop_event=stop_event, event_callback=_handle)
                         if stop_event is not None and stop_event.is_set():
                             break
@@ -9007,6 +9292,40 @@ class GestureWorker(QObject):
                             and intent_app_name == "touchless"
                             and intent_action in {"clip_1m", "clip_30s"}
                         ):
+                            # Anchor the clip window at when the user
+                            # actually finished saying "clip that", not
+                            # at the much-later moment when this branch
+                            # fires. Whisper + parse + dispatch easily
+                            # add 5-15 s; without this the saved clip
+                            # ends 5-15 s after the user's intent and
+                            # the moment they wanted to capture has
+                            # already scrolled out the back of the
+                            # rolling buffer. main_window reads this
+                            # attribute when processing the matching
+                            # _voice utility request.
+                            try:
+                                self._pending_clip_voice_end_ts = (
+                                    float(result.speech_end_ts)
+                                    if getattr(result, "speech_end_ts", None) is not None
+                                    else None
+                                )
+                            except (TypeError, ValueError):
+                                self._pending_clip_voice_end_ts = None
+                            try:
+                                import sys as _sys, time as _time
+                                _sys.stderr.write(
+                                    f"[clip-anchor] engine stashed end_ts={self._pending_clip_voice_end_ts} "
+                                    f"(now={_time.time():.3f}, "
+                                    f"lag_since_speech_end="
+                                    f"{(_time.time() - self._pending_clip_voice_end_ts):.2f}s)"
+                                    if self._pending_clip_voice_end_ts is not None
+                                    else
+                                    f"[clip-anchor] engine stashed end_ts=None (speech_end_ts missing from listener result)"
+                                )
+                                _sys.stderr.write("\n")
+                                _sys.stderr.flush()
+                            except Exception:
+                                pass
                             try:
                                 self._queue_utility_request(f"{intent_action}_voice")
                             except Exception:
@@ -9328,7 +9647,10 @@ class GestureWorker(QObject):
         instruction = "Say the corresponding letter"
         items: list[tuple[str, str, str]] = []
         for line in lines:
-            match = re.match(r"^([A-Za-z]|\d+)\.\s+(.*?)(?:\s+[—-]\s+(.*))?$", line)
+            # Accept A-Z keys AND the new A1/B1/Z5 cycle-suffix keys
+            # produced past index 25 by _selection_key_for_index.
+            # Prior `[A-Za-z]` (single char) rejected anything past Z.
+            match = re.match(r"^([A-Za-z]\d*|\d+)\.\s+(.*?)(?:\s+[—-]\s+(.*))?$", line)
             if match:
                 selection_key = str(match.group(1) or "").strip().upper()
                 label = str(match.group(2) or "").strip()
