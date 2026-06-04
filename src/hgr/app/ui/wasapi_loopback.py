@@ -134,13 +134,25 @@ class WasapiLoopbackWriter:
         # the open still fails (exclusive-mode lock, device gone),
         # we return False and the caller falls back cleanly.
         try:
+            # frames_per_buffer=4096 (was 1024) gives ~85ms cushion
+            # per read at 48 kHz. When amix in the audio cache ffmpeg
+            # consumes input in bursts (because one input — the
+            # system loopback — is delivering samples at less than
+            # nominal rate, amix throttles to the slower input), the
+            # larger cushion absorbs the back-pressure on our pipe/
+            # socket write so PortAudio's input buffer doesn't
+            # underflow and DROP our microphone samples. Dropped
+            # samples were the cause of the user's "mic glitchy /
+            # barely understandable" report — voice frames were
+            # getting cut every 21 ms whenever amix was busy
+            # rebalancing.
             self._stream = self._pa.open(
                 format=pa.paInt16,
                 channels=self.channels,
                 rate=self.rate,
                 input=True,
                 input_device_index=self._device_index,
-                frames_per_buffer=1024,
+                frames_per_buffer=4096,
             )
         except Exception as exc:
             self._on_error(f"WASAPI loopback open failed: {exc}")
@@ -175,7 +187,11 @@ class WasapiLoopbackWriter:
         try:
             while not self._stop.is_set():
                 try:
-                    data = stream.read(1024, exception_on_overflow=False)
+                    # Read matches frames_per_buffer above (4096) so
+                    # PortAudio hands us a whole input quantum at a
+                    # time — fewer cross-thread copies, fewer chances
+                    # to underflow during amix back-pressure.
+                    data = stream.read(4096, exception_on_overflow=False)
                 except Exception as exc:
                     self._on_error(f"WASAPI read error: {exc}")
                     break

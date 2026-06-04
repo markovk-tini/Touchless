@@ -23748,7 +23748,11 @@ Admin elevation
             if fmt is not None:
                 _dev, rate, channels = fmt
                 input_args.extend([
-                    "-thread_queue_size", "1024",
+                    # 8192 packets (was 1024) — ffmpeg's per-input
+                    # packet queue cushion. Pairs with the larger
+                    # PortAudio frames_per_buffer to keep amix from
+                    # back-pressuring the mic when sys input is slow.
+                    "-thread_queue_size", "8192",
                     "-f", "s16le",
                     "-ar", str(rate),
                     "-ac", str(channels),
@@ -23878,7 +23882,7 @@ Admin elevation
                     else:
                         self._clip_mic_tcp_acceptor = acceptor
                         input_args.extend([
-                            "-thread_queue_size", "1024",
+                            "-thread_queue_size", "8192",
                             "-f", "s16le",
                             "-ar", str(mic_rate),
                             "-ac", str(mic_channels),
@@ -23893,7 +23897,7 @@ Admin elevation
                         )
                 else:
                     input_args.extend([
-                        "-thread_queue_size", "1024",
+                        "-thread_queue_size", "8192",
                         "-f", "s16le",
                         "-ar", str(mic_rate),
                         "-ac", str(mic_channels),
