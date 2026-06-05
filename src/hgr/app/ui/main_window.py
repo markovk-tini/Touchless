@@ -23749,24 +23749,22 @@ Admin elevation
                 latest_by_path[key] = entry
         ordered = sorted(latest_by_path.values(), key=lambda e: e["end_time"])
         # CHAIN wall_start_mtime to the previous segment's
-        # wall_end_mtime. The naive `wall_start = wall_end -
-        # file_duration` undershoots by (file_duration / device_rate -
-        # file_duration) seconds per segment — for 89 % WASAPI
-        # under-delivery and 10 s segments that's a 1.24 s gap per
-        # segment, which the export consumes as audio-vs-video skew
-        # (~3 s by the time the user clipped, even with the
-        # mtime-only fix). Chaining gives each segment a wall_start
-        # equal to the previous segment's wall_end, eliminating the
-        # gap and aligning the entire concat with real wall time.
-        # First segment falls back to wall_end - file_duration since
-        # there's no predecessor to chain from.
+        # wall_end_mtime so successive segments are wall-contiguous
+        # regardless of how slowly ffmpeg's amix processed inputs.
+        # First segment falls back to (wall_end - file_duration) —
+        # not perfect (file_duration is nominal, real wall-duration
+        # may be ~5 % longer due to rate drift), but better than the
+        # per-segment-anchor approaches I tried (which produce ~10 s
+        # errors when -segment_wrap has rotated the manifest).
         prev_wall_end = 0.0
         for entry in ordered:
             wall_end = float(entry.get("wall_end_mtime", 0.0) or 0.0)
             file_duration = float(entry.get("file_duration", 0.0) or 0.0)
-            if wall_end > 0 and prev_wall_end > 0:
+            if wall_end <= 0:
+                continue
+            if prev_wall_end > 0:
                 entry["wall_start_mtime"] = prev_wall_end
-            elif wall_end > 0:
+            else:
                 entry["wall_start_mtime"] = wall_end - file_duration
             prev_wall_end = wall_end
         return ordered
@@ -24966,7 +24964,7 @@ Admin elevation
                         getattr(self.config, "clip_audio_offset_ms", 0) or 0)
                 except Exception:
                     user_offset_ms = 0
-                user_offset_ms = max(-5000, min(5000, user_offset_ms))
+                user_offset_ms = max(-10000, min(10000, user_offset_ms))
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
@@ -25571,7 +25569,7 @@ Admin elevation
                         getattr(self.config, "clip_audio_offset_ms", 0) or 0)
                 except Exception:
                     user_offset_ms = 0
-                user_offset_ms = max(-5000, min(5000, user_offset_ms))
+                user_offset_ms = max(-10000, min(10000, user_offset_ms))
                 offset_seconds = user_offset_ms / 1000.0
                 shifted_start = max(0.0, a_start_trim - offset_seconds)
                 m = len(audio_selected)

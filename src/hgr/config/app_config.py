@@ -260,6 +260,14 @@ class AppConfig:
     # the first migration. This second migration flips +2500 → -2500
     # to actually compensate the WASAPI capture lag.
     clip_audio_offset_sign_corrected: bool = False
+    # Third-pass marker: after the bridge silence-fill + mtime fixes
+    # the residual underlying offset is audio playing ~5-6 s EARLIER
+    # than video (ffmpeg amix startup + segment-muxer pre-roll while
+    # mic burst-dumps its anchor pre-pad). The -2500 default
+    # under-compensated, leaving audio still 3 s early. Flip to
+    # -5500 to fully compensate. Bumps the clamp to ±10000 ms so
+    # this and other deep mis-calibrations stay within tunable range.
+    clip_audio_offset_post_silence_fill_migrated: bool = False
     # Audio-vs-video offset applied at clip export by biasing the
     # audio-trim start point. Sign convention is set by the export
     # math `shifted_start = a_start_trim - offset_seconds`:
@@ -271,16 +279,17 @@ class AppConfig:
     #     samples → audio events appear EARLIER in the clip (use when
     #     audio is reported LATE).
     #
-    # Default -2500 ms compensates for WASAPI / PortAudio capture
-    # lag: the OS hands us samples a couple of seconds after they
-    # actually hit the render endpoint, so without the bias every
-    # clip plays audio events ~2-3 s before the visual cue. The
-    # negative bias pushes audio later by the same amount.
+    # Default -5500 ms compensates for the cumulative startup-pad
+    # offset of the clip-audio pipeline: WASAPI loopback capture lag
+    # + ffmpeg amix startup + mic anchor pre-pad burst that lets the
+    # mic input race ahead of sys on the very first segment. Without
+    # this bias every clip plays audio events ~5-6 s before the
+    # visual cue.
     #
     # Tune in 500 ms increments if your hardware differs (some
     # Realtek + Atmos DACs add another 200-500 ms; a low-latency
-    # USB interface needs less). Clamp is ±5000 ms.
-    clip_audio_offset_ms: int = -2500
+    # USB interface needs less). Clamp is ±10000 ms.
+    clip_audio_offset_ms: int = -5500
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -638,6 +647,16 @@ def load_config() -> AppConfig:
             if values.get("clip_audio_offset_ms") == 2500:
                 values["clip_audio_offset_ms"] = -2500
             values["clip_audio_offset_sign_corrected"] = True
+
+        # Third-pass migration after the bridge silence-fill + mtime
+        # fixes uncovered the true underlying offset (~5-6 s early
+        # audio). The earlier -2500 default under-compensated. Bump
+        # only the exact prior default -2500 to the new default
+        # -5500. Deliberate user-tunes (any other value) survive.
+        if not data.get("clip_audio_offset_post_silence_fill_migrated", False):
+            if values.get("clip_audio_offset_ms") == -2500:
+                values["clip_audio_offset_ms"] = -5500
+            values["clip_audio_offset_post_silence_fill_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if
