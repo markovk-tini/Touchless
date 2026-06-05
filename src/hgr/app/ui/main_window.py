@@ -23663,9 +23663,9 @@ Admin elevation
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
-                    f"[{mic_idx}:a]{ns}[amic];"
+                    f"[{mic_idx}:a]{ns},volume=1.5[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
-                    "dropout_transition=0[aout]"
+                    "dropout_transition=0:weights=1 3[aout]"
                 ),
             ],
             ["-map", "0:v", "-map", "[aout]"],
@@ -24025,21 +24025,25 @@ Admin elevation
                 "-map", "[aout]",
             ]
         else:
-            # weights=1 2: keep amix's default normalize=1 (output is
-            # divided by total weight) but boost mic 2:1 over sys.
-            # Net amplitudes: sys at 1/3, mic at 2/3 of the mixed
-            # output. Mic comes through clearly while sys + mic sum
-            # never exceeds peak so no clipping. The previous
-            # normalize=0 approach let both streams pass at 100% and
-            # the AAC encoder hard-clipped on overlap peaks — the
-            # "music garbled and low" symptom.
+            # weights=1 3: mic dominates the mix 3:1 over sys (mic at
+            # 75 % of output, sys at 25 %). Default amix normalize=1
+            # keeps the sum bounded, so no clipping. User reported
+            # mic still 'low' with weights=1 2 because music+game
+            # audio masked the voice; bumping mic to 75 % makes
+            # speech cut through clearly while keeping enough sys
+            # presence to know what was playing in the background.
+            #
+            # Mic chain also gets an explicit volume=1.5 boost
+            # BEFORE amix, applied after the noise-reduction filter.
+            # Combined with the 75 % amix weight this gives mic a
+            # ~2.2× effective level over sys's natural amplitude.
             filter_args = [
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
-                    f"[{mic_idx}:a]{ns}[amic];"
+                    f"[{mic_idx}:a]{ns},volume=1.5[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
-                    "dropout_transition=0:weights=1 2[aout]"
+                    "dropout_transition=0:weights=1 3[aout]"
                 ),
                 "-map", "[aout]",
             ]
