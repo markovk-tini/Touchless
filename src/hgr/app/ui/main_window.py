@@ -5986,22 +5986,15 @@ class MainWindow(QMainWindow):
         self._screen_record_timer = QTimer(self)
         self._screen_record_timer.setInterval(int(round(1000.0 / self._screen_record_fps)))
         self._screen_record_timer.timeout.connect(self._capture_screen_record_frame)
-        # Bumped from 20 → 60 fps to match Medal-quality smoothness.
-        # The cache runs continuously while Touchless is up, so the
-        # previous 20 fps was producing slideshow-y clips for
-        # gameplay capture (the entire reason "clip that" exists is
-        # to share moments from games that run at 60+ fps). With the
-        # hardware encoder auto-detection in _ffmpeg_capture_input_args
-        # / _ffmpeg_encoder_args (h264_nvenc → h264_amf → h264_qsv →
-        # libx264 fallback), 60 fps on an NVENC/AMF/QSV path costs
-        # ~3-5% GPU and produces clips indistinguishable from Medal's.
-        # libx264-veryfast fallback handles 60 fps too on modern CPUs,
-        # though at higher CPU cost. The cache writes to AAC + MKV
-        # segments at this rate; storage cost is ~6 MB/s at 60 fps
-        # H.264 4 Mbps, well within ring-buffer disk usage.
+        # Bumped from 8 → 20 fps for the background "clip that"
+        # cache. The cache runs continuously while Touchless is up,
+        # so we keep it a notch under the explicit recording rate
+        # (above) to leave headroom for the game's GPU work — but
+        # 8 fps was visibly stuttery on playback and the user asked
+        # for less lag. 20 fps is close enough to real-time motion
         # that gameplay clips feel fluid without spending the full
         # 30-fps overhead during background capture.
-        self._clip_cache_fps = 60.0
+        self._clip_cache_fps = 20.0
         self._clip_cache_segment_seconds = 10.0
         self._clip_cache_max_seconds = 65.0
         self._clip_cache_region: QRect | None = None
@@ -24300,17 +24293,7 @@ Admin elevation
         command = [
             self._ffmpeg_path,
             "-hide_banner", "-loglevel", "error", "-y",
-            # prefer_low_overhead=True picks the GPU-native capture
-            # path (ddagrab / gfxcapture) when ffmpeg has them and a
-            # specific monitor is targeted. ddagrab uses DXGI Desktop
-            # Duplication — same Direct3D 11 API Medal/OBS/ShadowPlay
-            # use — which is ~10x cheaper than gdigrab's GDI BitBlt
-            # and can sustain 60+ fps without dropping frames. Falls
-            # back to gdigrab when ddagrab isn't built into the
-            # bundled ffmpeg or when no monitor index is identifiable
-            # (e.g., the user is clipping a custom region instead of
-            # a whole monitor).
-            *self._ffmpeg_capture_input_args(region, fps=self._clip_cache_fps, prefer_low_overhead=True),
+            *self._ffmpeg_capture_input_args(region, fps=self._clip_cache_fps, prefer_low_overhead=False),
             "-an",
             *self._ffmpeg_encoder_args(purpose="clip", fps=self._clip_cache_fps, segment_seconds=self._clip_cache_segment_seconds),
             "-force_key_frames", f"expr:gte(t,n_forced*{float(self._clip_cache_segment_seconds):.3f})",
