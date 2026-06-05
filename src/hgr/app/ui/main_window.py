@@ -23663,7 +23663,7 @@ Admin elevation
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
-                    f"[{mic_idx}:a]{ns},volume=1.5[amic];"
+                    f"[{mic_idx}:a]{ns}[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
                     "dropout_transition=0:weights=1 3[aout]"
                 ),
@@ -24032,16 +24032,14 @@ Admin elevation
             # audio masked the voice; bumping mic to 75 % makes
             # speech cut through clearly while keeping enough sys
             # presence to know what was playing in the background.
-            #
-            # Mic chain also gets an explicit volume=1.5 boost
-            # BEFORE amix, applied after the noise-reduction filter.
-            # Combined with the 75 % amix weight this gives mic a
-            # ~2.2× effective level over sys's natural amplitude.
+            # (The previous volume=1.5 boost on top of this was
+            # reverted — it could clip loud mic samples and sound
+            # like 'static'; weights alone do the job cleanly.)
             filter_args = [
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
-                    f"[{mic_idx}:a]{ns},volume=1.5[amic];"
+                    f"[{mic_idx}:a]{ns}[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
                     "dropout_transition=0:weights=1 3[aout]"
                 ),
