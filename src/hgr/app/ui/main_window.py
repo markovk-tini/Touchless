@@ -23778,8 +23778,18 @@ Admin elevation
             fmt = self._probe_wasapi_loopback_format()
             if fmt is not None:
                 _dev, rate, channels = fmt
+                # -use_wallclock_as_timestamps 1: stamp each raw-PCM
+                # packet with its ARRIVAL wall time, not a per-input
+                # sample-count PTS that resets to 0. Combined with
+                # the same flag on the mic input below, amix can
+                # align the two streams by wall clock. Without it,
+                # amix treats mic's first byte (which arrives ~4 s
+                # after sys's because of the TCP-accept wait) as
+                # PTS=0 and mixes it with sys PTS=0, producing the
+                # "mic is N seconds early relative to sys" symptom.
                 input_args.extend([
                     "-thread_queue_size", "1024",
+                    "-use_wallclock_as_timestamps", "1",
                     "-f", "s16le",
                     "-ar", str(rate),
                     "-ac", str(channels),
@@ -23915,8 +23925,14 @@ Admin elevation
                         # before amix asks for more, dropping packets
                         # and producing the "glitchy mic" symptom.
                         # 4096 buys ~4x more headroom.
+                        #
+                        # -use_wallclock_as_timestamps 1 mirrors the
+                        # sys input above — required for amix to
+                        # align mic + sys by wall arrival time
+                        # instead of per-input sample-count PTS.
                         input_args.extend([
                             "-thread_queue_size", "4096",
+                            "-use_wallclock_as_timestamps", "1",
                             "-f", "s16le",
                             "-ar", str(mic_rate),
                             "-ac", str(mic_channels),
@@ -23932,6 +23948,7 @@ Admin elevation
                 else:
                     input_args.extend([
                         "-thread_queue_size", "4096",
+                        "-use_wallclock_as_timestamps", "1",
                         "-f", "s16le",
                         "-ar", str(mic_rate),
                         "-ac", str(mic_channels),
@@ -23973,20 +23990,21 @@ Admin elevation
                 "-map", "[aout]",
             ]
         else:
-            # normalize=0: amix's default normalize=1 divides each
-            # input by the input count, halving mic volume to ~50%
-            # when mixed with system audio. The user-reported "mic is
-            # really low" is exactly that attenuation. With
-            # normalize=0 each input keeps its natural amplitude; AAC
-            # encoder soft-clips on the rare overlap peaks rather
-            # than us pre-attenuating everything by 6 dB.
+            # weights=1 2: keep amix's default normalize=1 (output is
+            # divided by total weight) but boost mic 2:1 over sys.
+            # Net amplitudes: sys at 1/3, mic at 2/3 of the mixed
+            # output. Mic comes through clearly while sys + mic sum
+            # never exceeds peak so no clipping. The previous
+            # normalize=0 approach let both streams pass at 100% and
+            # the AAC encoder hard-clipped on overlap peaks — the
+            # "music garbled and low" symptom.
             filter_args = [
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
                     f"[{mic_idx}:a]{ns}[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
-                    "dropout_transition=0:normalize=0[aout]"
+                    "dropout_transition=0:weights=1 2[aout]"
                 ),
                 "-map", "[aout]",
             ]
