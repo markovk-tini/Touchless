@@ -268,28 +268,30 @@ class AppConfig:
     # -5500 to fully compensate. Bumps the clamp to ±10000 ms so
     # this and other deep mis-calibrations stay within tunable range.
     clip_audio_offset_post_silence_fill_migrated: bool = False
+    # Fourth-pass marker: -5500 didn't move the needle for the user
+    # (still 3 s early — same as -2500). Either the offset sign is
+    # inverted in the export math, or my model of how offset shifts
+    # audio is wrong. Reset to 0 so we observe the TRUE underlying
+    # offset and can derive a correct sign + magnitude from a clean
+    # baseline test.
+    clip_audio_offset_zeroed_for_diagnosis: bool = False
     # Audio-vs-video offset applied at clip export by biasing the
-    # audio-trim start point. Sign convention is set by the export
-    # math `shifted_start = a_start_trim - offset_seconds`:
-    #   * NEGATIVE offset → LARGER shifted_start → reads LATER samples
-    #     → audio events appear LATER in the clip (use when audio is
-    #     reported EARLY relative to video — gunshot heard before
-    #     muzzle flash seen).
-    #   * POSITIVE offset → SMALLER shifted_start → reads EARLIER
-    #     samples → audio events appear EARLIER in the clip (use when
-    #     audio is reported LATE).
+    # audio-trim start point. Sign convention from the export math
+    # `shifted_start = a_start_trim - offset_seconds`:
+    #   * NEGATIVE offset → LARGER shifted_start (atrim skips MORE
+    #     of the concat before extracting) → the audio that ends up
+    #     at clip-T=0 was captured at a LATER wall time → audio
+    #     events appear EARLIER in playback.
+    #   * POSITIVE offset → SMALLER shifted_start → audio events
+    #     appear LATER in playback.
     #
-    # Default -5500 ms compensates for the cumulative startup-pad
-    # offset of the clip-audio pipeline: WASAPI loopback capture lag
-    # + ffmpeg amix startup + mic anchor pre-pad burst that lets the
-    # mic input race ahead of sys on the very first segment. Without
-    # this bias every clip plays audio events ~5-6 s before the
-    # visual cue.
-    #
-    # Tune in 500 ms increments if your hardware differs (some
-    # Realtek + Atmos DACs add another 200-500 ms; a low-latency
-    # USB interface needs less). Clamp is ±10000 ms.
-    clip_audio_offset_ms: int = -5500
+    # Default 0 means no bias. The user reports a residual offset
+    # we have NOT been able to fully diagnose; the right answer is
+    # to start from 0 and tune in 500 ms steps based on observed
+    # behavior, rather than guessing a default that has been wrong
+    # in both directions in prior iterations. Clamp ±10000 ms gives
+    # plenty of tuning room either way.
+    clip_audio_offset_ms: int = 0
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -657,6 +659,19 @@ def load_config() -> AppConfig:
             if values.get("clip_audio_offset_ms") == -2500:
                 values["clip_audio_offset_ms"] = -5500
             values["clip_audio_offset_post_silence_fill_migrated"] = True
+
+        # Fourth-pass migration: -5500 didn't move the perceived
+        # offset versus -2500 in user testing, suggesting the sign
+        # convention I derived from the export math is wrong or the
+        # residual offset comes from a code path the bias doesn't
+        # cover. Reset to 0 so we get a clean baseline reading and
+        # can derive the correct compensation from observed
+        # behavior. Only flips exact prior migration defaults
+        # (-5500 or -2500); deliberate user-tunes survive.
+        if not data.get("clip_audio_offset_zeroed_for_diagnosis", False):
+            if values.get("clip_audio_offset_ms") in (-5500, -2500):
+                values["clip_audio_offset_ms"] = 0
+            values["clip_audio_offset_zeroed_for_diagnosis"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if
