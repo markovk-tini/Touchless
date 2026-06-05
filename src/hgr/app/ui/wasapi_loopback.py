@@ -161,63 +161,147 @@ class WasapiLoopbackWriter:
         stream = self._stream
         stdin = self._stdin
         import time as _time
-        # Sample-count tracking so a "running but silent" bridge is
-        # visible in the log. Without this, a bridge that opens the
-        # device successfully but never produces audio (driver muted,
-        # endpoint switched out, exclusive-mode lock by another app,
-        # or — for the TCP mic path — ffmpeg never connected to dial
-        # back) sits permanently in "running" state and the user gets
-        # a silent clip with no diagnostic trail.
+        # The bridge writes 1024-frame chunks to ffmpeg's stdin (or
+        # to the TCP socket) at the device rate. Why we don't just
+        # blocking-read from PortAudio and pipe through:
+        #
+        # WASAPI loopback in shared mode only produces samples while
+        # an application is actively rendering audio. If the system
+        # is idle (no music, no game, no notification sound), the
+        # loopback stream returns NOTHING — `stream.read(1024)` blocks
+        # for as long as the device is silent. Observed in production:
+        # 66 seconds of zero samples while the user wasn't playing
+        # anything.
+        #
+        # That stall cascades catastrophically: ffmpeg opens its
+        # inputs in order, and `-f s16le -i pipe:0` doesn't return
+        # from avformat_open_input until SOME data arrives. While
+        # ffmpeg is blocked opening input #0, it can't open input #1
+        # (the mic's `tcp://127.0.0.1:PORT`). Our TCP acceptor times
+        # out after 30 seconds with "mic TCP listener never received
+        # an ffmpeg connection," closes the listener, and when ffmpeg
+        # finally gets unblocked and tries to open the TCP input it
+        # hits ECONNREFUSED (-138). The whole audio cache subprocess
+        # exits and the clip has NO audio.
+        #
+        # Fix: use `get_read_available()` to NEVER block on read.
+        # When the device hasn't produced anything, write a 1024-
+        # frame silence chunk paced at the device rate to keep
+        # ffmpeg's pipe fed. ffmpeg opens both inputs immediately,
+        # the TCP accept succeeds, and the clip captures real audio
+        # the moment the device starts producing it.
+        bytes_per_chunk = 1024 * int(self.channels) * 2  # paInt16
+        silence_chunk = b"\x00" * bytes_per_chunk
+        # Pace silence at the device rate so we don't flood ffmpeg
+        # with megabytes of zeros and race ahead of wall time.
+        tick_seconds = 1024.0 / max(1.0, float(self.rate))
+        real_bytes = 0
+        silence_bytes = 0
         bytes_total = 0
         start_t = _time.time()
         next_log_at = start_t + 0.5  # first heartbeat after 500ms
         silence_warned = False
+        # PRIMER: write one chunk of silence to stdin BEFORE the read
+        # loop starts. This unblocks ffmpeg's `-f s16le -i pipe:0`
+        # avformat_open_input probe within milliseconds (it just
+        # needs SOME bytes to confirm the input is alive). With the
+        # primer, ffmpeg moves on to open input #1 (mic TCP) right
+        # away — our acceptor accept() succeeds, mic writer connects,
+        # and the audio cache survives even when the WASAPI loopback
+        # endpoint is silent for the first 60+ seconds. Without the
+        # primer, get_read_available() could return 0 for an unknown
+        # period (idle device), the silence-fill branch sleeps one
+        # tick (~21 ms) before writing, and although that's still
+        # much faster than the old 66-second stall it leaves a brief
+        # window where ffmpeg's probe is starved. The primer
+        # eliminates that window entirely.
+        try:
+            stdin.write(silence_chunk)
+            try:
+                stdin.flush()
+            except Exception:
+                pass
+            silence_bytes += len(silence_chunk)
+            bytes_total += len(silence_chunk)
+            self.first_sample_at = start_t
+        except (BrokenPipeError, OSError, ValueError):
+            # ffmpeg already exited (unlikely this early but possible
+            # if the spawn failed). Nothing to do — fall through to
+            # the loop which will see the broken pipe on its first
+            # write and exit cleanly.
+            pass
         try:
             while not self._stop.is_set():
-                try:
-                    data = stream.read(1024, exception_on_overflow=False)
-                except Exception as exc:
-                    self._on_error(f"WASAPI read error: {exc}")
-                    break
                 now_t = _time.time()
+                data = None
+                # Non-blocking check for available frames. PyAudio /
+                # PortAudio expose this on the blocking-stream API;
+                # we treat any exception as "0 frames available" and
+                # silence-fill. NEVER fall back to blocking read —
+                # that's the 66-second-stall bug.
+                avail = 0
+                try:
+                    avail = int(stream.get_read_available())
+                except Exception:
+                    avail = 0
+                if avail >= 1024:
+                    # Real audio ready — read it without blocking.
+                    try:
+                        data = stream.read(1024, exception_on_overflow=False)
+                    except Exception as exc:
+                        self._on_error(f"WASAPI read error: {exc}")
+                        break
+                    if data:
+                        real_bytes += len(data)
+                else:
+                    # Device idle or producing < 1024 frames. Sleep
+                    # one device tick (~21 ms at 48 kHz) and write
+                    # silence to keep ffmpeg's pipe fed at the
+                    # nominal rate. This is the safety net that
+                    # prevents ffmpeg from stalling on stdin reads.
+                    _time.sleep(tick_seconds)
+                    data = silence_chunk
+                    silence_bytes += len(data)
                 if not data:
-                    # Empty read — count, and warn once if it lasts
-                    # past the first second so the user sees the bridge
-                    # opened the device but the device is producing no
-                    # audio (muted endpoint, exclusive-mode lock, etc.).
-                    if (not silence_warned
-                            and (now_t - start_t) > 1.0
-                            and bytes_total == 0):
-                        self._on_error(
-                            f"{self._label}: device opened OK but produced "
-                            "ZERO samples in the first 1.0s — the endpoint "
-                            "may be muted, locked by another app in "
-                            "exclusive mode, or not actually playing audio. "
-                            "Loopback captures only what reaches the "
-                            "selected render endpoint."
-                        )
-                        silence_warned = True
+                    # Defensive: avail>=1024 but read returned empty.
+                    # Sleep briefly and try again.
+                    _time.sleep(tick_seconds)
                     continue
                 if self.first_sample_at is None:
-                    # Stamp first-sample arrival exactly once. Used by
-                    # the clip-export aligner so audio time anchors at
-                    # the moment audio actually started flowing, not at
-                    # the (earlier) moment ffmpeg's process spawned.
+                    # Stamp wall-clock of the FIRST chunk written
+                    # (silence or real). The clip-export aligner uses
+                    # this as the wall time of file_offset 0; with
+                    # silence-fill the audio file's t=0 is the moment
+                    # this bridge started writing, NOT when the device
+                    # eventually produced real samples — exactly what
+                    # we want for sync against video.
                     self.first_sample_at = _time.time()
                 bytes_total += len(data)
+                if (not silence_warned
+                        and (now_t - start_t) > 2.0
+                        and real_bytes == 0):
+                    self._on_error(
+                        f"{self._label}: device opened OK but produced "
+                        "ZERO real samples in the first 2.0s — endpoint "
+                        "may be muted, locked by another app, or not "
+                        "playing audio. Writing silence to keep ffmpeg's "
+                        "pipe fed; real samples will be captured the "
+                        "moment the device starts producing them."
+                    )
+                    silence_warned = True
                 if now_t >= next_log_at:
-                    # Heartbeat: first one at 500ms, then every 5s. A
-                    # stalled bridge will stop printing, which is the
-                    # ONE clear failure signal we need to debug
-                    # "running but silent" reports.
+                    # Heartbeat: first one at 500ms, then every 5s.
+                    # Split real vs silence so a misbehaving bridge
+                    # (or muted/idle device) is obvious in the log.
                     try:
                         import sys as _sys
-                        kb = bytes_total // 1024
+                        kb_r = real_bytes // 1024
+                        kb_s = silence_bytes // 1024
                         _sys.stderr.write(
                             f"[wasapi-bridge] {self._label}: "
-                            f"{kb} KB ({bytes_total} B) since start "
+                            f"real={kb_r} KB silence={kb_s} KB "
                             f"(elapsed={now_t - start_t:.1f}s, "
-                            f"first_sample_at_offset="
+                            f"first_chunk_at_offset="
                             f"{(self.first_sample_at - start_t) * 1000:.0f}ms)\n"
                         )
                         _sys.stderr.flush()
