@@ -24872,7 +24872,7 @@ Admin elevation
                         getattr(self.config, "clip_audio_offset_ms", 0) or 0)
                 except Exception:
                     user_offset_ms = 0
-                user_offset_ms = max(-2000, min(2000, user_offset_ms))
+                user_offset_ms = max(-5000, min(5000, user_offset_ms))
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
@@ -25469,7 +25469,7 @@ Admin elevation
                         getattr(self.config, "clip_audio_offset_ms", 0) or 0)
                 except Exception:
                     user_offset_ms = 0
-                user_offset_ms = max(-2000, min(2000, user_offset_ms))
+                user_offset_ms = max(-5000, min(5000, user_offset_ms))
                 offset_seconds = user_offset_ms / 1000.0
                 shifted_start = max(0.0, a_start_trim - offset_seconds)
                 m = len(audio_selected)
