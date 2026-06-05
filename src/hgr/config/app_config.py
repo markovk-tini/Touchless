@@ -273,9 +273,13 @@ class AppConfig:
     # we no longer flip values, so re-running the load is a no-op
     # past the first time the flag was latched.)
     clip_audio_offset_zeroed_for_diagnosis: bool = False
-    # Fifth-pass marker: callback-mode mic bridge landed; user
-    # observed 1 s EARLY at -5500 and 1 s LATE at -4500. Settle
-    # the default at the midpoint -5000.
+    # Fifth-pass marker: callback-mode mic bridge landed. User
+    # observed 1 s EARLY at -5500, 1 s LATE at -4500, 1 s LATE at
+    # -5000 — run-to-run variance is larger than the offset step
+    # so settling at a perfect default is futile. Restore -5500
+    # (which the user reported as 'on time' on the first
+    # successful run) and leave the rest to user tuning via the
+    # config file.
     clip_audio_offset_post_callback_mode_migrated: bool = False
     # Audio-vs-video offset applied at clip export by biasing the
     # audio-trim start point. Sign convention from the export math
@@ -287,10 +291,13 @@ class AppConfig:
     #   * POSITIVE offset → SMALLER shifted_start → audio events
     #     appear LATER in playback.
     #
-    # Default -5000 ms: midpoint between -5500 (audio 1 s early on
-    # callback-mode build) and -4500 (audio 1 s late). User tunes
-    # ±500 ms from here if hardware differs.
-    clip_audio_offset_ms: int = -5000
+    # Default -5500 ms: the value the user confirmed audio synced
+    # on the first successful run after the callback-mode mic
+    # bridge landed. Later runs at this same value reported 1 s
+    # early — clip-start timing has enough run-to-run variance
+    # that hunting a perfect default isn't tractable. Tune via
+    # config if you consistently see drift.
+    clip_audio_offset_ms: int = -5500
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -670,13 +677,15 @@ def load_config() -> AppConfig:
         if not data.get("clip_audio_offset_zeroed_for_diagnosis", False):
             values["clip_audio_offset_zeroed_for_diagnosis"] = True
 
-        # Fifth-pass migration: after the callback-mode mic bridge
-        # the user observed -5500 = 1 s early and -4500 = 1 s late.
-        # Settle at the midpoint -5000. Flip either prior default
-        # (-5500 or -4500) to -5000; deliberate user-tunes survive.
+        # Fifth-pass migration: stop chasing the perfect offset
+        # default — run-to-run variance is larger than the
+        # adjustment steps. Flip any of the intermediate defaults
+        # (-4500, -5000) back to -5500, which the user confirmed
+        # on the first successful test. Deliberate user-tunes
+        # survive untouched.
         if not data.get("clip_audio_offset_post_callback_mode_migrated", False):
-            if values.get("clip_audio_offset_ms") in (-5500, -4500):
-                values["clip_audio_offset_ms"] = -5000
+            if values.get("clip_audio_offset_ms") in (-5000, -4500):
+                values["clip_audio_offset_ms"] = -5500
             values["clip_audio_offset_post_callback_mode_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.

@@ -23665,7 +23665,7 @@ Admin elevation
                     f"[{sys_idx}:a]anull[asys];"
                     f"[{mic_idx}:a]{ns}[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
-                    "dropout_transition=0:weights=1 3[aout]"
+                    "dropout_transition=0:weights=2 3[aout]"
                 ),
             ],
             ["-map", "0:v", "-map", "[aout]"],
@@ -24025,23 +24025,20 @@ Admin elevation
                 "-map", "[aout]",
             ]
         else:
-            # weights=1 3: mic dominates the mix 3:1 over sys (mic at
-            # 75 % of output, sys at 25 %). Default amix normalize=1
-            # keeps the sum bounded, so no clipping. User reported
-            # mic still 'low' with weights=1 2 because music+game
-            # audio masked the voice; bumping mic to 75 % makes
-            # speech cut through clearly while keeping enough sys
-            # presence to know what was playing in the background.
-            # (The previous volume=1.5 boost on top of this was
-            # reverted — it could clip loud mic samples and sound
-            # like 'static'; weights alone do the job cleanly.)
+            # weights=2 3: sys 40 % / mic 60 % of mix. Earlier
+            # weights=1 3 (sys 25 %) made music too quiet for the
+            # user. weights=2 3 keeps the mic dominant (so voice
+            # cuts through) while leaving enough sys headroom that
+            # background music / game audio is clearly audible.
+            # Default amix normalize=1 keeps the sum bounded so no
+            # clipping.
             filter_args = [
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
                     f"[{mic_idx}:a]{ns}[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
-                    "dropout_transition=0:weights=1 3[aout]"
+                    "dropout_transition=0:weights=2 3[aout]"
                 ),
                 "-map", "[aout]",
             ]
