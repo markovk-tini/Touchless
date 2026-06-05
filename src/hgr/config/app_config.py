@@ -268,12 +268,10 @@ class AppConfig:
     # -5500 to fully compensate. Bumps the clamp to ±10000 ms so
     # this and other deep mis-calibrations stay within tunable range.
     clip_audio_offset_post_silence_fill_migrated: bool = False
-    # Fourth-pass marker: -5500 didn't move the needle for the user
-    # (still 3 s early — same as -2500). Either the offset sign is
-    # inverted in the export math, or my model of how offset shifts
-    # audio is wrong. Reset to 0 so we observe the TRUE underlying
-    # offset and can derive a correct sign + magnitude from a clean
-    # baseline test.
+    # (Fourth-pass diagnostic-zero marker kept as inert tombstone so
+    # any user config that already migrated through it stays valid;
+    # we no longer flip values, so re-running the load is a no-op
+    # past the first time the flag was latched.)
     clip_audio_offset_zeroed_for_diagnosis: bool = False
     # Audio-vs-video offset applied at clip export by biasing the
     # audio-trim start point. Sign convention from the export math
@@ -285,13 +283,11 @@ class AppConfig:
     #   * POSITIVE offset → SMALLER shifted_start → audio events
     #     appear LATER in playback.
     #
-    # Default 0 means no bias. The user reports a residual offset
-    # we have NOT been able to fully diagnose; the right answer is
-    # to start from 0 and tune in 500 ms steps based on observed
-    # behavior, rather than guessing a default that has been wrong
-    # in both directions in prior iterations. Clamp ±10000 ms gives
-    # plenty of tuning room either way.
-    clip_audio_offset_ms: int = 0
+    # Default -5500 ms is the value the user confirmed lands audio
+    # ON TIME with this build's bridge silence-fill + mtime
+    # selection. Stays as default; tune in 500 ms steps from here
+    # if hardware differs.
+    clip_audio_offset_ms: int = -5500
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -660,17 +656,15 @@ def load_config() -> AppConfig:
                 values["clip_audio_offset_ms"] = -5500
             values["clip_audio_offset_post_silence_fill_migrated"] = True
 
-        # Fourth-pass migration: -5500 didn't move the perceived
-        # offset versus -2500 in user testing, suggesting the sign
-        # convention I derived from the export math is wrong or the
-        # residual offset comes from a code path the bias doesn't
-        # cover. Reset to 0 so we get a clean baseline reading and
-        # can derive the correct compensation from observed
-        # behavior. Only flips exact prior migration defaults
-        # (-5500 or -2500); deliberate user-tunes survive.
+        # (Fourth-pass diagnostic-zero migration ELIDED: the user
+        # confirmed -5500 lands audio on time, so we no longer want
+        # to flip values to 0. The flag is still latched so a stale
+        # config from the very brief window when this migration was
+        # active doesn't re-fire any prior pass. If a user landed at
+        # 0 from the diagnostic build, they can manually set -5500
+        # in their config or let the new default take effect on a
+        # fresh install.)
         if not data.get("clip_audio_offset_zeroed_for_diagnosis", False):
-            if values.get("clip_audio_offset_ms") in (-5500, -2500):
-                values["clip_audio_offset_ms"] = 0
             values["clip_audio_offset_zeroed_for_diagnosis"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
