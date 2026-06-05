@@ -266,52 +266,46 @@ class WasapiLoopbackWriter:
         # entirely and padding 30 s of silence is worse than just
         # letting the offset stand.
         anchor_pad_seconds = min(10.0, anchor_pad_seconds)
-        if anchor_pad_seconds > 0:
-            anchor_pad_bytes = int(anchor_pad_seconds * float(self.rate) * int(self.channels) * 2)
-            try:
-                # Write in chunk-sized blocks so we don't allocate
-                # one huge silence buffer.
-                remaining = anchor_pad_bytes
-                while remaining > 0:
-                    block = silence_chunk if remaining >= bytes_per_chunk else b"\x00" * remaining
-                    stdin.write(block)
-                    remaining -= len(block)
-                    silence_bytes += len(block)
-                    bytes_total += len(block)
-                try:
-                    stdin.flush()
-                except Exception:
-                    pass
-                # Anchor first_sample_at to the ALIGN target, not our
-                # start_t — so downstream consumers treat our
-                # stream's PTS=0 as that wall moment.
-                self.first_sample_at = self._align_to_wall_time
-            except (BrokenPipeError, OSError, ValueError):
-                pass
-        # PRIMER: write one chunk of silence to stdin BEFORE the read
-        # loop starts. Unblocks ffmpeg's `-f s16le -i pipe:0`
-        # avformat_open_input probe within milliseconds so it can
-        # move on to open input #1 (mic TCP) — without the primer
-        # ffmpeg waited up to 30+ seconds on a silent endpoint and
-        # the mic TCP acceptor timed out before ffmpeg dialed in.
-        # Skipped when we already wrote pre-pad silence above (which
-        # served the same primer purpose).
-        if anchor_pad_seconds <= 0:
-            try:
+        # Compute pre-pad in WHOLE 1024-frame chunks. Partial trailing
+        # blocks (e.g. `b"\x00" * 1` when the seconds-to-bytes math
+        # rounds to an odd byte count) destroy PCM alignment — ffmpeg
+        # then logs 'Invalid PCM packet, data has size 1 but at least
+        # a size of 2 was expected' and interprets every subsequent
+        # sample at the wrong byte boundary, producing LOUD STATIC
+        # across the whole clip. Whole 1024-frame chunks are sample-
+        # aligned by construction.
+        anchor_pad_chunks = int(
+            anchor_pad_seconds * float(self.rate) / 1024.0
+        )
+        # Always write AT LEAST ONE silence chunk (the primer) so
+        # ffmpeg's `-f s16le -i pipe:0` avformat_open_input probe
+        # completes within milliseconds — without it ffmpeg waits up
+        # to 30+ seconds on a silent endpoint and the mic TCP
+        # acceptor times out before ffmpeg dials in.
+        total_init_chunks = max(1, anchor_pad_chunks)
+        try:
+            for _ in range(total_init_chunks):
                 stdin.write(silence_chunk)
-                try:
-                    stdin.flush()
-                except Exception:
-                    pass
-                silence_bytes += len(silence_chunk)
-                bytes_total += len(silence_chunk)
-                self.first_sample_at = start_t
-            except (BrokenPipeError, OSError, ValueError):
-                # ffmpeg already exited (unlikely this early but possible
-                # if the spawn failed). Nothing to do — fall through to
-                # the loop which will see the broken pipe on its first
-                # write and exit cleanly.
+                silence_bytes += bytes_per_chunk
+                bytes_total += bytes_per_chunk
+            try:
+                stdin.flush()
+            except Exception:
                 pass
+            # When we wrote real pre-pad (more than just the primer),
+            # anchor first_sample_at to the ALIGN target so downstream
+            # consumers treat our stream's PTS=0 as that wall moment.
+            # Otherwise anchor to start_t (the bridge's own start).
+            if anchor_pad_chunks > 0 and self._align_to_wall_time is not None:
+                self.first_sample_at = self._align_to_wall_time
+            else:
+                self.first_sample_at = start_t
+        except (BrokenPipeError, OSError, ValueError):
+            # ffmpeg already exited (unlikely this early but possible
+            # if the spawn failed). Nothing to do — fall through to
+            # the loop which will see the broken pipe on its first
+            # write and exit cleanly.
+            pass
         try:
             while not self._stop.is_set():
                 now_t = _time.time()
