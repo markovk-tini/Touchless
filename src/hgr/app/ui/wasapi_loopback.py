@@ -192,31 +192,38 @@ class WasapiLoopbackWriter:
         # the moment the device starts producing it.
         bytes_per_chunk = 1024 * int(self.channels) * 2  # paInt16
         silence_chunk = b"\x00" * bytes_per_chunk
-        # READ THE REAL AUDIO AT DEVICE RATE. Earlier iterations of
-        # this loop tried to wall-clock-pace by silence-filling any
-        # gap, but the user heard the inserted silence chunks as a
-        # constant fan-like stutter (~5 silence chunks per second
-        # when the WASAPI loopback under-delivered at ~89% of
-        # nominal). Solution: don't silence-fill in the middle.
-        # Just write whatever the device gives us. The audio file's
-        # duration may be slightly shorter than wall time but it
-        # sounds SMOOTH — and the export now reads segment wall
-        # times from file mtime (not from `a_anchor + file_time`),
-        # so under-delivery no longer mis-aligns the segments
-        # selected for the clip window.
+        # Two operating modes:
         #
-        # The ONLY safety net we keep is a "long stall" silence-
-        # fill: if `stream.read()` produces no real data for more
-        # than 500 ms straight, we write one silence chunk to keep
-        # ffmpeg's pipe alive (the original cascade-failure fix:
-        # without ANY bytes flowing, ffmpeg's avformat_open_input
-        # blocks indefinitely on input #0 and never gets to opening
-        # input #1, the mic TCP acceptor times out, ffmpeg dies).
-        # A 500 ms silence is well below the threshold where a
-        # listener perceives a stutter, and only fires when the
-        # device is genuinely idle for that long.
+        # ACTIVE — the device is producing real audio. We read what
+        # it gives us and write it out as-is. We do NOT silence-fill
+        # the small per-tick gaps that show up when the device is
+        # slightly under nominal rate; doing so produced an audible
+        # ~5 Hz stutter in the user's clips (the "behind a fan"
+        # symptom). Audio sounds smooth, exactly as the OS captured
+        # it. The audio FILE may be a few % shorter than wall time
+        # over a long cache run; the export reads each segment's
+        # wall time from file mtime so the segment selection stays
+        # correct regardless.
+        #
+        # SILENCE — entered only when the device hasn't produced
+        # real audio for more than 500 ms straight (a truly idle /
+        # muted loopback, e.g. no music or game playing). In this
+        # mode we generate silence at the NOMINAL device rate so
+        # ffmpeg's input never starves — segments keep getting
+        # written, the manifest keeps getting entries, the export
+        # has audio to anchor against. The first time real audio
+        # reappears we drop back into ACTIVE mode immediately.
+        #
+        # Previous attempt tried writing one silence chunk per
+        # 500 ms stall detection, which works out to ~4 % of
+        # nominal rate — ffmpeg starved, no segments completed,
+        # the clip had no audio at all (the user-reported "no
+        # audio from anything" symptom).
         long_stall_threshold = 0.5
+        tick_seconds = 1024.0 / max(1.0, float(self.rate))
         last_real_at = _time.time()
+        next_silence_due = 0.0
+        silence_mode = False
         real_bytes = 0
         silence_bytes = 0
         bytes_total = 0
@@ -248,18 +255,15 @@ class WasapiLoopbackWriter:
             while not self._stop.is_set():
                 now_t = _time.time()
                 data = None
-                # Non-blocking check for available frames. If the
-                # device hasn't produced 1024 yet, don't read (would
-                # block) — just sleep briefly and re-check. The
-                # 500 ms long-stall watchdog below covers truly idle
-                # endpoints (silent loopback) so ffmpeg's pipe never
-                # underruns long enough to kill the cache.
                 avail = 0
                 try:
                     avail = int(stream.get_read_available())
                 except Exception:
                     avail = 0
                 if avail >= 1024:
+                    # Real audio available — read and write it.
+                    # Always exit silence mode the moment real data
+                    # comes back so we don't double-write.
                     try:
                         data = stream.read(1024, exception_on_overflow=False)
                     except Exception as exc:
@@ -268,20 +272,37 @@ class WasapiLoopbackWriter:
                     if data:
                         real_bytes += len(data)
                         last_real_at = now_t
-                elif (now_t - last_real_at) >= long_stall_threshold:
-                    # Long stall — device idle / muted for > 500 ms.
-                    # Write one silence chunk to keep ffmpeg fed and
-                    # reset the stall timer so we don't burst silence.
+                        silence_mode = False
+                else:
+                    # No real data this tick.
+                    if not silence_mode:
+                        if (now_t - last_real_at) >= long_stall_threshold:
+                            # Crossed the long-stall threshold —
+                            # enter silence mode. Schedule the next
+                            # silence chunk for "now" so we start
+                            # writing it immediately.
+                            silence_mode = True
+                            next_silence_due = now_t
+                        else:
+                            # Brief gap; wait for real data without
+                            # silence-filling.
+                            _time.sleep(0.005)
+                            continue
+                    # In silence mode — pace silence chunks at the
+                    # nominal device rate so ffmpeg's input never
+                    # starves and segments keep getting written.
+                    if now_t < next_silence_due:
+                        _time.sleep(min(0.020, next_silence_due - now_t))
+                        continue
                     data = silence_chunk
                     silence_bytes += len(data)
-                    last_real_at = now_t
-                else:
-                    # Brief gap (< 500 ms since last real chunk).
-                    # Just sleep one tick and retry; don't silence-
-                    # fill — silence-fill in this band is exactly
-                    # what produced the user-perceived stutter.
-                    _time.sleep(0.005)
-                    continue
+                    next_silence_due += tick_seconds
+                    # If we fell so far behind the silence schedule
+                    # that the next chunk is already overdue, snap
+                    # to "now" — avoids a burst when waking from a
+                    # long sleep.
+                    if next_silence_due < now_t:
+                        next_silence_due = now_t + tick_seconds
                 if not data:
                     # Defensive: avail >= 1024 but read returned empty.
                     _time.sleep(0.005)
