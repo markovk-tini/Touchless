@@ -23908,8 +23908,15 @@ Admin elevation
                         mic_pcm_format = None
                     else:
                         self._clip_mic_tcp_acceptor = acceptor
+                        # thread_queue_size 4096 (was 1024): amix
+                        # throttles to the slowest input (system
+                        # loopback at ~89% nominal). With only 1024
+                        # packets the mic's input queue overflows
+                        # before amix asks for more, dropping packets
+                        # and producing the "glitchy mic" symptom.
+                        # 4096 buys ~4x more headroom.
                         input_args.extend([
-                            "-thread_queue_size", "1024",
+                            "-thread_queue_size", "4096",
                             "-f", "s16le",
                             "-ar", str(mic_rate),
                             "-ac", str(mic_channels),
@@ -23924,7 +23931,7 @@ Admin elevation
                         )
                 else:
                     input_args.extend([
-                        "-thread_queue_size", "1024",
+                        "-thread_queue_size", "4096",
                         "-f", "s16le",
                         "-ar", str(mic_rate),
                         "-ac", str(mic_channels),
@@ -23966,13 +23973,20 @@ Admin elevation
                 "-map", "[aout]",
             ]
         else:
+            # normalize=0: amix's default normalize=1 divides each
+            # input by the input count, halving mic volume to ~50%
+            # when mixed with system audio. The user-reported "mic is
+            # really low" is exactly that attenuation. With
+            # normalize=0 each input keeps its natural amplitude; AAC
+            # encoder soft-clips on the rare overlap peaks rather
+            # than us pre-attenuating everything by 6 dB.
             filter_args = [
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
                     f"[{mic_idx}:a]{ns}[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
-                    "dropout_transition=0[aout]"
+                    "dropout_transition=0:normalize=0[aout]"
                 ),
                 "-map", "[aout]",
             ]
@@ -24862,11 +24876,16 @@ Admin elevation
                         int(round((v_clip_wall_end - overlap_wall_end) * 1000))
                     )
                 # User-tunable fine-shift on the audio relative to video.
-                # NEGATIVE pulls audio EARLIER in the clip (use when
-                # audio plays N ms LATE relative to video), POSITIVE
-                # pushes audio LATER. Applied AFTER the auto end-align
-                # math so it nudges the result without breaking the
-                # existing alignment.
+                # Sign comes from `shifted_start = a_start_trim - offset_seconds`:
+                #   * POSITIVE offset → SMALLER shifted_start → atrim
+                #     reads EARLIER samples → audio plays EARLIER in
+                #     the clip (use when audio is LATE).
+                #   * NEGATIVE offset → LARGER shifted_start → atrim
+                #     reads LATER samples → audio plays LATER in the
+                #     clip (use when audio is EARLY — the WASAPI
+                #     capture-lag case the default -2500 compensates).
+                # Applied AFTER the auto end-align math so it nudges
+                # the result without breaking the existing alignment.
                 try:
                     user_offset_ms = int(
                         getattr(self.config, "clip_audio_offset_ms", 0) or 0)
@@ -24876,11 +24895,12 @@ Admin elevation
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
-                # Bias the trim start by the user offset BEFORE atrim,
-                # so a negative offset pulls EARLIER audio samples into
-                # the window (which makes audio play sooner in the
-                # exported clip). Clamp so we never atrim past 0 or
-                # past the available concat duration.
+                # Bias the trim start by the user offset BEFORE atrim.
+                # POSITIVE offset → SMALLER shifted_start → reads
+                # EARLIER samples → audio plays EARLIER in the clip.
+                # NEGATIVE offset → LARGER shifted_start → reads LATER
+                # samples → audio plays LATER. Clamp so we never atrim
+                # past 0 or past the available concat duration.
                 offset_seconds = user_offset_ms / 1000.0
                 shifted_start = max(0.0, a_start_trim - offset_seconds)
                 a_chain.append(
