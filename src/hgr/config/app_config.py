@@ -252,24 +252,35 @@ class AppConfig:
     # Parallel marker for clip_audio_offset_ms default change
     # (0 → +2500). Latched True after the one-time promotion.
     clip_audio_offset_default_migrated: bool = False
+    # Second-pass marker: the +2500 default migration was the WRONG
+    # sign (POSITIVE values actually shift audio EARLIER in the
+    # exported clip, not LATER, because `shifted_start = a_start_trim
+    # - offset_seconds` reads earlier samples for a positive offset).
+    # User observed audio jumped from 2-3 s early to 5 s early after
+    # the first migration. This second migration flips +2500 → -2500
+    # to actually compensate the WASAPI capture lag.
+    clip_audio_offset_sign_corrected: bool = False
     # Audio-vs-video offset applied at clip export by biasing the
-    # audio-trim start point. NEGATIVE shifts audio EARLIER in the
-    # clip (audio events play before the corresponding video frame —
-    # use when audio is reported LATE). POSITIVE shifts audio LATER.
+    # audio-trim start point. Sign convention is set by the export
+    # math `shifted_start = a_start_trim - offset_seconds`:
+    #   * NEGATIVE offset → LARGER shifted_start → reads LATER samples
+    #     → audio events appear LATER in the clip (use when audio is
+    #     reported EARLY relative to video — gunshot heard before
+    #     muzzle flash seen).
+    #   * POSITIVE offset → SMALLER shifted_start → reads EARLIER
+    #     samples → audio events appear EARLIER in the clip (use when
+    #     audio is reported LATE).
     #
-    # Default +2500 ms compensates for WASAPI / PortAudio capture
+    # Default -2500 ms compensates for WASAPI / PortAudio capture
     # lag: the OS hands us samples a couple of seconds after they
-    # actually hit the render endpoint, so `first_sample_at` lands
-    # ~2-3 s after the true zero of the audio stream. Without the
-    # bias, every clip plays audio events 2-3 s before the visual
-    # cue that produced them (gunshot heard, then muzzle flash
-    # seen). The bias slides the read-window the same amount the
-    # anchor is off by, restoring sync.
+    # actually hit the render endpoint, so without the bias every
+    # clip plays audio events ~2-3 s before the visual cue. The
+    # negative bias pushes audio later by the same amount.
     #
     # Tune in 500 ms increments if your hardware differs (some
     # Realtek + Atmos DACs add another 200-500 ms; a low-latency
     # USB interface needs less). Clamp is ±5000 ms.
-    clip_audio_offset_ms: int = 2500
+    clip_audio_offset_ms: int = -2500
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -615,6 +626,18 @@ def load_config() -> AppConfig:
             if values.get("clip_audio_offset_ms") == 0:
                 values["clip_audio_offset_ms"] = 2500
             values["clip_audio_offset_default_migrated"] = True
+
+        # Sign-corrected pass for clip_audio_offset_ms. The +2500
+        # default from the previous migration was the wrong sign —
+        # POSITIVE values pull audio EARLIER in the export, but the
+        # symptom we needed to fix was already-early audio, so the
+        # +2500 made it WORSE. Flip exactly the bad migration value
+        # +2500 → -2500. Other values (deliberate tunes, untouched
+        # zeros) are not modified.
+        if not data.get("clip_audio_offset_sign_corrected", False):
+            if values.get("clip_audio_offset_ms") == 2500:
+                values["clip_audio_offset_ms"] = -2500
+            values["clip_audio_offset_sign_corrected"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if
