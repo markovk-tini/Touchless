@@ -192,23 +192,31 @@ class WasapiLoopbackWriter:
         # the moment the device starts producing it.
         bytes_per_chunk = 1024 * int(self.channels) * 2  # paInt16
         silence_chunk = b"\x00" * bytes_per_chunk
-        # WALL-CLOCK PACING. Audio MUST be written to ffmpeg at the
-        # exact nominal device rate (e.g. 192,000 B/s for stereo
-        # 16-bit 48 kHz). ffmpeg knows the rate from `-ar` / `-ac` and
-        # places samples in the output file at that rate; if we write
-        # FASTER than nominal, the audio file ends up longer than
-        # wall time and plays SLOWER on export (the "underwater +
-        # static" symptom — sys bridge over-wrote by 33%, mic by
-        # 44%, in the user's bad clip). If we write SLOWER, ffmpeg
-        # underruns and the clip has gaps / dropouts.
+        # READ THE REAL AUDIO AT DEVICE RATE. Earlier iterations of
+        # this loop tried to wall-clock-pace by silence-filling any
+        # gap, but the user heard the inserted silence chunks as a
+        # constant fan-like stutter (~5 silence chunks per second
+        # when the WASAPI loopback under-delivered at ~89% of
+        # nominal). Solution: don't silence-fill in the middle.
+        # Just write whatever the device gives us. The audio file's
+        # duration may be slightly shorter than wall time but it
+        # sounds SMOOTH — and the export now reads segment wall
+        # times from file mtime (not from `a_anchor + file_time`),
+        # so under-delivery no longer mis-aligns the segments
+        # selected for the clip window.
         #
-        # The pacing rule: at any wall-clock moment, the total bytes
-        # we've written should equal `elapsed_seconds * bytes_per_sec`.
-        # If we're at-or-above that target, sleep until we'd be
-        # behind. If we're below, write the next chunk — preferring
-        # real audio from `stream.read()` when available, falling
-        # back to silence when the device is producing nothing.
-        bytes_per_sec = float(self.rate * int(self.channels) * 2)
+        # The ONLY safety net we keep is a "long stall" silence-
+        # fill: if `stream.read()` produces no real data for more
+        # than 500 ms straight, we write one silence chunk to keep
+        # ffmpeg's pipe alive (the original cascade-failure fix:
+        # without ANY bytes flowing, ffmpeg's avformat_open_input
+        # blocks indefinitely on input #0 and never gets to opening
+        # input #1, the mic TCP acceptor times out, ffmpeg dies).
+        # A 500 ms silence is well below the threshold where a
+        # listener perceives a stutter, and only fires when the
+        # device is genuinely idle for that long.
+        long_stall_threshold = 0.5
+        last_real_at = _time.time()
         real_bytes = 0
         silence_bytes = 0
         bytes_total = 0
@@ -221,9 +229,6 @@ class WasapiLoopbackWriter:
         # move on to open input #1 (mic TCP) — without the primer
         # ffmpeg waited up to 30+ seconds on a silent endpoint and
         # the mic TCP acceptor timed out before ffmpeg dialed in.
-        # The primer's bytes count toward the pacing budget so the
-        # main loop naturally sleeps for one tick before writing
-        # the next chunk.
         try:
             stdin.write(silence_chunk)
             try:
@@ -242,22 +247,13 @@ class WasapiLoopbackWriter:
         try:
             while not self._stop.is_set():
                 now_t = _time.time()
-                elapsed = max(0.0, now_t - start_t)
-                target_bytes = elapsed * bytes_per_sec
-                if bytes_total >= target_bytes:
-                    # At or ahead of nominal rate. Sleep until the
-                    # next chunk is "due", with a small safety
-                    # margin so we wake slightly before the deadline
-                    # and don't underrun.
-                    bytes_ahead = bytes_total - target_bytes
-                    seconds_ahead = bytes_ahead / bytes_per_sec
-                    # Cap the sleep so we re-check stop flag and
-                    # heartbeat at least every 50 ms.
-                    _time.sleep(min(max(0.001, seconds_ahead), 0.050))
-                    continue
-                # Behind nominal — write one chunk (real if
-                # available, silence otherwise). Never block on read.
                 data = None
+                # Non-blocking check for available frames. If the
+                # device hasn't produced 1024 yet, don't read (would
+                # block) — just sleep briefly and re-check. The
+                # 500 ms long-stall watchdog below covers truly idle
+                # endpoints (silent loopback) so ffmpeg's pipe never
+                # underruns long enough to kill the cache.
                 avail = 0
                 try:
                     avail = int(stream.get_read_available())
@@ -271,13 +267,24 @@ class WasapiLoopbackWriter:
                         break
                     if data:
                         real_bytes += len(data)
-                else:
+                        last_real_at = now_t
+                elif (now_t - last_real_at) >= long_stall_threshold:
+                    # Long stall — device idle / muted for > 500 ms.
+                    # Write one silence chunk to keep ffmpeg fed and
+                    # reset the stall timer so we don't burst silence.
                     data = silence_chunk
                     silence_bytes += len(data)
+                    last_real_at = now_t
+                else:
+                    # Brief gap (< 500 ms since last real chunk).
+                    # Just sleep one tick and retry; don't silence-
+                    # fill — silence-fill in this band is exactly
+                    # what produced the user-perceived stutter.
+                    _time.sleep(0.005)
+                    continue
                 if not data:
-                    # Defensive: avail>=1024 but read returned empty.
-                    # Brief sleep and re-check the budget.
-                    _time.sleep(0.001)
+                    # Defensive: avail >= 1024 but read returned empty.
+                    _time.sleep(0.005)
                     continue
                 if self.first_sample_at is None:
                     # Stamp wall-clock of the FIRST chunk written

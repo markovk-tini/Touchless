@@ -23697,10 +23697,42 @@ Admin elevation
                         path = self._clip_cache_dir() / path
                     if not path.exists() or path.stat().st_size <= 0:
                         continue
+                    # Wall-clock end time of this segment from the
+                    # file's mtime. ffmpeg writes the segment file
+                    # then closes it (and sometimes touches it once
+                    # more on rotation), so mtime tracks segment
+                    # completion in wall time. Using mtime instead
+                    # of `a_anchor + end_time` makes the manifest
+                    # robust to WASAPI loopback rate drift — when
+                    # the device under-delivers at e.g. 89 % of
+                    # nominal, file-time grows slower than wall time
+                    # and the a_anchor-based math systematically
+                    # picks segments from BEFORE the requested wall
+                    # window (the user-reported "audio is 6-7 s
+                    # early" symptom). mtime keeps each segment
+                    # pinned to the actual moment its content
+                    # finished arriving at ffmpeg regardless of how
+                    # the device clock ran.
+                    try:
+                        wall_end_mtime = float(path.stat().st_mtime)
+                    except Exception:
+                        wall_end_mtime = 0.0
+                    file_duration = max(0.0, end_time - start_time)
                     entries.append({
                         "path": path,
                         "start_time": start_time,
                         "end_time": end_time,
+                        "file_duration": file_duration,
+                        # Wall-clock window the segment covers,
+                        # derived from mtime. Consumed by the
+                        # export path instead of recomputing from
+                        # a_anchor.
+                        "wall_end_mtime": wall_end_mtime,
+                        "wall_start_mtime": (
+                            wall_end_mtime - file_duration
+                            if wall_end_mtime > 0
+                            else 0.0
+                        ),
                     })
         except Exception:
             return []
@@ -24707,11 +24739,19 @@ Admin elevation
                     self._clip_cache_audio_list_path = _saved_audio_list_path
                 # Convert every audio entry's relative times to
                 # wall-clock once so logging and selection share one
-                # source of truth.
+                # source of truth. Prefer the parser's mtime-based
+                # wall times (resilient to WASAPI rate drift); fall
+                # back to a_anchor + file_time only when mtime is
+                # missing or unreliable.
                 for entry in audio_entries:
                     e_start_rel = float(entry.get("start_time", 0.0))
                     e_end_rel = float(entry.get("end_time", 0.0))
-                    if a_anchor > 0:
+                    mt_end = float(entry.get("wall_end_mtime", 0.0) or 0.0)
+                    mt_start = float(entry.get("wall_start_mtime", 0.0) or 0.0)
+                    if mt_end > 0 and mt_start > 0:
+                        e_start_wall = mt_start
+                        e_end_wall = mt_end
+                    elif a_anchor > 0:
                         e_start_wall = a_anchor + e_start_rel
                         e_end_wall = a_anchor + e_end_rel
                     else:
@@ -25362,7 +25402,14 @@ Admin elevation
                 for entry in audio_entries:
                     e_start_rel = float(entry.get("start_time", 0.0))
                     e_end_rel = float(entry.get("end_time", 0.0))
-                    if a_anchor > 0:
+                    mt_end = float(entry.get("wall_end_mtime", 0.0) or 0.0)
+                    mt_start = float(entry.get("wall_start_mtime", 0.0) or 0.0)
+                    if mt_end > 0 and mt_start > 0:
+                        # Prefer mtime — resilient to WASAPI rate
+                        # drift (see comment in the parser).
+                        e_start_wall = mt_start
+                        e_end_wall = mt_end
+                    elif a_anchor > 0:
                         e_start_wall = a_anchor + e_start_rel
                         e_end_wall = a_anchor + e_end_rel
                     else:
