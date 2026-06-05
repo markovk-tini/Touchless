@@ -23747,7 +23747,29 @@ Admin elevation
             prior = latest_by_path.get(key)
             if prior is None or entry["end_time"] > prior["end_time"]:
                 latest_by_path[key] = entry
-        return sorted(latest_by_path.values(), key=lambda e: e["end_time"])
+        ordered = sorted(latest_by_path.values(), key=lambda e: e["end_time"])
+        # CHAIN wall_start_mtime to the previous segment's
+        # wall_end_mtime. The naive `wall_start = wall_end -
+        # file_duration` undershoots by (file_duration / device_rate -
+        # file_duration) seconds per segment — for 89 % WASAPI
+        # under-delivery and 10 s segments that's a 1.24 s gap per
+        # segment, which the export consumes as audio-vs-video skew
+        # (~3 s by the time the user clipped, even with the
+        # mtime-only fix). Chaining gives each segment a wall_start
+        # equal to the previous segment's wall_end, eliminating the
+        # gap and aligning the entire concat with real wall time.
+        # First segment falls back to wall_end - file_duration since
+        # there's no predecessor to chain from.
+        prev_wall_end = 0.0
+        for entry in ordered:
+            wall_end = float(entry.get("wall_end_mtime", 0.0) or 0.0)
+            file_duration = float(entry.get("file_duration", 0.0) or 0.0)
+            if wall_end > 0 and prev_wall_end > 0:
+                entry["wall_start_mtime"] = prev_wall_end
+            elif wall_end > 0:
+                entry["wall_start_mtime"] = wall_end - file_duration
+            prev_wall_end = wall_end
+        return ordered
 
     def _start_clip_cache_audio(self) -> bool:
         """Spawn a SECOND ffmpeg subprocess that captures system
@@ -24177,6 +24199,17 @@ Admin elevation
                         )
                         self._clip_mic_tcp_acceptor = None
                     else:
+                        # Pass sys writer's first_sample_at as the
+                        # mic's alignment anchor. The mic bridge will
+                        # pre-pad silence equal to (mic_start_t -
+                        # sys_first_sample_at) so its PTS=0 lands at
+                        # the same wall moment as sys's PTS=0. Fixes
+                        # the "mic is 3-4 s ahead of video" symptom
+                        # that came from the TCP-accept gap between
+                        # the two bridges starting.
+                        sys_first_sample = None
+                        if self._wasapi_writer is not None:
+                            sys_first_sample = self._wasapi_writer.first_sample_at
                         mic_writer = WasapiLoopbackWriter(
                             sock_file,
                             device_index=mic_dev,
@@ -24186,6 +24219,7 @@ Admin elevation
                             is_loopback=False,
                             label="WasapiMicInput",
                             close_stdin_on_exit=True,
+                            align_to_wall_time=sys_first_sample,
                         )
                         if mic_writer.start():
                             self._wasapi_mic_writer = mic_writer

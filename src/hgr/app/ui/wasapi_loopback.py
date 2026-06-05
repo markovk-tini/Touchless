@@ -73,6 +73,7 @@ class WasapiLoopbackWriter:
         is_loopback: bool = True,
         label: str = "WasapiLoopback",
         close_stdin_on_exit: bool = True,
+        align_to_wall_time: Optional[float] = None,
     ) -> None:
         self._stdin = ffmpeg_stdin
         self._device_index = int(device_index)
@@ -110,6 +111,22 @@ class WasapiLoopbackWriter:
         # later than video in the exported clip. None until the bridge
         # has actually read its first sample.
         self.first_sample_at: Optional[float] = None
+        # Optional wall time this bridge should ALIGN ITS STREAM TO.
+        # When set (typically to the SYSTEM-loopback bridge's
+        # first_sample_at when starting the MIC bridge), the mic
+        # bridge pre-pads silence equal to (start_t - align_to_wall_time)
+        # before sending real samples. This compensates for the TCP
+        # accept wait (~4 s on Windows) — without the pad, mic byte 0
+        # ends up at amix output PTS=0 alongside sys byte 0, so when
+        # the user clips, mic content at any output PTS is captured at
+        # a wall time ~4 s LATER than sys content at the same PTS.
+        # The user perceives this as "mic plays N seconds ahead of
+        # the video".
+        self._align_to_wall_time: Optional[float] = (
+            float(align_to_wall_time)
+            if align_to_wall_time is not None
+            else None
+        )
 
     def start(self) -> bool:
         """Open the loopback stream + spawn the writer thread.
@@ -230,27 +247,71 @@ class WasapiLoopbackWriter:
         start_t = _time.time()
         next_log_at = start_t + 0.5  # first heartbeat after 500ms
         silence_warned = False
+        # ALIGN PRE-PAD: when we were given an `align_to_wall_time`
+        # (typically the sys-loopback bridge's first_sample_at when
+        # we're the mic bridge), pre-pad silence equal to the gap
+        # between that wall time and our own start_t. This shifts
+        # our stream's effective PTS=0 to the align target so amix
+        # mixes us with the other input at matching wall times.
+        # Without this, the mic input lands at amix output PTS=0
+        # alongside sys input PTS=0 even though mic byte 0 was
+        # captured ~4 seconds after sys byte 0 (TCP accept wait) —
+        # the user-reported "mic plays N seconds ahead of video"
+        # symptom. The pre-pad bytes count toward bytes_total so
+        # heartbeat numbers stay honest.
+        anchor_pad_seconds = 0.0
+        if self._align_to_wall_time is not None and self._align_to_wall_time > 0:
+            anchor_pad_seconds = max(0.0, start_t - self._align_to_wall_time)
+        # Cap at 10 s of silence — beyond that we've lost a bridge
+        # entirely and padding 30 s of silence is worse than just
+        # letting the offset stand.
+        anchor_pad_seconds = min(10.0, anchor_pad_seconds)
+        if anchor_pad_seconds > 0:
+            anchor_pad_bytes = int(anchor_pad_seconds * float(self.rate) * int(self.channels) * 2)
+            try:
+                # Write in chunk-sized blocks so we don't allocate
+                # one huge silence buffer.
+                remaining = anchor_pad_bytes
+                while remaining > 0:
+                    block = silence_chunk if remaining >= bytes_per_chunk else b"\x00" * remaining
+                    stdin.write(block)
+                    remaining -= len(block)
+                    silence_bytes += len(block)
+                    bytes_total += len(block)
+                try:
+                    stdin.flush()
+                except Exception:
+                    pass
+                # Anchor first_sample_at to the ALIGN target, not our
+                # start_t — so downstream consumers treat our
+                # stream's PTS=0 as that wall moment.
+                self.first_sample_at = self._align_to_wall_time
+            except (BrokenPipeError, OSError, ValueError):
+                pass
         # PRIMER: write one chunk of silence to stdin BEFORE the read
         # loop starts. Unblocks ffmpeg's `-f s16le -i pipe:0`
         # avformat_open_input probe within milliseconds so it can
         # move on to open input #1 (mic TCP) — without the primer
         # ffmpeg waited up to 30+ seconds on a silent endpoint and
         # the mic TCP acceptor timed out before ffmpeg dialed in.
-        try:
-            stdin.write(silence_chunk)
+        # Skipped when we already wrote pre-pad silence above (which
+        # served the same primer purpose).
+        if anchor_pad_seconds <= 0:
             try:
-                stdin.flush()
-            except Exception:
+                stdin.write(silence_chunk)
+                try:
+                    stdin.flush()
+                except Exception:
+                    pass
+                silence_bytes += len(silence_chunk)
+                bytes_total += len(silence_chunk)
+                self.first_sample_at = start_t
+            except (BrokenPipeError, OSError, ValueError):
+                # ffmpeg already exited (unlikely this early but possible
+                # if the spawn failed). Nothing to do — fall through to
+                # the loop which will see the broken pipe on its first
+                # write and exit cleanly.
                 pass
-            silence_bytes += len(silence_chunk)
-            bytes_total += len(silence_chunk)
-            self.first_sample_at = start_t
-        except (BrokenPipeError, OSError, ValueError):
-            # ffmpeg already exited (unlikely this early but possible
-            # if the spawn failed). Nothing to do — fall through to
-            # the loop which will see the broken pipe on its first
-            # write and exit cleanly.
-            pass
         try:
             while not self._stop.is_set():
                 now_t = _time.time()
