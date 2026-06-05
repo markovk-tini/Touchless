@@ -42,6 +42,7 @@ video-only when both fail).
 
 from __future__ import annotations
 
+import queue
 import socket
 import sys
 import threading
@@ -74,6 +75,7 @@ class WasapiLoopbackWriter:
         label: str = "WasapiLoopback",
         close_stdin_on_exit: bool = True,
         align_to_wall_time: Optional[float] = None,
+        use_callback_mode: bool = False,
     ) -> None:
         self._stdin = ffmpeg_stdin
         self._device_index = int(device_index)
@@ -127,6 +129,29 @@ class WasapiLoopbackWriter:
             if align_to_wall_time is not None
             else None
         )
+        # When True, capture audio via PortAudio CALLBACK mode
+        # (pa.open(stream_callback=...)) instead of polling
+        # get_read_available() + non-blocking read. Memory note
+        # `project_wasapi_callback_vs_read.md` documents that
+        # polling-mode on WASAPI shared mode produces corrupted
+        # audio on Kiyo Pro and other UVC mics — the "static /
+        # garbled" symptom the user keeps reporting. Callback
+        # mode goes through a different PortAudio code path that
+        # is clean on the same hardware. Default False keeps the
+        # polling path for sys loopback (the loopback wrapper has
+        # historically been finicky in callback mode); main_window
+        # passes True for the mic bridge.
+        self._use_callback_mode = bool(use_callback_mode)
+        # Bounded queue from PortAudio callback to the writer
+        # thread. Callback must return fast (PortAudio realtime
+        # thread); writer thread does the IO to stdin/socket.
+        # maxsize 200 chunks × 21 ms = ~4 s of buffering before
+        # we start dropping — generous, but small enough to bound
+        # memory if ffmpeg stops draining.
+        self._callback_queue: Optional[queue.Queue] = (
+            queue.Queue(maxsize=200) if self._use_callback_mode else None
+        )
+        self._drain_thread: Optional[threading.Thread] = None
 
     def start(self) -> bool:
         """Open the loopback stream + spawn the writer thread.
@@ -151,14 +176,30 @@ class WasapiLoopbackWriter:
         # the open still fails (exclusive-mode lock, device gone),
         # we return False and the caller falls back cleanly.
         try:
-            self._stream = self._pa.open(
-                format=pa.paInt16,
-                channels=self.channels,
-                rate=self.rate,
-                input=True,
-                input_device_index=self._device_index,
-                frames_per_buffer=1024,
-            )
+            if self._use_callback_mode:
+                # Open with stream_callback. start=False so we can
+                # write primer + pre-pad to stdin before audio
+                # samples start flowing (callback fires the moment
+                # the stream starts).
+                self._stream = self._pa.open(
+                    format=pa.paInt16,
+                    channels=self.channels,
+                    rate=self.rate,
+                    input=True,
+                    input_device_index=self._device_index,
+                    frames_per_buffer=1024,
+                    start=False,
+                    stream_callback=self._stream_callback,
+                )
+            else:
+                self._stream = self._pa.open(
+                    format=pa.paInt16,
+                    channels=self.channels,
+                    rate=self.rate,
+                    input=True,
+                    input_device_index=self._device_index,
+                    frames_per_buffer=1024,
+                )
         except Exception as exc:
             self._on_error(f"WASAPI loopback open failed: {exc}")
             try:
@@ -168,11 +209,125 @@ class WasapiLoopbackWriter:
                 pass
             self._pa = None
             return False
-        self._thread = threading.Thread(
-            target=self._run, name=self._label, daemon=True
-        )
-        self._thread.start()
+        if self._use_callback_mode:
+            # CALLBACK MODE: write primer + pre-pad to the pipe
+            # FIRST so ffmpeg's input #0 probe completes before
+            # any callback samples arrive. Then spawn the drain
+            # thread (writes queued callback data to stdin) and
+            # start the stream — callbacks begin firing.
+            try:
+                self._write_init_silence()
+            except Exception as exc:
+                self._on_error(f"primer write failed: {exc}")
+                # Best-effort: continue anyway, the drain thread
+                # will write whatever comes in.
+            self._drain_thread = threading.Thread(
+                target=self._drain_callback_queue,
+                name=f"{self._label}_drain",
+                daemon=True,
+            )
+            self._drain_thread.start()
+            try:
+                self._stream.start_stream()
+            except Exception as exc:
+                self._on_error(f"stream.start_stream failed: {exc}")
+                self._stop.set()
+                return False
+        else:
+            self._thread = threading.Thread(
+                target=self._run, name=self._label, daemon=True
+            )
+            self._thread.start()
         return True
+
+    def _write_init_silence(self) -> None:
+        """Write the primer + anchor pre-pad silence to stdin.
+        Used by callback mode (where primer/pre-pad can't happen
+        inside the read loop because there is no read loop)."""
+        bytes_per_chunk = 1024 * int(self.channels) * 2
+        silence_chunk = b"\x00" * bytes_per_chunk
+        start_t = time.time()
+        anchor_pad_seconds = 0.0
+        if self._align_to_wall_time is not None and self._align_to_wall_time > 0:
+            anchor_pad_seconds = max(0.0, start_t - self._align_to_wall_time)
+        anchor_pad_seconds = min(10.0, anchor_pad_seconds)
+        # Whole 1024-frame chunks only — see polling-mode comment
+        # about odd-byte LOUD STATIC for the gory details.
+        anchor_pad_chunks = int(
+            anchor_pad_seconds * float(self.rate) / 1024.0
+        )
+        total_init_chunks = max(1, anchor_pad_chunks)
+        for _ in range(total_init_chunks):
+            self._stdin.write(silence_chunk)
+        try:
+            self._stdin.flush()
+        except Exception:
+            pass
+        if anchor_pad_chunks > 0 and self._align_to_wall_time is not None:
+            self.first_sample_at = self._align_to_wall_time
+        else:
+            self.first_sample_at = start_t
+
+    def _stream_callback(self, in_data, frame_count, time_info, status):
+        """PortAudio realtime callback — MUST return fast. Enqueues
+        the captured bytes for the drain thread to write to the
+        pipe/socket. Returning paContinue keeps the stream alive."""
+        if self._stop.is_set():
+            try:
+                import pyaudiowpatch as _pa
+                return (None, _pa.paComplete)
+            except Exception:
+                return (None, 0)
+        if in_data and self._callback_queue is not None:
+            try:
+                self._callback_queue.put_nowait(in_data)
+            except queue.Full:
+                # Drop the chunk silently. ffmpeg is back-pressuring
+                # the drain thread; better to lose a few ms of audio
+                # than back up the realtime audio thread.
+                pass
+        try:
+            import pyaudiowpatch as _pa
+            return (None, _pa.paContinue)
+        except Exception:
+            return (None, 0)
+
+    def _drain_callback_queue(self) -> None:
+        """Pull captured chunks off the callback queue and write
+        them to stdin/socket. This is the only thread that writes
+        to the pipe in callback mode, so no IO sync needed."""
+        import time as _time
+        bytes_written = 0
+        chunks_dropped = 0
+        start_t = _time.time()
+        next_log_at = start_t + 0.5
+        q = self._callback_queue
+        if q is None:
+            return
+        while not self._stop.is_set():
+            try:
+                data = q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                self._stdin.write(data)
+            except (BrokenPipeError, OSError, ValueError):
+                break
+            bytes_written += len(data)
+            now_t = _time.time()
+            if now_t >= next_log_at:
+                try:
+                    kb = bytes_written // 1024
+                    qsize = q.qsize()
+                    sys.stderr.write(
+                        f"[wasapi-bridge] {self._label} (callback): "
+                        f"{kb} KB written, queue depth={qsize} "
+                        f"(elapsed={now_t - start_t:.1f}s)\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                next_log_at = now_t + 5.0
 
     def _run(self) -> None:
         stream = self._stream
@@ -436,6 +591,40 @@ class WasapiLoopbackWriter:
         thread to drain. Safe to call multiple times; safe to call
         when start() returned False (no-op)."""
         self._stop.set()
+        # Callback-mode tear-down: tell PortAudio to stop, then
+        # join the drain thread. The PortAudio callback itself
+        # checks self._stop and returns paComplete the next time
+        # it fires, but we also explicitly stop the stream so the
+        # callback stops firing immediately.
+        if self._use_callback_mode:
+            stream = self._stream
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            if self._pa is not None:
+                try:
+                    self._pa.terminate()
+                except Exception:
+                    pass
+                self._pa = None
+            dt = self._drain_thread
+            if dt is not None:
+                try:
+                    dt.join(timeout=timeout)
+                except Exception:
+                    pass
+            if self._close_stdin_on_exit:
+                try:
+                    self._stdin.close()
+                except Exception:
+                    pass
+        # Polling-mode tear-down (existing _run thread joins).
         t = self._thread
         if t is not None:
             try:

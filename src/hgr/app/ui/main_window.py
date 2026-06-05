@@ -24220,6 +24220,17 @@ Admin elevation
                             label="WasapiMicInput",
                             close_stdin_on_exit=True,
                             align_to_wall_time=sys_first_sample,
+                            # PortAudio CALLBACK mode for the mic
+                            # bridge: memory note
+                            # project_wasapi_callback_vs_read.md
+                            # documents that polling-mode capture
+                            # corrupts audio on Kiyo Pro and other
+                            # UVC mics ("static / garbled" symptom
+                            # the user kept reporting). Callback
+                            # mode goes through a different
+                            # PortAudio code path that's clean on
+                            # the same hardware.
+                            use_callback_mode=True,
                         )
                         if mic_writer.start():
                             self._wasapi_mic_writer = mic_writer
@@ -24243,6 +24254,7 @@ Admin elevation
                         on_error=_on_writer_err,
                         is_loopback=False,
                         label="WasapiMicInput",
+                        use_callback_mode=True,
                         close_stdin_on_exit=mic_owns_stdin,
                     )
                     if mic_writer.start():
