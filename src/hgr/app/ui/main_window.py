@@ -22369,18 +22369,47 @@ Admin elevation
                 pass
     def _ffmpeg_ready(self) -> bool:
         return bool(sys.platform.startswith("win") and self._ffmpeg_path and self._ffmpeg_capabilities.get("available"))
+    def _clip_cache_session_id(self) -> str:
+        """Per-session suffix shared by video + audio manifest/segment
+        paths so files from a previous Touchless session can't
+        contaminate this one. Generated lazily and cached on self.
+
+        Why this matters: the previous design used fixed filenames
+        (`segments.csv`, `segment_%03d.mkv`, `audio_segments.csv`,
+        `audio_%03d.aac`). `_cleanup_ffmpeg_clip_cache_files` tries
+        to delete them at startup, but on Windows a zombie ffmpeg
+        from a force-closed prior session can keep a file handle
+        open and block unlink. The new ffmpeg then APPENDS to the
+        old manifest CSV, and the export reads STALE entries whose
+        relative times don't map onto the new session's wall anchor
+        — producing the user's reported 'whole clip is one frozen
+        frame' (massive bogus tail_to_drop) and 'time jumps
+        mid-clip' symptoms.
+
+        Unique suffix per session means even when the old files
+        can't be deleted, the new ones don't collide and the
+        manifest the export reads is guaranteed to belong to the
+        current session's anchor."""
+        sid = getattr(self, "_clip_cache_session_id_cache", None)
+        if sid is None:
+            try:
+                sid = f"{int(time.time())}_{time.time_ns() % 1_000_000}"
+            except Exception:
+                sid = "default"
+            self._clip_cache_session_id_cache = sid
+        return sid
     def _ffmpeg_clip_list_path(self) -> Path:
-        return self._clip_cache_dir() / "segments.csv"
+        return self._clip_cache_dir() / f"segments_{self._clip_cache_session_id()}.csv"
     def _ffmpeg_clip_segment_pattern(self) -> Path:
-        return self._clip_cache_dir() / "segment_%03d.mkv"
+        return self._clip_cache_dir() / f"segment_{self._clip_cache_session_id()}_%03d.mkv"
     def _ffmpeg_clip_audio_list_path(self) -> Path:
-        return self._clip_cache_dir() / "audio_segments.csv"
+        return self._clip_cache_dir() / f"audio_segments_{self._clip_cache_session_id()}.csv"
     def _ffmpeg_clip_audio_segment_pattern(self) -> Path:
         # ADTS AAC (.aac) — raw stream framed for direct concatenation
         # by the segment muxer. .m4a/MP4 would require an explicit
         # -segment_format mp4 and a moov atom per segment, which the
         # segment muxer doesn't produce cleanly mid-stream.
-        return self._clip_cache_dir() / "audio_%03d.aac"
+        return self._clip_cache_dir() / f"audio_{self._clip_cache_session_id()}_%03d.aac"
     def _kill_orphan_ffmpeg_for_clip_cache(self) -> int:
         """Find and kill any ffmpeg.exe processes that are using
         files in our clip cache directory. These are zombies from
@@ -22497,12 +22526,14 @@ Admin elevation
         cache_dir = self._clip_cache_dir()
         failed: list[Path] = []
         for pattern in (
-            "segment_*.mkv",
-            "segments.csv",
+            "segment_*.mkv",          # matches both legacy `segment_NNN.mkv` and new `segment_SID_NNN.mkv`
+            "segments.csv",           # legacy fixed-name manifest
+            "segments_*.csv",         # new timestamped manifests from prior aborted sessions
             "concat_*.txt",
-            "audio_*.aac",
-            "audio_*.m4a",  # leftover from prior builds; clean up too
-            "audio_segments.csv",
+            "audio_*.aac",            # matches both legacy `audio_NNN.aac` and new `audio_SID_NNN.aac`
+            "audio_*.m4a",            # leftover from prior builds; clean up too
+            "audio_segments.csv",     # legacy fixed-name manifest
+            "audio_segments_*.csv",   # new timestamped manifests from prior aborted sessions
             "audio_concat_*.txt",
         ):
             for path in cache_dir.glob(pattern):
@@ -24343,6 +24374,11 @@ Admin elevation
             self._clip_cache_list_path = None
             self._clip_cache_segment_pattern = None
             self._clip_cache_region = None
+            # Force a fresh session id for the next start so leftover
+            # files that couldn't be unlinked (Windows file locks held
+            # by a still-exiting ffmpeg) don't collide with the new
+            # session's manifest and segment paths.
+            self._clip_cache_session_id_cache = None
         self._clip_cache_backend = ""
 
         def _capture_clip_cache_frame(self) -> None:
