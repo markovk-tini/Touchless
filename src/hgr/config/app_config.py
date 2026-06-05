@@ -273,10 +273,9 @@ class AppConfig:
     # we no longer flip values, so re-running the load is a no-op
     # past the first time the flag was latched.)
     clip_audio_offset_zeroed_for_diagnosis: bool = False
-    # Fifth-pass marker: with the callback-mode mic bridge landed
-    # the user reported audio 1 s EARLY at the prior -5500 default.
-    # POSITIVE offset push (less-negative) shifts audio LATER, so
-    # bump default by +1000 ms (-5500 → -4500).
+    # Fifth-pass marker: callback-mode mic bridge landed; user
+    # observed 1 s EARLY at -5500 and 1 s LATE at -4500. Settle
+    # the default at the midpoint -5000.
     clip_audio_offset_post_callback_mode_migrated: bool = False
     # Audio-vs-video offset applied at clip export by biasing the
     # audio-trim start point. Sign convention from the export math
@@ -288,10 +287,10 @@ class AppConfig:
     #   * POSITIVE offset → SMALLER shifted_start → audio events
     #     appear LATER in playback.
     #
-    # Default -4500 ms = the user-confirmed -5500 dialed back by
-    # 1 s to land audio on time after the callback-mode mic bridge
-    # change reduced the residual capture-pipeline early-shift.
-    clip_audio_offset_ms: int = -4500
+    # Default -5000 ms: midpoint between -5500 (audio 1 s early on
+    # callback-mode build) and -4500 (audio 1 s late). User tunes
+    # ±500 ms from here if hardware differs.
+    clip_audio_offset_ms: int = -5000
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -672,13 +671,12 @@ def load_config() -> AppConfig:
             values["clip_audio_offset_zeroed_for_diagnosis"] = True
 
         # Fifth-pass migration: after the callback-mode mic bridge
-        # commit (which fixed the static / garbled mic), audio is
-        # 1 s EARLY at the prior -5500 default. Bump to -4500 so
-        # audio lands on time. Only flips the exact prior default
-        # (-5500); deliberate user-tunes survive.
+        # the user observed -5500 = 1 s early and -4500 = 1 s late.
+        # Settle at the midpoint -5000. Flip either prior default
+        # (-5500 or -4500) to -5000; deliberate user-tunes survive.
         if not data.get("clip_audio_offset_post_callback_mode_migrated", False):
-            if values.get("clip_audio_offset_ms") == -5500:
-                values["clip_audio_offset_ms"] = -4500
+            if values.get("clip_audio_offset_ms") in (-5500, -4500):
+                values["clip_audio_offset_ms"] = -5000
             values["clip_audio_offset_post_callback_mode_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.

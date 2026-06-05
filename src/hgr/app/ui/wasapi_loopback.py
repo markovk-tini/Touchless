@@ -145,11 +145,15 @@ class WasapiLoopbackWriter:
         # Bounded queue from PortAudio callback to the writer
         # thread. Callback must return fast (PortAudio realtime
         # thread); writer thread does the IO to stdin/socket.
-        # maxsize 200 chunks × 21 ms = ~4 s of buffering before
-        # we start dropping — generous, but small enough to bound
-        # memory if ffmpeg stops draining.
+        # maxsize 2000 chunks × 21 ms = ~42 s of buffering before
+        # drops — large because ffmpeg's pipe can briefly back up
+        # while it's flushing a segment file, and dropped mic
+        # callback chunks sound like white-noise glitches in the
+        # final clip (input is unsigned-PCM; a dropped 21 ms chunk
+        # leaves the stream out of frame-alignment until the next
+        # full chunk arrives).
         self._callback_queue: Optional[queue.Queue] = (
-            queue.Queue(maxsize=200) if self._use_callback_mode else None
+            queue.Queue(maxsize=2000) if self._use_callback_mode else None
         )
         self._drain_thread: Optional[threading.Thread] = None
 
@@ -591,28 +595,26 @@ class WasapiLoopbackWriter:
         thread to drain. Safe to call multiple times; safe to call
         when start() returned False (no-op)."""
         self._stop.set()
-        # Callback-mode tear-down: tell PortAudio to stop, then
-        # join the drain thread. The PortAudio callback itself
-        # checks self._stop and returns paComplete the next time
-        # it fires, but we also explicitly stop the stream so the
-        # callback stops firing immediately.
         if self._use_callback_mode:
+            # Order matters here. The crash on clip-save was from
+            # tearing PortAudio down while the realtime callback
+            # was still in flight. Sequence:
+            # 1. Stop the stream — callback stops firing.
+            # 2. Join the drain thread — finishes whatever was in
+            #    the queue (drain checks self._stop on its 100 ms
+            #    timeout cycle so this is bounded).
+            # 3. Close stdin so the next test's spawn doesn't see
+            #    a leaked pipe.
+            # 4. THEN close the stream and terminate PyAudio.
+            #    Doing this LAST avoids the realtime-thread vs
+            #    main-thread race that tripped the previous
+            #    teardown.
             stream = self._stream
             if stream is not None:
                 try:
                     stream.stop_stream()
                 except Exception:
                     pass
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-            if self._pa is not None:
-                try:
-                    self._pa.terminate()
-                except Exception:
-                    pass
-                self._pa = None
             dt = self._drain_thread
             if dt is not None:
                 try:
@@ -624,6 +626,17 @@ class WasapiLoopbackWriter:
                     self._stdin.close()
                 except Exception:
                     pass
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            if self._pa is not None:
+                try:
+                    self._pa.terminate()
+                except Exception:
+                    pass
+                self._pa = None
         # Polling-mode tear-down (existing _run thread joins).
         t = self._thread
         if t is not None:
