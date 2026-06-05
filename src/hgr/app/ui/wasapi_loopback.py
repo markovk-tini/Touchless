@@ -192,9 +192,23 @@ class WasapiLoopbackWriter:
         # the moment the device starts producing it.
         bytes_per_chunk = 1024 * int(self.channels) * 2  # paInt16
         silence_chunk = b"\x00" * bytes_per_chunk
-        # Pace silence at the device rate so we don't flood ffmpeg
-        # with megabytes of zeros and race ahead of wall time.
-        tick_seconds = 1024.0 / max(1.0, float(self.rate))
+        # WALL-CLOCK PACING. Audio MUST be written to ffmpeg at the
+        # exact nominal device rate (e.g. 192,000 B/s for stereo
+        # 16-bit 48 kHz). ffmpeg knows the rate from `-ar` / `-ac` and
+        # places samples in the output file at that rate; if we write
+        # FASTER than nominal, the audio file ends up longer than
+        # wall time and plays SLOWER on export (the "underwater +
+        # static" symptom — sys bridge over-wrote by 33%, mic by
+        # 44%, in the user's bad clip). If we write SLOWER, ffmpeg
+        # underruns and the clip has gaps / dropouts.
+        #
+        # The pacing rule: at any wall-clock moment, the total bytes
+        # we've written should equal `elapsed_seconds * bytes_per_sec`.
+        # If we're at-or-above that target, sleep until we'd be
+        # behind. If we're below, write the next chunk — preferring
+        # real audio from `stream.read()` when available, falling
+        # back to silence when the device is producing nothing.
+        bytes_per_sec = float(self.rate * int(self.channels) * 2)
         real_bytes = 0
         silence_bytes = 0
         bytes_total = 0
@@ -202,19 +216,14 @@ class WasapiLoopbackWriter:
         next_log_at = start_t + 0.5  # first heartbeat after 500ms
         silence_warned = False
         # PRIMER: write one chunk of silence to stdin BEFORE the read
-        # loop starts. This unblocks ffmpeg's `-f s16le -i pipe:0`
-        # avformat_open_input probe within milliseconds (it just
-        # needs SOME bytes to confirm the input is alive). With the
-        # primer, ffmpeg moves on to open input #1 (mic TCP) right
-        # away — our acceptor accept() succeeds, mic writer connects,
-        # and the audio cache survives even when the WASAPI loopback
-        # endpoint is silent for the first 60+ seconds. Without the
-        # primer, get_read_available() could return 0 for an unknown
-        # period (idle device), the silence-fill branch sleeps one
-        # tick (~21 ms) before writing, and although that's still
-        # much faster than the old 66-second stall it leaves a brief
-        # window where ffmpeg's probe is starved. The primer
-        # eliminates that window entirely.
+        # loop starts. Unblocks ffmpeg's `-f s16le -i pipe:0`
+        # avformat_open_input probe within milliseconds so it can
+        # move on to open input #1 (mic TCP) — without the primer
+        # ffmpeg waited up to 30+ seconds on a silent endpoint and
+        # the mic TCP acceptor timed out before ffmpeg dialed in.
+        # The primer's bytes count toward the pacing budget so the
+        # main loop naturally sleeps for one tick before writing
+        # the next chunk.
         try:
             stdin.write(silence_chunk)
             try:
@@ -233,19 +242,28 @@ class WasapiLoopbackWriter:
         try:
             while not self._stop.is_set():
                 now_t = _time.time()
+                elapsed = max(0.0, now_t - start_t)
+                target_bytes = elapsed * bytes_per_sec
+                if bytes_total >= target_bytes:
+                    # At or ahead of nominal rate. Sleep until the
+                    # next chunk is "due", with a small safety
+                    # margin so we wake slightly before the deadline
+                    # and don't underrun.
+                    bytes_ahead = bytes_total - target_bytes
+                    seconds_ahead = bytes_ahead / bytes_per_sec
+                    # Cap the sleep so we re-check stop flag and
+                    # heartbeat at least every 50 ms.
+                    _time.sleep(min(max(0.001, seconds_ahead), 0.050))
+                    continue
+                # Behind nominal — write one chunk (real if
+                # available, silence otherwise). Never block on read.
                 data = None
-                # Non-blocking check for available frames. PyAudio /
-                # PortAudio expose this on the blocking-stream API;
-                # we treat any exception as "0 frames available" and
-                # silence-fill. NEVER fall back to blocking read —
-                # that's the 66-second-stall bug.
                 avail = 0
                 try:
                     avail = int(stream.get_read_available())
                 except Exception:
                     avail = 0
                 if avail >= 1024:
-                    # Real audio ready — read it without blocking.
                     try:
                         data = stream.read(1024, exception_on_overflow=False)
                     except Exception as exc:
@@ -254,18 +272,12 @@ class WasapiLoopbackWriter:
                     if data:
                         real_bytes += len(data)
                 else:
-                    # Device idle or producing < 1024 frames. Sleep
-                    # one device tick (~21 ms at 48 kHz) and write
-                    # silence to keep ffmpeg's pipe fed at the
-                    # nominal rate. This is the safety net that
-                    # prevents ffmpeg from stalling on stdin reads.
-                    _time.sleep(tick_seconds)
                     data = silence_chunk
                     silence_bytes += len(data)
                 if not data:
                     # Defensive: avail>=1024 but read returned empty.
-                    # Sleep briefly and try again.
-                    _time.sleep(tick_seconds)
+                    # Brief sleep and re-check the budget.
+                    _time.sleep(0.001)
                     continue
                 if self.first_sample_at is None:
                     # Stamp wall-clock of the FIRST chunk written
