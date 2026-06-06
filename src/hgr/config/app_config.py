@@ -284,6 +284,9 @@ class AppConfig:
     # Sixth-pass marker: after the previous revert to -5500 the
     # user reported audio 1 s LATE. Push to -6500.
     clip_audio_offset_late_at_5500_migrated: bool = False
+    # Seventh-pass marker: -6500 was slightly EARLY (<1 s).
+    # Pull back to -6000.
+    clip_audio_offset_early_at_6500_migrated: bool = False
     # Audio-vs-video offset applied at clip export by biasing the
     # audio-trim start point. Sign convention from the export math
     # `shifted_start = a_start_trim - offset_seconds`:
@@ -294,11 +297,11 @@ class AppConfig:
     #   * POSITIVE offset → SMALLER shifted_start → audio events
     #     appear LATER in playback.
     #
-    # Default -6500 ms. Latest user observation: 1 s LATE at
-    # -5500, so push another 1 s of negative shift (more-negative
-    # = audio shifted EARLIER in playback per the export math).
-    # Tune via config if you consistently see drift.
-    clip_audio_offset_ms: int = -6500
+    # Default -6000 ms. Latest user observation: <1 s EARLY at
+    # -6500, so dial back 500 ms (less negative = audio shifted
+    # slightly LATER in playback). Tune via config if you
+    # consistently see drift.
+    clip_audio_offset_ms: int = -6000
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -697,6 +700,13 @@ def load_config() -> AppConfig:
             if values.get("clip_audio_offset_ms") == -5500:
                 values["clip_audio_offset_ms"] = -6500
             values["clip_audio_offset_late_at_5500_migrated"] = True
+
+        # Seventh-pass migration: -6500 was slightly EARLY (<1 s),
+        # dial back to -6000. Flips only the exact prior default.
+        if not data.get("clip_audio_offset_early_at_6500_migrated", False):
+            if values.get("clip_audio_offset_ms") == -6500:
+                values["clip_audio_offset_ms"] = -6000
+            values["clip_audio_offset_early_at_6500_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if

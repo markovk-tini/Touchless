@@ -23663,7 +23663,7 @@ Admin elevation
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
-                    f"[{mic_idx}:a]{ns}[amic];"
+                    f"[{mic_idx}:a]{ns},afftdn=nr=10[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
                     "dropout_transition=0:weights=2 3[aout]"
                 ),
@@ -24032,11 +24032,20 @@ Admin elevation
             # background music / game audio is clearly audible.
             # Default amix normalize=1 keeps the sum bounded so no
             # clipping.
+            #
+            # afftdn=nr=10 on the mic chain: mild FFT denoiser
+            # ('nr' = noise reduction in dB; 10 is moderate). User
+            # reported white noise in the mic; the Kiyo Pro has a
+            # noticeable noise floor when no NR filter is applied.
+            # 10 dB is enough to suppress the hiss without altering
+            # the voice's tone the way a higher value (25-30 dB)
+            # would. Applied AFTER the {ns} preset so user-chosen
+            # noise gating still runs first.
             filter_args = [
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
-                    f"[{mic_idx}:a]{ns}[amic];"
+                    f"[{mic_idx}:a]{ns},afftdn=nr=10[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
                     "dropout_transition=0:weights=2 3[aout]"
                 ),
