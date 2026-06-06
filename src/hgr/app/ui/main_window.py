@@ -5996,7 +5996,22 @@ class MainWindow(QMainWindow):
         # 30-fps overhead during background capture.
         self._clip_cache_fps = 20.0
         self._clip_cache_segment_seconds = 10.0
-        self._clip_cache_max_seconds = 65.0
+        # Buffer length — derived from config when available so the
+        # user's preset clip length (or any voice-requested duration
+        # up to 5 min) actually has the footage to back it. Default
+        # 305 s (5 min + 5 s slack) so 'clip last 5 minutes' works
+        # out of the box. v1 was 65 s; bringing the scaling forward
+        # from plan Beta-step-6 because user is actively testing
+        # 2 m / 5 m voice commands and would otherwise see frozen
+        # frames where the buffer ran short.
+        try:
+            from hgr.config.app_config import load_config as _load_config_for_buffer
+            _cfg_probe = _load_config_for_buffer()
+            self._clip_cache_max_seconds = float(
+                max(65, int(getattr(_cfg_probe, "clip_max_buffer_seconds", 305) or 305))
+            )
+        except Exception:
+            self._clip_cache_max_seconds = 305.0
         self._clip_cache_region: QRect | None = None
         self._clip_cache_segment_writer = None
         self._clip_cache_segment_path: Path | None = None

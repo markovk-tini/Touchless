@@ -316,12 +316,13 @@ class AppConfig:
     # only the export pays for the higher preset. Allowed: "low",
     # "medium", "high". Default "high".
     clip_quality_preset: str = "high"
-    # Maximum rolling buffer length in seconds. v1 was 65 s; the
-    # buffer auto-bumps to max(65, default_length + 5) in beta so a
-    # 5 min default actually has 5 min of footage. Stays at 65 in
-    # MVP — voice grammar accepts "clip last 5 minutes" but won't
-    # have 5 min of buffer until beta lands the scaling.
-    clip_max_buffer_seconds: int = 65
+    # Maximum rolling buffer length in seconds. v1 was 65 s; bumped
+    # to 305 s (5 min + 5 s slack) in MVP-fixup after the user
+    # found 2 m / 5 m voice clips landed frozen frames where the
+    # buffer ran short. Disk footprint cap is ~470 MB on a typical
+    # 20 fps + 192 kbps audio session — handled by the existing
+    # _cleanup_ffmpeg_clip_cache_files teardown on app shutdown.
+    clip_max_buffer_seconds: int = 305
     # When True (default), the live camera/gesture pipeline keeps
     # running during clip export. With the non-blocking toast +
     # off-thread export this is fine. Power-user escape hatch for
