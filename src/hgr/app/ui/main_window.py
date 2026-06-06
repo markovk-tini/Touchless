@@ -26923,6 +26923,40 @@ Admin elevation
                         self._worker._pending_clip_voice_end_ts = None
                 except Exception:
                     pass
+            elif utility_request_action in ("clip_2m_voice", "clip_5m_voice"):
+                # 2-minute / 5-minute voice variants. Mirrors the
+                # _voice branches above. The buffer is still 65 s in
+                # MVP (beta will scale it), so clips longer than
+                # buffer length will silently land at the available
+                # window — same graceful behavior as existing 30s/1m.
+                _duration_seconds = 120 if utility_request_action == "clip_2m_voice" else 300
+                _voice_end_ts = (
+                    getattr(self._worker, "_pending_clip_voice_end_ts", None)
+                    if self._worker is not None else None
+                )
+                try:
+                    import sys as _sys, time as _time
+                    _sys.stderr.write(
+                        f"[clip-anchor] main_window {utility_request_action} "
+                        f"end_ts={_voice_end_ts} (now={_time.time():.3f}, "
+                        f"lag={(_time.time() - _voice_end_ts):.2f}s)\n"
+                        if _voice_end_ts is not None else
+                        f"[clip-anchor] main_window {utility_request_action} "
+                        f"end_ts=None — using default 'now' anchor\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                utility_handled = self._export_recent_clip(
+                    _duration_seconds,
+                    auto_save=True, auto_select_monitor=True,
+                    end_ts=_voice_end_ts,
+                )
+                try:
+                    if self._worker is not None:
+                        self._worker._pending_clip_voice_end_ts = None
+                except Exception:
+                    pass
             if utility_handled:
                 self._last_utility_request_token = utility_request_token
                 if self._worker is not None and hasattr(self._worker, "acknowledge_utility_request"):

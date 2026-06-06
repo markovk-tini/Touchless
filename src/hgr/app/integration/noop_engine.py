@@ -9290,8 +9290,30 @@ class GestureWorker(QObject):
                         if (
                             execution.success
                             and intent_app_name == "touchless"
-                            and intent_action in {"clip_1m", "clip_30s"}
+                            and intent_action in {
+                                "clip_1m", "clip_30s", "clip_2m", "clip_5m",
+                                "clip_default",
+                            }
                         ):
+                            # Resolve clip_default to a concrete length
+                            # using the user's preset preference. Keeps
+                            # the voice parser config-agnostic.
+                            if intent_action == "clip_default":
+                                try:
+                                    preset_seconds = int(
+                                        getattr(self.config, "clip_default_duration_seconds", 60)
+                                        or 60
+                                    )
+                                except Exception:
+                                    preset_seconds = 60
+                                if preset_seconds <= 30:
+                                    intent_action = "clip_30s"
+                                elif preset_seconds <= 90:
+                                    intent_action = "clip_1m"
+                                elif preset_seconds <= 180:
+                                    intent_action = "clip_2m"
+                                else:
+                                    intent_action = "clip_5m"
                             # Anchor the clip window at when the user
                             # actually finished saying "clip that", not
                             # at the much-later moment when this branch

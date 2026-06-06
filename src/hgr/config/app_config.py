@@ -302,6 +302,42 @@ class AppConfig:
     # slightly LATER in playback). Tune via config if you
     # consistently see drift.
     clip_audio_offset_ms: int = -6000
+
+    # ===== Clip v2 settings (MVP commit 1) =====
+    # Default voice "clip that" duration in seconds. When the user
+    # says just "clip that" / "clip this" / "save clip" without a
+    # duration token, the engine resolves to this length. Allowed
+    # set in the future Settings UI dropdown: 30, 60, 120, 300.
+    # Default 60 matches v1 implicit behavior — existing users
+    # don't get a surprise length flip.
+    clip_default_duration_seconds: int = 60
+    # Encoder quality preset for clip EXPORT. The rolling cache
+    # always runs at "medium" to keep 24/7 GPU/disk cost bounded;
+    # only the export pays for the higher preset. Allowed: "low",
+    # "medium", "high". Default "high".
+    clip_quality_preset: str = "high"
+    # Maximum rolling buffer length in seconds. v1 was 65 s; the
+    # buffer auto-bumps to max(65, default_length + 5) in beta so a
+    # 5 min default actually has 5 min of footage. Stays at 65 in
+    # MVP — voice grammar accepts "clip last 5 minutes" but won't
+    # have 5 min of buffer until beta lands the scaling.
+    clip_max_buffer_seconds: int = 65
+    # When True (default), the live camera/gesture pipeline keeps
+    # running during clip export. With the non-blocking toast +
+    # off-thread export this is fine. Power-user escape hatch for
+    # low-end CPUs where libx264 + camera widget contend.
+    clip_show_live_view_during_export: bool = True
+    # When True (default), a non-blocking "Clip saved" toast shows
+    # after a successful auto-save export. Click → opens clip
+    # folder, auto-dismisses after 4 s (8 s on hover). Failure
+    # popups (QMessageBox.warning) are NOT subject to this toggle
+    # — errors deserve modal attention.
+    clip_show_save_popup: bool = True
+    # Latched True after the v2 fields' first AppConfig load. No
+    # values are mutated in the migration — every new field's
+    # default matches the v1 implicit behavior — so this flag is
+    # purely an artifact for future cleanup symmetry.
+    clip_v2_settings_migrated: bool = False
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -707,6 +743,15 @@ def load_config() -> AppConfig:
             if values.get("clip_audio_offset_ms") == -6500:
                 values["clip_audio_offset_ms"] = -6000
             values["clip_audio_offset_early_at_6500_migrated"] = True
+
+        # Clip v2 settings — MVP commit 1. Every new field's default
+        # matches v1 implicit behavior, so this migration mutates
+        # NOTHING. The flag is just an artifact for future cleanup
+        # symmetry (the file is large; missing migration markers
+        # confuse code-search). Anyone who hand-edits one of the
+        # new fields keeps their value.
+        if not data.get("clip_v2_settings_migrated", False):
+            values["clip_v2_settings_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if
