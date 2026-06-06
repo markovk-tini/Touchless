@@ -172,6 +172,30 @@ CLIP_TRIGGER_PHRASES = (
     "clip the last 30 seconds",
     "clip last 30 seconds",
     "clip last thirty seconds",
+    # v2: 2 minute / 5 minute variants
+    "clip the last 2 minutes",
+    "clip last 2 minutes",
+    "clip the past 2 minutes",
+    "clip past 2 minutes",
+    "clip last two minutes",
+    "clip the last two minutes",
+    "clip the last 5 minutes",
+    "clip last 5 minutes",
+    "clip the past 5 minutes",
+    "clip past 5 minutes",
+    "clip last five minutes",
+    "clip the last five minutes",
+)
+# Polite-prefix variants that should still trigger a clip. The
+# matcher strips these at the head of the spoken text before
+# running the trigger-phrase check.
+CLIP_POLITE_PREFIXES = (
+    "can you ",
+    "could you ",
+    "would you ",
+    "would you mind ",
+    "will you ",
+    "please ",
 )
 CLIP_30S_HINT_PHRASES = (
     "30 second",
@@ -183,6 +207,34 @@ CLIP_30S_HINT_PHRASES = (
     "past 30",
     "past thirty",
     "half a minute",
+)
+CLIP_60S_HINT_PHRASES = (
+    "60 second",
+    "60 seconds",
+    "sixty second",
+    "sixty seconds",
+    "last minute",
+    "past minute",
+    "one minute",
+    "a minute",
+)
+CLIP_120S_HINT_PHRASES = (
+    "2 minute",
+    "2 minutes",
+    "two minute",
+    "two minutes",
+    "last 2 minutes",
+    "past 2 minutes",
+    "couple minutes",
+    "couple of minutes",
+)
+CLIP_300S_HINT_PHRASES = (
+    "5 minute",
+    "5 minutes",
+    "five minute",
+    "five minutes",
+    "last 5 minutes",
+    "past 5 minutes",
 )
 APP_OBJECT_HINTS = (
     "app called",
@@ -327,6 +379,147 @@ EDGE_NOISE_WORDS = (
     "with",
 )
 
+# ----- Volume command phrases ----------------------------------------------
+# Phrases that set the system volume to an ABSOLUTE level. The number that
+# follows is extracted as a 0-100 percentage by `_extract_volume_level`.
+# Order matters: longer prefixes first so "set the volume to" wins over
+# bare "volume to" when both could match.
+VOLUME_SET_PHRASES = (
+    "set the volume to ",
+    "set the volume at ",
+    "set volume to ",
+    "set volume at ",
+    "change the volume to ",
+    "change volume to ",
+    "make the volume ",
+    "make volume ",
+    "put the volume at ",
+    "put volume at ",
+    "volume to ",
+    "volume at ",
+)
+# Phrases that nudge the system volume UP. If the trailing words include
+# "to N" the parser switches to an absolute set (so "increase volume to
+# 80" lands on 80, not "current + step"). "by N" stays relative.
+VOLUME_UP_PHRASES = (
+    "turn up the volume",
+    "turn up volume",
+    "turn the volume up",
+    "turn volume up",
+    "raise the volume",
+    "raise volume",
+    "increase the volume",
+    "increase volume",
+    "bump up the volume",
+    "bump the volume",
+    "bump volume",
+    "louder",
+    "volume up",
+)
+# Phrases that nudge the system volume DOWN. Same "by N" / "to N" handling.
+VOLUME_DOWN_PHRASES = (
+    "turn down the volume",
+    "turn down volume",
+    "turn the volume down",
+    "turn volume down",
+    "lower the volume",
+    "lower volume",
+    "decrease the volume",
+    "decrease volume",
+    "bring down the volume",
+    "bring the volume down",
+    "softer",
+    "quieter",
+    "volume down",
+)
+# Bare system-mute phrases. App-scoped mutes ("mute spotify", "mute me on
+# discord") are intercepted by app-specific parsers earlier in the chain
+# (Discord requires discord context; Spotify mute isn't implemented yet),
+# so anything reaching this list is treated as the system master mute.
+VOLUME_MUTE_PHRASES = (
+    "mute everything",
+    "mute audio",
+    "mute the audio",
+    "mute sound",
+    "mute the sound",
+    "mute the system",
+    "mute system",
+    "mute the pc",
+    "mute pc",
+    "mute the computer",
+    "mute computer",
+    "mute volume",
+    "mute the volume",
+    "silence everything",
+    "silence audio",
+    "silence the audio",
+    "mute",
+)
+VOLUME_UNMUTE_PHRASES = (
+    "unmute everything",
+    "unmute audio",
+    "unmute the audio",
+    "unmute sound",
+    "unmute the sound",
+    "unmute the system",
+    "unmute system",
+    "unmute the pc",
+    "unmute pc",
+    "unmute the computer",
+    "unmute computer",
+    "unmute volume",
+    "unmute the volume",
+    "unmute",
+)
+VOLUME_TOGGLE_MUTE_PHRASES = (
+    "toggle mute",
+    "toggle the mute",
+)
+# Terse "volume <word>" forms that go straight to an absolute level
+# without any verb prefix ("set", "change", "to", "at"). Checked
+# before VOLUME_SET_PHRASES so substring matches like "volume max"
+# resolve cleanly.
+VOLUME_DIRECT_PHRASES = {
+    "volume max":         100,
+    "volume maximum":     100,
+    "volume full":        100,
+    "volume to max":      100,
+    "volume to maximum":  100,
+    "volume to full":     100,
+    "volume all the way": 100,
+    "volume halfway":      50,
+    "volume half":         50,
+    "volume to half":      50,
+    "volume min":           0,
+    "volume minimum":       0,
+    "volume off":           0,
+    "volume zero":          0,
+}
+# Word-to-number map for "set volume to fifty" / "volume max" / "half".
+# Covers the common spoken-style cases; unknown words fall through to
+# the numeric regex.
+_VOLUME_WORD_LEVELS = {
+    "zero": 0, "none": 0, "off": 0, "silent": 0, "silence": 0,
+    "min": 0, "minimum": 0, "lowest": 0,
+    "ten": 10, "twenty": 20, "thirty": 30, "forty": 40,
+    "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "hundred": 100, "one hundred": 100, "a hundred": 100,
+    "max": 100, "maximum": 100, "full": 100, "all the way up": 100,
+    "half": 50, "halfway": 50, "middle": 50, "mid": 50,
+}
+# Step size for "volume up" / "volume down" without an explicit "by N".
+# 10 percentage points matches the Windows volume-key default.
+_VOLUME_DEFAULT_STEP_PERCENT = 10
+# Step pattern: "by 20" / "by 20 percent" / "by 20%"
+_VOLUME_RELATIVE_BY_RE = re.compile(
+    r"\bby\s+(\d{1,3})\s*(?:%|percent|percentage)?\b", re.IGNORECASE,
+)
+# Absolute pattern in a tail string: "80" / "80%" / "80 percent" / "to 80"
+_VOLUME_ABSOLUTE_TAIL_RE = re.compile(
+    r"(?:^|\bto\s+)(\d{1,3})\s*(?:%|percent|percentage)?\s*$", re.IGNORECASE,
+)
+
+
 SETTINGS_TOPICS = {
     "apps": ("apps", "applications", "installed apps", "programs"),
     "bluetooth": ("bluetooth",),
@@ -386,30 +579,118 @@ FILE_REQUEST_HINTS = {
     "xlsx",
 }
 
-SELECTION_LETTERS = "ABCDEFGH"
+# --- Save-folder file matcher ---------------------------------------
+# Replaces the old `startswith()` prefix filter in the
+# pick_save_folder_file branch of _execute_touchless_app. The previous
+# implementation rejected any filename whose stem did not begin with
+# the literal `Touchless_<Kind>_` (or legacy `HGR_<Kind>_`) prefix —
+# including files with spaces / hyphens / no separators, files where
+# the brand appears mid-name, and any file the user renamed.
+#
+# Algorithm: lowercase + strip every non-alphanumeric character from
+# the stem to produce a canonical key (so "Touchless Drawing 1.png"
+# and "Touchless_Drawing_1.png" both normalize to
+# "touchlessdrawing1"). Then require:
+#   - at least one BRAND token in the normalized stem
+#     (default: "touchless", "hgr"; runtime callers may extend with
+#     a user's customized save-name prefix)
+#   - at least one KIND token in the normalized stem
+#   - a kind-appropriate extension
+# Junk files and dotfiles are always rejected.
+# O(len(name)) per file — same big-O as the previous prefix filter.
+
+_SAVE_KIND_BRAND_TOKENS = ("touchless", "hgr")
+
+_SAVE_KIND_SPECS = {
+    "drawings": {
+        "kind_tokens": ("drawing",),
+        "exts": (".png", ".jpg", ".jpeg", ".webp", ".bmp"),
+    },
+    "screenshots": {
+        "kind_tokens": ("screenshot",),
+        "exts": (".png", ".jpg", ".jpeg", ".webp", ".bmp"),
+    },
+    "screen_recordings": {
+        "kind_tokens": ("recording", "screenrecording"),
+        "exts": (".mp4", ".mkv", ".mov", ".webm", ".avi"),
+    },
+    "clips": {
+        "kind_tokens": ("clip",),
+        "exts": (".mp4", ".mkv", ".mov", ".webm", ".avi"),
+    },
+}
+
+_SAVE_FOLDER_JUNK = {"desktop.ini", "thumbs.db", "ehthumbs.db", ".ds_store"}
+_SAVE_FOLDER_STRIP_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _save_folder_norm_stem(stem: str) -> str:
+    """Lowercase + strip every non-alphanumeric char from `stem`.
+    Collapses spaces, underscores, hyphens, dots, and camelCase into
+    a single canonical string so substring checks are separator-
+    agnostic. E.g. 'Touchless Drawing 1' -> 'touchlessdrawing1'."""
+    return _SAVE_FOLDER_STRIP_RE.sub("", stem.lower())
+
+
+def _file_matches_save_kind(
+    path,
+    output_kind: str,
+    *,
+    extra_brand_tokens: tuple[str, ...] = (),
+) -> bool:
+    """True iff `path` looks like a Touchless save of kind
+    `output_kind`. `path` is a pathlib.Path; `output_kind` is one of
+    "drawings"/"screenshots"/"screen_recordings"/"clips".
+    `extra_brand_tokens` lets callers add a user's normalized custom
+    save-name prefix to the brand whitelist (so renamed prefixes
+    like 'MyArt' don't lose their own files)."""
+    name = path.name
+    if not name or name.startswith("."):
+        return False
+    if name.lower() in _SAVE_FOLDER_JUNK:
+        return False
+    spec = _SAVE_KIND_SPECS.get(output_kind)
+    if spec is None:
+        return False
+    if path.suffix.lower() not in spec["exts"]:
+        return False
+    norm = _save_folder_norm_stem(path.stem)
+    if not any(b in norm for b in _SAVE_KIND_BRAND_TOKENS) \
+            and not any(b and b in norm for b in extra_brand_tokens):
+        return False
+    if not any(k in norm for k in spec["kind_tokens"]):
+        return False
+    return True
+
+
+SELECTION_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 SELECTION_LETTER_WORDS = {
-    "a": 1,
-    "ay": 1,
-    "alpha": 1,
-    "b": 2,
-    "bee": 2,
-    "bravo": 2,
-    "c": 3,
-    "cee": 3,
-    "charlie": 3,
-    "d": 4,
-    "dee": 4,
-    "delta": 4,
-    "e": 5,
-    "echo": 5,
-    "f": 6,
-    "foxtrot": 6,
-    "g": 7,
-    "gee": 7,
-    "golf": 7,
-    "h": 8,
-    "aitch": 8,
-    "hotel": 8,
+    "a": 1, "ay": 1, "alpha": 1,
+    "b": 2, "bee": 2, "bravo": 2, "be": 2,
+    "c": 3, "cee": 3, "charlie": 3, "see": 3, "sea": 3,
+    "d": 4, "dee": 4, "delta": 4,
+    "e": 5, "echo": 5,
+    "f": 6, "foxtrot": 6, "ef": 6, "eff": 6,
+    "g": 7, "gee": 7, "golf": 7,
+    "h": 8, "aitch": 8, "hotel": 8, "ache": 8,
+    "i": 9, "india": 9, "eye": 9,
+    "j": 10, "jay": 10, "juliet": 10,
+    "k": 11, "kay": 11, "kilo": 11,
+    "l": 12, "el": 12, "lima": 12, "ell": 12,
+    "m": 13, "em": 13, "mike": 13,
+    "n": 14, "en": 14, "november": 14,
+    "o": 15, "oh": 15, "oscar": 15,
+    "p": 16, "pee": 16, "papa": 16,
+    "q": 17, "cue": 17, "quebec": 17, "queue": 17,
+    "r": 18, "are": 18, "romeo": 18, "ar": 18,
+    "s": 19, "es": 19, "ess": 19, "sierra": 19,
+    "t": 20, "tee": 20, "tango": 20,
+    "u": 21, "you": 21, "uniform": 21,
+    "v": 22, "vee": 22, "victor": 22,
+    "w": 23, "double u": 23, "double you": 23, "whiskey": 23,
+    "x": 24, "ex": 24, "xray": 24, "x ray": 24,
+    "y": 25, "why": 25, "yankee": 25,
+    "z": 26, "zee": 26, "zed": 26, "zulu": 26,
 }
 
 
@@ -628,6 +909,11 @@ class VoiceCommandProcessor:
             # (mute/deafen/hang up/leave call/join voice).
             self._parse_discord(normalized, raw_text=spoken_text, context=context),
             self._parse_chrome(normalized, raw_text=spoken_text, context=context),
+            # Volume parser runs BEFORE _parse_settings because the
+            # settings topic table contains "volume" — without this,
+            # "set volume to 50" would hit _parse_settings and just
+            # OPEN the Sound panel instead of changing the volume.
+            self._parse_volume(normalized, raw_text=spoken_text),
             self._parse_settings(normalized, raw_text=spoken_text, context=context),
             self._parse_close_window(normalized, raw_text=spoken_text, context=context),
             self._parse_file_explorer(normalized, raw_text=spoken_text, context=context),
@@ -703,7 +989,13 @@ class VoiceCommandProcessor:
             return "?"
         if index < len(SELECTION_LETTERS):
             return SELECTION_LETTERS[index]
-        return str(index + 1)
+        # Past Z, wrap with a numeric suffix: A1, B1, …, Z1, A2, …
+        # This stays voice-pronounceable while extending capacity
+        # well beyond 26 items. cap=260 keeps the chooser bounded.
+        wrapped = index - len(SELECTION_LETTERS)
+        letter = SELECTION_LETTERS[wrapped % len(SELECTION_LETTERS)]
+        cycle = wrapped // len(SELECTION_LETTERS) + 1
+        return f"{letter}{cycle}"
 
     def _extract_selection_number(self, spoken_text: str) -> int | None:
         normalized = self._normalize_text(spoken_text)
@@ -727,12 +1019,47 @@ class VoiceCommandProcessor:
             if re.search(pat, normalized):
                 return -1
         word_map = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8}
+        # `and`, `then`, `or`, `the`, `please`, `pick` are added so
+        # the chooser tolerates Whisper's most common misreads of
+        # "open" — "and B" gets parsed as letter B, not rejected.
         prefix = (
             r"(?:(?:can\s+(?:you|i)\s+)?(?:open|show(?:\s+me)?|launch|pull\s+up|choose|select|see|"
-            r"let(?:(?:'|\s)?s)\s+(?:see|open|look\s+at|check)|i(?:'|\s)?ll\s+take)"
+            r"let(?:(?:'|\s)?s)\s+(?:see|open|look\s+at|check)|i(?:'|\s)?ll\s+take|"
+            r"and|then|or|the|a|please|pick|go(?:\s+to)?|i\s+want)"
             r")?(?:\s+(?:file|folder|item|number|option))?"
         )
-        match = re.search(rf"\b{prefix}\s*(\d{{1,2}})\b", normalized)
+        # Cycle-suffixed letter pick: "A1", "B2", … "Z5". Spoken as
+        # "A one" / "A 1" / "alpha 1" etc. Captured before the bare
+        # digit branch so "A 1" doesn't get read as just 1.
+        # Index formula matches _selection_key_for_index: letter
+        # gives base position 1-26; cycle N adds N*26 (cycle 1
+        # starts at 27 = A1, cycle 2 starts at 53 = A2, …).
+        letter_alts = "|".join(re.escape(k) for k in sorted(
+            SELECTION_LETTER_WORDS.keys(), key=len, reverse=True
+        ))
+        cycle_word_map = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        }
+        cycle_match = re.search(
+            rf"\b({letter_alts})\s*(\d{{1,2}})\b",
+            normalized,
+        )
+        cycle_word_match = re.search(
+            rf"\b({letter_alts})\s+(one|two|three|four|five|six|seven|eight|nine|ten)\b",
+            normalized,
+        )
+        if cycle_match or cycle_word_match:
+            chosen = cycle_match or cycle_word_match
+            base = SELECTION_LETTER_WORDS.get(chosen.group(1))
+            raw_cycle = chosen.group(2)
+            try:
+                cycle = int(raw_cycle) if raw_cycle.isdigit() else cycle_word_map.get(raw_cycle, 0)
+            except Exception:
+                cycle = 0
+            if base and cycle > 0:
+                return base + cycle * len(SELECTION_LETTERS)
+        match = re.search(rf"\b{prefix}\s*(\d{{1,3}})\b", normalized)
         if match:
             try:
                 return int(match.group(1))
@@ -743,7 +1070,7 @@ class VoiceCommandProcessor:
             return word_map.get(word_match.group(1))
         letter_match = re.search(
             rf"^(?:{prefix}\s*)?(?:option|number|letter|choice|pick)?\s*"
-            r"(a|ay|alpha|b|bee|bravo|c|cee|charlie|d|dee|delta|e|echo|f|foxtrot|g|gee|golf|h|aitch|hotel)\s*$",
+            rf"({letter_alts})\s*$",
             normalized,
         )
         if letter_match:
@@ -804,7 +1131,10 @@ class VoiceCommandProcessor:
             "kind": kind,
             "query": query,
             "heard_text": heard_text,
-            "options": cleaned[:8],
+            # Cap chooser to a screenful (A-Z then A1-Z1 etc.).
+            # Practical limit so the overlay doesn't render
+            # thousands of items, but well above the prior 8.
+            "options": cleaned[:52],
         }
         title = "Which file/folder?" if kind == "file" else "Which app?"
         lines = [title]
@@ -823,6 +1153,28 @@ class VoiceCommandProcessor:
             return None
         choice = self._extract_selection_number(spoken_text)
         if choice is None:
+            # If the user's utterance looks like a fresh command
+            # (multiple meaningful words, doesn't start with a
+            # selection-letter token), abandon the chooser and let
+            # the caller fall through to normal command parsing.
+            # Without this escape the user was trapped in the
+            # chooser — every non-selection utterance would just
+            # re-display the prompt with no way out short of saying
+            # "cancel" / "stop".
+            normalized = self._normalize_text(spoken_text) or ""
+            words = normalized.split()
+            noise = {
+                "the", "a", "an", "and", "or", "um", "uh",
+                "please", "maybe", "i", "to", "in",
+            }
+            meaningful = [w for w in words if w not in noise]
+            looks_like_letter_attempt = bool(meaningful) and (
+                meaningful[0] in SELECTION_LETTER_WORDS
+                or (len(meaningful[0]) == 1 and meaningful[0].isalpha())
+            )
+            if len(meaningful) >= 2 and not looks_like_letter_attempt:
+                self._pending_selection = None
+                return None  # caller will run the normal parser
             prompt = self._create_pending_selection(
                 kind=str(pending.get("kind", "file")),
                 query=str(pending.get("query", "")),
@@ -911,6 +1263,8 @@ class VoiceCommandProcessor:
             result = self._execute_youtube(intent)
         elif intent.app_name == "discord":
             result = self._execute_discord(intent)
+        elif intent.app_name == "volume":
+            result = self._execute_volume(intent)
         elif intent.app_name == "settings":
             result = self._execute_settings(intent)
         elif intent.app_name == "file_explorer":
@@ -937,7 +1291,7 @@ class VoiceCommandProcessor:
         have routed those phrases to the generic launch path and
         the user would see Touchless come to the foreground —
         which is what they reported as wrong."""
-        if intent.action == "open_save_folder":
+        if intent.action in ("open_save_folder", "pick_save_folder_file"):
             output_kind = ""
             try:
                 slots = dict(getattr(intent, "slots", {}) or {})
@@ -950,9 +1304,12 @@ class VoiceCommandProcessor:
                 # back to the AppConfig defaults if MainWindow is
                 # somehow missing.
                 from PySide6.QtWidgets import QApplication
-                from ...config.app_config import (
+                from ..config.app_config import (
                     SAVE_LOCATION_CONFIG_FIELDS,
                     SAVE_LOCATION_LABELS,
+                    SAVE_NAME_DEFAULTS,
+                    LEGACY_SAVE_NAME_DEFAULTS,
+                    configured_save_name,
                     default_save_directory,
                 )
                 target_dir: Path | None = None
@@ -982,9 +1339,76 @@ class VoiceCommandProcessor:
                         control_text=info,
                         info_text=info,
                     )
+                label = SAVE_LOCATION_LABELS.get(output_kind, output_kind)
+                # Token-containment matcher (see
+                # _file_matches_save_kind at module top). Replaces
+                # the prior strict literal-prefix filter that rejected
+                # any filename whose stem didn't START with
+                # 'Touchless_<Kind>_' verbatim — including space-
+                # separated names, hyphenated names, no-separator
+                # names, and files where the brand appeared mid-name.
+                # Brand-agnostic between "touchless" and legacy "hgr",
+                # kind-gated by extension. If the user has customized
+                # their save-name prefix (e.g. drawings_save_name =
+                # "MyArt"), the normalized version is added to the
+                # brand whitelist so their own files still match.
+                if intent.action == "pick_save_folder_file":
+                    extra_brand: tuple[str, ...] = ()
+                    try:
+                        if main_window is not None:
+                            custom = configured_save_name(main_window.config, output_kind)
+                            custom_norm = _save_folder_norm_stem(custom)
+                            if custom_norm and custom_norm not in _SAVE_KIND_BRAND_TOKENS:
+                                extra_brand = (custom_norm,)
+                    except Exception:
+                        extra_brand = ()
+                    try:
+                        candidates = list(target_dir.iterdir())
+                    except Exception:
+                        candidates = []
+                    matched: list = []
+                    for p in candidates:
+                        try:
+                            if not p.is_file():
+                                continue
+                            if _file_matches_save_kind(p, output_kind, extra_brand_tokens=extra_brand):
+                                matched.append(p)
+                        except OSError:
+                            continue
+                    try:
+                        matched.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    except Exception:
+                        pass
+                    if not matched:
+                        info = f"no {label.lower()} files saved yet"
+                        return VoiceExecutionResult(
+                            success=False,
+                            target="touchless_app",
+                            heard_text=intent.raw_text,
+                            control_text=info,
+                            info_text=info,
+                        )
+                    options = [
+                        {"label": p.name, "path": str(p.resolve())}
+                        for p in matched[:52]
+                    ]
+                    prompt = self._create_pending_selection(
+                        kind="file",
+                        query=output_kind,
+                        heard_text=intent.raw_text,
+                        options=options,
+                    )
+                    return VoiceExecutionResult(
+                        success=False,
+                        target="voice_selection",
+                        heard_text=intent.raw_text,
+                        control_text=f"choose a {label.lower()[:-1]} to open",
+                        info_text=prompt,
+                        display_text=prompt,
+                    )
+                # Folder variant: open Explorer at the configured dir.
                 import os as _os
                 _os.startfile(str(target_dir))
-                label = SAVE_LOCATION_LABELS.get(output_kind, output_kind)
                 info = f"opening Touchless {label.lower()} folder"
                 return VoiceExecutionResult(
                     success=True,
@@ -1119,8 +1543,14 @@ class VoiceCommandProcessor:
         to call _export_recent_clip directly. We just return a
         success result with a clear control_text so the live status
         line reads naturally."""
-        action = intent.action or "clip_1m"
-        seconds_label = "1-minute" if action == "clip_1m" else "30-second"
+        action = intent.action or "clip_default"
+        seconds_label = {
+            "clip_30s": "30-second",
+            "clip_1m": "1-minute",
+            "clip_2m": "2-minute",
+            "clip_5m": "5-minute",
+            "clip_default": "preset",
+        }.get(action, "preset")
         info = f"saving last {seconds_label} clip"
         return VoiceExecutionResult(
             success=True,
@@ -1205,6 +1635,12 @@ class VoiceCommandProcessor:
         elif intent.app_name == "touchless":
             if intent.action == "clip_30s":
                 return "save 30-second clip"
+            if intent.action == "clip_2m":
+                return "save 2-minute clip"
+            if intent.action == "clip_5m":
+                return "save 5-minute clip"
+            if intent.action == "clip_default":
+                return "save clip"
             return "save 1-minute clip"
         return intent.normalized_text or intent.raw_text
 
@@ -1247,16 +1683,75 @@ class VoiceCommandProcessor:
                 f"[spotify] play_search_request query={intent.query!r} "
                 f"types={preferred_types or 'default'}"
             )
+            # Capture BEFORE-state so we know if Spotify ACTUALLY
+            # switched to the new track. Without this, immediate
+            # get_current_track_details returns the OLD track's
+            # info (Rolling Stones - Satisfaction when user asked
+            # for Poker Face) — Spotify takes ~300-800ms to swap.
+            before_title = None
+            try:
+                before = self.spotify_controller.get_current_track_details()
+                if before is not None:
+                    # SpotifyTrackDetails fields are song_name/
+                    # artist_names — using "title" silently returns
+                    # None and breaks track-change detection.
+                    before_title = getattr(before, "song_name", None)
+            except Exception:
+                before_title = None
             success = self.spotify_controller.play_search_request(intent.query or "", preferred_types=preferred_types)
             self._log_step(
                 f"[spotify] play_search_request → {'ok' if success else 'failed'} "
                 f"({self.spotify_controller.message})"
             )
-            details = self.spotify_controller.get_current_track_details() if success else None
+            details = None
+            if success:
+                import time as _t
+                # Spotify's PUT /me/player/play returns 202 immediately,
+                # but the actual track transition happens asynchronously
+                # over ~1.5-2.5s. During that window the "currently
+                # playing" state can briefly show:
+                #   1. The PREVIOUS track (before Spotify swaps)
+                #   2. An AUTO-QUEUED recommendation from the prior
+                #      playlist context (Spotify pre-loads "next up")
+                #   3. The actual requested track
+                # Polling and breaking on first non-before-title match
+                # catches state #2 ("queued Kokomo instead of Poker
+                # Face"). Two-read stability check is also fooled when
+                # #2 sits there for 300+ ms.
+                #
+                # Pragmatic fix: wait 2.5s (past the transition window)
+                # then read ONCE. The user's perceived latency is the
+                # same whether we poll-and-stabilize or fixed-wait,
+                # and fixed-wait is far more reliable for the "what's
+                # playing now" answer. Plus we add a final-stability
+                # check: do one extra read 400ms later and require it
+                # matches.
+                _t.sleep(2.5)
+                try:
+                    first = self.spotify_controller.get_current_track_details()
+                except Exception:
+                    first = None
+                first_title = getattr(first, "song_name", None) if first else None
+                _t.sleep(0.4)
+                try:
+                    second = self.spotify_controller.get_current_track_details()
+                except Exception:
+                    second = None
+                second_title = getattr(second, "song_name", None) if second else None
+                # Trust the second read when it matches first; otherwise
+                # take the second (later) read as the most up-to-date.
+                if (first_title and second_title
+                        and first_title == second_title):
+                    details = second
+                elif second_title:
+                    details = second
+                elif first_title:
+                    details = first
             if details is not None:
                 info_text = details.summary()
                 self._log_step(f"[spotify] now playing: {info_text}")
             elif intent.query:
+                # Don't report a song name we can't confirm.
                 info_text = f"Spotify request: {intent.query}"
         elif intent.action == "pause":
             self._log_step("[spotify] sending pause...")
@@ -2376,11 +2871,21 @@ class VoiceCommandProcessor:
         # don't overlap with TOUCHLESS_TAB_KEYWORDS entries, but
         # being explicit makes the precedence obvious).
         if touchless_file_kind is not None:
+            # "file"/"files" in the phrase → show a letter-chooser of
+            # recent saved files instead of just opening the folder
+            # in Explorer. Matches the generic "open testing two
+            # file" pattern users already know.
+            wants_file_picker = any(tok in ("file", "files") for tok in tokens)
+            action = (
+                "pick_save_folder_file"
+                if wants_file_picker
+                else "open_save_folder"
+            )
             return ParsedVoiceCommand(
                 raw_text=raw_text,
                 normalized_text=text,
                 app_name="touchless_app",
-                action="open_save_folder",
+                action=action,
                 confidence=1.10,
                 query=touchless_file_kind,
                 matched_alias="touchless",
@@ -2406,10 +2911,33 @@ class VoiceCommandProcessor:
     ) -> ParsedVoiceCommand | None:
         """Recognise 'clip that' / 'clip the last minute' / 'save
         clip' style phrases. Routes to app_name='touchless',
-        action='clip_1m' (or 'clip_30s' when a 30-second hint is
-        present). The engine catches this intent and fires the
-        clip-export with auto-save enabled."""
+        action='clip_default' (engine resolves to user's preset
+        length) when no explicit duration was spoken, or
+        'clip_30s' / 'clip_1m' / 'clip_2m' / 'clip_5m' when the
+        spoken phrase carries an explicit duration hint.
+
+        Polite prefixes ('can you', 'could you', 'would you',
+        'please') are stripped before matching so they trigger the
+        same way the bare phrase would. The 'clip + recency-noun'
+        loose-match regex requires the qualifier to sit ADJACENT
+        to 'clip' (or with at most 'the ' between them), tight
+        enough to reject 'clip thing on the desk' while still
+        catching 'clip the past minute'."""
         trimmed = (text or "").strip()
+        if not trimmed:
+            return None
+        # Strip polite prefixes so "can you clip that for me" hits
+        # the same path as "clip that". Re-strip after each match
+        # in case the speaker stacked prefixes.
+        stripped_polite = False
+        for _ in range(2):
+            for prefix in CLIP_POLITE_PREFIXES:
+                if trimmed.startswith(prefix):
+                    trimmed = trimmed[len(prefix):].lstrip()
+                    stripped_polite = True
+                    break
+            else:
+                break
         if not trimmed:
             return None
         # Bare "clip" alone is ambiguous (could be misheard "click",
@@ -2422,19 +2950,39 @@ class VoiceCommandProcessor:
                 matched = True
                 break
         if not matched:
-            # Loose match: "clip" with a recency qualifier.
-            if re.search(r"\bclip\b.*\b(that|this|it|now|here|just|right now|last|past|previous|recent)\b", trimmed):
+            # Loose match: 'clip' followed (with at most 'the ')
+            # by a recency qualifier. Previously this used .* which
+            # accepted "clip thing on the desk"; the tighter regex
+            # demands the qualifier be adjacent so the rejection is
+            # tight without losing "clip the past minute" etc.
+            if re.search(
+                r"\bclip\b\s+(?:the\s+)?"
+                r"(that|this|it|now|here|just|right now|last|past|previous|recent)\b",
+                trimmed,
+            ):
                 matched = True
-            elif re.search(r"\b(clip|record)\b.*\b(last|past)\b.*\b(minute|sixty|60|30|thirty)\b", trimmed):
+            elif re.search(
+                r"\b(clip|record)\b\s+(?:the\s+)?(last|past)\b"
+                r".{0,12}\b(minute|minutes|sixty|60|30|thirty|2|two|5|five)\b",
+                trimmed,
+            ):
                 matched = True
         if not matched:
             return None
-        # Pick duration variant.
-        action = "clip_1m"
-        if any(hint in trimmed for hint in CLIP_30S_HINT_PHRASES):
+        # Pick duration variant. Order matters: check 5 min before
+        # 30 s before 2 min before 1 min so "5 minutes" doesn't
+        # collide with "5" appearing inside "30 5..." etc.
+        action = "clip_default"
+        if any(hint in trimmed for hint in CLIP_300S_HINT_PHRASES):
+            action = "clip_5m"
+        elif any(hint in trimmed for hint in CLIP_120S_HINT_PHRASES):
+            action = "clip_2m"
+        elif any(hint in trimmed for hint in CLIP_30S_HINT_PHRASES):
             action = "clip_30s"
         elif re.search(r"\b30\b|\bthirty\b", trimmed) and "minute" not in trimmed:
             action = "clip_30s"
+        elif any(hint in trimmed for hint in CLIP_60S_HINT_PHRASES):
+            action = "clip_1m"
         return ParsedVoiceCommand(
             raw_text=raw_text,
             normalized_text=text,
@@ -2680,6 +3228,225 @@ class VoiceCommandProcessor:
             confidence=confidence,
             query=query,
             matched_alias=matched_alias,
+        )
+
+    # ---- System volume parser + executor ------------------------------
+    def _parse_volume(self, text: str, *, raw_text: str) -> ParsedVoiceCommand | None:
+        """Parse system-volume commands.
+
+        Recognises:
+          * `set volume to N`, `volume to N`, `volume at N`, `make
+            volume N`, `change volume to N`  → action="set", level=N
+          * `increase/raise/turn up volume [by N | to N]`,
+            `volume up`, `louder`            → action="up"
+                                              (slot["level"] when "to N",
+                                               slot["step"] when "by N")
+          * `decrease/lower/turn down volume`,
+            `volume down`, `quieter`         → action="down" (same slots)
+          * `mute` / `mute system` / `mute audio`            → action="mute"
+          * `unmute` / `unmute system` / `unmute audio`      → action="unmute"
+          * `toggle mute`                                     → action="toggle_mute"
+
+        Numbers may be digits ("50", "50%", "50 percent") or words
+        ("fifty", "max", "half"). Always clamped to 0-100.
+
+        Returns None when no volume phrase matches. Order is important:
+        absolute "set" phrases are checked first so "set volume to 50"
+        isn't mis-detected as the relative "increase volume to 50" later.
+        """
+        # Pass 0: terse "volume max/min/half" without any verb prefix.
+        for phrase, level in VOLUME_DIRECT_PHRASES.items():
+            if phrase in text:
+                return ParsedVoiceCommand(
+                    raw_text=raw_text, normalized_text=text,
+                    app_name="volume", action="set",
+                    slots={"level": int(level)},
+                    confidence=1.05,
+                )
+
+        # Pass 1: absolute set ("set volume to N", "volume to N", ...).
+        for prefix in VOLUME_SET_PHRASES:
+            if prefix in text:
+                tail = text.split(prefix, 1)[1].strip()
+                level = self._extract_volume_level(tail)
+                if level is not None:
+                    return ParsedVoiceCommand(
+                        raw_text=raw_text, normalized_text=text,
+                        app_name="volume", action="set",
+                        slots={"level": int(level)},
+                        confidence=1.05,
+                    )
+
+        # Pass 2: relative up/down. If the tail contains "to N" the
+        # intent collapses to an absolute set (Windows users say
+        # "increase volume to 80" meaning "make it 80%", not "+80%").
+        for direction, phrases in (("up", VOLUME_UP_PHRASES), ("down", VOLUME_DOWN_PHRASES)):
+            for phrase in phrases:
+                if phrase not in text:
+                    continue
+                tail = text.split(phrase, 1)[1].strip()
+                # "to N" → absolute set.
+                abs_match = _VOLUME_ABSOLUTE_TAIL_RE.search(" " + tail)
+                if abs_match and ("to " in tail or tail.startswith(("to ", str(abs_match.group(1))))):
+                    level = max(0, min(100, int(abs_match.group(1))))
+                    return ParsedVoiceCommand(
+                        raw_text=raw_text, normalized_text=text,
+                        app_name="volume", action="set",
+                        slots={"level": level},
+                        confidence=1.02,
+                    )
+                # "by N" → relative step.
+                step_match = _VOLUME_RELATIVE_BY_RE.search(tail)
+                step = (
+                    max(1, min(100, int(step_match.group(1))))
+                    if step_match
+                    else _VOLUME_DEFAULT_STEP_PERCENT
+                )
+                return ParsedVoiceCommand(
+                    raw_text=raw_text, normalized_text=text,
+                    app_name="volume", action=direction,
+                    slots={"step": int(step)},
+                    confidence=1.0,
+                )
+
+        # Pass 3: mute / unmute. Unmute checked first so "unmute" doesn't
+        # match "mute" via substring.
+        for phrase in VOLUME_TOGGLE_MUTE_PHRASES:
+            if phrase in text:
+                return ParsedVoiceCommand(
+                    raw_text=raw_text, normalized_text=text,
+                    app_name="volume", action="toggle_mute",
+                    confidence=1.02,
+                )
+        for phrase in VOLUME_UNMUTE_PHRASES:
+            if phrase in text:
+                return ParsedVoiceCommand(
+                    raw_text=raw_text, normalized_text=text,
+                    app_name="volume", action="unmute",
+                    confidence=1.02,
+                )
+        for phrase in VOLUME_MUTE_PHRASES:
+            if phrase not in text:
+                continue
+            # Bare "mute" is system mute UNLESS the text also mentions a
+            # specific app the user clearly meant — Discord context is
+            # captured by _parse_discord earlier, so anything reaching
+            # here is a system-scope mute by default. Reject only the
+            # case where the text contains "spotify" / "youtube" /
+            # "chrome" alongside "mute" so we don't accidentally swallow
+            # an app-scoped command those parsers haven't picked up yet.
+            if any(app in text for app in ("spotify", "youtube", "chrome ", "discord")):
+                continue
+            return ParsedVoiceCommand(
+                raw_text=raw_text, normalized_text=text,
+                app_name="volume", action="mute",
+                confidence=1.02,
+            )
+
+        return None
+
+    @staticmethod
+    def _extract_volume_level(text: str) -> int | None:
+        """Pull a 0-100 percentage out of a tail string. Returns None
+        when nothing parseable was found."""
+        text = (text or "").strip().rstrip(".!?,")
+        if not text:
+            return None
+        # Number-word forms first ("fifty", "max", "half"). Try exact
+        # then prefix-match so trailing words like "fifty percent" still
+        # resolve.
+        lowered = text.lower()
+        if lowered in _VOLUME_WORD_LEVELS:
+            return int(_VOLUME_WORD_LEVELS[lowered])
+        for word, value in _VOLUME_WORD_LEVELS.items():
+            if lowered.startswith(word + " ") or lowered.endswith(" " + word):
+                return int(value)
+        # Numeric forms: "50", "50%", "50 percent".
+        m = re.search(r"\b(\d{1,3})\b", text)
+        if m:
+            return max(0, min(100, int(m.group(1))))
+        return None
+
+    def _execute_volume(self, intent: ParsedVoiceCommand) -> VoiceExecutionResult:
+        """Drive the system volume via VolumeController.
+
+        Lazily instantiates the controller — it talks to Windows Core
+        Audio over COM which costs ~50 ms on first construction. Doing
+        it on demand keeps cold-start cheap and skips the cost entirely
+        for users who never use voice volume commands.
+
+        TODO(iris-prompt): a future Iris-mode could accept fuzzy
+        targets ("turn the music down a bit") and translate them into
+        these primitives. The deterministic path here is what powers
+        explicit voice / phone-text commands."""
+        action = intent.action
+        slots = intent.slots or {}
+        # Lazy controller.
+        controller = getattr(self, "_volume_controller", None)
+        if controller is None:
+            try:
+                from ..debug.volume_controller import VolumeController
+                controller = VolumeController()
+            except Exception as exc:
+                return VoiceExecutionResult(
+                    success=False, target="volume",
+                    heard_text=intent.raw_text,
+                    control_text="volume control unavailable",
+                    info_text=f"{type(exc).__name__}: {exc}",
+                )
+            self._volume_controller = controller
+
+        success = False
+        info = "-"
+
+        if action == "set":
+            try:
+                level = int(slots.get("level", -1))
+            except (TypeError, ValueError):
+                level = -1
+            if 0 <= level <= 100:
+                success = bool(controller.set_level(level / 100.0))
+                info = f"volume set to {level}%"
+            else:
+                info = "no level given"
+        elif action in ("up", "down"):
+            try:
+                step = int(slots.get("step", _VOLUME_DEFAULT_STEP_PERCENT))
+            except (TypeError, ValueError):
+                step = _VOLUME_DEFAULT_STEP_PERCENT
+            step = max(1, min(100, step))
+            current = controller.get_level()
+            if current is not None:
+                delta = (step / 100.0) * (1 if action == "up" else -1)
+                target = max(0.0, min(1.0, float(current) + delta))
+                success = bool(controller.set_level(target))
+                info = f"volume {action} to {int(round(target * 100))}%"
+            else:
+                # Endpoint unreachable — fall back to the OS volume keys
+                # (no precise level read-back, but at least a single
+                # step lands so the user sees something happen).
+                direction = +1 if action == "up" else -1
+                success = bool(controller.nudge_system_volume_key(direction))
+                info = f"volume {action} (nudge)"
+        elif action == "mute":
+            success = bool(controller.set_mute(True))
+            info = "muted" if success else "mute failed"
+        elif action == "unmute":
+            success = bool(controller.set_mute(False))
+            info = "unmuted" if success else "unmute failed"
+        elif action == "toggle_mute":
+            new_state = controller.toggle_mute()
+            success = new_state is not None
+            info = "muted" if new_state else ("unmuted" if new_state is False else "toggle failed")
+        else:
+            info = f"unknown volume action {action!r}"
+
+        return VoiceExecutionResult(
+            success=success,
+            target="volume",
+            heard_text=intent.raw_text,
+            control_text=info,
+            info_text=info if success else f"volume {action}: {controller.message}",
         )
 
     def _parse_settings(
