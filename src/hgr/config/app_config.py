@@ -339,6 +339,12 @@ class AppConfig:
     # default matches the v1 implicit behavior — so this flag is
     # purely an artifact for future cleanup symmetry.
     clip_v2_settings_migrated: bool = False
+    # MVP-fixup-A migration marker: bumps the persisted v1 default
+    # clip_max_buffer_seconds=65 up to 305. Users who launched the
+    # MVP v2 build saved 65 into settings.json before the buffer
+    # scaling landed; without this migration their cache stays at
+    # 65 s and 2 m / 5 m voice clips still freeze.
+    clip_buffer_scaled_to_305_migrated: bool = False
     # Microphone noise-reduction preset for clip audio capture.
     # Applied as an ffmpeg `filter_complex` chain on the MIC input
     # ONLY, before amix mixes it with the system-audio stream.
@@ -753,6 +759,16 @@ def load_config() -> AppConfig:
         # new fields keeps their value.
         if not data.get("clip_v2_settings_migrated", False):
             values["clip_v2_settings_migrated"] = True
+
+        # MVP-fixup-A — flip the persisted v1 buffer default 65 ->
+        # 305 so the user's existing settings.json picks up the new
+        # 5-min buffer. Only mutates when the value is EXACTLY 65
+        # (the old default); a deliberate user-tune to e.g. 90 or
+        # 120 survives untouched.
+        if not data.get("clip_buffer_scaled_to_305_migrated", False):
+            if values.get("clip_max_buffer_seconds") == 65:
+                values["clip_max_buffer_seconds"] = 305
+            values["clip_buffer_scaled_to_305_migrated"] = True
 
         # Migrate the mouse control box only when the user still has the old defaults.
         # Each `if` chain rewrites a previous default to the current default; if
