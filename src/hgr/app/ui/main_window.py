@@ -26157,6 +26157,28 @@ Admin elevation
             self.last_action_label.setText(
                 f"Last action: saved {actual_seconds:.1f}s clip to {output_path}"
             )
+            # v2 MVP commit 2: non-blocking save confirmation toast
+            # via the existing SavedLocationOverlay (bottom-center
+            # pill, auto-fade, click-to-open). Gated on
+            # `clip_show_save_popup` config — the failure-path
+            # QMessageBox.warning above is NOT subject to this
+            # toggle since errors deserve modal attention.
+            try:
+                show_toast = bool(
+                    getattr(self.config, "clip_show_save_popup", True)
+                )
+            except Exception:
+                show_toast = True
+            if show_toast:
+                try:
+                    self.saved_location_overlay.show_saved(
+                        f"Clip saved: {Path(output_path).name}",
+                        total_ms=4000,
+                        fade_ms=600,
+                        click_target=Path(output_path),
+                    )
+                except Exception:
+                    pass
             return
         self.last_action_label.setText(
             f"Last action: saved {actual_seconds:.1f}s clip to {output_path}"
