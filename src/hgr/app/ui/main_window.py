@@ -24214,20 +24214,24 @@ Admin elevation
                         # that came from the TCP-accept gap between
                         # the two bridges starting.
                         #
-                        # Callback-mode mic adds another ~1 s of
-                        # latency vs polling mode (PortAudio
-                        # callback queue + drain-thread pipe write).
-                        # User reported mic 1 s LATE after the
-                        # callback-mode switch. Shift the align
-                        # target 1 s EARLIER so the mic bridge
-                        # pre-pads an additional 1 s of silence,
-                        # effectively pulling mic content 1 s
-                        # earlier in the audio file to compensate.
+                        # Callback-mode mic ends up LATE in the
+                        # clip vs sys (~1 s under the previous
+                        # default, ~2 s after I shifted the align
+                        # target by -1 s). Sign trace from the math
+                        # `anchor_pad_seconds = start_t -
+                        # align_to_wall_time`: a LATER align target
+                        # means SMALLER pre-pad → fewer silence
+                        # bytes before real mic samples in the file
+                        # → real mic appears EARLIER in the clip's
+                        # mic stream. So to pull mic earlier we
+                        # ADD time to the align target (sign was
+                        # inverted in the previous attempt). +1 s
+                        # adjustment lands mic synced with sys.
                         sys_first_sample = None
                         if self._wasapi_writer is not None:
                             sys_first_sample = self._wasapi_writer.first_sample_at
                             if sys_first_sample is not None:
-                                sys_first_sample -= 1.0
+                                sys_first_sample += 1.0
                         mic_writer = WasapiLoopbackWriter(
                             sock_file,
                             device_index=mic_dev,
