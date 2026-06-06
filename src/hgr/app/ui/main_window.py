@@ -24487,8 +24487,24 @@ Admin elevation
         # the audio process fails, the video keeps running unaffected.
         if self._start_clip_cache_audio():
             self._clip_cache_has_audio = True
+            # Start the audio-endpoint watchdog so a mid-session
+            # change to the Windows default playback (loopback
+            # source) or the user's preferred microphone is detected
+            # and the audio sidecar gets hot-restarted on the new
+            # device without losing the rolling video buffer.
+            try:
+                self._start_audio_endpoint_watchdog()
+            except Exception:
+                pass
         return True
     def _stop_clip_cache_ffmpeg(self, *, delete_files: bool) -> None:
+        # Stop the audio-endpoint watchdog FIRST so a tick can't
+        # race the teardown by trying to restart the audio sidecar
+        # we're about to take down.
+        try:
+            self._stop_audio_endpoint_watchdog()
+        except Exception:
+            pass
         # Tear down the separate audio capture FIRST. It writes into
         # its own ffmpeg subprocess via a WASAPI bridge thread; the
         # bridge has to exit cleanly before ffmpeg is reaped or it
@@ -24510,6 +24526,219 @@ Admin elevation
             # session's manifest and segment paths.
             self._clip_cache_session_id_cache = None
         self._clip_cache_backend = ""
+
+    # ===== Audio-endpoint watchdog (MVP-fixup D) =====================
+    #
+    # The video cache opens its WASAPI loopback once at start. If the
+    # user changes the Windows default playback (speakers ↔ headset)
+    # the loopback stream stays bound to the OLD endpoint and silently
+    # captures from a device that may now be inactive. Same problem for
+    # the mic: if the user switches their preferred microphone in
+    # Touchless settings mid-session, the cache keeps recording from
+    # the old device.
+    #
+    # The watchdog polls the CURRENT default playback + preferred mic
+    # identity every 700 ms (cheap — just metadata reads, no stream
+    # open). When the identity changes vs the last tick AND the change
+    # is still observed 700 ms later (debounce — protects against pro-
+    # audio driver flicker e.g. Razer Synapse / VoiceMeeter), it hot-
+    # restarts the audio sidecar on the new device. The VIDEO cache is
+    # left running so the rolling buffer survives the switch.
+    #
+    # Suppressed during in-progress export (race with audio-segment
+    # snapshot reads) and for 5 s after each restart (coalesce window
+    # so a multi-step switch doesn't fire 3 restarts back-to-back).
+    # Kill switch: env var HGR_CLIP_DEVICE_WATCHDOG=0 disables.
+
+    def _audio_endpoint_fingerprint(self) -> tuple:
+        """Snapshot of (sys_idx, sys_name, mic_idx, mic_name) for
+        the watchdog tick. Both halves are independently nullable
+        so a partial probe failure doesn't mask a real change."""
+        try:
+            from hgr.app.ui.wasapi_loopback import (
+                probe_default_loopback_identity,
+                probe_input_device_identity,
+            )
+        except Exception:
+            return (None, "", None, "")
+        sys_pair = None
+        try:
+            sys_pair = probe_default_loopback_identity()
+        except Exception:
+            sys_pair = None
+        sys_idx = sys_pair[0] if sys_pair else None
+        sys_name = sys_pair[1] if sys_pair else ""
+        mic_name_hint = ""
+        listener_idx: int | None = None
+        try:
+            mic_name_hint = str(
+                getattr(self.config, "preferred_microphone_name", "") or ""
+            ).strip()
+        except Exception:
+            mic_name_hint = ""
+        try:
+            if (self._worker is not None
+                    and getattr(self._worker, "voice_listener", None) is not None):
+                try:
+                    listener_idx = self._worker.voice_listener.input_device_index()
+                except Exception:
+                    listener_idx = None
+        except Exception:
+            listener_idx = None
+        mic_pair = None
+        try:
+            mic_pair = probe_input_device_identity(
+                mic_name_hint or None,
+                device_index=listener_idx,
+            )
+        except Exception:
+            mic_pair = None
+        mic_idx = mic_pair[0] if mic_pair else None
+        mic_name = mic_pair[1] if mic_pair else ""
+        return (sys_idx, sys_name, mic_idx, mic_name)
+
+    def _start_audio_endpoint_watchdog(self) -> None:
+        """Wire up the QTimer that polls for default-playback /
+        preferred-mic changes. Called from _start_clip_cache_ffmpeg
+        AFTER _start_clip_cache_audio has succeeded (no point
+        polling when there's no audio sidecar to restart)."""
+        import os as _os
+        if _os.environ.get("HGR_CLIP_DEVICE_WATCHDOG", "1") == "0":
+            return
+        # Idempotent: if a timer is already running, leave it.
+        if getattr(self, "_audio_endpoint_watchdog_timer", None) is not None:
+            try:
+                if self._audio_endpoint_watchdog_timer.isActive():
+                    return
+            except Exception:
+                pass
+        self._audio_endpoint_last_fingerprint = self._audio_endpoint_fingerprint()
+        self._audio_endpoint_change_pending_since = 0.0
+        self._audio_endpoint_last_restart_at = 0.0
+        self._audio_endpoint_restart_in_progress = False
+        timer = QTimer(self)
+        timer.setInterval(700)  # ms
+        timer.timeout.connect(self._tick_audio_endpoint_watchdog)
+        timer.start()
+        self._audio_endpoint_watchdog_timer = timer
+
+    def _stop_audio_endpoint_watchdog(self) -> None:
+        timer = getattr(self, "_audio_endpoint_watchdog_timer", None)
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except Exception:
+            pass
+        try:
+            timer.deleteLater()
+        except Exception:
+            pass
+        self._audio_endpoint_watchdog_timer = None
+
+    def _tick_audio_endpoint_watchdog(self) -> None:
+        """Single watchdog tick. Cheap when nothing has changed
+        (~3 ms total: two metadata probes + a tuple compare)."""
+        try:
+            # Don't fire while no audio sidecar is running.
+            if not bool(getattr(self, "_clip_cache_has_audio", False)):
+                return
+            # Don't race an in-progress export: it snapshots audio
+            # manifests while we'd be tearing the sidecar down.
+            export_thread = getattr(self, "_clip_export_thread", None)
+            if export_thread is not None and export_thread.is_alive():
+                return
+            if getattr(self, "_audio_endpoint_restart_in_progress", False):
+                return
+            import time as _time
+            now = _time.monotonic()
+            # 5 s coalesce window after the last restart so a
+            # multi-step switch (driver enumerating intermediate
+            # device names) doesn't fire several restarts back to
+            # back.
+            last_restart_at = float(getattr(self, "_audio_endpoint_last_restart_at", 0.0))
+            if (now - last_restart_at) < 5.0:
+                return
+            current = self._audio_endpoint_fingerprint()
+            prev = getattr(self, "_audio_endpoint_last_fingerprint", None)
+            if prev is None:
+                self._audio_endpoint_last_fingerprint = current
+                return
+            if current != prev:
+                pending_since = float(
+                    getattr(self, "_audio_endpoint_change_pending_since", 0.0)
+                )
+                if pending_since == 0.0:
+                    # First tick observing the change. Start the
+                    # debounce window — wait 700 ms to confirm it
+                    # wasn't just a 1-tick flicker.
+                    self._audio_endpoint_change_pending_since = now
+                    return
+                if (now - pending_since) < 0.7:
+                    # Still within debounce. Wait for the next tick.
+                    return
+                # Debounce passed — the change is real. Hot-restart
+                # the audio sidecar on the new endpoint.
+                self._audio_endpoint_change_pending_since = 0.0
+                self._audio_endpoint_last_fingerprint = current
+                self._audio_endpoint_last_restart_at = now
+                self._audio_endpoint_restart_in_progress = True
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[clip-audio] default endpoint changed "
+                        f"prev={prev!r} -> now={current!r} — "
+                        f"hot-restarting audio sidecar\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    self._restart_audio_cache_only()
+                except Exception as exc:
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"[clip-audio] hot-restart failed: "
+                            f"{type(exc).__name__}: {exc!s}\n"
+                        )
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+                finally:
+                    self._audio_endpoint_restart_in_progress = False
+            else:
+                # Identity stable this tick — clear any pending
+                # debounce so a transient flicker doesn't
+                # accumulate across stable ticks.
+                self._audio_endpoint_change_pending_since = 0.0
+                self._audio_endpoint_last_fingerprint = current
+        except Exception:
+            # Watchdog must never escape an exception into the
+            # main loop — that would freeze the GUI.
+            pass
+
+    def _restart_audio_cache_only(self) -> None:
+        """Tear down the audio sidecar ffmpeg + WASAPI bridges and
+        respawn them on the CURRENT default endpoints. The video
+        cache is left running so the rolling video buffer survives
+        the switch. delete_files=False keeps any audio segment
+        files on disk (the new sidecar will re-use the same session
+        id and continue rotating into them)."""
+        try:
+            self._stop_clip_cache_audio(delete_files=False)
+        except Exception:
+            pass
+        try:
+            ok = self._start_clip_cache_audio()
+        except Exception:
+            ok = False
+        try:
+            self._clip_cache_has_audio = bool(ok)
+        except Exception:
+            pass
+
+    # ===== End audio-endpoint watchdog ==============================
 
         def _capture_clip_cache_frame(self) -> None:
             if self._clip_cache_segment_writer is None or self._clip_cache_region is None:

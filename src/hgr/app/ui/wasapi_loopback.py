@@ -795,6 +795,90 @@ def probe_input_device_format(
                 pass
 
 
+def probe_default_loopback_identity() -> Optional[tuple[int, str]]:
+    """Cheap (index, name) probe of the CURRENT Windows default
+    playback endpoint that WASAPI loopback would capture. Used by
+    the audio-endpoint watchdog to detect mid-session output-device
+    changes (user swaps speakers ↔ headset) without paying the
+    full open-stream cost of probe_default_loopback_format().
+
+    Returns None if PyAudioWPatch is missing or no default playback
+    endpoint exists. ~3 ms in practice."""
+    try:
+        import pyaudiowpatch as pa  # type: ignore
+    except Exception:
+        return None
+    p = None
+    try:
+        p = pa.PyAudio()
+        info = p.get_default_wasapi_loopback()
+        return (int(info.get("index", -1)), str(info.get("name", "")))
+    except Exception:
+        return None
+    finally:
+        if p is not None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+
+def probe_input_device_identity(
+    name_hint: Optional[str] = None,
+    *,
+    device_index: Optional[int] = None,
+) -> Optional[tuple[int, str]]:
+    """Cheap (index, name) probe of the user's preferred mic.
+    Mirror of probe_input_device_format but without the format
+    fields. Resolution priority matches the full probe so the
+    watchdog sees the SAME device the cache writer actually opens:
+
+      1. device_index (typically voice listener's resolved index)
+      2. case-insensitive substring match on name_hint
+      3. PortAudio default WASAPI input
+    """
+    try:
+        import pyaudiowpatch as pa  # type: ignore
+    except Exception:
+        return None
+    p = None
+    try:
+        p = pa.PyAudio()
+        if device_index is not None and int(device_index) >= 0:
+            try:
+                info = p.get_device_info_by_index(int(device_index))
+                if int(info.get("maxInputChannels", 0) or 0) > 0:
+                    return (int(device_index), str(info.get("name", "")))
+            except Exception:
+                pass
+        if name_hint:
+            name_lower = str(name_hint).lower().strip()
+            if name_lower:
+                for i in range(p.get_device_count()):
+                    try:
+                        info = p.get_device_info_by_index(i)
+                        if int(info.get("maxInputChannels", 0) or 0) <= 0:
+                            continue
+                        nm = str(info.get("name", "")).lower()
+                        if name_lower in nm or nm in name_lower:
+                            return (int(i), str(info.get("name", "")))
+                    except Exception:
+                        continue
+        try:
+            info = p.get_default_input_device_info()
+            return (int(info.get("index", -1)), str(info.get("name", "")))
+        except Exception:
+            return None
+    except Exception:
+        return None
+    finally:
+        if p is not None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+
 def probe_default_loopback_format() -> Optional[tuple[int, int, int]]:
     """Open + immediately close a PyAudio instance to discover the
     default WASAPI loopback endpoint's (device_index, rate, channels).
