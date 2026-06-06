@@ -24584,8 +24584,19 @@ Admin elevation
         audio_anchor_snapshot = float(
             getattr(self, "_clip_cache_audio_started_at", 0.0) or 0.0
         )
-        if was_active:
-            self._stop_clip_cache_ffmpeg(delete_files=False)
+        # CLIP V2: do NOT stop the cache before reading the manifest.
+        # The v1 stop+restart pattern wiped the rolling buffer after
+        # every clip — finally-block called _cleanup_ffmpeg_clip_cache_files
+        # which deleted every segment_*.mkv + manifest CSV, then the
+        # restart began writing from segment 0 again. Net effect: a 5-min
+        # buffer became 0 s after each export, so the next 2 m / 5 m clip
+        # only had what had been recorded since the previous clip.
+        #
+        # By keeping the cache running we trade a tiny bit of recency
+        # (the in-progress segment isn't in the manifest until ffmpeg
+        # naturally finalizes it, ~10 s) for buffer continuity. The
+        # hot-segment snapshot below already covers the in-progress
+        # segment on its own.
         try:
             entries = self._parse_ffmpeg_clip_manifest()
             if not entries:
@@ -25162,15 +25173,32 @@ Admin elevation
                 pass
             return (False, None, 0.0)
         finally:
-            self._cleanup_ffmpeg_clip_cache_files()
-            if (
-                was_active
-                and self._worker is not None
-                and getattr(self._worker, "is_running", False)
-            ):
-                # subprocess.Popen + attribute writes only — no
-                # QWidget / QObject calls, so safe from a thread.
-                self._start_clip_cache_ffmpeg()
+            # CLIP V2: do NOT wipe + restart the cache here. The cache
+            # is still running and its rolling buffer must survive the
+            # export so the next clip ('clip last 2 minutes' right
+            # after 'clip that') has the previous buffer worth of
+            # footage available. The v1 cleanup+restart pattern reset
+            # the buffer on every export, producing the symptom the
+            # user reported: a 2-min clip immediately after a 60-s
+            # clip only had ~40 s of real footage + frozen-frame
+            # padding for the rest. _cleanup_ffmpeg_clip_cache_files
+            # is still called on full cache stop (settings-driven
+            # restart, app shutdown) so stale files don't accumulate
+            # forever.
+            #
+            # We DO clean up the per-export temp files: the hot
+            # snapshot copies and any concat_*.txt list files. Those
+            # are not segments and don't carry buffer state.
+            try:
+                cache_dir = self._clip_cache_dir()
+                for pattern in ("hot_snapshot_*.mkv", "concat_*.txt", "audio_concat_*.txt"):
+                    for path in cache_dir.glob(pattern):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     def _run_clip_export_opencv(
         self, duration_seconds: int, target_region: QRect,
