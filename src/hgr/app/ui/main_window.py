@@ -6073,12 +6073,6 @@ class MainWindow(QMainWindow):
         self._clip_cache_audio_list_path: Path | None = None
         self._clip_cache_audio_segment_pattern: Path | None = None
         self._clip_cache_audio_started_at: float = 0.0
-        # Bumped by _restart_audio_cache_only when the watchdog
-        # detects a mid-session device change. Each value picks a
-        # unique CSV + segment filename pattern so the OLD audio
-        # (pre-switch) stays on disk and the export's parser can
-        # merge it with the NEW audio.
-        self._clip_cache_audio_subindex: int = 0
         self._clip_cache_wrap_count = max(3, int(np.ceil(self._clip_cache_max_seconds / self._clip_cache_segment_seconds)) + 1)
         self._clip_cache_timer = QTimer(self)
         self._clip_cache_timer.setInterval(int(round(1000.0 / self._clip_cache_fps)))
@@ -22424,26 +22418,13 @@ Admin elevation
     def _ffmpeg_clip_segment_pattern(self) -> Path:
         return self._clip_cache_dir() / f"segment_{self._clip_cache_session_id()}_%03d.mkv"
     def _ffmpeg_clip_audio_list_path(self) -> Path:
-        # The audio sidecar can be hot-restarted by the device-change
-        # watchdog (MVP-fixup D) WITHOUT touching the video cache. Each
-        # restart bumps `_clip_cache_audio_subindex` so the new sidecar
-        # uses a new filename, and the OLD audio segments stay on disk.
-        # Without the sub-index, the new sidecar would reuse the same
-        # CSV (truncated on reopen) and overwrite the existing audio
-        # segments starting at slot 0 — wiping every second of audio
-        # captured before the device change. The export-side parser
-        # below scans all `audio_segments_<sid>_<subindex>.csv` files
-        # and merges their entries so a clip spanning a device switch
-        # still has continuous audio.
-        sub = int(getattr(self, "_clip_cache_audio_subindex", 0) or 0)
-        return self._clip_cache_dir() / f"audio_segments_{self._clip_cache_session_id()}_{sub:02d}.csv"
+        return self._clip_cache_dir() / f"audio_segments_{self._clip_cache_session_id()}.csv"
     def _ffmpeg_clip_audio_segment_pattern(self) -> Path:
         # ADTS AAC (.aac) — raw stream framed for direct concatenation
         # by the segment muxer. .m4a/MP4 would require an explicit
         # -segment_format mp4 and a moov atom per segment, which the
         # segment muxer doesn't produce cleanly mid-stream.
-        sub = int(getattr(self, "_clip_cache_audio_subindex", 0) or 0)
-        return self._clip_cache_dir() / f"audio_{self._clip_cache_session_id()}_{sub:02d}_%03d.aac"
+        return self._clip_cache_dir() / f"audio_{self._clip_cache_session_id()}_%03d.aac"
     def _kill_orphan_ffmpeg_for_clip_cache(self) -> int:
         """Find and kill any ffmpeg.exe processes that are using
         files in our clip cache directory. These are zombies from
@@ -23706,124 +23687,82 @@ Admin elevation
         )
 
     def _parse_ffmpeg_clip_audio_manifest(self) -> list[dict]:
-        """Parse the audio segment CSV(s) — same shape as
+        """Parse the audio segment CSV — same shape as
         `_parse_ffmpeg_clip_manifest` but for the parallel audio
         ffmpeg's output. Used by the export to pick which audio
-        segments overlap the video time window being saved.
-
-        Reads from EVERY `audio_segments_<sid>_<*>.csv` it finds in
-        the cache dir, not just the currently-active one. The
-        watchdog (MVP-fixup D) bumps a sub-index on each device-
-        change restart, so audio captured before a switch lives in
-        an older CSV — merging them all keeps a clip that spans a
-        switch from going silent on the pre-switch half.
-
-        Cross-session order is established by wall_end_mtime (each
-        segment's file mtime is the wall-clock moment ffmpeg
-        finalized it), not by the per-session relative end_time."""
-        cache_dir = self._clip_cache_dir()
-        # Glob all sub-session CSVs for this cache session id. If
-        # the live `_clip_cache_audio_list_path` exists outside the
-        # glob (e.g. legacy non-subindexed filename from before
-        # MVP-fixup D), include it too.
-        sid = ""
-        try:
-            sid = str(self._clip_cache_session_id() or "")
-        except Exception:
-            sid = ""
-        csv_paths: list[Path] = []
-        try:
-            if sid:
-                csv_paths.extend(sorted(
-                    cache_dir.glob(f"audio_segments_{sid}_*.csv")
-                ))
-            # Legacy / non-subindex path (pre-MVP-fixup D).
-            legacy = cache_dir / f"audio_segments_{sid}.csv" if sid else None
-            if legacy is not None and legacy.exists() and legacy not in csv_paths:
-                csv_paths.append(legacy)
-            live_path = getattr(self, "_clip_cache_audio_list_path", None)
-            if live_path is not None and live_path.exists() and live_path not in csv_paths:
-                csv_paths.append(live_path)
-        except Exception:
-            pass
-        if not csv_paths:
+        segments overlap the video time window being saved."""
+        list_path = self._clip_cache_audio_list_path
+        if list_path is None or not list_path.exists():
             return []
         entries: list[dict] = []
-        for list_path in csv_paths:
-            try:
-                with list_path.open("r", newline="", encoding="utf-8") as handle:
-                    reader = csv.reader(handle)
-                    for row in reader:
-                        if len(row) < 3:
-                            continue
-                        raw_path = (row[0] or "").strip()
-                        try:
-                            start_time = float(row[1])
-                            end_time = float(row[2])
-                        except Exception:
-                            continue
-                        path = Path(raw_path)
-                        if not path.is_absolute():
-                            path = self._clip_cache_dir() / path
-                        if not path.exists() or path.stat().st_size <= 0:
-                            continue
-                        # Wall-clock end time of this segment from
-                        # the file's mtime. mtime tracks segment
-                        # completion in wall time. Using mtime
-                        # instead of `a_anchor + end_time` makes
-                        # the manifest robust to WASAPI loopback
-                        # rate drift (under-delivery causes
-                        # a_anchor math to systematically pick
-                        # segments from before the requested
-                        # window) AND lets entries from different
-                        # sub-sessions (post-watchdog-restart)
-                        # be ordered together correctly.
-                        try:
-                            wall_end_mtime = float(path.stat().st_mtime)
-                        except Exception:
-                            wall_end_mtime = 0.0
-                        file_duration = max(0.0, end_time - start_time)
-                        entries.append({
-                            "path": path,
-                            "start_time": start_time,
-                            "end_time": end_time,
-                            "file_duration": file_duration,
-                            "wall_end_mtime": wall_end_mtime,
-                            "wall_start_mtime": (
-                                wall_end_mtime - file_duration
-                                if wall_end_mtime > 0
-                                else 0.0
-                            ),
-                        })
-            except Exception:
-                # Skip this CSV but keep going with the others —
-                # one corrupt sub-session shouldn't blank the whole
-                # audio track.
-                continue
-        if not entries:
+        try:
+            with list_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.reader(handle)
+                for row in reader:
+                    if len(row) < 3:
+                        continue
+                    raw_path = (row[0] or "").strip()
+                    try:
+                        start_time = float(row[1])
+                        end_time = float(row[2])
+                    except Exception:
+                        continue
+                    path = Path(raw_path)
+                    if not path.is_absolute():
+                        path = self._clip_cache_dir() / path
+                    if not path.exists() or path.stat().st_size <= 0:
+                        continue
+                    # Wall-clock end time of this segment from the
+                    # file's mtime. ffmpeg writes the segment file
+                    # then closes it (and sometimes touches it once
+                    # more on rotation), so mtime tracks segment
+                    # completion in wall time. Using mtime instead
+                    # of `a_anchor + end_time` makes the manifest
+                    # robust to WASAPI loopback rate drift — when
+                    # the device under-delivers at e.g. 89 % of
+                    # nominal, file-time grows slower than wall time
+                    # and the a_anchor-based math systematically
+                    # picks segments from BEFORE the requested wall
+                    # window (the user-reported "audio is 6-7 s
+                    # early" symptom). mtime keeps each segment
+                    # pinned to the actual moment its content
+                    # finished arriving at ffmpeg regardless of how
+                    # the device clock ran.
+                    try:
+                        wall_end_mtime = float(path.stat().st_mtime)
+                    except Exception:
+                        wall_end_mtime = 0.0
+                    file_duration = max(0.0, end_time - start_time)
+                    entries.append({
+                        "path": path,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                        "file_duration": file_duration,
+                        # Wall-clock window the segment covers,
+                        # derived from mtime. Consumed by the
+                        # export path instead of recomputing from
+                        # a_anchor.
+                        "wall_end_mtime": wall_end_mtime,
+                        "wall_start_mtime": (
+                            wall_end_mtime - file_duration
+                            if wall_end_mtime > 0
+                            else 0.0
+                        ),
+                    })
+        except Exception:
             return []
         # Dedupe by path — same rationale as the video manifest
         # parser: -segment_wrap reuses filenames after the ring
         # rolls over, so the same audio_NNN.aac may briefly appear
-        # twice in a CSV with different times, and feeding both
-        # to concat would play the same (latest) bytes twice. With
-        # multiple sub-sessions, dedup is keyed by wall_end_mtime
-        # tiebreak so the LATEST written content wins.
+        # twice in the CSV with different times, and feeding both
+        # to concat would play the same (latest) bytes twice.
         latest_by_path: dict[str, dict] = {}
         for entry in entries:
             key = str(entry["path"])
             prior = latest_by_path.get(key)
-            if (prior is None
-                    or entry["wall_end_mtime"] > prior["wall_end_mtime"]):
+            if prior is None or entry["end_time"] > prior["end_time"]:
                 latest_by_path[key] = entry
-        # Order by wall_end_mtime, not the per-session relative
-        # end_time. Cross-session correctness requires the wall-
-        # clock ordering since each sub-session's end_time restarts
-        # at 0.
-        ordered = sorted(
-            latest_by_path.values(),
-            key=lambda e: float(e.get("wall_end_mtime", 0.0) or 0.0),
-        )
+        ordered = sorted(latest_by_path.values(), key=lambda e: e["end_time"])
         # CHAIN wall_start_mtime to the previous segment's
         # wall_end_mtime so successive segments are wall-contiguous
         # regardless of how slowly ffmpeg's amix processed inputs.
@@ -24586,9 +24525,6 @@ Admin elevation
             # by a still-exiting ffmpeg) don't collide with the new
             # session's manifest and segment paths.
             self._clip_cache_session_id_cache = None
-            # And reset the audio sub-index — a fresh session id
-            # means there's no prior sub-session content to preserve.
-            self._clip_cache_audio_subindex = 0
         self._clip_cache_backend = ""
 
     # ===== Audio-endpoint watchdog (MVP-fixup D) =====================
@@ -24786,25 +24722,13 @@ Admin elevation
         """Tear down the audio sidecar ffmpeg + WASAPI bridges and
         respawn them on the CURRENT default endpoints. The video
         cache is left running so the rolling video buffer survives
-        the switch.
-
-        Bumps `_clip_cache_audio_subindex` BEFORE the new sidecar
-        starts so its CSV + AAC segments land in a fresh per-sub-
-        session filename pattern. The previous sub-session's files
-        are left untouched on disk (delete_files=False) so the
-        export can still read audio captured before the device
-        change. The export-side parser merges entries from every
-        `audio_segments_<sid>_<*>.csv` it finds in the cache dir."""
+        the switch. delete_files=False keeps any audio segment
+        files on disk (the new sidecar will re-use the same session
+        id and continue rotating into them)."""
         try:
             self._stop_clip_cache_audio(delete_files=False)
         except Exception:
             pass
-        try:
-            self._clip_cache_audio_subindex = int(
-                getattr(self, "_clip_cache_audio_subindex", 0) or 0
-            ) + 1
-        except Exception:
-            self._clip_cache_audio_subindex = 1
         try:
             ok = self._start_clip_cache_audio()
         except Exception:
