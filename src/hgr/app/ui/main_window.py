@@ -24213,9 +24213,21 @@ Admin elevation
                         # the "mic is 3-4 s ahead of video" symptom
                         # that came from the TCP-accept gap between
                         # the two bridges starting.
+                        #
+                        # Callback-mode mic adds another ~1 s of
+                        # latency vs polling mode (PortAudio
+                        # callback queue + drain-thread pipe write).
+                        # User reported mic 1 s LATE after the
+                        # callback-mode switch. Shift the align
+                        # target 1 s EARLIER so the mic bridge
+                        # pre-pads an additional 1 s of silence,
+                        # effectively pulling mic content 1 s
+                        # earlier in the audio file to compensate.
                         sys_first_sample = None
                         if self._wasapi_writer is not None:
                             sys_first_sample = self._wasapi_writer.first_sample_at
+                            if sys_first_sample is not None:
+                                sys_first_sample -= 1.0
                         mic_writer = WasapiLoopbackWriter(
                             sock_file,
                             device_index=mic_dev,
