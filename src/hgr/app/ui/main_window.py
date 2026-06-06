@@ -26080,7 +26080,35 @@ Admin elevation
     def _on_clip_export_finished_main_thread(self) -> None:
         """GUI-thread completion for the off-thread clip export.
         Hides the processing overlay, updates the action label,
-        and (on success) fires the save-location voice prompt."""
+        and (on success) fires the save-location voice prompt.
+
+        Wrapped in a top-level try/except + stderr trace so a crash
+        in any post-export step (overlay hide, toast show, save
+        prompt queue, cache restart) lands a clear diagnostic in
+        the log instead of taking the whole app down silently. The
+        user has reported 'crash on clip save' for 2-min variants
+        and without the trace we can't pinpoint the call site."""
+        try:
+            self._on_clip_export_finished_main_thread_inner()
+        except Exception as _post_export_exc:
+            try:
+                import sys as _sys, traceback as _tb
+                _sys.stderr.write(
+                    f"[clip-export] CRASH in post-export GUI handler: "
+                    f"{type(_post_export_exc).__name__}: {_post_export_exc!s}\n"
+                )
+                _tb.print_exc(file=_sys.stderr)
+                _sys.stderr.flush()
+            except Exception:
+                pass
+            # Best-effort: hide the processing overlay so the UI
+            # doesn't get stuck on the spinning pill.
+            try:
+                self.processing_overlay.hide_processing()
+            except Exception:
+                pass
+
+    def _on_clip_export_finished_main_thread_inner(self) -> None:
         try:
             self.processing_overlay.hide_processing()
         except Exception:
