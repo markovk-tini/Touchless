@@ -156,6 +156,15 @@ class WasapiLoopbackWriter:
             queue.Queue(maxsize=2000) if self._use_callback_mode else None
         )
         self._drain_thread: Optional[threading.Thread] = None
+        # Externally-observable liveness counter for the liveness
+        # watchdog. Updated each time real (non-silence) audio data
+        # arrives from PortAudio. Main thread's liveness QTimer
+        # compares this against time.time(); if it hasn't moved in
+        # >N seconds the bridge is silently dead and the watchdog
+        # triggers auto-repair via swap_device(). Stays 0.0 until
+        # the first real chunk so a startup race doesn't trigger
+        # false-positive repair.
+        self.last_real_data_at: float = 0.0
         # Device hot-swap state. The watchdog calls swap_device() to
         # follow a Windows-default-playback / preferred-mic change
         # mid-session WITHOUT restarting ffmpeg (the segment ring
@@ -530,6 +539,12 @@ class WasapiLoopbackWriter:
             # original -ar/-ac.
             if self._resample_src_rate is not None:
                 in_data = self._maybe_resample(in_data)
+            # Liveness signal for the main-thread watchdog.
+            try:
+                import time as _t
+                self.last_real_data_at = _t.time()
+            except Exception:
+                pass
             try:
                 self._callback_queue.put_nowait(in_data)
             except queue.Full:
@@ -783,6 +798,8 @@ class WasapiLoopbackWriter:
                         real_bytes += len(data)
                         last_real_at = now_t
                         silence_mode = False
+                        # Liveness signal for main-thread watchdog.
+                        self.last_real_data_at = now_t
                 else:
                     # No real data this tick.
                     if not silence_mode:

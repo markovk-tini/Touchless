@@ -24496,10 +24496,29 @@ Admin elevation
                 self._start_audio_endpoint_watchdog()
             except Exception:
                 pass
+            # Start the bridge-liveness watchdog. Polls every 5 s for
+            # last_real_data_at on both bridges; if the mic hasn't
+            # produced real samples in 15 s OR the sys loopback in
+            # 45 s, attempts an in-place swap as auto-repair. This
+            # catches the "60s clip with no audio at all" failure
+            # mode where the bridge opens OK but the device produces
+            # zero real samples (driver quiesced, exclusive lock, etc.)
+            try:
+                self._start_audio_liveness_watchdog()
+            except Exception:
+                pass
         return True
     def _stop_clip_cache_ffmpeg(self, *, delete_files: bool) -> None:
-        # Stop the watchdog FIRST so a tick can't race the teardown by
-        # trying to swap a stream we're about to close.
+        # Stop the liveness watchdog FIRST (it can call into the
+        # endpoint watchdog's swap path which we're about to tear
+        # down).
+        try:
+            self._stop_audio_liveness_watchdog()
+        except Exception:
+            pass
+        # Stop the endpoint watchdog SECOND so a tick can't race
+        # the teardown by trying to swap a stream we're about to
+        # close.
         try:
             self._stop_audio_endpoint_watchdog()
         except Exception:
@@ -24782,6 +24801,158 @@ Admin elevation
                             pass
 
     # ===== End audio-endpoint watchdog =============================
+
+    # ===== Audio-liveness watchdog + auto-repair (FM4) =============
+    # Checks each bridge's externally-observable last_real_data_at
+    # timestamp every 5 s. If MIC has been silent >15 s OR SYS has
+    # been silent >45 s (longer because user pausing music is a
+    # legitimate silence-source for sys-loopback), triggers an
+    # in-place swap as auto-repair. The repair is cheap (swap_device
+    # is ~50 ms) and the worst-case false positive (user truly
+    # has nothing playing) is harmless: swap to the same default
+    # device is a no-op.
+    #
+    # Kill switch: env var HGR_CLIP_CACHE_AUTO_REPAIR=0 disables the
+    # repair leg; the watchdog still WARNS on stderr.
+
+    def _start_audio_liveness_watchdog(self) -> None:
+        existing = getattr(self, "_audio_liveness_watchdog_timer", None)
+        if existing is not None:
+            try:
+                if existing.isActive():
+                    return
+            except Exception:
+                pass
+        # Initialise the last-repair-attempt stamps so the first
+        # tick has 5 s grace before any auto-repair can fire.
+        self._audio_liveness_sys_warned_at: float = 0.0
+        self._audio_liveness_mic_warned_at: float = 0.0
+        self._audio_liveness_sys_repaired_at: float = 0.0
+        self._audio_liveness_mic_repaired_at: float = 0.0
+        timer = QTimer(self)
+        timer.setInterval(5000)  # 5 s
+        timer.timeout.connect(self._tick_audio_liveness_watchdog)
+        timer.start()
+        self._audio_liveness_watchdog_timer = timer
+
+    def _stop_audio_liveness_watchdog(self) -> None:
+        timer = getattr(self, "_audio_liveness_watchdog_timer", None)
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except Exception:
+            pass
+        try:
+            timer.deleteLater()
+        except Exception:
+            pass
+        self._audio_liveness_watchdog_timer = None
+
+    def _tick_audio_liveness_watchdog(self) -> None:
+        """Check bridge liveness; warn + auto-repair on prolonged
+        silence. Runs every 5 s."""
+        try:
+            if not bool(getattr(self, "_clip_cache_has_audio", False)):
+                return
+            export_thread = getattr(self, "_clip_export_thread", None)
+            if export_thread is not None and export_thread.is_alive():
+                return
+            # Don't race the endpoint watchdog's in-progress swap.
+            if getattr(self, "_audio_endpoint_swap_in_progress", False):
+                return
+            import time as _time
+            import os as _os
+            now = _time.time()
+            auto_repair_enabled = (
+                _os.environ.get("HGR_CLIP_CACHE_AUTO_REPAIR", "1") != "0"
+            )
+            # SYS bridge: 45 s silence threshold, 60 s repair cooldown.
+            sys_writer = getattr(self, "_wasapi_writer", None)
+            if sys_writer is not None:
+                sys_last = float(getattr(sys_writer, "last_real_data_at", 0.0) or 0.0)
+                if sys_last > 0:
+                    silent_for = now - sys_last
+                    if silent_for >= 45.0:
+                        warned_at = float(self._audio_liveness_sys_warned_at)
+                        if (now - warned_at) >= 30.0:
+                            try:
+                                import sys as _sys
+                                _sys.stderr.write(
+                                    f"[clip-audio] SYS bridge silent for "
+                                    f"{silent_for:.1f}s (user likely paused "
+                                    f"playback — informational)\n"
+                                )
+                                _sys.stderr.flush()
+                            except Exception:
+                                pass
+                            self._audio_liveness_sys_warned_at = now
+                        if (auto_repair_enabled
+                                and silent_for >= 60.0
+                                and (now - float(self._audio_liveness_sys_repaired_at)) >= 60.0):
+                            try:
+                                import sys as _sys
+                                _sys.stderr.write(
+                                    f"[clip-audio] SYS auto-repair: "
+                                    f"silent {silent_for:.0f}s -> swap_device\n"
+                                )
+                                _sys.stderr.flush()
+                            except Exception:
+                                pass
+                            self._audio_liveness_sys_repaired_at = now
+                            try:
+                                self._swap_audio_endpoints_in_place()
+                            except Exception:
+                                pass
+            # MIC bridge: 15 s silence threshold (mic should ALWAYS
+            # produce samples — silence here means a broken driver
+            # or device gone). 30 s repair cooldown.
+            mic_writer = getattr(self, "_wasapi_mic_writer", None)
+            if mic_writer is not None:
+                mic_last = float(getattr(mic_writer, "last_real_data_at", 0.0) or 0.0)
+                if mic_last > 0:
+                    silent_for = now - mic_last
+                    if silent_for >= 15.0:
+                        warned_at = float(self._audio_liveness_mic_warned_at)
+                        if (now - warned_at) >= 30.0:
+                            try:
+                                import sys as _sys
+                                _sys.stderr.write(
+                                    f"[clip-audio] WARNING: MIC bridge silent "
+                                    f"for {silent_for:.1f}s — bridge looks dead\n"
+                                )
+                                _sys.stderr.flush()
+                            except Exception:
+                                pass
+                            try:
+                                self.last_action_label.setText(
+                                    f"Mic capture stalled {silent_for:.0f}s — "
+                                    "attempting recovery"
+                                )
+                            except Exception:
+                                pass
+                            self._audio_liveness_mic_warned_at = now
+                        if (auto_repair_enabled
+                                and (now - float(self._audio_liveness_mic_repaired_at)) >= 30.0):
+                            try:
+                                import sys as _sys
+                                _sys.stderr.write(
+                                    f"[clip-audio] MIC auto-repair: silent "
+                                    f"{silent_for:.0f}s -> swap_device\n"
+                                )
+                                _sys.stderr.flush()
+                            except Exception:
+                                pass
+                            self._audio_liveness_mic_repaired_at = now
+                            try:
+                                self._swap_audio_endpoints_in_place()
+                            except Exception:
+                                pass
+        except Exception:
+            # Watchdog must never escape an exception.
+            pass
+
+    # ===== End audio-liveness watchdog =============================
 
         def _capture_clip_cache_frame(self) -> None:
             if self._clip_cache_segment_writer is None or self._clip_cache_region is None:
