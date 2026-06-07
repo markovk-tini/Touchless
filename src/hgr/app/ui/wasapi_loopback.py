@@ -156,6 +156,246 @@ class WasapiLoopbackWriter:
             queue.Queue(maxsize=2000) if self._use_callback_mode else None
         )
         self._drain_thread: Optional[threading.Thread] = None
+        # Device hot-swap state. The watchdog calls swap_device() to
+        # follow a Windows-default-playback / preferred-mic change
+        # mid-session WITHOUT restarting ffmpeg (the segment ring
+        # would be wiped). Two transports:
+        # * callback mode: stop old stream, open new stream sharing
+        #   the SAME self._stream_callback so chunks land in the
+        #   SAME _callback_queue, swap self._stream/self._pa under
+        #   _swap_lock, close old outside the lock.
+        # * polling mode: open the new stream (start=True implicit
+        #   via pa.open), store as _swap_pending tuple; the _run
+        #   loop picks it up at the top of its next iteration,
+        #   swaps the local `stream` ref, and closes the old
+        #   stream outside the lock.
+        # _resample_src_* are set when the new device has a
+        # different rate/channel config from the originally-opened
+        # one; _maybe_resample() then linear-interp-resamples each
+        # chunk before it reaches stdin so ffmpeg keeps seeing
+        # bytes at its original -ar/-ac.
+        self._swap_lock: threading.Lock = threading.Lock()
+        self._swap_pending: Optional[tuple] = None
+        self._resample_src_rate: Optional[int] = None
+        self._resample_src_channels: Optional[int] = None
+
+    def swap_device(
+        self,
+        new_device_index: int,
+        new_rate: int,
+        new_channels: int,
+    ) -> bool:
+        """Replace the underlying PortAudio capture device WITHOUT
+        touching the downstream stdin/socket pipe, the callback
+        queue, the drain thread, or the ffmpeg subprocess on the
+        other end. The segment ring keeps rotating with continuous
+        filenames; first_sample_at stays anchored to the original
+        startup wall time so mic-alignment math is preserved.
+
+        Returns True on successful swap, False on any open/start
+        failure (the OLD stream is left intact in that case so the
+        user keeps hearing audio in the next clip).
+
+        Format-mismatch case: if the new device's rate/channels
+        differ from the original we opened with, install the
+        _resample_src_* fields so _maybe_resample() linear-interps
+        each chunk back to the original format. PortAudio's WASAPI
+        shared-mode resampler usually handles this automatically
+        when we ask for the original rate/channels — that's the
+        first attempt; numpy fallback is the safety net."""
+        try:
+            new_device_index = int(new_device_index)
+        except Exception:
+            return False
+        if new_device_index < 0:
+            return False
+        if new_device_index == int(self._device_index):
+            return True  # no-op: already on this device
+        try:
+            import pyaudiowpatch as pa  # type: ignore
+        except Exception:
+            return False
+        # Build a NEW PyAudio instance + stream. We use a fresh PA
+        # instance for the new device because PortAudio's stream
+        # handles are tied to the PA context they were opened in;
+        # closing the old PA context after the swap is also cleaner.
+        new_pa = None
+        new_stream = None
+        try:
+            new_pa = pa.PyAudio()
+            # First attempt: ask PA for the ORIGINAL rate/channels.
+            # WASAPI shared-mode resamples internally — handles
+            # rate/channel mismatch cleanly for the common cases
+            # (48k stereo <-> 44.1k stereo, 48k stereo <-> 48k mono).
+            common_kwargs = dict(
+                format=pa.paInt16,
+                channels=self.channels,
+                rate=self.rate,
+                input=True,
+                input_device_index=new_device_index,
+                frames_per_buffer=1024,
+            )
+            if self._use_callback_mode:
+                common_kwargs["start"] = False
+                common_kwargs["stream_callback"] = self._stream_callback
+            try:
+                new_stream = new_pa.open(**common_kwargs)
+                # Success at original format -> no software resampler needed.
+                self._resample_src_rate = None
+                self._resample_src_channels = None
+            except Exception:
+                # PA-side resampler refused (rare: exclusive mode,
+                # weird DAC). Fall back to opening at the device's
+                # native format and software-resample in
+                # _maybe_resample.
+                common_kwargs["rate"] = int(new_rate) or 48000
+                common_kwargs["channels"] = max(1, int(new_channels) or 1)
+                new_stream = new_pa.open(**common_kwargs)
+                self._resample_src_rate = int(common_kwargs["rate"])
+                self._resample_src_channels = int(common_kwargs["channels"])
+        except Exception:
+            try:
+                if new_pa is not None:
+                    new_pa.terminate()
+            except Exception:
+                pass
+            return False
+        # Stage the swap. Polling mode hands the new stream/pa to
+        # the _run loop via _swap_pending; the loop performs the
+        # ref swap + closes the old stream outside the lock.
+        # Callback mode does the start_stream + ref swap inline
+        # here because there's no main loop to defer into.
+        if not self._use_callback_mode:
+            old_stream = self._stream
+            old_pa = self._pa
+            with self._swap_lock:
+                # If a previous swap hadn't been consumed yet,
+                # close it now so we don't leak a stream.
+                prev = self._swap_pending
+                if prev is not None:
+                    try:
+                        prev_stream, prev_pa, *_ = prev
+                        try:
+                            prev_stream.stop_stream()
+                        except Exception:
+                            pass
+                        try:
+                            prev_stream.close()
+                        except Exception:
+                            pass
+                        try:
+                            prev_pa.terminate()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                self._swap_pending = (
+                    new_stream, new_pa, int(new_device_index),
+                    old_stream, old_pa,
+                )
+            return True
+        # Callback mode: start the new stream first (callbacks
+        # begin firing into our shared _callback_queue), then swap
+        # references atomically, then stop+close the old stream
+        # OUTSIDE the lock so its final callbacks don't deadlock.
+        try:
+            new_stream.start_stream()
+        except Exception:
+            try:
+                new_stream.close()
+            except Exception:
+                pass
+            try:
+                new_pa.terminate()
+            except Exception:
+                pass
+            return False
+        with self._swap_lock:
+            old_stream = self._stream
+            old_pa = self._pa
+            self._stream = new_stream
+            self._pa = new_pa
+            self._device_index = int(new_device_index)
+        # Now drain + close old outside the lock.
+        try:
+            if old_stream is not None:
+                try:
+                    old_stream.stop_stream()
+                except Exception:
+                    pass
+                try:
+                    old_stream.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if old_pa is not None:
+                old_pa.terminate()
+        except Exception:
+            pass
+        return True
+
+    def _maybe_resample(self, data: bytes) -> bytes:
+        """Linear-interp resample `data` from
+        (_resample_src_rate, _resample_src_channels) to
+        (self.rate, self.channels). No-op when no resampler is
+        installed (the common case after a same-format swap).
+        Cheap: ~0.5 ms per 21 ms chunk via numpy."""
+        src_rate = self._resample_src_rate
+        src_channels = self._resample_src_channels
+        if src_rate is None or src_channels is None:
+            return data
+        if src_rate == self.rate and src_channels == self.channels:
+            return data
+        try:
+            import numpy as np
+            # Reinterpret bytes as int16 samples, reshape to
+            # (frames, src_channels).
+            arr = np.frombuffer(data, dtype=np.int16)
+            if arr.size == 0:
+                return data
+            if src_channels > 1:
+                if arr.size % src_channels != 0:
+                    return data  # ragged - skip
+                arr = arr.reshape(-1, src_channels)
+            else:
+                arr = arr.reshape(-1, 1)
+            # Channel adapt first.
+            if src_channels != self.channels:
+                if self.channels == 1:
+                    # Down-mix to mono via average.
+                    arr = arr.mean(axis=1, keepdims=True).astype(np.int16)
+                elif self.channels == 2 and src_channels == 1:
+                    # Up-mix to stereo by duplicating.
+                    arr = np.repeat(arr, 2, axis=1)
+                else:
+                    # Other channel mappings: just truncate / pad.
+                    if arr.shape[1] > self.channels:
+                        arr = arr[:, :self.channels]
+                    else:
+                        pad = np.zeros(
+                            (arr.shape[0], self.channels - arr.shape[1]),
+                            dtype=np.int16,
+                        )
+                        arr = np.concatenate([arr, pad], axis=1)
+            # Rate adapt via linear interp.
+            if src_rate != self.rate:
+                ratio = float(self.rate) / float(src_rate)
+                new_len = int(arr.shape[0] * ratio)
+                if new_len <= 0:
+                    return data
+                x_old = np.linspace(0.0, 1.0, num=arr.shape[0], endpoint=False)
+                x_new = np.linspace(0.0, 1.0, num=new_len, endpoint=False)
+                out = np.empty((new_len, arr.shape[1]), dtype=np.int16)
+                for c in range(arr.shape[1]):
+                    out[:, c] = np.interp(x_new, x_old, arr[:, c]).astype(np.int16)
+                arr = out
+            return arr.tobytes()
+        except Exception:
+            # On any failure, return the original bytes — better to
+            # have slightly-mistimed audio than no audio at all.
+            return data
 
     def start(self) -> bool:
         """Open the loopback stream + spawn the writer thread.
@@ -283,6 +523,13 @@ class WasapiLoopbackWriter:
             except Exception:
                 return (None, 0)
         if in_data and self._callback_queue is not None:
+            # If a swap installed a software resampler (different
+            # rate or channels on the new device), bring the chunk
+            # back to the original (rate, channels) before
+            # enqueueing so ffmpeg keeps seeing bytes at its
+            # original -ar/-ac.
+            if self._resample_src_rate is not None:
+                in_data = self._maybe_resample(in_data)
             try:
                 self._callback_queue.put_nowait(in_data)
             except queue.Full:
@@ -469,6 +716,55 @@ class WasapiLoopbackWriter:
             while not self._stop.is_set():
                 now_t = _time.time()
                 data = None
+                # Hot-swap pickup: if the watchdog called swap_device()
+                # the new stream/pa are staged in _swap_pending. Pick
+                # them up here (under _swap_lock), swap the local
+                # `stream` ref, then close the OLD stream outside the
+                # lock so its final read can't deadlock. ffmpeg never
+                # sees an interruption.
+                pending = None
+                with self._swap_lock:
+                    if self._swap_pending is not None:
+                        pending = self._swap_pending
+                        self._swap_pending = None
+                if pending is not None:
+                    try:
+                        new_stream, new_pa, new_idx, old_stream, old_pa = pending
+                        stream = new_stream  # MUST swap the local ref
+                        self._stream = new_stream
+                        self._pa = new_pa
+                        self._device_index = int(new_idx)
+                        try:
+                            import sys as _sys
+                            _sys.stderr.write(
+                                f"[wasapi-bridge] {self._label}: device "
+                                f"hot-swap polling -> new_idx={new_idx}\n"
+                            )
+                            _sys.stderr.flush()
+                        except Exception:
+                            pass
+                        # Drain + close old stream OUTSIDE the lock.
+                        try:
+                            if old_stream is not None:
+                                try:
+                                    old_stream.stop_stream()
+                                except Exception:
+                                    pass
+                                try:
+                                    old_stream.close()
+                                except Exception:
+                                    pass
+                            if old_pa is not None:
+                                try:
+                                    old_pa.terminate()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    except Exception:
+                        # Swap data was malformed — abort the swap and
+                        # keep going with the existing stream.
+                        pass
                 avail = 0
                 try:
                     avail = int(stream.get_read_available())
@@ -563,6 +859,14 @@ class WasapiLoopbackWriter:
                         pass
                     # Schedule next heartbeat 5s out.
                     next_log_at = now_t + 5.0
+                # If a swap installed a software resampler, bring the
+                # chunk back to original (rate, channels) before write.
+                # silence_chunk is already at native format (bytes_per_chunk
+                # is computed from self.channels) so no resample needed
+                # for the silence path.
+                if (data is not silence_chunk
+                        and self._resample_src_rate is not None):
+                    data = self._maybe_resample(data)
                 try:
                     stdin.write(data)
                 except (BrokenPipeError, OSError, ValueError):
@@ -595,6 +899,37 @@ class WasapiLoopbackWriter:
         thread to drain. Safe to call multiple times; safe to call
         when start() returned False (no-op)."""
         self._stop.set()
+        # Reap any unconsumed swap_device() handoff so we don't
+        # leak a new PA stream that the _run loop never picked up.
+        try:
+            with self._swap_lock:
+                pending = self._swap_pending
+                self._swap_pending = None
+        except Exception:
+            pending = None
+        if pending is not None:
+            try:
+                new_stream = pending[0]
+                new_pa = pending[1]
+                try:
+                    if new_stream is not None:
+                        try:
+                            new_stream.stop_stream()
+                        except Exception:
+                            pass
+                        try:
+                            new_stream.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    if new_pa is not None:
+                        new_pa.terminate()
+                except Exception:
+                    pass
+            except Exception:
+                pass
         if self._use_callback_mode:
             # Order matters here. The crash on clip-save was from
             # tearing PortAudio down while the realtime callback
