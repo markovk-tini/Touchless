@@ -236,6 +236,191 @@ CLIP_300S_HINT_PHRASES = (
     "last 5 minutes",
     "past 5 minutes",
 )
+
+# v3 — additional trigger-phrase variants. Cover Whisper-medium mis-
+# hears ("clip lasts X"), natural mid-utterance duration phrasing
+# ("save clip last 2 minutes"), and tail-loaded forms ("save the
+# last 5 minute clip" → after Layer-A rewrite, then catches here).
+CLIP_TRIGGER_PHRASES_V3 = (
+    # 'lasts' mishears (Whisper-medium loves trailing 's')
+    "clip lasts",
+    "clip last's",
+    "clip the lasts",
+    # tail-loaded after Layer-A rewrite
+    "save the last minute clip",
+    "save the last 30 second clip",
+    "save the last 2 minute clip",
+    "save the last 5 minute clip",
+    "save the last five minute clip",
+    # save+clip+duration (no recency-noun before duration)
+    "save clip last",
+    "save clip 30 seconds",
+    "save clip 2 minutes",
+    "save clip 5 minutes",
+    # bare digit-only durations
+    "clip last 30",
+    "clip last 60",
+    "clip the past 30",
+    "clip the past 60",
+    "clip last 1 minute",
+    "clip last one minute",
+    "clip the last one minute",
+    "clip past 30 seconds",
+    "clip the past 30 seconds",
+    # grab variants
+    "grab the last clip",
+    "grab last clip",
+    "grab the last 30 seconds",
+    "grab the last minute",
+    "grab the last 2 minutes",
+    "grab the last 5 minutes",
+    # make/create + clip of last N
+    "make a clip of the last minute",
+    "make a clip of the last 30 seconds",
+    "make a clip of the last 2 minutes",
+    "make a clip of the last 5 minutes",
+    "create a clip of the last minute",
+    "create a clip of the last 2 minutes",
+    "create a clip of the last 5 minutes",
+)
+
+# Add v3 phrases to the master tuple (preserve order so earlier
+# phrases still get first match).
+CLIP_TRIGGER_PHRASES = CLIP_TRIGGER_PHRASES + CLIP_TRIGGER_PHRASES_V3
+
+# Additional hint phrases per duration bucket — match "X minute
+# clip" tail-loaded phrasing.
+CLIP_30S_HINT_PHRASES = CLIP_30S_HINT_PHRASES + (
+    "30 second clip",
+    "thirty second clip",
+)
+CLIP_60S_HINT_PHRASES = CLIP_60S_HINT_PHRASES + (
+    "1 minute clip",
+    "one minute clip",
+    "minute clip",
+)
+CLIP_120S_HINT_PHRASES = CLIP_120S_HINT_PHRASES + (
+    "2 minute clip",
+    "two minute clip",
+)
+CLIP_300S_HINT_PHRASES = CLIP_300S_HINT_PHRASES + (
+    "5 minute clip",
+    "five minute clip",
+)
+
+# Layer A — Whisper mis-hear / phrase-normalisation rewrites.
+# Applied BEFORE trigger-phrase / loose-regex matching so the
+# downstream code sees the canonical form. Each entry is
+# (compiled_pattern, replacement). Word-bounded to avoid false
+# positives on "lasts" inside larger words.
+_CLIP_MISHEAR_REWRITES = (
+    # "lasts" / "last's" / "lasted" -> "last"
+    (re.compile(r"\blast['’]?s\b"), "last"),
+    (re.compile(r"\blasted\b"), "last"),
+    # "saved clip" -> "save clip" (Whisper sometimes hears past tense)
+    (re.compile(r"\bsaved\s+clip\b"), "save clip"),
+    # "clipped that/this/the last/digit" -> "clip ..."
+    (re.compile(
+        r"\bclipped\b(?=\s+(?:the|that|this|it|last|past|previous|recent|\d))"
+    ), "clip"),
+    # Whisper occasionally drops articles: "clip and last 5 minutes"
+    # -> "clip the last 5 minutes"
+    (re.compile(
+        r"\bclip\s+and\s+(?=last|past|the\s+last|the\s+past)"
+    ), "clip the "),
+    # Tail re-order: "the last N minute clip" -> "clip the last N minute"
+    (re.compile(
+        r"\bthe\s+last\s+(\d{1,3}|thirty|sixty|one|two|three|five|a)\s+"
+        r"(minute|minutes|second|seconds)\s+clip\b"
+    ), r"clip the last \1 \2"),
+    (re.compile(
+        r"\bthe\s+past\s+(\d{1,3}|thirty|sixty|one|two|three|five|a)\s+"
+        r"(minute|minutes|second|seconds)\s+clip\b"
+    ), r"clip the past \1 \2"),
+)
+
+# Number-word lookup for the duration extractor.
+_CLIP_NUMBER_WORDS = {
+    "a": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "fifteen": 15, "twenty": 20, "thirty": 30, "forty": 40,
+    "fifty": 50, "sixty": 60, "ninety": 90,
+}
+
+# Match a (number, unit) pair anywhere in the utterance. The number
+# may be a digit (1..999) or a word ("one".."ninety"). The unit must
+# be a second/minute variant.
+_CLIP_DURATION_RE = re.compile(
+    r"\b("
+    r"\d{1,3}"
+    r"|a"
+    r"|one|two|three|four|five|six|seven|eight|nine|ten"
+    r"|fifteen|twenty|thirty|forty|fifty|sixty|ninety"
+    r")\s+"
+    r"(seconds?|minutes?)\b",
+    re.IGNORECASE,
+)
+
+# Duration buckets and the action string each maps to. Used by the
+# extractor to snap "90 seconds" to its nearest supported bucket.
+_CLIP_DURATION_BUCKETS = (
+    (30, "clip_30s"),
+    (60, "clip_1m"),
+    (120, "clip_2m"),
+    (300, "clip_5m"),
+)
+
+
+def _clip_normalize_utterance(trimmed: str) -> str:
+    """Layer A: apply Whisper mis-hear rewrites to bring the
+    utterance into a canonical form before any matching."""
+    out = trimmed
+    for pattern, replacement in _CLIP_MISHEAR_REWRITES:
+        out = pattern.sub(replacement, out)
+    # Collapse extra whitespace introduced by rewrites.
+    out = re.sub(r"\s+", " ", out).strip()
+    return out
+
+
+def _clip_extract_duration_action(text: str) -> str | None:
+    """Layer B: find the LAST (number, unit) pair in the utterance
+    and snap it to the nearest duration bucket. Returns the matching
+    clip_NNs / clip_Nm action string, or None if no duration was
+    found.
+
+    Snapping rule: pick the bucket whose value is closest to the
+    spoken seconds. \"90 seconds\" picks clip_1m (closer to 60 than
+    to 120). \"45 seconds\" picks clip_30s (closer to 30 than 60).
+    \"4 minutes\" -> 240s, closer to 300 than 120, picks clip_5m.
+
+    The LAST match wins so 'save 30 second clip of the last 5 minutes'
+    -> 5 minutes (5 minutes is the actual ask, 30 seconds modifies
+    a leading noun). This is a heuristic; ambiguity reports tracked
+    in feedback channels."""
+    matches = list(_CLIP_DURATION_RE.finditer(text))
+    if not matches:
+        # Bare-digit branch: "clip last 30" with no unit. Magnitude
+        # disambiguates — >=10 = seconds, else minutes.
+        bare = re.search(
+            r"\b(?:last|past)\s+(\d{1,3})\b(?!\s*(?:seconds?|minutes?))",
+            text,
+            re.IGNORECASE,
+        )
+        if not bare:
+            return None
+        n = int(bare.group(1))
+        seconds = n if n >= 10 else n * 60
+    else:
+        last = matches[-1]
+        token = last.group(1).lower()
+        unit = last.group(2).lower()
+        n = int(token) if token.isdigit() else _CLIP_NUMBER_WORDS.get(token, 0)
+        if n <= 0:
+            return None
+        seconds = n * 60 if unit.startswith("minute") else n
+    # Snap to nearest bucket.
+    best_bucket = min(_CLIP_DURATION_BUCKETS, key=lambda b: abs(b[0] - seconds))
+    return best_bucket[1]
 APP_OBJECT_HINTS = (
     "app called",
     "application called",
@@ -2940,6 +3125,13 @@ class VoiceCommandProcessor:
                 break
         if not trimmed:
             return None
+        # LAYER A — apply Whisper mis-hear rewrites BEFORE matching.
+        # Brings "clip lasts 5 minutes" -> "clip last 5 minutes",
+        # "save the last 2 minute clip" -> "clip the last 2 minute",
+        # etc. into the canonical forms downstream code expects.
+        trimmed = _clip_normalize_utterance(trimmed)
+        if not trimmed:
+            return None
         # Bare "clip" alone is ambiguous (could be misheard "click",
         # "clipboard", a Spotify queue follow-up, etc.). Require
         # either an explicit phrase or 'clip' adjacent to a
@@ -2950,39 +3142,52 @@ class VoiceCommandProcessor:
                 matched = True
                 break
         if not matched:
-            # Loose match: 'clip' followed (with at most 'the ')
-            # by a recency qualifier. Previously this used .* which
-            # accepted "clip thing on the desk"; the tighter regex
-            # demands the qualifier be adjacent so the rejection is
-            # tight without losing "clip the past minute" etc.
-            if re.search(
+            # Loose match: 4-regex gate. Was 2 regexes; expanded to
+            # also accept 'lasts?' (Layer-A backstop), bare-digit
+            # patterns, and create-verb phrasings ("make a clip of
+            # the last 5 minutes").
+            loose_patterns = (
+                # regex 1 — clip + qualifier (adds `lasts?`)
                 r"\bclip\b\s+(?:the\s+)?"
-                r"(that|this|it|now|here|just|right now|last|past|previous|recent)\b",
-                trimmed,
-            ):
-                matched = True
-            elif re.search(
-                r"\b(clip|record)\b\s+(?:the\s+)?(last|past)\b"
-                r".{0,12}\b(minute|minutes|sixty|60|30|thirty|2|two|5|five)\b",
-                trimmed,
-            ):
-                matched = True
+                r"(that|this|it|now|here|just|right now|lasts?|past|previous|recent)\b",
+                # regex 2 — clip|record + last/past + duration
+                r"\b(clip|record)\b\s+(?:the\s+)?(lasts?|past|previous|recent)\b"
+                r".{0,16}\b(minute|minutes|second|seconds|sixty|60|30|thirty|1|one|2|two|3|three|5|five)\b",
+                # regex 3 — clip + explicit digit + unit (no recency required)
+                r"\bclip\b\s+(?:the\s+)?\d{1,3}\s*(?:second|seconds|minute|minutes)\b",
+                # regex 4 — create-verb + clip + (optional last/past) + N + unit
+                r"\b(save|make|create|grab|record)\b\s+(?:a\s+)?clip\b"
+                r"\s+(?:of\s+)?(?:the\s+)?(?:last|past)?\s*"
+                r"(?:\d{1,3}|thirty|sixty|one|two|three|five|a)\s*"
+                r"(?:second|seconds|minute|minutes)\b",
+            )
+            for pattern in loose_patterns:
+                if re.search(pattern, trimmed):
+                    matched = True
+                    break
         if not matched:
             return None
-        # Pick duration variant. Order matters: check 5 min before
-        # 30 s before 2 min before 1 min so "5 minutes" doesn't
-        # collide with "5" appearing inside "30 5..." etc.
-        action = "clip_default"
-        if any(hint in trimmed for hint in CLIP_300S_HINT_PHRASES):
-            action = "clip_5m"
-        elif any(hint in trimmed for hint in CLIP_120S_HINT_PHRASES):
-            action = "clip_2m"
-        elif any(hint in trimmed for hint in CLIP_30S_HINT_PHRASES):
-            action = "clip_30s"
-        elif re.search(r"\b30\b|\bthirty\b", trimmed) and "minute" not in trimmed:
-            action = "clip_30s"
-        elif any(hint in trimmed for hint in CLIP_60S_HINT_PHRASES):
-            action = "clip_1m"
+        # LAYER B — extract duration via the unified extractor, which
+        # scans the WHOLE utterance for (number, unit) pairs and snaps
+        # to the nearest supported bucket. Handles "save clip last 2
+        # minutes" (duration at tail), "clip last 30" (bare digit),
+        # "make a clip of the last 5 minutes" (mid-utterance), etc.
+        action = _clip_extract_duration_action(trimmed)
+        if action is None:
+            # Fallback to legacy hint-phrase scanning for edge cases
+            # the extractor missed.
+            if any(hint in trimmed for hint in CLIP_300S_HINT_PHRASES):
+                action = "clip_5m"
+            elif any(hint in trimmed for hint in CLIP_120S_HINT_PHRASES):
+                action = "clip_2m"
+            elif any(hint in trimmed for hint in CLIP_30S_HINT_PHRASES):
+                action = "clip_30s"
+            elif re.search(r"\b30\b|\bthirty\b", trimmed) and "minute" not in trimmed:
+                action = "clip_30s"
+            elif any(hint in trimmed for hint in CLIP_60S_HINT_PHRASES):
+                action = "clip_1m"
+            else:
+                action = "clip_default"
         return ParsedVoiceCommand(
             raw_text=raw_text,
             normalized_text=text,

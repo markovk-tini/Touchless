@@ -1829,6 +1829,8 @@ class VoiceCommandListener:
             "'search for cat videos on YouTube.' 'go to gmail.' "
             "'increase volume to fifty.' 'mute volume.' "
             "'clip that.' 'clip the last minute.' 'save clip.' "
+            "'save the last 2 minute clip.' 'clip the past 5 minutes.' "
+            "'clip the last 30 seconds.' "
             "Verbs include open, launch, start, run, boot up, fire up, "
             "load, pull up, show me, bring up, switch to, focus on, "
             "close, exit, quit, play, put on, listen to, queue, "
