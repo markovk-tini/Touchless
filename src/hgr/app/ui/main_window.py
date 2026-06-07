@@ -25369,8 +25369,97 @@ Admin elevation
                     pass
             except Exception:
                 pass
+            # Audio hot-snapshot: any audio segment whose mtime is
+            # within the last 1.5 s is being actively rotated by the
+            # audio sidecar ffmpeg. Reading it directly while the
+            # cache rewrites it produces the "End of file" AVERROR_EOF
+            # the user has seen on export. Snapshot via shutil.copyfile
+            # to a temp name so the export reads a stable copy.
+            # Filename prefix hot_snapshot_audio_*.aac is matched by
+            # the existing per-export cleanup sweep AND by the cache-
+            # dir scrub at app start.
+            audio_input_paths: list[Path] = []
+            audio_hot_copies: list[Path] = []
+            try:
+                import shutil as _shutil_aud
+            except Exception:
+                _shutil_aud = None
             for entry in audio_selected:
-                inputs.extend(["-i", str(Path(entry["path"]).resolve())])
+                src = Path(entry["path"]).resolve()
+                audio_input_paths.append(src)
+                if _shutil_aud is None:
+                    continue
+                try:
+                    mtime_age_aud = time.time() - src.stat().st_mtime
+                except Exception:
+                    mtime_age_aud = 999.0
+                if mtime_age_aud > 1.5:
+                    continue
+                try:
+                    snap = (self._clip_cache_dir()
+                            / f"hot_snapshot_audio_{time.time_ns()}.aac")
+                    _shutil_aud.copyfile(str(src), str(snap))
+                    if snap.stat().st_size > 0:
+                        audio_input_paths[-1] = snap
+                        audio_hot_copies.append(snap)
+                        try:
+                            import sys as _sys
+                            _sys.stderr.write(
+                                f"[clip-export] audio hot-snapshot: "
+                                f"{src.name} (mtime_age={mtime_age_aud:.2f}s) "
+                                f"-> {snap.name} ({snap.stat().st_size} B)\n"
+                            )
+                            _sys.stderr.flush()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # Pre-flight: verify every audio input path is non-empty.
+            # A 0-byte segment ALSO causes AVERROR_EOF on open. If any
+            # input is too small to be a valid ADTS AAC frame (~16 B
+            # minimum header), drop it from the input list — better to
+            # produce a clip with a small audio gap than fail the whole
+            # export.
+            audio_dropped_paths: list[str] = []
+            audio_input_paths_filtered: list[Path] = []
+            for ap in audio_input_paths:
+                try:
+                    sz = ap.stat().st_size
+                except Exception:
+                    sz = 0
+                if sz < 16:
+                    audio_dropped_paths.append(f"{ap.name}({sz}B)")
+                    continue
+                audio_input_paths_filtered.append(ap)
+            if audio_dropped_paths:
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[clip-export] pre-flight dropped "
+                        f"{len(audio_dropped_paths)} empty audio segment(s): "
+                        f"{audio_dropped_paths[:5]}\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+            if not audio_input_paths_filtered:
+                # All audio inputs were empty/missing — fall back to
+                # video-only export rather than failing the whole clip.
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        "[clip-export] all audio inputs dropped by pre-flight"
+                        " — exporting video-only\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                has_audio = False
+                audio_input_paths = []
+            else:
+                audio_input_paths = audio_input_paths_filtered
+            for p in audio_input_paths:
+                inputs.extend(["-i", str(p)])
             # Video chain — concat all video segments, optional crop,
             # trim tail-to-drop seconds off the END, then keep
             # `duration_seconds`. Each step is comma-joined into one
@@ -25586,6 +25675,17 @@ Admin elevation
                         snap.unlink(missing_ok=True)
                     except Exception:
                         pass
+                # Audio hot-snapshot cleanup (mirrors the video sweep
+                # above so audio snaps don't accumulate in the cache
+                # dir between exports).
+                try:
+                    for snap in audio_hot_copies:
+                        try:
+                            snap.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                except NameError:
+                    pass
                 return (True, output_path, actual_seconds)
             # Failure — print ffmpeg's own stderr so the diagnostic
             # survives even when the caller doesn't surface it. Tail
@@ -25608,8 +25708,23 @@ Admin elevation
                 # _on_clip_export_finished_main_thread can surface it
                 # in its QMessageBox instead of the generic "no output
                 # produced" copy.
+                # Map known ffmpeg error codes to friendly labels.
+                # AVERROR_EOF is reported as unsigned 3753488571 on
+                # Windows (= signed -541478725 = ('E','O','F',' ')
+                # FOURCC encoded as 32-bit int). Surface as 'EOF on
+                # input' so the user / log reader doesn't have to
+                # decode the magic number.
+                rc = completed.returncode
+                friendly_rc = str(rc)
+                if rc in (3753488571, -541478725):
+                    friendly_rc = (
+                        f"{rc} (AVERROR_EOF — input pipe / segment file "
+                        f"returned EOF on open; usually a 0-byte or "
+                        f"actively-rotating segment, mitigated by audio "
+                        f"hot-snapshot + pre-flight)"
+                    )
                 self._last_ffmpeg_clip_error = (
-                    f"ffmpeg exit {completed.returncode}: "
+                    f"ffmpeg exit {friendly_rc}: "
                     f"{tail.strip().splitlines()[-1] if tail.strip() else 'no stderr captured'}"
                 )
             except Exception:
@@ -25634,7 +25749,12 @@ Admin elevation
             # are not segments and don't carry buffer state.
             try:
                 cache_dir = self._clip_cache_dir()
-                for pattern in ("hot_snapshot_*.mkv", "concat_*.txt", "audio_concat_*.txt"):
+                for pattern in (
+                    "hot_snapshot_*.mkv",
+                    "hot_snapshot_audio_*.aac",
+                    "concat_*.txt",
+                    "audio_concat_*.txt",
+                ):
                     for path in cache_dir.glob(pattern):
                         try:
                             path.unlink(missing_ok=True)
