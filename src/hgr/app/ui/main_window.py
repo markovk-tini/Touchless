@@ -24487,8 +24487,23 @@ Admin elevation
         # the audio process fails, the video keeps running unaffected.
         if self._start_clip_cache_audio():
             self._clip_cache_has_audio = True
+            # Start the in-place audio-endpoint watchdog. Polls every
+            # 700 ms for the current default playback + preferred-mic
+            # identity; on a confirmed change (700 ms debounce, 5 s
+            # coalesce), calls writer.swap_device() WITHOUT restarting
+            # ffmpeg. Buffer survives the switch.
+            try:
+                self._start_audio_endpoint_watchdog()
+            except Exception:
+                pass
         return True
     def _stop_clip_cache_ffmpeg(self, *, delete_files: bool) -> None:
+        # Stop the watchdog FIRST so a tick can't race the teardown by
+        # trying to swap a stream we're about to close.
+        try:
+            self._stop_audio_endpoint_watchdog()
+        except Exception:
+            pass
         # Tear down the separate audio capture FIRST. It writes into
         # its own ffmpeg subprocess via a WASAPI bridge thread; the
         # bridge has to exit cleanly before ffmpeg is reaped or it
@@ -24510,6 +24525,263 @@ Admin elevation
             # session's manifest and segment paths.
             self._clip_cache_session_id_cache = None
         self._clip_cache_backend = ""
+
+    # ===== Audio-endpoint watchdog (clip-v3 in-place swap) =========
+    # Polls every 700 ms for the current Windows default playback +
+    # preferred-mic identity. On a confirmed change (700 ms debounce,
+    # 5 s coalesce window), calls writer.swap_device() to replace the
+    # underlying PortAudio device WITHOUT restarting the audio sidecar
+    # ffmpeg. The segment ring keeps rotating; the buffer survives.
+    #
+    # This is the in-place variant of MVP-fixup D — the restart-based
+    # version was reverted because it wiped the rolling buffer. The
+    # in-place primitive (commit 18fa434) preserves it.
+    #
+    # Kill switch: env var HGR_CLIP_DEVICE_WATCHDOG=0 disables.
+
+    def _audio_endpoint_fingerprint(self) -> tuple:
+        """Snapshot of (sys_idx, sys_name, mic_idx, mic_name)."""
+        try:
+            from hgr.app.ui.wasapi_loopback import (
+                probe_default_loopback_identity,
+                probe_input_device_identity,
+            )
+        except Exception:
+            return (None, "", None, "")
+        sys_pair = None
+        try:
+            sys_pair = probe_default_loopback_identity()
+        except Exception:
+            sys_pair = None
+        sys_idx = sys_pair[0] if sys_pair else None
+        sys_name = sys_pair[1] if sys_pair else ""
+        mic_name_hint = ""
+        listener_idx: int | None = None
+        try:
+            mic_name_hint = str(
+                getattr(self.config, "preferred_microphone_name", "") or ""
+            ).strip()
+        except Exception:
+            mic_name_hint = ""
+        try:
+            if (self._worker is not None
+                    and getattr(self._worker, "voice_listener", None) is not None):
+                try:
+                    listener_idx = self._worker.voice_listener.input_device_index()
+                except Exception:
+                    listener_idx = None
+        except Exception:
+            listener_idx = None
+        mic_pair = None
+        try:
+            mic_pair = probe_input_device_identity(
+                mic_name_hint or None,
+                device_index=listener_idx,
+            )
+        except Exception:
+            mic_pair = None
+        mic_idx = mic_pair[0] if mic_pair else None
+        mic_name = mic_pair[1] if mic_pair else ""
+        return (sys_idx, sys_name, mic_idx, mic_name)
+
+    def _start_audio_endpoint_watchdog(self) -> None:
+        import os as _os
+        if _os.environ.get("HGR_CLIP_DEVICE_WATCHDOG", "1") == "0":
+            return
+        existing = getattr(self, "_audio_endpoint_watchdog_timer", None)
+        if existing is not None:
+            try:
+                if existing.isActive():
+                    return
+            except Exception:
+                pass
+        self._audio_endpoint_last_fingerprint = self._audio_endpoint_fingerprint()
+        self._audio_endpoint_change_pending_since = 0.0
+        self._audio_endpoint_last_swap_at = 0.0
+        self._audio_endpoint_swap_in_progress = False
+        timer = QTimer(self)
+        timer.setInterval(700)
+        timer.timeout.connect(self._tick_audio_endpoint_watchdog)
+        timer.start()
+        self._audio_endpoint_watchdog_timer = timer
+
+    def _stop_audio_endpoint_watchdog(self) -> None:
+        timer = getattr(self, "_audio_endpoint_watchdog_timer", None)
+        if timer is None:
+            return
+        try:
+            timer.stop()
+        except Exception:
+            pass
+        try:
+            timer.deleteLater()
+        except Exception:
+            pass
+        self._audio_endpoint_watchdog_timer = None
+
+    def _tick_audio_endpoint_watchdog(self) -> None:
+        """Single watchdog tick. If endpoint identity changed and
+        the change is still observed after 700 ms debounce, calls
+        _swap_audio_endpoints_in_place() (which calls writer.swap_device()
+        WITHOUT touching ffmpeg)."""
+        try:
+            if not bool(getattr(self, "_clip_cache_has_audio", False)):
+                return
+            export_thread = getattr(self, "_clip_export_thread", None)
+            if export_thread is not None and export_thread.is_alive():
+                return
+            if getattr(self, "_audio_endpoint_swap_in_progress", False):
+                return
+            import time as _time
+            now = _time.monotonic()
+            last_swap_at = float(getattr(self, "_audio_endpoint_last_swap_at", 0.0))
+            if (now - last_swap_at) < 5.0:
+                return
+            current = self._audio_endpoint_fingerprint()
+            prev = getattr(self, "_audio_endpoint_last_fingerprint", None)
+            if prev is None:
+                self._audio_endpoint_last_fingerprint = current
+                return
+            if current != prev:
+                pending_since = float(
+                    getattr(self, "_audio_endpoint_change_pending_since", 0.0)
+                )
+                if pending_since == 0.0:
+                    self._audio_endpoint_change_pending_since = now
+                    return
+                if (now - pending_since) < 0.7:
+                    return
+                self._audio_endpoint_change_pending_since = 0.0
+                self._audio_endpoint_last_fingerprint = current
+                self._audio_endpoint_last_swap_at = now
+                self._audio_endpoint_swap_in_progress = True
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[clip-audio] endpoint changed "
+                        f"prev={prev!r} -> now={current!r} — "
+                        f"swap_device (NO ffmpeg restart)\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    self._swap_audio_endpoints_in_place()
+                except Exception as exc:
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"[clip-audio] in-place swap failed: "
+                            f"{type(exc).__name__}: {exc!s}\n"
+                        )
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+                finally:
+                    self._audio_endpoint_swap_in_progress = False
+            else:
+                self._audio_endpoint_change_pending_since = 0.0
+                self._audio_endpoint_last_fingerprint = current
+        except Exception:
+            # Watchdog must never escape an exception into the
+            # main loop — that would freeze the GUI.
+            pass
+
+    def _swap_audio_endpoints_in_place(self) -> None:
+        """Swap the underlying PortAudio devices on both the sys and
+        mic bridges. NEVER touches ffmpeg, NEVER re-stamps
+        _clip_cache_audio_started_at — segment ring keeps rotating
+        with continuous filenames and existing mic-alignment math
+        is preserved."""
+        # SYS bridge swap.
+        sys_writer = getattr(self, "_wasapi_writer", None)
+        if sys_writer is not None:
+            try:
+                from hgr.app.ui.wasapi_loopback import probe_default_loopback_format
+                new_fmt = probe_default_loopback_format()
+            except Exception:
+                new_fmt = None
+            if new_fmt is not None:
+                try:
+                    new_idx, new_rate, new_ch = new_fmt
+                    ok = sys_writer.swap_device(int(new_idx), int(new_rate), int(new_ch))
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"[clip-audio] sys swap -> idx={new_idx} "
+                            f"rate={new_rate} ch={new_ch} ok={ok}\n"
+                        )
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(f"[clip-audio] sys swap raised: {exc!s}\n")
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+        # MIC bridge swap.
+        mic_writer = getattr(self, "_wasapi_mic_writer", None)
+        if mic_writer is not None:
+            try:
+                from hgr.app.ui.wasapi_loopback import probe_input_device_format
+            except Exception:
+                probe_input_device_format = None
+            if probe_input_device_format is not None:
+                # Same resolution priority as the original spawn.
+                mic_name = ""
+                listener_index: int | None = None
+                try:
+                    mic_name = str(
+                        getattr(self.config, "preferred_microphone_name", "") or ""
+                    ).strip()
+                except Exception:
+                    mic_name = ""
+                try:
+                    if (self._worker is not None
+                            and getattr(self._worker, "voice_listener", None) is not None):
+                        try:
+                            listener_index = (
+                                self._worker.voice_listener.input_device_index()
+                            )
+                        except Exception:
+                            listener_index = None
+                except Exception:
+                    listener_index = None
+                try:
+                    fmt = probe_input_device_format(
+                        mic_name or None,
+                        device_index=listener_index,
+                        fallback_rate=48000,
+                        max_channels=1,
+                    )
+                except Exception:
+                    fmt = None
+                if fmt is not None:
+                    try:
+                        new_idx, new_rate, new_ch = fmt
+                        ok = mic_writer.swap_device(
+                            int(new_idx), int(new_rate), int(new_ch),
+                        )
+                        try:
+                            import sys as _sys
+                            _sys.stderr.write(
+                                f"[clip-audio] mic swap -> idx={new_idx} "
+                                f"rate={new_rate} ch={new_ch} ok={ok}\n"
+                            )
+                            _sys.stderr.flush()
+                        except Exception:
+                            pass
+                    except Exception as exc:
+                        try:
+                            import sys as _sys
+                            _sys.stderr.write(f"[clip-audio] mic swap raised: {exc!s}\n")
+                            _sys.stderr.flush()
+                        except Exception:
+                            pass
+
+    # ===== End audio-endpoint watchdog =============================
 
         def _capture_clip_cache_frame(self) -> None:
             if self._clip_cache_segment_writer is None or self._clip_cache_region is None:
