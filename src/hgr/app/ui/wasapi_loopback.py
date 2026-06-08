@@ -230,12 +230,40 @@ class WasapiLoopbackWriter:
         # closing the old PA context after the swap is also cleaner.
         new_pa = None
         new_stream = None
+        # Polling mode: DO NOT pre-open the new stream here. PortAudio's
+        # WASAPI shared-mode loopback typically refuses to deliver to
+        # two concurrent loopback streams in the same process — the
+        # second open "succeeds" but silently produces zero data,
+        # which the user reported as "switched output to headset, no
+        # audio captured". Instead, stage only the swap REQUEST
+        # (device params); _run does close-old-then-open-new inline.
+        # The bridge's silence backfill (already implemented) keeps
+        # ffmpeg fed during the brief gap (~50-200 ms typical).
+        if not self._use_callback_mode:
+            with self._swap_lock:
+                self._swap_pending = (
+                    "request",
+                    int(new_device_index),
+                    int(new_rate) or 48000,
+                    max(1, int(new_channels) or 1),
+                )
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[wasapi-bridge] {self._label}: polling-mode swap "
+                    f"request staged old_idx={self._device_index} -> "
+                    f"new_idx={new_device_index} (rate={new_rate}, "
+                    f"ch={new_channels})\n"
+                )
+                _sys.stderr.flush()
+            except Exception:
+                pass
+            return True
+        # Callback mode: PA happily delivers to multiple concurrent
+        # callback streams (each gets its own host buffer). Open the
+        # new stream first, atomic-swap refs, then close old.
         try:
             new_pa = pa.PyAudio()
-            # First attempt: ask PA for the ORIGINAL rate/channels.
-            # WASAPI shared-mode resamples internally — handles
-            # rate/channel mismatch cleanly for the common cases
-            # (48k stereo <-> 44.1k stereo, 48k stereo <-> 48k mono).
             common_kwargs = dict(
                 format=pa.paInt16,
                 channels=self.channels,
@@ -243,20 +271,16 @@ class WasapiLoopbackWriter:
                 input=True,
                 input_device_index=new_device_index,
                 frames_per_buffer=1024,
+                start=False,
+                stream_callback=self._stream_callback,
             )
-            if self._use_callback_mode:
-                common_kwargs["start"] = False
-                common_kwargs["stream_callback"] = self._stream_callback
             try:
                 new_stream = new_pa.open(**common_kwargs)
-                # Success at original format -> no software resampler needed.
                 self._resample_src_rate = None
                 self._resample_src_channels = None
             except Exception:
-                # PA-side resampler refused (rare: exclusive mode,
-                # weird DAC). Fall back to opening at the device's
-                # native format and software-resample in
-                # _maybe_resample.
+                # PA-side resampler refused — fall back to native rate
+                # + software resample in _maybe_resample.
                 common_kwargs["rate"] = int(new_rate) or 48000
                 common_kwargs["channels"] = max(1, int(new_channels) or 1)
                 new_stream = new_pa.open(**common_kwargs)
@@ -269,40 +293,6 @@ class WasapiLoopbackWriter:
             except Exception:
                 pass
             return False
-        # Stage the swap. Polling mode hands the new stream/pa to
-        # the _run loop via _swap_pending; the loop performs the
-        # ref swap + closes the old stream outside the lock.
-        # Callback mode does the start_stream + ref swap inline
-        # here because there's no main loop to defer into.
-        if not self._use_callback_mode:
-            old_stream = self._stream
-            old_pa = self._pa
-            with self._swap_lock:
-                # If a previous swap hadn't been consumed yet,
-                # close it now so we don't leak a stream.
-                prev = self._swap_pending
-                if prev is not None:
-                    try:
-                        prev_stream, prev_pa, *_ = prev
-                        try:
-                            prev_stream.stop_stream()
-                        except Exception:
-                            pass
-                        try:
-                            prev_stream.close()
-                        except Exception:
-                            pass
-                        try:
-                            prev_pa.terminate()
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                self._swap_pending = (
-                    new_stream, new_pa, int(new_device_index),
-                    old_stream, old_pa,
-                )
-            return True
         # Callback mode: start the new stream first (callbacks
         # begin firing into our shared _callback_queue), then swap
         # references atomically, then stop+close the old stream
@@ -731,12 +721,16 @@ class WasapiLoopbackWriter:
             while not self._stop.is_set():
                 now_t = _time.time()
                 data = None
-                # Hot-swap pickup: if the watchdog called swap_device()
-                # the new stream/pa are staged in _swap_pending. Pick
-                # them up here (under _swap_lock), swap the local
-                # `stream` ref, then close the OLD stream outside the
-                # lock so its final read can't deadlock. ffmpeg never
-                # sees an interruption.
+                # Hot-swap pickup (polling mode): the watchdog called
+                # swap_device() which staged only the swap REQUEST
+                # (new device params). We do close-old-then-open-new
+                # HERE inside the _run loop because PortAudio's
+                # WASAPI shared-mode loopback refuses to deliver to
+                # two concurrent loopback streams in the same process
+                # (verified empirically: opening NEW while OLD is alive
+                # makes NEW's reads return zero data). Brief gap
+                # (~50-200 ms) is filled by silence-backfill which the
+                # loop already runs whenever `avail < 1024`.
                 pending = None
                 with self._swap_lock:
                     if self._swap_pending is not None:
@@ -744,48 +738,124 @@ class WasapiLoopbackWriter:
                         self._swap_pending = None
                 if pending is not None:
                     try:
-                        new_stream, new_pa, new_idx, old_stream, old_pa = pending
-                        stream = new_stream  # MUST swap the local ref
-                        self._stream = new_stream
-                        self._pa = new_pa
-                        self._device_index = int(new_idx)
-                        try:
-                            import sys as _sys
-                            _sys.stderr.write(
-                                f"[wasapi-bridge] {self._label}: device "
-                                f"hot-swap polling -> new_idx={new_idx}\n"
-                            )
-                            _sys.stderr.flush()
-                        except Exception:
-                            pass
-                        # Drain + close old stream OUTSIDE the lock.
-                        try:
-                            if old_stream is not None:
+                        tag = pending[0] if isinstance(pending, tuple) and len(pending) >= 1 else None
+                        if tag == "request":
+                            _, new_idx, new_rate, new_ch = pending
+                            old_stream = stream
+                            old_pa = self._pa
+                            # Step 1: close OLD first.
+                            try:
+                                if old_stream is not None:
+                                    try:
+                                        old_stream.stop_stream()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        old_stream.close()
+                                    except Exception:
+                                        pass
+                                if old_pa is not None:
+                                    try:
+                                        old_pa.terminate()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            # Step 2: open NEW on a fresh PA instance.
+                            try:
+                                import pyaudiowpatch as _pa  # type: ignore
+                                new_pa = _pa.PyAudio()
+                                open_kwargs = dict(
+                                    format=_pa.paInt16,
+                                    channels=self.channels,
+                                    rate=self.rate,
+                                    input=True,
+                                    input_device_index=int(new_idx),
+                                    frames_per_buffer=1024,
+                                )
                                 try:
-                                    old_stream.stop_stream()
+                                    new_stream = new_pa.open(**open_kwargs)
+                                    self._resample_src_rate = None
+                                    self._resample_src_channels = None
+                                except Exception:
+                                    # PA-side resampler refused —
+                                    # fall back to device native rate
+                                    # + software resample.
+                                    open_kwargs["rate"] = int(new_rate) or 48000
+                                    open_kwargs["channels"] = max(1, int(new_ch) or 1)
+                                    new_stream = new_pa.open(**open_kwargs)
+                                    self._resample_src_rate = int(open_kwargs["rate"])
+                                    self._resample_src_channels = int(open_kwargs["channels"])
+                                # Atomic publish.
+                                stream = new_stream
+                                self._stream = new_stream
+                                self._pa = new_pa
+                                self._device_index = int(new_idx)
+                                try:
+                                    import sys as _sys
+                                    _sys.stderr.write(
+                                        f"[wasapi-bridge] {self._label}: device "
+                                        f"hot-swap polling close-then-open OK "
+                                        f"-> new_idx={new_idx}\n"
+                                    )
+                                    _sys.stderr.flush()
                                 except Exception:
                                     pass
+                            except Exception as _swap_exc:
+                                # Open failed. Bridge is now in a no-stream
+                                # state — silence backfill will keep ffmpeg
+                                # fed, but we need to surface this so the
+                                # main-thread watchdog can retry.
                                 try:
-                                    old_stream.close()
+                                    import sys as _sys
+                                    _sys.stderr.write(
+                                        f"[wasapi-bridge] {self._label}: hot-swap "
+                                        f"open FAILED on idx={new_idx}: "
+                                        f"{type(_swap_exc).__name__}: {_swap_exc!s} "
+                                        f"— bridge now in silence-only mode\n"
+                                    )
+                                    _sys.stderr.flush()
                                 except Exception:
                                     pass
-                            if old_pa is not None:
-                                try:
-                                    old_pa.terminate()
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
+                                stream = None
+                                self._stream = None
+                        elif isinstance(pending, tuple) and len(pending) == 5:
+                            # Legacy pre-opened-stream protocol (callback
+                            # mode used to stage here too; kept for
+                            # compatibility if any callsite still uses it).
+                            new_stream, new_pa, new_idx, old_stream, old_pa = pending
+                            stream = new_stream
+                            self._stream = new_stream
+                            self._pa = new_pa
+                            self._device_index = int(new_idx)
+                            try:
+                                if old_stream is not None:
+                                    try:
+                                        old_stream.stop_stream()
+                                    except Exception:
+                                        pass
+                                    try:
+                                        old_stream.close()
+                                    except Exception:
+                                        pass
+                                if old_pa is not None:
+                                    try:
+                                        old_pa.terminate()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                     except Exception:
                         # Swap data was malformed — abort the swap and
                         # keep going with the existing stream.
                         pass
                 avail = 0
-                try:
-                    avail = int(stream.get_read_available())
-                except Exception:
-                    avail = 0
-                if avail >= 1024:
+                if stream is not None:
+                    try:
+                        avail = int(stream.get_read_available())
+                    except Exception:
+                        avail = 0
+                if avail >= 1024 and stream is not None:
                     # Real audio available — read and write it.
                     # Always exit silence mode the moment real data
                     # comes back so we don't double-write.
@@ -867,6 +937,7 @@ class WasapiLoopbackWriter:
                         _sys.stderr.write(
                             f"[wasapi-bridge] {self._label}: "
                             f"real={kb_r} KB silence={kb_s} KB "
+                            f"dev_idx={self._device_index} "
                             f"(elapsed={now_t - start_t:.1f}s, "
                             f"first_chunk_at_offset="
                             f"{(self.first_sample_at - start_t) * 1000:.0f}ms)\n"
@@ -926,25 +997,36 @@ class WasapiLoopbackWriter:
             pending = None
         if pending is not None:
             try:
-                new_stream = pending[0]
-                new_pa = pending[1]
-                try:
-                    if new_stream is not None:
-                        try:
-                            new_stream.stop_stream()
-                        except Exception:
-                            pass
-                        try:
-                            new_stream.close()
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                try:
-                    if new_pa is not None:
-                        new_pa.terminate()
-                except Exception:
-                    pass
+                # Two pending shapes coexist:
+                #   * ("request", new_idx, new_rate, new_ch) — polling-
+                #     mode params-only handoff. Nothing to reap (no
+                #     pre-opened resources).
+                #   * (new_stream, new_pa, new_idx, old_stream, old_pa)
+                #     — legacy pre-opened-stream protocol. Close both
+                #     ends to avoid leaking a PA stream.
+                tag = pending[0] if isinstance(pending, tuple) and len(pending) >= 1 else None
+                if tag == "request":
+                    pass  # nothing to reap
+                elif isinstance(pending, tuple) and len(pending) >= 2:
+                    new_stream = pending[0]
+                    new_pa = pending[1]
+                    try:
+                        if new_stream is not None:
+                            try:
+                                new_stream.stop_stream()
+                            except Exception:
+                                pass
+                            try:
+                                new_stream.close()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        if new_pa is not None:
+                            new_pa.terminate()
+                    except Exception:
+                        pass
             except Exception:
                 pass
         if self._use_callback_mode:
