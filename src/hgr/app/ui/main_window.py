@@ -25582,6 +25582,28 @@ Admin elevation
                 except Exception:
                     user_offset_ms = 0
                 user_offset_ms = max(-10000, min(10000, user_offset_ms))
+                # Duration-aware extra offset for LONG clips. The
+                # rolling cache's per-segment rotation gap accumulates
+                # over many segments — 30 × ~0.3-0.5 s gap on the
+                # 5-min path manifests as audio sounding ~10 s early
+                # vs the corresponding visual. Add the user's tuned
+                # extra ONLY when duration >= the threshold so 60 s
+                # and 120 s clips keep their already-correct alignment.
+                try:
+                    long_threshold = int(getattr(
+                        self.config, "clip_audio_offset_long_threshold_seconds", 240
+                    ) or 240)
+                except Exception:
+                    long_threshold = 240
+                try:
+                    long_extra_ms = int(getattr(
+                        self.config, "clip_audio_offset_ms_long", -10000
+                    ) or 0)
+                except Exception:
+                    long_extra_ms = 0
+                long_extra_ms = max(-20000, min(20000, long_extra_ms))
+                if int(duration_seconds) >= long_threshold:
+                    user_offset_ms = max(-30000, min(30000, user_offset_ms + long_extra_ms))
                 m = len(audio_selected)
                 concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
                 a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
@@ -26235,6 +26257,24 @@ Admin elevation
                 except Exception:
                     user_offset_ms = 0
                 user_offset_ms = max(-10000, min(10000, user_offset_ms))
+                # Duration-aware extra offset for LONG clips. Mirrors
+                # the primary export path's correction for the
+                # accumulated segment-rotation drift on 5-min clips.
+                try:
+                    long_threshold = int(getattr(
+                        self.config, "clip_audio_offset_long_threshold_seconds", 240
+                    ) or 240)
+                except Exception:
+                    long_threshold = 240
+                try:
+                    long_extra_ms = int(getattr(
+                        self.config, "clip_audio_offset_ms_long", -10000
+                    ) or 0)
+                except Exception:
+                    long_extra_ms = 0
+                long_extra_ms = max(-20000, min(20000, long_extra_ms))
+                if int(duration_seconds) >= long_threshold:
+                    user_offset_ms = max(-30000, min(30000, user_offset_ms + long_extra_ms))
                 offset_seconds = user_offset_ms / 1000.0
                 shifted_start = max(0.0, a_start_trim - offset_seconds)
                 m = len(audio_selected)

@@ -303,6 +303,25 @@ class AppConfig:
     # consistently see drift.
     clip_audio_offset_ms: int = -6000
 
+    # Duration-aware extra audio offset for LONG clips. Applied IN
+    # ADDITION to clip_audio_offset_ms when the requested clip
+    # duration is >= clip_audio_offset_long_threshold_seconds. The
+    # extra is negative because the symptom users see on 5-min clips
+    # is audio playing ~10 s EARLIER than the corresponding video
+    # frame. Mechanism: the rolling audio cache's segment-muxer
+    # rotation introduces a small wall-time gap between every
+    # 10-s file segment (~0.3-0.5 s per rotation). Over 30 segments
+    # that accumulates to ~10 s of "missing wall time" the concat
+    # silently closes. atrim then reads samples that were captured
+    # earlier than the wall time it thinks they map to. Shifting the
+    # atrim start later (more negative offset → larger shifted_start)
+    # picks up samples that correspond to the correct wall time at
+    # the END of the clip; the silence-padding (apad) absorbs the
+    # missing samples at the start. Per-rig, users on faster I/O
+    # can dial this toward 0; users on slow SSDs may need -12000+.
+    clip_audio_offset_ms_long: int = -10000
+    clip_audio_offset_long_threshold_seconds: int = 240
+
     # ===== Clip v2 settings (MVP commit 1) =====
     # Default voice "clip that" duration in seconds. When the user
     # says just "clip that" / "clip this" / "save clip" without a
