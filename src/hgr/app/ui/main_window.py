@@ -24642,7 +24642,16 @@ Admin elevation
         """Single watchdog tick. If endpoint identity changed and
         the change is still observed after 700 ms debounce, calls
         _swap_audio_endpoints_in_place() (which calls writer.swap_device()
-        WITHOUT touching ffmpeg)."""
+        WITHOUT touching ffmpeg).
+
+        Diagnostic: every ~30s a poll-result line is emitted to
+        stderr so it's visible in the log whether the probe is
+        currently seeing each endpoint's identity. If the probe
+        ever returns a stale identity for >30s while the user has
+        clearly switched endpoints in Windows, this trace is the
+        signal that PyAudioWPatch's default-endpoint lookup is
+        caching and we need a different probe strategy.
+        """
         try:
             if not bool(getattr(self, "_clip_cache_has_audio", False)):
                 return
@@ -24658,6 +24667,20 @@ Admin elevation
                 return
             current = self._audio_endpoint_fingerprint()
             prev = getattr(self, "_audio_endpoint_last_fingerprint", None)
+            # Diagnostic heartbeat — every 30s log the current poll
+            # result so it's visible when the probe is or isn't
+            # tracking endpoint changes.
+            last_diag_at = float(getattr(self, "_audio_endpoint_last_diag_at", 0.0))
+            if (now - last_diag_at) >= 30.0:
+                self._audio_endpoint_last_diag_at = now
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[clip-audio] endpoint-poll fingerprint={current!r}\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
             if prev is None:
                 self._audio_endpoint_last_fingerprint = current
                 return
