@@ -297,29 +297,35 @@ class AppConfig:
     #   * POSITIVE offset → SMALLER shifted_start → audio events
     #     appear LATER in playback.
     #
-    # Default -6000 ms. Latest user observation: <1 s EARLY at
-    # -6500, so dial back 500 ms (less negative = audio shifted
-    # slightly LATER in playback). Tune via config if you
-    # consistently see drift.
-    clip_audio_offset_ms: int = -6000
+    # Default 0 ms. The historical -6000 was calibrated against the
+    # pre-COM-probe / pre-worker-swap / pre-buffer-drain bridge
+    # behavior, where additional un-modeled latency along the
+    # capture path made audio land late and a negative compensation
+    # pulled it back into sync. With the new bridge (COM-resolved
+    # default endpoint + background-thread close-then-open + post-
+    # swap buffer drain) the capture path is wall-aligned and the
+    # offset becomes pure user preference. Latest user observation
+    # at -6000 was 6 s EARLY on 60 s clips and 4 s LATE on 5 min
+    # clips (with the previous +10000 long-extra), which
+    # extrapolated linearly puts the wall-aligned baseline at 0.
+    # Users who still see consistent drift can tune via config.
+    clip_audio_offset_ms: int = 0
 
     # Duration-aware extra audio offset for LONG clips. Applied IN
     # ADDITION to clip_audio_offset_ms when the requested clip
-    # duration is >= clip_audio_offset_long_threshold_seconds. The
-    # extra is POSITIVE: empirical user testing showed the 5-min
-    # clip's audio runs ~10 s ahead of the video by the END of the
-    # clip (each segment rotation drops a tiny bit of wall content
-    # that the concat silently closes, accumulating across 30
-    # segments). With the existing sign convention
-    # `shifted_start = a_start_trim - offset_seconds`, a POSITIVE
-    # offset SHRINKS shifted_start so atrim reads samples that map
-    # to EARLIER concat positions; the silence-padding (apad)
-    # absorbs the missing samples at the end and the audio aligns.
-    # An initial negative-sign attempt (-10000) made the drift
-    # ~8 s worse, confirming the direction. Per-rig tuning: if 5-min
-    # clips end up LATE after this change, dial toward 0; if still
-    # early, push to +12000+.
-    clip_audio_offset_ms_long: int = 10000
+    # duration is >= clip_audio_offset_long_threshold_seconds.
+    # History:
+    #   - Initial +10000 overshot by ~4 s (user reported 5-min
+    #     clips landing 4 s LATE).
+    #   - A separate fix (drain post-swap WASAPI buffer on the
+    #     polling-mode bridge harvest) eliminated the burst-induced
+    #     mtime shift that was the bulk of the perceived 5-min
+    #     drift. With buffer drain the residual long-clip drift is
+    #     small enough that 0 is a safer default than a guessed
+    #     positive value. Users who still see a few seconds early
+    #     on 5-min clips can push toward +4000 to +6000; users who
+    #     see late should pull negative.
+    clip_audio_offset_ms_long: int = 0
     clip_audio_offset_long_threshold_seconds: int = 240
 
     # ===== Clip v2 settings (MVP commit 1) =====
@@ -769,6 +775,20 @@ def load_config() -> AppConfig:
             if values.get("clip_audio_offset_ms") == -6500:
                 values["clip_audio_offset_ms"] = -6000
             values["clip_audio_offset_early_at_6500_migrated"] = True
+
+        # Eighth-pass migration: post-COM-probe / post-worker-swap /
+        # post-buffer-drain bridge rewrite removed the un-modeled
+        # capture-path latency the historical -6000 was compensating
+        # for. User at -6000 now reports 60 s clips landing 6 s
+        # EARLY, which extrapolated to 0 means the rewritten bridge
+        # is wall-aligned by default. Flip the exact prior default
+        # (-6000) to 0; deliberate user-tunes (e.g. -4000 from a
+        # rig where the user manually compensated for a specific
+        # device) survive untouched.
+        if not data.get("clip_audio_offset_bridge_rewrite_aligned_migrated", False):
+            if values.get("clip_audio_offset_ms") == -6000:
+                values["clip_audio_offset_ms"] = 0
+            values["clip_audio_offset_bridge_rewrite_aligned_migrated"] = True
 
         # Clip v2 settings — MVP commit 1. Every new field's default
         # matches v1 implicit behavior, so this migration mutates

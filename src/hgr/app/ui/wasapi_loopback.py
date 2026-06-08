@@ -974,11 +974,43 @@ class WasapiLoopbackWriter:
                             self._device_index = int(new_idx_w)
                             self._resample_src_rate = new_resample_src_rate
                             self._resample_src_channels = new_resample_src_channels
+                            # Drain the new stream's WASAPI client buffer.
+                            # The PA stream has been open and capturing
+                            # the entire time the worker was running
+                            # (~200-1000 ms typical, up to several
+                            # seconds on slow systems). Without drain,
+                            # the next reads return that backlog AS
+                            # FAST AS THE LOOP CAN ITERATE — bursting
+                            # several seconds of file content into
+                            # ffmpeg in ~50 ms of wall, delaying
+                            # segment mtimes by the burst duration and
+                            # shifting subsequent chain math earlier by
+                            # the same amount. User observed this as
+                            # the post-swap audio leading video by 4-6 s.
+                            # The silence-fill the loop just emitted
+                            # already covered the wall gap during the
+                            # swap — the buffered real samples would
+                            # duplicate that coverage, so discarding is
+                            # correct.
+                            drained_chunks = 0
+                            try:
+                                while True:
+                                    avail_drain = int(new_stream_w.get_read_available())
+                                    if avail_drain < 1024:
+                                        break
+                                    new_stream_w.read(1024, exception_on_overflow=False)
+                                    drained_chunks += 1
+                                    if drained_chunks > 2000:
+                                        break  # safety
+                            except Exception:
+                                pass
                             try:
                                 import sys as _sys
                                 _sys.stderr.write(
                                     f"[wasapi-bridge] {self._label}: "
-                                    f"swap worker landed OK -> dev_idx={new_idx_w}"
+                                    f"swap worker landed OK -> dev_idx={new_idx_w} "
+                                    f"(drained {drained_chunks} pre-buffered chunks "
+                                    f"= {drained_chunks * 1024 / max(1.0, float(self.rate)):.2f}s)"
                                     f"{' (resampling)' if new_resample_src_rate else ''}\n"
                                 )
                                 _sys.stderr.flush()
