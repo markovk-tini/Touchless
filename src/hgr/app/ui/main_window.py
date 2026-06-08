@@ -24697,10 +24697,37 @@ Admin elevation
                 self._audio_endpoint_last_fingerprint = current
                 self._audio_endpoint_last_swap_at = now
                 self._audio_endpoint_swap_in_progress = True
+                # Diff prev vs current. Fingerprint shape is
+                # (sys_idx, sys_name, mic_idx, mic_name). If only the
+                # sys halves changed we pass sys_only=True so the mic
+                # bridge isn't disturbed (and vice versa). Conservative
+                # default if shapes don't match: swap both (legacy).
+                sys_only = False
+                mic_only = False
+                try:
+                    if (isinstance(prev, tuple) and isinstance(current, tuple)
+                            and len(prev) >= 4 and len(current) >= 4):
+                        sys_changed = (
+                            prev[0] != current[0] or prev[1] != current[1]
+                        )
+                        mic_changed = (
+                            prev[2] != current[2] or prev[3] != current[3]
+                        )
+                        if sys_changed and not mic_changed:
+                            sys_only = True
+                        elif mic_changed and not sys_changed:
+                            mic_only = True
+                except Exception:
+                    pass
                 try:
                     import sys as _sys
+                    side = "sys+mic"
+                    if sys_only:
+                        side = "sys-only"
+                    elif mic_only:
+                        side = "mic-only"
                     _sys.stderr.write(
-                        f"[clip-audio] endpoint changed "
+                        f"[clip-audio] endpoint changed ({side}) "
                         f"prev={prev!r} -> now={current!r} — "
                         f"swap_device (NO ffmpeg restart)\n"
                     )
@@ -24708,7 +24735,9 @@ Admin elevation
                 except Exception:
                     pass
                 try:
-                    self._swap_audio_endpoints_in_place()
+                    self._swap_audio_endpoints_in_place(
+                        sys_only=sys_only, mic_only=mic_only,
+                    )
                 except Exception as exc:
                     try:
                         import sys as _sys
@@ -24729,15 +24758,33 @@ Admin elevation
             # main loop — that would freeze the GUI.
             pass
 
-    def _swap_audio_endpoints_in_place(self) -> None:
-        """Swap the underlying PortAudio devices on both the sys and
-        mic bridges. NEVER touches ffmpeg, NEVER re-stamps
+    def _swap_audio_endpoints_in_place(
+        self,
+        *,
+        sys_only: bool = False,
+        mic_only: bool = False,
+    ) -> None:
+        """Swap the underlying PortAudio devices on the sys and mic
+        bridges. NEVER touches ffmpeg, NEVER re-stamps
         _clip_cache_audio_started_at — segment ring keeps rotating
         with continuous filenames and existing mic-alignment math
-        is preserved."""
+        is preserved.
+
+        Per-bridge selection (sys_only / mic_only) is critical: the
+        previous unconditional both-swap caused a regression where
+        switching Windows default OUTPUT (sys) ALSO ran the mic
+        swap path. Even though the mic path's no-op short-circuit
+        protected against device-index changes, the probe could
+        occasionally resolve the listener's device differently than
+        the bridge's current device (race against voice-listener
+        teardown / restart), causing a real mic swap to fire mid-
+        clip and break ~10 s of mic audio. Watchdog now passes the
+        side that actually changed; liveness watchdog passes the
+        silent bridge.
+        """
         # SYS bridge swap.
         sys_writer = getattr(self, "_wasapi_writer", None)
-        if sys_writer is not None:
+        if sys_writer is not None and not mic_only:
             try:
                 from hgr.app.ui.wasapi_loopback import probe_default_loopback_format
                 new_fmt = probe_default_loopback_format()
@@ -24765,7 +24812,7 @@ Admin elevation
                         pass
         # MIC bridge swap.
         mic_writer = getattr(self, "_wasapi_mic_writer", None)
-        if mic_writer is not None:
+        if mic_writer is not None and not sys_only:
             try:
                 from hgr.app.ui.wasapi_loopback import probe_input_device_format
             except Exception:
@@ -24924,7 +24971,7 @@ Admin elevation
                                 pass
                             self._audio_liveness_sys_repaired_at = now
                             try:
-                                self._swap_audio_endpoints_in_place()
+                                self._swap_audio_endpoints_in_place(sys_only=True)
                             except Exception:
                                 pass
             # MIC bridge: 15 s silence threshold (mic should ALWAYS
@@ -24968,7 +25015,7 @@ Admin elevation
                                 pass
                             self._audio_liveness_mic_repaired_at = now
                             try:
-                                self._swap_audio_endpoints_in_place()
+                                self._swap_audio_endpoints_in_place(mic_only=True)
                             except Exception:
                                 pass
         except Exception:
