@@ -994,16 +994,37 @@ class WasapiLoopbackWriter:
                             # correct.
                             drained_chunks = 0
                             try:
+                                # Drain in 256-sample increments so we
+                                # leave at most 255 frames in the buffer
+                                # (~5 ms at 48 k) instead of 1023 frames
+                                # (~21 ms). The wider <1024 boundary
+                                # combined with silence_mode staying
+                                # True caused the post-swap loop to
+                                # emit an extra silence chunk before
+                                # falling through to a real read,
+                                # duplicating wall coverage and
+                                # presenting as a 2 s drift after a
+                                # swap (verified via workflow's
+                                # adversarial pass on this code path).
                                 while True:
                                     avail_drain = int(new_stream_w.get_read_available())
-                                    if avail_drain < 1024:
+                                    if avail_drain < 256:
                                         break
-                                    new_stream_w.read(1024, exception_on_overflow=False)
+                                    take = 1024 if avail_drain >= 1024 else avail_drain
+                                    new_stream_w.read(take, exception_on_overflow=False)
                                     drained_chunks += 1
-                                    if drained_chunks > 2000:
+                                    if drained_chunks > 4000:
                                         break  # safety
                             except Exception:
                                 pass
+                            # Exit silence mode now that the new stream
+                            # is published AND drained. The next loop
+                            # iteration reads real audio if the device
+                            # is producing; if it isn't, the 500 ms
+                            # stall threshold re-engages silence mode
+                            # naturally — same as a cold bridge start.
+                            silence_mode = False
+                            last_real_at = now_t
                             try:
                                 import sys as _sys
                                 _sys.stderr.write(

@@ -25350,14 +25350,50 @@ Admin elevation
                 # wall times (resilient to WASAPI rate drift); fall
                 # back to a_anchor + file_time only when mtime is
                 # missing or unreliable.
+                #
+                # mtime CLOSE-DELAY CORRECTION: the OS sets a segment
+                # file's mtime when ffmpeg CLOSES the file, which
+                # happens ~100-1000 ms AFTER the segment's LAST audio
+                # sample was actually captured (OS write buffer flush,
+                # close syscall, journal commit). The video pipeline
+                # is anchored to v_anchor (= when capture started),
+                # so this mtime lag manifests as audio appearing 1 s
+                # LATE relative to video on the user's hardware.
+                #
+                # Estimate the close_delay from the FIRST segment whose
+                # start_time is exactly 0: its true wall_end is
+                # a_anchor + file_duration; observed wall_end_mtime is
+                # that plus close_delay. Subtract the estimate from
+                # every entry's wall times so audio and video share
+                # the same anchor in wall clock. Bounded to [0, 2.0]
+                # so a misreported mtime can't shift audio wildly.
+                close_delay_est = 0.0
+                try:
+                    if a_anchor > 0 and audio_entries:
+                        for cand in audio_entries:
+                            try:
+                                if float(cand.get("start_time", 1.0)) > 0.001:
+                                    continue
+                                cand_end_rel = float(cand.get("end_time", 0.0))
+                                cand_mt_end = float(cand.get("wall_end_mtime", 0.0) or 0.0)
+                                if cand_end_rel > 0 and cand_mt_end > 0:
+                                    expected_wall_end = a_anchor + cand_end_rel
+                                    delta = cand_mt_end - expected_wall_end
+                                    if 0.05 <= delta <= 2.0:
+                                        close_delay_est = delta
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    close_delay_est = 0.0
                 for entry in audio_entries:
                     e_start_rel = float(entry.get("start_time", 0.0))
                     e_end_rel = float(entry.get("end_time", 0.0))
                     mt_end = float(entry.get("wall_end_mtime", 0.0) or 0.0)
                     mt_start = float(entry.get("wall_start_mtime", 0.0) or 0.0)
                     if mt_end > 0 and mt_start > 0:
-                        e_start_wall = mt_start
-                        e_end_wall = mt_end
+                        e_start_wall = mt_start - close_delay_est
+                        e_end_wall = mt_end - close_delay_est
                     elif a_anchor > 0:
                         e_start_wall = a_anchor + e_start_rel
                         e_end_wall = a_anchor + e_end_rel
@@ -25440,14 +25476,28 @@ Admin elevation
             except Exception:
                 pass
             # Audio hot-snapshot: any audio segment whose mtime is
-            # within the last 1.5 s is being actively rotated by the
+            # within the last 10 s (= one full segment rotation
+            # window) is potentially being actively rotated by the
             # audio sidecar ffmpeg. Reading it directly while the
             # cache rewrites it produces the "End of file" AVERROR_EOF
             # the user has seen on export. Snapshot via shutil.copyfile
             # to a temp name so the export reads a stable copy.
-            # Filename prefix hot_snapshot_audio_*.aac is matched by
-            # the existing per-export cleanup sweep AND by the cache-
-            # dir scrub at app start.
+            #
+            # CRITICAL: when the snapshot attempt FAILS (copyfile raises
+            # OR the resulting snapshot is 0 bytes because the source
+            # was being O_TRUNC'd by the rotator at copy time), the
+            # ORIGINAL HOT FILE must NOT remain in audio_input_paths.
+            # The previous logic left it in place and relied on the
+            # pre-flight size check, but the original could have grown
+            # past the pre-flight threshold by check time and then be
+            # truncated AGAIN by the rotator before ffmpeg opens it.
+            # The workflow's adversarial pass identified this as the
+            # critical regression behind the AVERROR_EOF popup. Pop
+            # the entry on any failure so pre-flight sees a clean list.
+            #
+            # Window widened from 1.5 s to 10 s (= segment_rotation
+            # period) so files still anywhere in their rotation cycle
+            # are snapshotted, not just freshly-written ones.
             audio_input_paths: list[Path] = []
             audio_hot_copies: list[Path] = []
             try:
@@ -25463,8 +25513,10 @@ Admin elevation
                     mtime_age_aud = time.time() - src.stat().st_mtime
                 except Exception:
                     mtime_age_aud = 999.0
-                if mtime_age_aud > 1.5:
+                if mtime_age_aud > 10.0:
                     continue
+                snap_ok = False
+                snap = None
                 try:
                     snap = (self._clip_cache_dir()
                             / f"hot_snapshot_audio_{time.time_ns()}.aac")
@@ -25472,6 +25524,7 @@ Admin elevation
                     if snap.stat().st_size > 0:
                         audio_input_paths[-1] = snap
                         audio_hot_copies.append(snap)
+                        snap_ok = True
                         try:
                             import sys as _sys
                             _sys.stderr.write(
@@ -25484,12 +25537,38 @@ Admin elevation
                             pass
                 except Exception:
                     pass
-            # Pre-flight: verify every audio input path is non-empty.
-            # A 0-byte segment ALSO causes AVERROR_EOF on open. If any
-            # input is too small to be a valid ADTS AAC frame (~16 B
-            # minimum header), drop it from the input list — better to
-            # produce a clip with a small audio gap than fail the whole
-            # export.
+                if not snap_ok:
+                    # Snapshot failed (exception OR 0-byte copy).
+                    # Drop the ORIGINAL hot file from the input list
+                    # so it can't reach ffmpeg and trigger AVERROR_EOF.
+                    # Best-effort unlink of any partial snap file.
+                    try:
+                        audio_input_paths.pop()
+                    except Exception:
+                        pass
+                    try:
+                        if snap is not None and snap.exists():
+                            snap.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"[clip-export] audio hot-snapshot FAILED for "
+                            f"{src.name} (mtime_age={mtime_age_aud:.2f}s) — "
+                            f"dropping from export to avoid AVERROR_EOF\n"
+                        )
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+            # Pre-flight: verify every audio input path is large enough
+            # to plausibly contain a valid ADTS AAC frame. ADTS header
+            # alone is 7 B; a single AAC frame at typical bitrate is
+            # 200-600 B. A file with 7-255 B might be just a header
+            # (or header + a few frame bytes), which ffmpeg rejects
+            # with AVERROR_EOF when it tries to parse the next frame.
+            # 256 B floor catches the "essentially empty" case without
+            # disqualifying very low-content edge segments.
             audio_dropped_paths: list[str] = []
             audio_input_paths_filtered: list[Path] = []
             for ap in audio_input_paths:
@@ -25497,7 +25576,7 @@ Admin elevation
                     sz = ap.stat().st_size
                 except Exception:
                     sz = 0
-                if sz < 16:
+                if sz < 256:
                     audio_dropped_paths.append(f"{ap.name}({sz}B)")
                     continue
                 audio_input_paths_filtered.append(ap)
@@ -26165,6 +26244,29 @@ Admin elevation
                     audio_entries = self._parse_ffmpeg_clip_audio_manifest()
                 finally:
                     self._clip_cache_audio_list_path = _saved_audio_list_path
+                # Same close_delay estimate as the primary export
+                # path: the OS-set mtime lags the actual last-sample
+                # capture by ~100-1000 ms, manifesting as audio 1 s
+                # LATE vs video.
+                close_delay_est = 0.0
+                try:
+                    if a_anchor > 0 and audio_entries:
+                        for cand in audio_entries:
+                            try:
+                                if float(cand.get("start_time", 1.0)) > 0.001:
+                                    continue
+                                cand_end_rel = float(cand.get("end_time", 0.0))
+                                cand_mt_end = float(cand.get("wall_end_mtime", 0.0) or 0.0)
+                                if cand_end_rel > 0 and cand_mt_end > 0:
+                                    expected_wall_end = a_anchor + cand_end_rel
+                                    delta = cand_mt_end - expected_wall_end
+                                    if 0.05 <= delta <= 2.0:
+                                        close_delay_est = delta
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    close_delay_est = 0.0
                 for entry in audio_entries:
                     e_start_rel = float(entry.get("start_time", 0.0))
                     e_end_rel = float(entry.get("end_time", 0.0))
@@ -26173,8 +26275,8 @@ Admin elevation
                     if mt_end > 0 and mt_start > 0:
                         # Prefer mtime — resilient to WASAPI rate
                         # drift (see comment in the parser).
-                        e_start_wall = mt_start
-                        e_end_wall = mt_end
+                        e_start_wall = mt_start - close_delay_est
+                        e_end_wall = mt_end - close_delay_est
                     elif a_anchor > 0:
                         e_start_wall = a_anchor + e_start_rel
                         e_end_wall = a_anchor + e_end_rel
