@@ -306,20 +306,20 @@ class AppConfig:
     # Duration-aware extra audio offset for LONG clips. Applied IN
     # ADDITION to clip_audio_offset_ms when the requested clip
     # duration is >= clip_audio_offset_long_threshold_seconds. The
-    # extra is negative because the symptom users see on 5-min clips
-    # is audio playing ~10 s EARLIER than the corresponding video
-    # frame. Mechanism: the rolling audio cache's segment-muxer
-    # rotation introduces a small wall-time gap between every
-    # 10-s file segment (~0.3-0.5 s per rotation). Over 30 segments
-    # that accumulates to ~10 s of "missing wall time" the concat
-    # silently closes. atrim then reads samples that were captured
-    # earlier than the wall time it thinks they map to. Shifting the
-    # atrim start later (more negative offset → larger shifted_start)
-    # picks up samples that correspond to the correct wall time at
-    # the END of the clip; the silence-padding (apad) absorbs the
-    # missing samples at the start. Per-rig, users on faster I/O
-    # can dial this toward 0; users on slow SSDs may need -12000+.
-    clip_audio_offset_ms_long: int = -10000
+    # extra is POSITIVE: empirical user testing showed the 5-min
+    # clip's audio runs ~10 s ahead of the video by the END of the
+    # clip (each segment rotation drops a tiny bit of wall content
+    # that the concat silently closes, accumulating across 30
+    # segments). With the existing sign convention
+    # `shifted_start = a_start_trim - offset_seconds`, a POSITIVE
+    # offset SHRINKS shifted_start so atrim reads samples that map
+    # to EARLIER concat positions; the silence-padding (apad)
+    # absorbs the missing samples at the end and the audio aligns.
+    # An initial negative-sign attempt (-10000) made the drift
+    # ~8 s worse, confirming the direction. Per-rig tuning: if 5-min
+    # clips end up LATE after this change, dial toward 0; if still
+    # early, push to +12000+.
+    clip_audio_offset_ms_long: int = 10000
     clip_audio_offset_long_threshold_seconds: int = 240
 
     # ===== Clip v2 settings (MVP commit 1) =====

@@ -1229,24 +1229,107 @@ def probe_input_device_format(
                 pass
 
 
-def probe_default_loopback_identity() -> Optional[tuple[int, str]]:
-    """Cheap (index, name) probe of the CURRENT Windows default
-    playback endpoint that WASAPI loopback would capture. Used by
-    the audio-endpoint watchdog to detect mid-session output-device
-    changes (user swaps speakers ↔ headset) without paying the
-    full open-stream cost of probe_default_loopback_format().
+def _query_default_render_friendly_name_via_com() -> Optional[str]:
+    """Query Windows' IMMDeviceEnumerator for the CURRENT default
+    render endpoint's friendly name. Bypasses PortAudio entirely —
+    PortAudio (and PyAudioWPatch's get_default_wasapi_loopback)
+    caches the default at PA_Initialize time and DOES NOT re-resolve
+    after Windows fires OnDefaultDeviceChanged. The user reported
+    this concrete symptom: switching default playback in Windows
+    Sound settings did not change the watchdog's fingerprint until
+    the app was restarted.
 
-    Returns None if PyAudioWPatch is missing or no default playback
-    endpoint exists. ~3 ms in practice."""
+    Pycaw.AudioUtilities.GetSpeakers() re-resolves on every call
+    (it calls IMMDeviceEnumerator::GetDefaultAudioEndpoint freshly)
+    so it tracks Windows state correctly. We only need the friendly
+    name — the matching PA loopback wrapper is then found by name
+    suffix match in the identity probe.
+
+    Returns None if pycaw or COM init failed. Logs are silent so
+    this can be called in a tight watchdog poll loop without noise.
+    """
+    try:
+        # comtypes auto-inits COM on the calling thread. Qt's main
+        # thread already runs CoInitialize(STA) via the Qt event loop
+        # init, so this is free in the watchdog tick.
+        from pycaw.pycaw import AudioUtilities  # type: ignore
+        spk = AudioUtilities.GetSpeakers()
+        if spk is None:
+            return None
+        name = getattr(spk, "FriendlyName", None)
+        if not name:
+            return None
+        return str(name)
+    except Exception:
+        return None
+
+
+def probe_default_loopback_identity() -> Optional[tuple[int, str]]:
+    """(index, name) probe of the CURRENT Windows default playback
+    endpoint that WASAPI loopback would capture. Used by the audio-
+    endpoint watchdog to detect mid-session output-device changes
+    (user swaps speakers ↔ headset) without paying the full open-
+    stream cost of probe_default_loopback_format().
+
+    Resolution strategy (in order):
+      1. Live COM query → IMMDeviceEnumerator returns the current
+         default render device's friendly name. THIS is the only
+         path that survives a Windows default-output change at
+         runtime; PyAudioWPatch's get_default_wasapi_loopback()
+         caches at PA_Initialize even across PA instance recreation,
+         so a watchdog driven by it can NEVER see the switch.
+      2. Match the friendly name against PA's loopback wrappers.
+         PyAudioWPatch names loopback wrappers '<friendly> [Loopback]',
+         so the friendly prefix + the '[Loopback]' suffix uniquely
+         identifies the wrapper index we'd open for capture.
+      3. Fallback to legacy get_default_wasapi_loopback() if either
+         the COM query or the PA enumeration leg fails. Keeps the
+         existing behavior on machines where pycaw isn't available
+         (e.g. partial Windows installs); the watchdog will still
+         work for swaps the cached path happens to catch.
+
+    Returns None if no default playback endpoint can be identified
+    by either path. ~5-10 ms in practice."""
     try:
         import pyaudiowpatch as pa  # type: ignore
     except Exception:
         return None
+    friendly = _query_default_render_friendly_name_via_com()
     p = None
     try:
         p = pa.PyAudio()
-        info = p.get_default_wasapi_loopback()
-        return (int(info.get("index", -1)), str(info.get("name", "")))
+        # Path 1+2: COM friendly name -> PA loopback wrapper.
+        if friendly:
+            target_loopback = f"{friendly} [Loopback]"
+            try:
+                count = int(p.get_device_count())
+            except Exception:
+                count = 0
+            for i in range(count):
+                try:
+                    info = p.get_device_info_by_index(i)
+                except Exception:
+                    continue
+                name = str(info.get("name", ""))
+                if name == target_loopback:
+                    return (int(i), name)
+            # Fuzzier match: some friendly names may differ in
+            # punctuation/casing between PA's enumeration and COM's
+            # response. Try a prefix + suffix match.
+            for i in range(count):
+                try:
+                    info = p.get_device_info_by_index(i)
+                except Exception:
+                    continue
+                name = str(info.get("name", ""))
+                if name.startswith(friendly) and name.endswith("[Loopback]"):
+                    return (int(i), name)
+        # Path 3 (legacy fallback): PA's cached default lookup.
+        try:
+            info = p.get_default_wasapi_loopback()
+            return (int(info.get("index", -1)), str(info.get("name", "")))
+        except Exception:
+            return None
     except Exception:
         return None
     finally:
@@ -1323,18 +1406,48 @@ def probe_default_loopback_format() -> Optional[tuple[int, int, int]]:
     pipe input match exactly what the writer thread will produce —
     a mismatch causes pitched / fast / slow playback even though
     the bytes flow fine.
+
+    Resolution: uses the same COM-first strategy as
+    probe_default_loopback_identity() so a watchdog-detected
+    endpoint change yields a swap target that matches the detection.
     """
     try:
         import pyaudiowpatch as pa  # type: ignore
     except Exception:
         return None
+    friendly = _query_default_render_friendly_name_via_com()
     p = None
     try:
         p = pa.PyAudio()
-        info = p.get_default_wasapi_loopback()
-        idx = int(info.get("index"))
-        rate = int(info.get("defaultSampleRate") or 48000) or 48000
-        channels = int(info.get("maxInputChannels") or 2) or 2
+        target_info = None
+        # Path 1+2: COM friendly name -> PA loopback wrapper, then
+        # pull rate/channels from the wrapper's PA device info.
+        if friendly:
+            target_loopback = f"{friendly} [Loopback]"
+            try:
+                count = int(p.get_device_count())
+            except Exception:
+                count = 0
+            for i in range(count):
+                try:
+                    info = p.get_device_info_by_index(i)
+                except Exception:
+                    continue
+                name = str(info.get("name", ""))
+                if name == target_loopback or (
+                    name.startswith(friendly) and name.endswith("[Loopback]")
+                ):
+                    target_info = info
+                    break
+        # Path 3 (fallback): PA's cached default lookup.
+        if target_info is None:
+            try:
+                target_info = p.get_default_wasapi_loopback()
+            except Exception:
+                return None
+        idx = int(target_info.get("index"))
+        rate = int(target_info.get("defaultSampleRate") or 48000) or 48000
+        channels = int(target_info.get("maxInputChannels") or 2) or 2
         return (idx, rate, max(1, channels))
     except Exception:
         return None
