@@ -25989,11 +25989,29 @@ Admin elevation
             # Now: ffmpeg's stderr is captured, printed to OUR stderr
             # on non-zero exit, and surfaced through the export result
             # so the GUI's failure dialog can show it to the user.
+            # Lower the export ffmpeg's process priority so it
+            # doesn't starve the CACHE ffmpeg + WASAPI bridge threads
+            # of CPU / disk-IO. Without this, on user retest the
+            # 60-s clip export caused enough resource pressure that
+            # the sys bridge polling thread stalled for ~2 s, WASAPI's
+            # capture buffer accumulated, and on resume the bridge
+            # bursted the backlog into the cache ffmpeg's stdin —
+            # collapsing ~2 s of wall-time worth of mtime cadence
+            # into a fraction of that, shifting subsequent segment
+            # wall_start values 2 s EARLIER than reality. The next
+            # 5-min clip then showed sys 2 s ahead of video for the
+            # entire post-60-s portion. BELOW_NORMAL keeps the export
+            # making forward progress without out-competing the
+            # cache + bridge that need to stay realtime.
+            export_creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            below_normal = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+            if below_normal:
+                export_creationflags |= below_normal
             completed = subprocess.run(
                 command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=export_creationflags,
             )
             # When audio was wired in but the export still succeeded,
             # surface ffmpeg's stderr to the Detailed Log anyway —
@@ -26663,11 +26681,22 @@ Admin elevation
                 *(["-c:a", "aac", "-b:a", "192k"] if has_audio else []),
                 str(output_path),
             ]
+            # Below-normal priority so disk-IO / CPU contention can't
+            # starve the cache ffmpeg + WASAPI bridges of resources.
+            # Without this, on user retest the post-export sys bridge
+            # bursted accumulated WASAPI buffer into ffmpeg's stdin,
+            # collapsing 2 s of wall-time worth of mtime cadence into
+            # a fraction of that and shifting all subsequent segment
+            # wall_starts 2 s earlier than reality.
+            export_creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            below_normal = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+            if below_normal:
+                export_creationflags |= below_normal
             completed = subprocess.run(
                 command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=export_creationflags,
             )
             if completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024:
                 actual_seconds = min(float(duration_seconds), max(0.0, total_duration))
@@ -29144,11 +29173,22 @@ def _export_recent_clip_ffmpeg(self, duration_seconds: int, target_region: QRect
                 *self._ffmpeg_encoder_args(purpose="clip_export", fps=self._clip_cache_fps),
                 str(output_path),
             ]
+            # Below-normal priority so disk-IO / CPU contention can't
+            # starve the cache ffmpeg + WASAPI bridges of resources.
+            # Without this, on user retest the post-export sys bridge
+            # bursted accumulated WASAPI buffer into ffmpeg's stdin,
+            # collapsing 2 s of wall-time worth of mtime cadence into
+            # a fraction of that and shifting all subsequent segment
+            # wall_starts 2 s earlier than reality.
+            export_creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            below_normal = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+            if below_normal:
+                export_creationflags |= below_normal
             completed = subprocess.run(
                 command,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=export_creationflags,
             )
             if completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024:
                 actual_seconds = min(float(duration_seconds), max(0.0, total_duration))

@@ -344,13 +344,16 @@ class AppConfig:
     # sys chain BEFORE amix. Positive = sys audio shifts LATER in
     # the mixed output, used when sys leads mic + video (the
     # symptom: 'pc output audio plays before the visual it
-    # corresponds to'). Default 500 ms calibrated to compensate the
-    # TCP-accept-floor residual on rigs where actual TCP-accept is
-    # less than the 1.0 s floor — sys's PTS=0 lands at the bridge's
-    # real start, but mic gets pre-padded to the floor, leaving sys
-    # systematically ahead by (1.0 - actual_tcp) seconds. Bounded
-    # [0, 2000] for safety. Set to 0 to disable.
-    clip_sys_audio_delay_ms: int = 500
+    # corresponds to'). Default 1000 ms calibrated to compensate
+    # the TCP-accept-floor residual on rigs where actual TCP-accept
+    # is less than the 1.0 s floor — sys's PTS=0 lands at the
+    # bridge's real start, but mic gets pre-padded to the floor,
+    # leaving sys systematically ahead by (1.0 - actual_tcp)
+    # seconds. 500 ms was tried first and the user reported sys
+    # was still ~0.5 s ahead, so the residual is closer to 1.0 s
+    # on this rig. Bounded [0, 2000] for safety; set to 0 to
+    # disable.
+    clip_sys_audio_delay_ms: int = 1000
 
     # ===== Clip v2 settings (MVP commit 1) =====
     # Default voice "clip that" duration in seconds. When the user

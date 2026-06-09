@@ -1043,6 +1043,60 @@ class WasapiLoopbackWriter:
                         avail = int(stream.get_read_available())
                     except Exception:
                         avail = 0
+                # Burst protection. If the bridge thread was stalled
+                # (e.g. by an EXPORT subprocess saturating disk-IO or
+                # the GIL holder running heavy work), WASAPI's
+                # capture buffer accumulates samples while no one
+                # reads them. When the thread resumes, avail can be
+                # MUCH larger than 1024 — and the read+write loop
+                # below has no rate limit, so it bursts the entire
+                # backlog into ffmpeg's stdin in fractional wall
+                # time. ffmpeg then writes multiple segment files
+                # back-to-back, their mtimes packed tightly within
+                # the burst window, and the export aligner's chain
+                # math reads those compressed mtimes as if they
+                # represent real wall — shifting wall_starts
+                # backlog_duration seconds EARLIER than reality.
+                # Symptom user reported: after taking a 60-s clip,
+                # the next 5-min clip's sys audio was 2 s ahead of
+                # video for the entire post-60-s portion (= the
+                # accumulated backlog the export caused).
+                #
+                # Threshold: 47 chunks ≈ 1 s of audio at 48 kHz.
+                # Normal scheduling jitter keeps avail well under
+                # 5 chunks (~100 ms). > 47 chunks indicates a real
+                # stall, not transient jitter. Drain ALL excess past
+                # ~half a chunk so the next iteration reads in
+                # realtime cadence again. Drained samples are
+                # silently dropped at the bridge — the resulting
+                # clip will have a brief silent gap during the
+                # stall window, but timing on EVERY SUBSEQUENT
+                # frame stays accurate.
+                if avail > 47 * 1024 and stream is not None:
+                    drained_bytes = 0
+                    try:
+                        while int(stream.get_read_available()) >= 1024:
+                            stream.read(1024, exception_on_overflow=False)
+                            drained_bytes += 1024 * 2 * max(1, self.channels)
+                    except Exception:
+                        pass
+                    try:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"[wasapi-bridge] {self._label}: burst-drain "
+                            f"after stall — {drained_bytes // 1024} KB "
+                            f"dropped (avail was {avail} samples, ~"
+                            f"{avail / max(1, self.rate):.2f}s backlog)\n"
+                        )
+                        _sys.stderr.flush()
+                    except Exception:
+                        pass
+                    # Re-read avail so the if/else below picks the
+                    # right path now that the buffer is drained.
+                    try:
+                        avail = int(stream.get_read_available())
+                    except Exception:
+                        avail = 0
                 if avail >= 1024 and stream is not None:
                     # Real audio available — read and write it.
                     # Always exit silence mode the moment real data
