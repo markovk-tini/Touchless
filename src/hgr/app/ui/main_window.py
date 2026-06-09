@@ -25484,7 +25484,7 @@ Admin elevation
                                 if 0 < cand_end_rel < 30 and cand_mt_end > 0:
                                     expected_wall_end = a_anchor + cand_end_rel
                                     delta = cand_mt_end - expected_wall_end
-                                    if 0.05 <= delta <= 8.0:
+                                    if 0.05 <= delta <= 0.75:
                                         close_delay_est = delta
                                     break
                             except Exception:
@@ -26535,7 +26535,7 @@ Admin elevation
                                 if 0 < cand_end_rel < 30 and cand_mt_end > 0:
                                     expected_wall_end = a_anchor + cand_end_rel
                                     delta = cand_mt_end - expected_wall_end
-                                    if 0.05 <= delta <= 8.0:
+                                    if 0.05 <= delta <= 0.75:
                                         close_delay_est = delta
                                     break
                             except Exception:
