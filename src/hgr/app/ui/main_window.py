@@ -24102,10 +24102,32 @@ Admin elevation
                 )
             else:
                 mic_chain = f"[{mic_idx}:a]{ns},afftdn=nr=10[amic]"
+            # Sys-only delay. The TCP-accept-floor (max(1.0,
+            # tcp_elapsed)) used to align the mic bridge leaves sys
+            # systematically AHEAD of mic by (1.0 - actual_tcp) on
+            # rigs where TCP accept is fast. User reports show sys
+            # ~0.5 s earlier than mic + video. Compensate at the
+            # cache-spawn filter by inserting adelay on sys before
+            # amix — pushes sys content (1.0 - tcp) seconds later
+            # so PTS=N of sys aligns with PTS=N of mic. mic + video
+            # alignment stays untouched.
+            try:
+                sys_delay_ms = int(getattr(
+                    self.config, "clip_sys_audio_delay_ms", 500
+                ) or 0)
+            except Exception:
+                sys_delay_ms = 500
+            sys_delay_ms = max(0, min(2000, sys_delay_ms))
+            if sys_delay_ms > 0:
+                sys_chain = (
+                    f"[{sys_idx}:a]anull,adelay={sys_delay_ms}:all=1[asys]"
+                )
+            else:
+                sys_chain = f"[{sys_idx}:a]anull[asys]"
             filter_args = [
                 "-filter_complex",
                 (
-                    f"[{sys_idx}:a]anull[asys];"
+                    f"{sys_chain};"
                     f"{mic_chain};"
                     "[asys][amic]amix=inputs=2:duration=longest:"
                     "dropout_transition=0:weights=2 3[aout]"
@@ -25488,6 +25510,93 @@ Admin elevation
                         "wall_start": e_start_wall,
                         "wall_end": e_end_wall,
                     })
+                # IN-PROGRESS SEGMENT: ffmpeg's segment muxer only
+                # appends to the CSV manifest when a segment ROTATES
+                # (= reaches segment_time worth of file content).
+                # The in-progress file being WRITTEN at clip time is
+                # NOT yet in audio_entries, so the export's
+                # a_seg_wall_end falls up to one segment-duration
+                # (~10 s) behind v_clip_wall_end. The downstream
+                # apad math then masks the gap with silence — the
+                # user-observed "audio cuts out ~4.5 s before end".
+                #
+                # Glob the cache dir for audio_*.aac files. Any file
+                # whose mtime is NEWER than the last manifest entry
+                # AND larger than the pre-flight threshold is the
+                # in-progress segment. Synthesize a manifest entry
+                # for it so the selection picks it up and the hot-
+                # snapshot path below grabs a stable copy.
+                try:
+                    cache_dir = self._clip_cache_dir()
+                    pattern = self._clip_cache_audio_segment_pattern
+                    if pattern is not None:
+                        glob_pat = pattern.name.replace("%03d", "[0-9][0-9][0-9]")
+                        last_mt_end = max(
+                            (float(e.get("wall_end_mtime", 0.0) or 0.0)
+                             for e in audio_entries),
+                            default=0.0,
+                        )
+                        last_end_rel = max(
+                            (float(e.get("end_time", 0.0))
+                             for e in audio_entries),
+                            default=0.0,
+                        )
+                        nominal_seg = float(self._clip_cache_segment_seconds)
+                        in_progress_candidates: list = []
+                        for path in cache_dir.glob(glob_pat):
+                            try:
+                                st = path.stat()
+                            except Exception:
+                                continue
+                            if st.st_size < 256:
+                                continue
+                            if st.st_mtime <= last_mt_end + 0.05:
+                                continue
+                            in_progress_candidates.append(
+                                (path, st.st_mtime, st.st_size)
+                            )
+                        if in_progress_candidates:
+                            # Pick the NEWEST one — that's the file
+                            # ffmpeg is actively appending to right now.
+                            in_progress_candidates.sort(key=lambda t: t[1], reverse=True)
+                            ip_path, ip_mtime, ip_size = in_progress_candidates[0]
+                            # The in-progress file has been growing
+                            # since last_mt_end. Its content covers
+                            # the wall window [last_mt_end, NOW].
+                            # End_time relative is last_end_rel +
+                            # (wall_now - last_mt_end).
+                            wall_now = time.time()
+                            ip_wall_end = wall_now
+                            ip_wall_start = last_mt_end
+                            ip_start_rel = last_end_rel
+                            ip_end_rel = (
+                                last_end_rel + max(0.0, wall_now - last_mt_end)
+                            )
+                            synthetic = {
+                                "path": str(ip_path),
+                                "start_time": ip_start_rel,
+                                "end_time": ip_end_rel,
+                                "wall_start_mtime": ip_wall_start,
+                                "wall_end_mtime": ip_wall_end,
+                                "wall_start": ip_wall_start - close_delay_est,
+                                "wall_end": ip_wall_end - close_delay_est,
+                                "_in_progress": True,
+                            }
+                            audio_entries_wall.append(synthetic)
+                            try:
+                                import sys as _sys
+                                _sys.stderr.write(
+                                    f"[clip-export] in-progress audio segment "
+                                    f"detected: {ip_path.name} "
+                                    f"(size={ip_size} B, mtime_age="
+                                    f"{wall_now - ip_mtime:.2f}s) covering wall "
+                                    f"[{ip_wall_start:.2f},{ip_wall_end:.2f}]\n"
+                                )
+                                _sys.stderr.flush()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
                 for entry in audio_entries_wall:
                     if (entry["wall_end"] < a_window_wall_start
                             or entry["wall_start"] > a_window_wall_end):

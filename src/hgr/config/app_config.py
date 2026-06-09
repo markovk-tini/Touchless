@@ -340,6 +340,18 @@ class AppConfig:
     # compensated here.
     clip_mic_capture_latency_ms: int = 0
 
+    # SYS-only delay (ms) applied at cache spawn via adelay on the
+    # sys chain BEFORE amix. Positive = sys audio shifts LATER in
+    # the mixed output, used when sys leads mic + video (the
+    # symptom: 'pc output audio plays before the visual it
+    # corresponds to'). Default 500 ms calibrated to compensate the
+    # TCP-accept-floor residual on rigs where actual TCP-accept is
+    # less than the 1.0 s floor — sys's PTS=0 lands at the bridge's
+    # real start, but mic gets pre-padded to the floor, leaving sys
+    # systematically ahead by (1.0 - actual_tcp) seconds. Bounded
+    # [0, 2000] for safety. Set to 0 to disable.
+    clip_sys_audio_delay_ms: int = 500
+
     # ===== Clip v2 settings (MVP commit 1) =====
     # Default voice "clip that" duration in seconds. When the user
     # says just "clip that" / "clip this" / "save clip" without a
