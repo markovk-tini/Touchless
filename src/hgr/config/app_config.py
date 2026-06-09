@@ -292,6 +292,8 @@ class AppConfig:
     clip_audio_offset_bridge_rewrite_aligned_migrated: bool = False
     # Ninth-pass marker: clip_sys_audio_delay_ms 500 -> 1000.
     clip_sys_delay_to_1000_migrated: bool = False
+    # Tenth-pass marker: clip_mic_capture_latency_ms 0 -> 2500.
+    clip_mic_latency_to_2500_migrated: bool = False
     # Audio-vs-video offset applied at clip export by biasing the
     # audio-trim start point. Sign convention from the export math
     # `shifted_start = a_start_trim - offset_seconds`:
@@ -335,15 +337,21 @@ class AppConfig:
 
     # Mic hardware capture-latency compensation (ms). Applied at
     # cache-spawn time as an atrim on the MIC chain BEFORE amix.
-    # Razer Kiyo Pro (webcam): ~2500 ms DSP capture lag.
-    # Razer BlackShark V2 Pro (headset): ~1700 ms.
-    # Generic / line-in mics: typically 0 ms.
+    # Default 2500 ms calibrated to user retest: in 5-min clips
+    # mic was landing ~2.5 s LATE relative to sys/video; in shorter
+    # clips the offset was present but masked because measurement
+    # depended on a clear mic event. The atrim discards the
+    # leading 2.5 s of mic content (which represents pre-anchor
+    # audio anyway due to the mic's DSP capture buffer) and shifts
+    # the rest forward into alignment with sys.
+    # Typical values by hardware:
+    #   Razer Kiyo Pro (webcam): ~2500 ms DSP capture lag.
+    #   Razer BlackShark V2 Pro (headset): ~1700 ms.
+    #   Generic / line-in mics: typically 0 ms.
     # Negative values are nonsense (a mic can't capture future
     # audio), so the apply path clamps to >= 0. 5000 ms upper bound
-    # for safety against typos. After the TCP-accept measurement
-    # fix landed, only the HARDWARE-LATENCY portion remains to be
-    # compensated here.
-    clip_mic_capture_latency_ms: int = 0
+    # for safety against typos.
+    clip_mic_capture_latency_ms: int = 2500
 
     # SYS-only delay (ms) applied at cache spawn via adelay on the
     # sys chain BEFORE amix. Positive = sys audio shifts LATER in
@@ -832,6 +840,22 @@ def load_config() -> AppConfig:
             if values.get("clip_sys_audio_delay_ms") == 500:
                 values["clip_sys_audio_delay_ms"] = 1000
             values["clip_sys_delay_to_1000_migrated"] = True
+
+        # Tenth-pass migration: clip_mic_capture_latency_ms bumped
+        # from 0 to 2500 because user reported in 5-min retest that
+        # mic was ~2.5 s LATE relative to sys/video. The atrim on
+        # the mic chain at cache spawn discards the leading mic
+        # content (which represents pre-anchor audio anyway due to
+        # the mic's DSP capture buffer) and shifts the rest forward
+        # into alignment with sys. Flip persisted 0 -> 2500 so
+        # existing configs pick up the new default on first load
+        # without the user editing settings.json. Users who have
+        # already manually tuned (e.g. to 1700 for BlackShark V2 Pro,
+        # or to 0 for a clean line-in mic) keep their value.
+        if not data.get("clip_mic_latency_to_2500_migrated", False):
+            if values.get("clip_mic_capture_latency_ms") == 0:
+                values["clip_mic_capture_latency_ms"] = 2500
+            values["clip_mic_latency_to_2500_migrated"] = True
 
         # Clip v2 settings — MVP commit 1. Every new field's default
         # matches v1 implicit behavior, so this migration mutates
