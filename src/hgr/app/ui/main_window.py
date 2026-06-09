@@ -18737,7 +18737,26 @@ Admin elevation
             self.use_phone_camera_qr_checkbox.blockSignals(False)
 
         engine_was_running = self._worker is not None
-        if engine_was_running:
+        # Only reconstruct the worker engine when the camera CHOICE
+        # actually changed. Previously this fired on every save —
+        # including saves where only the Live View Overlay checkboxes
+        # (FPS / latency / tracking-quality) were toggled, with the
+        # camera selection unchanged. The user-reported symptom:
+        # toggling FPS + latency froze Touchless for 1-2 s because
+        # the deferred-but-still-synchronous _safe_start_engine path
+        # tore down and restarted the camera capture pipeline for no
+        # reason, blocking the GIL during the construct step. That
+        # freeze also delayed audio-bridge first_sample_at timestamps
+        # so the user's subsequent clip alignment was thrown off.
+        # Comparing against the saved combo value is the same predicate
+        # the Save button already uses to enable/disable itself.
+        try:
+            camera_choice_changed = (
+                selected_data != self._saved_camera_settings_combo_value()
+            )
+        except Exception:
+            camera_choice_changed = True
+        if engine_was_running and camera_choice_changed:
             # Defer the hot worker swap to the next event-loop tick
             # so the click handler returns IMMEDIATELY. Without this,
             # the rest of start_engine (~3-4 s of stop-old + construct-
@@ -18777,7 +18796,7 @@ Admin elevation
             confirmation = (
                 f"Camera preference saved. Touchless will now use:\n\n{label}"
             )
-        if engine_was_running:
+        if engine_was_running and camera_choice_changed:
             confirmation += "\n\nThe camera is being switched live — gestures may pause for 1-3 seconds while the new camera initializes."
         if show_notice:
             TouchlessNotice.show_info(self, "Camera Saved", confirmation)
@@ -25367,6 +25386,25 @@ Admin elevation
                 # every entry's wall times so audio and video share
                 # the same anchor in wall clock. Bounded to [0, 2.0]
                 # so a misreported mtime can't shift audio wildly.
+                # CONSERVATIVE bounds: actual OS close-syscall delay
+                # on Windows is typically 50-500 ms, plus ffmpeg
+                # write-buffer flush ~100-200 ms. 700 ms upper bound
+                # catches legitimate close_delay without absorbing
+                # WASAPI rate drift (which inflates delta beyond the
+                # pure close_delay). Over-subtracting drift-as-delay
+                # was the regression user saw after the initial fix:
+                # audio went from 1 s late (the un-corrected case)
+                # past zero to 1-2 s early because the estimator
+                # was saturating at the previous 2.0 s upper bound.
+                #
+                # Also REQUIRE end_time < 30 s on the candidate: in
+                # a long-running cache, the FIRST entry-with-start-
+                # time-0 in the CSV might be a wrapped slot whose
+                # mtime is from a much later write (the parser
+                # keeps the latest mtime per path). end_time on a
+                # genuine first segment is ~10 s; on a re-written
+                # slot it's hundreds of seconds, and using its
+                # mtime as the close-delay reference is meaningless.
                 close_delay_est = 0.0
                 try:
                     if a_anchor > 0 and audio_entries:
@@ -25376,10 +25414,10 @@ Admin elevation
                                     continue
                                 cand_end_rel = float(cand.get("end_time", 0.0))
                                 cand_mt_end = float(cand.get("wall_end_mtime", 0.0) or 0.0)
-                                if cand_end_rel > 0 and cand_mt_end > 0:
+                                if 0 < cand_end_rel < 30 and cand_mt_end > 0:
                                     expected_wall_end = a_anchor + cand_end_rel
                                     delta = cand_mt_end - expected_wall_end
-                                    if 0.05 <= delta <= 2.0:
+                                    if 0.05 <= delta <= 0.75:
                                         close_delay_est = delta
                                     break
                             except Exception:
@@ -26248,6 +26286,25 @@ Admin elevation
                 # path: the OS-set mtime lags the actual last-sample
                 # capture by ~100-1000 ms, manifesting as audio 1 s
                 # LATE vs video.
+                # CONSERVATIVE bounds: actual OS close-syscall delay
+                # on Windows is typically 50-500 ms, plus ffmpeg
+                # write-buffer flush ~100-200 ms. 700 ms upper bound
+                # catches legitimate close_delay without absorbing
+                # WASAPI rate drift (which inflates delta beyond the
+                # pure close_delay). Over-subtracting drift-as-delay
+                # was the regression user saw after the initial fix:
+                # audio went from 1 s late (the un-corrected case)
+                # past zero to 1-2 s early because the estimator
+                # was saturating at the previous 2.0 s upper bound.
+                #
+                # Also REQUIRE end_time < 30 s on the candidate: in
+                # a long-running cache, the FIRST entry-with-start-
+                # time-0 in the CSV might be a wrapped slot whose
+                # mtime is from a much later write (the parser
+                # keeps the latest mtime per path). end_time on a
+                # genuine first segment is ~10 s; on a re-written
+                # slot it's hundreds of seconds, and using its
+                # mtime as the close-delay reference is meaningless.
                 close_delay_est = 0.0
                 try:
                     if a_anchor > 0 and audio_entries:
@@ -26257,10 +26314,10 @@ Admin elevation
                                     continue
                                 cand_end_rel = float(cand.get("end_time", 0.0))
                                 cand_mt_end = float(cand.get("wall_end_mtime", 0.0) or 0.0)
-                                if cand_end_rel > 0 and cand_mt_end > 0:
+                                if 0 < cand_end_rel < 30 and cand_mt_end > 0:
                                     expected_wall_end = a_anchor + cand_end_rel
                                     delta = cand_mt_end - expected_wall_end
-                                    if 0.05 <= delta <= 2.0:
+                                    if 0.05 <= delta <= 0.75:
                                         close_delay_est = delta
                                     break
                             except Exception:
