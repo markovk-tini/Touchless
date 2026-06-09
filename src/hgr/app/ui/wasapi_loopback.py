@@ -662,6 +662,14 @@ class WasapiLoopbackWriter:
         last_real_at = _time.time()
         next_silence_due = 0.0
         silence_mode = False
+        # Per-chunk pacing for the real-read path. Tracks the
+        # last wall-clock moment we wrote a real (non-silence)
+        # chunk to ffmpeg's stdin. Used to throttle bursts that
+        # would otherwise pack many chunks into fractional wall
+        # time and shift segment-muxer mtimes earlier than
+        # reality. 0.0 = uninitialized; first real write skips
+        # the throttle.
+        last_real_write_at = 0.0
         real_bytes = 0
         silence_bytes = 0
         bytes_total = 0
@@ -1057,22 +1065,15 @@ class WasapiLoopbackWriter:
                 # math reads those compressed mtimes as if they
                 # represent real wall — shifting wall_starts
                 # backlog_duration seconds EARLIER than reality.
-                # Symptom user reported: after taking a 60-s clip,
-                # the next 5-min clip's sys audio was 2 s ahead of
-                # video for the entire post-60-s portion (= the
-                # accumulated backlog the export caused).
                 #
-                # Threshold: 47 chunks ≈ 1 s of audio at 48 kHz.
-                # Normal scheduling jitter keeps avail well under
-                # 5 chunks (~100 ms). > 47 chunks indicates a real
-                # stall, not transient jitter. Drain ALL excess past
-                # ~half a chunk so the next iteration reads in
-                # realtime cadence again. Drained samples are
-                # silently dropped at the bridge — the resulting
-                # clip will have a brief silent gap during the
-                # stall window, but timing on EVERY SUBSEQUENT
-                # frame stays accurate.
-                if avail > 47 * 1024 and stream is not None:
+                # Threshold lowered from 47 chunks (~1 s) to 8
+                # chunks (~170 ms) per user retest: at 47 chunks a
+                # 500 ms stall doesn't trigger drain but still
+                # produces ~500 ms of drift. 8 chunks is just above
+                # normal scheduling jitter (~2 chunks at 30 ms) but
+                # well within WASAPI's internal buffer floor so we
+                # don't false-positive-drain real audio.
+                if avail > 8 * 1024 and stream is not None:
                     drained_bytes = 0
                     try:
                         while int(stream.get_read_available()) >= 1024:
@@ -1107,6 +1108,25 @@ class WasapiLoopbackWriter:
                         self._on_error(f"WASAPI read error: {exc}")
                         break
                     if data:
+                        # Per-chunk pacing. If WASAPI has been
+                        # delivering samples faster than the loop
+                        # consumed them (typical right after a
+                        # transient stall that didn't fully trigger
+                        # the burst-drain above), back-to-back reads
+                        # would happen with near-zero wall between
+                        # them. Throttle to one chunk per tick_seconds
+                        # so ffmpeg's input-PTS clock advances at
+                        # realtime rate. Sleep capped at 30 ms so we
+                        # can still catch up gradually if stream.read
+                        # blocked briefly. last_real_write_at == 0
+                        # on first real chunk = no throttle.
+                        if last_real_write_at > 0:
+                            target_t = last_real_write_at + tick_seconds
+                            now_inner = _time.time()
+                            sleep_for = target_t - now_inner
+                            if sleep_for > 0.001:
+                                _time.sleep(min(0.030, sleep_for))
+                        last_real_write_at = _time.time()
                         real_bytes += len(data)
                         last_real_at = now_t
                         silence_mode = False

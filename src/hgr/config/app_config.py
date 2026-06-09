@@ -287,6 +287,11 @@ class AppConfig:
     # Seventh-pass marker: -6500 was slightly EARLY (<1 s).
     # Pull back to -6000.
     clip_audio_offset_early_at_6500_migrated: bool = False
+    # Eighth-pass marker: post-bridge-rewrite the -6000 default is no
+    # longer needed; flip persisted -6000 -> 0 on first load.
+    clip_audio_offset_bridge_rewrite_aligned_migrated: bool = False
+    # Ninth-pass marker: clip_sys_audio_delay_ms 500 -> 1000.
+    clip_sys_delay_to_1000_migrated: bool = False
     # Audio-vs-video offset applied at clip export by biasing the
     # audio-trim start point. Sign convention from the export math
     # `shifted_start = a_start_trim - offset_seconds`:
@@ -816,6 +821,17 @@ def load_config() -> AppConfig:
             if values.get("clip_audio_offset_ms") == -6000:
                 values["clip_audio_offset_ms"] = 0
             values["clip_audio_offset_bridge_rewrite_aligned_migrated"] = True
+
+        # Ninth-pass migration: clip_sys_audio_delay_ms bumped from
+        # 500 to 1000 because user reported sys audio still ~0.5 s
+        # ahead with 500 ms. The TCP-floor at max(1.0, tcp_elapsed)
+        # leaves the residual closer to 1.0 s. Flip persisted 500 ->
+        # 1000 so existing configs pick up the new default without
+        # the user editing settings.json.
+        if not data.get("clip_sys_delay_to_1000_migrated", False):
+            if values.get("clip_sys_audio_delay_ms") == 500:
+                values["clip_sys_audio_delay_ms"] = 1000
+            values["clip_sys_delay_to_1000_migrated"] = True
 
         # Clip v2 settings — MVP commit 1. Every new field's default
         # matches v1 implicit behavior, so this migration mutates
