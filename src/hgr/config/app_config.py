@@ -328,6 +328,18 @@ class AppConfig:
     clip_audio_offset_ms_long: int = 0
     clip_audio_offset_long_threshold_seconds: int = 240
 
+    # Mic hardware capture-latency compensation (ms). Applied at
+    # cache-spawn time as an atrim on the MIC chain BEFORE amix.
+    # Razer Kiyo Pro (webcam): ~2500 ms DSP capture lag.
+    # Razer BlackShark V2 Pro (headset): ~1700 ms.
+    # Generic / line-in mics: typically 0 ms.
+    # Negative values are nonsense (a mic can't capture future
+    # audio), so the apply path clamps to >= 0. 5000 ms upper bound
+    # for safety against typos. After the TCP-accept measurement
+    # fix landed, only the HARDWARE-LATENCY portion remains to be
+    # compensated here.
+    clip_mic_capture_latency_ms: int = 0
+
     # ===== Clip v2 settings (MVP commit 1) =====
     # Default voice "clip that" duration in seconds. When the user
     # says just "clip that" / "clip this" / "save clip" without a

@@ -57,6 +57,21 @@ class ThreadedCvCapture:
         # while these frames pass through the reader thread) and
         # works on every camera regardless of lighting.
         self._warmup_remaining = max(0, int(warmup_frames))
+        # Secondary safety net for the "live view is mainly black
+        # with glitchy dots, camera didn't load" symptom: after the
+        # fixed-prefix discard, ALSO keep discarding while the next
+        # arriving frame is OVERWHELMINGLY black/zero (>= 98 % of
+        # pixels at value 0). This is NOT the standard brightness
+        # gate that the comment above rules out — that one passes
+        # noisy/corrupted frames through. THIS one only catches the
+        # case where the camera hasn't produced any real signal at
+        # all and is still returning zero buffers. Bounded so a
+        # genuinely dark scene doesn't stall the pipeline forever:
+        # at most 30 extra frames (~1 s at 30 fps) past the fixed
+        # prefix get the black-discard treatment. Empty / dim rooms
+        # have noise (sensor read noise alone is > 2 % non-zero), so
+        # this threshold doesn't false-positive on real content.
+        self._black_discard_remaining = 30
         if self._inner.isOpened():
             self._reader_thread = threading.Thread(
                 target=self._reader_loop,
@@ -115,6 +130,21 @@ class ThreadedCvCapture:
             if self._warmup_remaining > 0:
                 self._warmup_remaining -= 1
                 continue
+            if self._black_discard_remaining > 0:
+                # Cheap check on the raw frame buffer: a fully-black
+                # / unsignaled camera returns nearly-all-zero arrays.
+                # Real scenes — even very dark ones — have sensor
+                # read-noise floor of ~2 % non-zero pixels minimum.
+                try:
+                    if frame is not None and frame.size > 0:
+                        nonzero = int(np.count_nonzero(frame))
+                        ratio = nonzero / float(frame.size)
+                        if ratio < 0.02:
+                            self._black_discard_remaining -= 1
+                            continue
+                except Exception:
+                    pass
+                self._black_discard_remaining = 0
             decoded_at = time.monotonic()
             with self._frame_lock:
                 self._latest_frame = frame

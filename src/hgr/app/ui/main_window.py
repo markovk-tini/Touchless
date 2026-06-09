@@ -24075,11 +24075,38 @@ Admin elevation
             # the voice's tone the way a higher value (25-30 dB)
             # would. Applied AFTER the {ns} preset so user-chosen
             # noise gating still runs first.
+            # Mic hardware capture-latency compensation. Mics like
+            # Razer Kiyo Pro carry a DSP-buffer of ~2-3 s — the sample
+            # ARRIVING at the OS at wall T was actually captured at
+            # wall T - capture_latency. amix lines up streams by
+            # input PTS (cumulative-sample-count), so without any
+            # compensation the mic ends up systematically LATE in
+            # the mixed output by the capture_latency. We trim the
+            # first {latency} seconds off the mic chain BEFORE
+            # amix-ing — the trimmed samples represented audio from
+            # BEFORE the cache anchor anyway, so dropping them
+            # advances the mic stream into alignment with sys.
+            try:
+                mic_latency_ms = int(getattr(
+                    self.config, "clip_mic_capture_latency_ms", 0
+                ) or 0)
+            except Exception:
+                mic_latency_ms = 0
+            mic_latency_ms = max(0, min(5000, mic_latency_ms))
+            mic_latency_s = mic_latency_ms / 1000.0
+            if mic_latency_ms > 0:
+                mic_chain = (
+                    f"[{mic_idx}:a]{ns},afftdn=nr=10,"
+                    f"atrim=start={mic_latency_s:.3f},"
+                    f"asetpts=PTS-STARTPTS[amic]"
+                )
+            else:
+                mic_chain = f"[{mic_idx}:a]{ns},afftdn=nr=10[amic]"
             filter_args = [
                 "-filter_complex",
                 (
                     f"[{sys_idx}:a]anull[asys];"
-                    f"[{mic_idx}:a]{ns},afftdn=nr=10[amic];"
+                    f"{mic_chain};"
                     "[asys][amic]amix=inputs=2:duration=longest:"
                     "dropout_transition=0:weights=2 3[aout]"
                 ),
@@ -24230,7 +24257,9 @@ Admin elevation
                     # the user just reported). 30s is generous enough
                     # to survive antivirus-slow process spawn without
                     # hanging the clip-cache start UX forever.
+                    tcp_accept_t0 = time.time()
                     sock_file = self._clip_mic_tcp_acceptor.accept(timeout=30.0)
+                    tcp_accept_elapsed = max(0.0, time.time() - tcp_accept_t0)
                     if sock_file is None:
                         _log(
                             "mic TCP listener never received an ffmpeg "
@@ -24242,30 +24271,46 @@ Admin elevation
                         # Pass sys writer's first_sample_at as the
                         # mic's alignment anchor. The mic bridge will
                         # pre-pad silence equal to (mic_start_t -
-                        # sys_first_sample_at) so its PTS=0 lands at
-                        # the same wall moment as sys's PTS=0. Fixes
-                        # the "mic is 3-4 s ahead of video" symptom
-                        # that came from the TCP-accept gap between
-                        # the two bridges starting.
+                        # align_to_wall_time) so its PTS=0 lands at
+                        # the same wall moment as sys's PTS=0.
                         #
-                        # Callback-mode mic ends up LATE in the
-                        # clip vs sys (~1 s under the previous
-                        # default, ~2 s after I shifted the align
-                        # target by -1 s). Sign trace from the math
-                        # `anchor_pad_seconds = start_t -
-                        # align_to_wall_time`: a LATER align target
-                        # means SMALLER pre-pad → fewer silence
-                        # bytes before real mic samples in the file
-                        # → real mic appears EARLIER in the clip's
-                        # mic stream. So to pull mic earlier we
-                        # ADD time to the align target (sign was
-                        # inverted in the previous attempt). +1 s
-                        # adjustment lands mic synced with sys.
+                        # Previously this added a HARDCODED +1.0 to
+                        # the sys first_sample as the alignment
+                        # target — empirically chosen to compensate
+                        # for the typical TCP-accept + callback-mode
+                        # mic startup gap. The user reports show this
+                        # constant was systematically WRONG for their
+                        # rig: mic landed 1.7-2.5 s LATE, exactly the
+                        # excess TCP-accept duration that wasn't
+                        # being measured.
+                        #
+                        # FIX (per workflow wf_2d70e852-f3e): measure
+                        # the actual TCP-accept elapsed wall time
+                        # and use THAT as the alignment shift. This
+                        # gives a per-rig, per-spawn measurement
+                        # instead of a hardcoded guess. ffmpeg
+                        # spawn-time variance (antivirus, system
+                        # load) is now captured automatically.
+                        # Floor at 1.0 s so we never under-compensate
+                        # the known callback-mode latency on rigs
+                        # where TCP accept happens to be very fast.
                         sys_first_sample = None
                         if self._wasapi_writer is not None:
                             sys_first_sample = self._wasapi_writer.first_sample_at
                             if sys_first_sample is not None:
-                                sys_first_sample += 1.0
+                                tcp_shift = max(1.0, float(tcp_accept_elapsed))
+                                sys_first_sample += tcp_shift
+                                try:
+                                    import sys as _sys
+                                    _sys.stderr.write(
+                                        f"[clip-audio] mic alignment: "
+                                        f"tcp_accept={tcp_accept_elapsed:.3f}s "
+                                        f"-> shift={tcp_shift:.3f}s applied to "
+                                        f"sys_first_sample anchor\n"
+                                    )
+                                    _sys.stderr.flush()
+                                except Exception:
+                                    pass
                         mic_writer = WasapiLoopbackWriter(
                             sock_file,
                             device_index=mic_dev,
@@ -25491,6 +25536,7 @@ Admin elevation
                         f"entries_total={len(audio_entries)} selected={len(audio_selected)} "
                         f"window_fallback_used={window_fallback_used} "
                         f"v_anchor={v_anchor:.2f} a_anchor={a_anchor:.2f} "
+                        f"close_delay_est={close_delay_est:.3f}s "
                         f"a_window_wall=[{a_window_wall_start:.2f},{a_window_wall_end:.2f}] "
                         f"entry_wall_times={_entry_times}"
                     )
