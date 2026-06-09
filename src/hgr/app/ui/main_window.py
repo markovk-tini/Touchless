@@ -25484,7 +25484,7 @@ Admin elevation
                                 if 0 < cand_end_rel < 30 and cand_mt_end > 0:
                                     expected_wall_end = a_anchor + cand_end_rel
                                     delta = cand_mt_end - expected_wall_end
-                                    if 0.05 <= delta <= 0.75:
+                                    if 0.05 <= delta <= 8.0:
                                         close_delay_est = delta
                                     break
                             except Exception:
@@ -25924,8 +25924,48 @@ Admin elevation
                 if int(duration_seconds) >= long_threshold:
                     user_offset_ms = max(-30000, min(30000, user_offset_ms + long_extra_ms))
                 m = len(audio_selected)
-                concat_in_a = "".join(f"[{n + j}:a]" for j in range(m))
-                a_chain = [f"{concat_in_a}concat=n={m}:v=0:a=1"]
+                # SILENCE-GAP INSERTION for cache rate-drift compensation.
+                # The bridge sometimes falls behind realtime — segments
+                # take 10.1-10.6 s of wall to write 10 s of file content
+                # (~1-6 % per-segment drift). The export's chain math
+                # treats the concat as a linear wall-time mapping, but
+                # the "missing" wall slices (= wall_span - file_duration
+                # for each segment) accumulate as drift in the user's
+                # playback: audio leads video by the cumulative gap.
+                #
+                # Fix: between each consecutive segment in the concat,
+                # insert silence equal to the missing wall of the NEXT
+                # segment. After insertion, file_pts maps linearly to
+                # wall — atrim works correctly without drift growth.
+                # Generated via aevalsrc=0:d=<gap> filter sources.
+                concat_in_a_parts: list[str] = []
+                gap_filters: list[str] = []
+                gap_idx = 0
+                for j, entry_a in enumerate(audio_selected):
+                    if j > 0:
+                        try:
+                            wall_span = float(audio_selected[j].get("wall_end", 0.0)) - float(audio_selected[j].get("wall_start", 0.0))
+                            file_dur = float(entry_a.get("end_time", 0.0)) - float(entry_a.get("start_time", 0.0))
+                            gap_sec = max(0.0, wall_span - file_dur)
+                        except Exception:
+                            gap_sec = 0.0
+                        if gap_sec > 0.05:
+                            gap_label = f"agap{gap_idx}"
+                            gap_filters.append(
+                                f"aevalsrc=exprs=0|0:c=stereo:s=48000:d={gap_sec:.3f}[{gap_label}]"
+                            )
+                            concat_in_a_parts.append(f"[{gap_label}]")
+                            gap_idx += 1
+                    concat_in_a_parts.append(f"[{n + j}:a]")
+                concat_in_a = "".join(concat_in_a_parts)
+                total_concat_inputs = m + gap_idx
+                a_chain = [f"{concat_in_a}concat=n={total_concat_inputs}:v=0:a=1"]
+                # With silence-gap insertion the concat now spans
+                # (file_content + total_gaps) seconds. a_start_trim
+                # was computed against wall_end - wall_start of the
+                # selected entries, which equals the post-insertion
+                # concat length, so it's already correct. a_trim_duration
+                # similarly matches the post-insertion timeline.
                 # Bias the trim start by the user offset BEFORE atrim.
                 # POSITIVE offset → SMALLER shifted_start → reads
                 # EARLIER samples → audio plays EARLIER in the clip.
@@ -25950,7 +25990,12 @@ Admin elevation
                     a_chain.append(
                         f"apad=pad_dur={audio_apad_ms / 1000.0:.3f}"
                     )
+                # Gap filters are SOURCE filters (aevalsrc) producing
+                # their own labels — they need to be their own chains
+                # separated by ';' from the concat+atrim chain.
                 audio_complex = ",".join(a_chain) + "[aout]"
+                if gap_filters:
+                    audio_complex = ";".join(gap_filters) + ";" + audio_complex
                 filter_complex = video_complex + ";" + audio_complex
                 # Surface the alignment numbers so any future "audio
                 # is N seconds off" report is diagnosable from the log.
@@ -26490,7 +26535,7 @@ Admin elevation
                                 if 0 < cand_end_rel < 30 and cand_mt_end > 0:
                                     expected_wall_end = a_anchor + cand_end_rel
                                     delta = cand_mt_end - expected_wall_end
-                                    if 0.05 <= delta <= 0.75:
+                                    if 0.05 <= delta <= 8.0:
                                         close_delay_est = delta
                                     break
                             except Exception:
