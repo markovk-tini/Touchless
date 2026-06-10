@@ -351,6 +351,21 @@ class AppConfig:
     # Bounded [0, 5000].
     clip_mic_capture_latency_ms: int = 0
 
+    # Mic rate-compensation (per-mille = 1/1000th). Applied as an
+    # atempo on the MIC chain BEFORE amix at cache spawn. Positive
+    # values speed mic up = mic content lands at LOWER amix output
+    # PTS = mic plays EARLIER in the saved clip. Use this when long
+    # clips (2-5 min) show progressive mic-late drift while shorter
+    # clips (60 s) are aligned. The drift comes from the within-
+    # segment mic-vs-sys rate mismatch in the cache amix — silence-
+    # gap insertion at export fixes BETWEEN-segment drift but not
+    # WITHIN-segment. Defaults to 0 (= no change) so existing 60-s
+    # alignment is preserved. Typical tuning for a ~4 s drift over
+    # 5 min: try 13 (= atempo 1.013, ~1.3 % speed-up). Note that
+    # ANY non-zero value also shifts the 60-s alignment slightly,
+    # so tune empirically. Bounded [-50, 50] = ±5 %.
+    clip_mic_atempo_per_mille: int = 0
+
     # SYS-only delay (ms) applied at cache spawn via adelay on the
     # sys chain BEFORE amix. Positive = sys audio shifts LATER in
     # the mixed output, used when sys leads mic + video (the

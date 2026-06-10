@@ -24094,14 +24094,37 @@ Admin elevation
                 mic_latency_ms = 0
             mic_latency_ms = max(0, min(5000, mic_latency_ms))
             mic_latency_s = mic_latency_ms / 1000.0
+            # Bumped afftdn nr=10 -> nr=18 to reduce the residual
+            # white-noise hiss the user reported. 18 dB is a stronger
+            # FFT denoise than 10 but still well below the 25-30
+            # range where vocal tone visibly thins. Kiyo Pro + Razer
+            # webcam mics have a noticeable noise floor that 10 dB
+            # didn't fully suppress on a quiet room recording.
+            denoise = "afftdn=nr=18"
+            # Mic rate-compensation atempo. See clip_mic_atempo_per_mille
+            # in app_config for the full reasoning. Default 0 = no
+            # filter inserted (preserves the working 60-s alignment).
+            try:
+                mic_atempo_pm = int(getattr(
+                    self.config, "clip_mic_atempo_per_mille", 0
+                ) or 0)
+            except Exception:
+                mic_atempo_pm = 0
+            mic_atempo_pm = max(-50, min(50, mic_atempo_pm))
+            atempo_clause = ""
+            if mic_atempo_pm != 0:
+                atempo_factor = 1.0 + (mic_atempo_pm / 1000.0)
+                atempo_clause = f",atempo={atempo_factor:.4f}"
             if mic_latency_ms > 0:
                 mic_chain = (
-                    f"[{mic_idx}:a]{ns},afftdn=nr=10,"
+                    f"[{mic_idx}:a]{ns},{denoise}{atempo_clause},"
                     f"atrim=start={mic_latency_s:.3f},"
                     f"asetpts=PTS-STARTPTS[amic]"
                 )
             else:
-                mic_chain = f"[{mic_idx}:a]{ns},afftdn=nr=10[amic]"
+                mic_chain = (
+                    f"[{mic_idx}:a]{ns},{denoise}{atempo_clause}[amic]"
+                )
             # Sys-only delay. The TCP-accept-floor (max(1.0,
             # tcp_elapsed)) used to align the mic bridge leaves sys
             # systematically AHEAD of mic by (1.0 - actual_tcp) on
@@ -25274,10 +25297,14 @@ Admin elevation
                     latest_seg_path = entries[-1].get("path")
                     if latest_seg_path is not None:
                         latest_path = Path(latest_seg_path)
+                        try:
+                            prev_mt = float(latest_path.stat().st_mtime)
+                        except Exception:
+                            prev_mt = 0.0
                         cache_dir = latest_path.parent
                         stem = latest_path.stem
                         prefix_parts = stem.rsplit("_", 1)
-                        if len(prefix_parts) == 2:
+                        if len(prefix_parts) == 2 and prev_mt > 0:
                             session_prefix = prefix_parts[0]
                             for cand in cache_dir.glob(f"{session_prefix}_[0-9][0-9][0-9].mkv"):
                                 try:
@@ -25287,7 +25314,6 @@ Admin elevation
                                     if cs.st_size < 1024:
                                         continue
                                     cs_mtime = float(cs.st_mtime)
-                                    prev_mt = float(entries[-1].get("wall_end_mtime", 0.0) or 0.0)
                                     if cs_mtime > prev_mt + 0.05:
                                         try:
                                             import sys as _sys
