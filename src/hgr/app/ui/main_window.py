@@ -26085,6 +26085,30 @@ Admin elevation
                 concat_in_a_parts: list[str] = []
                 gap_filters: list[str] = []
                 gap_idx = 0
+                # GAP-INSERTION THRESHOLD. Originally 0.05 s (50 ms);
+                # bumped down to 0.005 s (5 ms) after diagnosing that
+                # per-segment drift in the 1-50 ms range was being
+                # silently dropped and accumulating linearly over the
+                # number of selected segments. Symptoms matched
+                # exactly: 60-s clip @ 6 segs -> ~300 ms drift, 2-min
+                # @ 12 segs -> ~600 ms drift, 5-min @ 30 segs ->
+                # ~1.5 s drift. Lowering the threshold inserts
+                # millisecond-level gaps for every segment, which
+                # bloats the filter graph slightly (one extra aevalsrc
+                # input per segment) but ffmpeg handles 30+ inputs
+                # fine (verified by ec1f051 fix on the 5-min path).
+                # Tunable via HGR_CLIP_GAP_THRESHOLD_MS (default 5);
+                # set to 50 to restore the prior threshold for fallback.
+                import os as _os_gap
+                try:
+                    gap_threshold_ms_env = _os_gap.environ.get(
+                        "HGR_CLIP_GAP_THRESHOLD_MS", "5"
+                    )
+                    gap_threshold_sec = max(
+                        0.001, float(gap_threshold_ms_env) / 1000.0
+                    )
+                except Exception:
+                    gap_threshold_sec = 0.005
                 for j, entry_a in enumerate(audio_selected):
                     if j > 0:
                         try:
@@ -26093,7 +26117,7 @@ Admin elevation
                             gap_sec = max(0.0, wall_span - file_dur)
                         except Exception:
                             gap_sec = 0.0
-                        if gap_sec > 0.05:
+                        if gap_sec > gap_threshold_sec:
                             gap_label = f"agap{gap_idx}"
                             # aevalsrc defaults to sample_fmt=dbl. The
                             # AAC-decoded segment inputs are fltp.
