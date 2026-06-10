@@ -25951,8 +25951,21 @@ Admin elevation
                             gap_sec = 0.0
                         if gap_sec > 0.05:
                             gap_label = f"agap{gap_idx}"
+                            # aevalsrc defaults to sample_fmt=dbl. The
+                            # AAC-decoded segment inputs are fltp.
+                            # concat REQUIRES identical sample_fmt +
+                            # channel_layout + sample_rate across all
+                            # inputs — without the aformat conversion
+                            # ffmpeg rejects the filter graph with
+                            # exit code 15 (= the 'ffmpeg exit 15: no
+                            # stderr captured' popup user just saw on
+                            # the 5-min clip). aformat forces the
+                            # silence stream into fltp/stereo/48kHz
+                            # matching the AAC inputs.
                             gap_filters.append(
-                                f"aevalsrc=exprs=0|0:c=stereo:s=48000:d={gap_sec:.3f}[{gap_label}]"
+                                f"aevalsrc=exprs=0|0:c=stereo:s=48000:d={gap_sec:.3f},"
+                                f"aformat=sample_fmts=fltp:channel_layouts=stereo:sample_rates=48000"
+                                f"[{gap_label}]"
                             )
                             concat_in_a_parts.append(f"[{gap_label}]")
                             gap_idx += 1
@@ -26737,10 +26750,13 @@ Admin elevation
             below_normal = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
             if below_normal:
                 export_creationflags |= below_normal
+            # Capture stderr so a filter-graph error (which would
+            # otherwise surface as the generic 'ffmpeg exit N: no
+            # stderr captured' popup) is diagnosable.
             completed = subprocess.run(
                 command,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 creationflags=export_creationflags,
             )
             if completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024:
@@ -26748,6 +26764,19 @@ Admin elevation
                 self.last_action_label.setText(f"Last action: saved {actual_seconds:.1f}s clip to {output_path}")
                 self._queue_post_action_save_prompt("clips", output_path)
                 return True
+            # Surface the captured stderr so the user-facing failure
+            # message has the actual ffmpeg complaint.
+            try:
+                tail = (completed.stderr or b"").decode("utf-8", errors="replace")
+            except Exception:
+                tail = ""
+            try:
+                self._last_ffmpeg_clip_error = (
+                    f"ffmpeg exit {completed.returncode}: "
+                    f"{tail.strip().splitlines()[-1] if tail.strip() else 'no stderr captured'}"
+                )
+            except Exception:
+                pass
             return False
         finally:
             self._cleanup_ffmpeg_clip_cache_files()
@@ -29229,10 +29258,13 @@ def _export_recent_clip_ffmpeg(self, duration_seconds: int, target_region: QRect
             below_normal = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
             if below_normal:
                 export_creationflags |= below_normal
+            # Capture stderr so a filter-graph error (which would
+            # otherwise surface as the generic 'ffmpeg exit N: no
+            # stderr captured' popup) is diagnosable.
             completed = subprocess.run(
                 command,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 creationflags=export_creationflags,
             )
             if completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 1024:
@@ -29240,6 +29272,19 @@ def _export_recent_clip_ffmpeg(self, duration_seconds: int, target_region: QRect
                 self.last_action_label.setText(f"Last action: saved {actual_seconds:.1f}s clip to {output_path}")
                 self._queue_post_action_save_prompt("clips", output_path)
                 return True
+            # Surface the captured stderr so the user-facing failure
+            # message has the actual ffmpeg complaint.
+            try:
+                tail = (completed.stderr or b"").decode("utf-8", errors="replace")
+            except Exception:
+                tail = ""
+            try:
+                self._last_ffmpeg_clip_error = (
+                    f"ffmpeg exit {completed.returncode}: "
+                    f"{tail.strip().splitlines()[-1] if tail.strip() else 'no stderr captured'}"
+                )
+            except Exception:
+                pass
             return False
         finally:
             try:
