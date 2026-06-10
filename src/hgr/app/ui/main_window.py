@@ -25686,7 +25686,23 @@ Admin elevation
                             default=0.0,
                         )
                         nominal_seg = float(self._clip_cache_segment_seconds)
+                        manifest_paths = {
+                            str(Path(e.get("path", "")).resolve())
+                            for e in audio_entries
+                        }
+                        # AGGRESSIVE in-progress detection. Original
+                        # detection (mtime > last_mt_end + 0.05) was
+                        # silently failing — the user-reported apad
+                        # gaps of 2-6 s across all clip lengths point
+                        # to a missing in-progress entry. Broader test:
+                        # any audio_*.aac in the cache dir that is NOT
+                        # in the manifest is a candidate. Pick the
+                        # one whose mtime is newest AND non-trivially
+                        # close to "now" (within 2 * segment_seconds,
+                        # i.e. within one rotation cycle).
                         in_progress_candidates: list = []
+                        wall_now_scan = time.time()
+                        scan_files: list[tuple[Path, float, int, bool]] = []
                         for path in cache_dir.glob(glob_pat):
                             try:
                                 st = path.stat()
@@ -25694,11 +25710,36 @@ Admin elevation
                                 continue
                             if st.st_size < 256:
                                 continue
-                            if st.st_mtime <= last_mt_end + 0.05:
+                            path_str = str(path.resolve())
+                            in_manifest = path_str in manifest_paths
+                            scan_files.append(
+                                (path, st.st_mtime, st.st_size, in_manifest)
+                            )
+                            if in_manifest:
+                                continue
+                            # Not in manifest = candidate for in-progress.
+                            # Bound mtime to "recent enough" to avoid
+                            # picking up a stale file from before the
+                            # cache restarted.
+                            mtime_age = wall_now_scan - st.st_mtime
+                            if mtime_age > 2.0 * nominal_seg:
                                 continue
                             in_progress_candidates.append(
                                 (path, st.st_mtime, st.st_size)
                             )
+                        try:
+                            import sys as _ip_sys
+                            _ip_sys.stderr.write(
+                                f"[clip-anchor] in-progress audio scan: "
+                                f"glob='{glob_pat}' files_in_dir={len(scan_files)} "
+                                f"in_manifest={sum(1 for f in scan_files if f[3])} "
+                                f"candidates={len(in_progress_candidates)} "
+                                f"last_mt_end={last_mt_end:.2f} now={wall_now_scan:.2f} "
+                                f"gap={wall_now_scan - last_mt_end:.2f}s\n"
+                            )
+                            _ip_sys.stderr.flush()
+                        except Exception:
+                            pass
                         if in_progress_candidates:
                             # Pick the NEWEST one — that's the file
                             # ffmpeg is actively appending to right now.
