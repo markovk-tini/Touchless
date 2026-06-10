@@ -24094,13 +24094,19 @@ Admin elevation
                 mic_latency_ms = 0
             mic_latency_ms = max(0, min(5000, mic_latency_ms))
             mic_latency_s = mic_latency_ms / 1000.0
-            # Bumped afftdn nr=10 -> nr=18 to reduce the residual
-            # white-noise hiss the user reported. 18 dB is a stronger
-            # FFT denoise than 10 but still well below the 25-30
-            # range where vocal tone visibly thins. Kiyo Pro + Razer
-            # webcam mics have a noticeable noise floor that 10 dB
-            # didn't fully suppress on a quiet room recording.
-            denoise = "afftdn=nr=18"
+            # REVERTED afftdn nr=18 -> nr=10. Bumping to 18 added
+            # extra per-buffer FFT-denoise CPU cost to the MIC-only
+            # chain (sys uses anull, no FFT). When mic processing
+            # fell behind realtime the cache's amix=longest filled
+            # the deficit with silence on the mic side, causing mic
+            # content to appear progressively LATER in the mixed
+            # output as cache age grew — symptom: 60-s clip @ cache
+            # age 80 s was perfect (pre-change), then 60-s @ cache
+            # age 262 s was 1 s mic-late (post-change). Going back
+            # to nr=10 to restore the working baseline. The residual
+            # mic hiss the user reported is preferable to broken
+            # alignment.
+            denoise = "afftdn=nr=10"
             # Mic rate-compensation atempo. See clip_mic_atempo_per_mille
             # in app_config for the full reasoning. Default 0 = no
             # filter inserted (preserves the working 60-s alignment).
