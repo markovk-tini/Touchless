@@ -397,11 +397,27 @@ class VolumeController:
 
         self._ensure_com_ready()
         endpoint_device = device if device is not None else AudioUtilities.GetSpeakers()
+        # pycaw's GetSpeakers() returns an AudioDevice wrapper whose
+        # endpoint id is exposed via the `.id` property. The previous
+        # code called `.GetId()` which is the raw IMMDevice method —
+        # AudioDevice doesn't proxy it, so the call always raised
+        # AttributeError and the except clause silently set
+        # endpoint_id = None. Combined with the same bug in
+        # _refresh_default_endpoint_if_changed below, this meant
+        # the comparison `None != None` was always False and the
+        # controller NEVER rebound when the user swapped default
+        # playback devices — all volume / mute calls kept hitting
+        # whatever was default at app-startup time.
         endpoint_id = None
         try:
-            endpoint_id = str(endpoint_device.GetId())
+            endpoint_id = str(endpoint_device.id)
         except Exception:
-            endpoint_id = None
+            try:
+                # Last-resort fallback: try .GetId() in case a future
+                # pycaw version restores the raw IMMDevice method.
+                endpoint_id = str(endpoint_device.GetId())
+            except Exception:
+                endpoint_id = None
         self._volume = endpoint_device.EndpointVolume
         self._endpoint_id = endpoint_id
         self._available = self._volume is not None
@@ -421,11 +437,21 @@ class VolumeController:
 
             self._ensure_com_ready()
             device = AudioUtilities.GetSpeakers()
+            # Same fix as _rebind_endpoint: AudioDevice exposes the
+            # endpoint id via `.id` (property), not `.GetId()` (raw
+            # IMMDevice method). The old code raised AttributeError
+            # here every poll, set device_id = None, then compared
+            # None != self._endpoint_id (also None from the same bug
+            # at init) — the result was False so rebind never fired
+            # even when Windows default playback changed.
             device_id = None
             try:
-                device_id = str(device.GetId())
+                device_id = str(device.id)
             except Exception:
-                device_id = None
+                try:
+                    device_id = str(device.GetId())
+                except Exception:
+                    device_id = None
             if self._volume is None or device_id != self._endpoint_id:
                 self._rebind_endpoint(device=device)
         except Exception:
