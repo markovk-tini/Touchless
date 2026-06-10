@@ -24320,15 +24320,46 @@ Admin elevation
                         if self._wasapi_writer is not None:
                             sys_first_sample = self._wasapi_writer.first_sample_at
                             if sys_first_sample is not None:
-                                tcp_shift = max(1.0, float(tcp_accept_elapsed))
+                                # TCP-shift floor + ceiling clamp.
+                                # Floor (1.0 s): preserves the prior
+                                # known-good 60-s baseline for fast-TCP
+                                # rigs where tcp_accept_elapsed < 1.0 —
+                                # callback-mode latency compensation.
+                                # Ceiling (3.0 s by default): on
+                                # slow-TCP rigs (user observed 4.483 s
+                                # this session), an uncapped tcp_shift
+                                # leaves mic pre-padded MUCH further
+                                # than reality, producing the ~2-5 s
+                                # structural sys-vs-mic offset the user
+                                # reported as "mic late". Clamping at
+                                # 3.0 s bounds the structural offset
+                                # to ~4 s max (3 s shift + 1 s adelay)
+                                # without breaking the floor case.
+                                # Kill switch: HGR_TCP_SHIFT_CEILING=0
+                                # disables the clamp entirely (restores
+                                # the prior un-bounded behavior).
+                                import os as _os
+                                try:
+                                    ceiling_env = _os.environ.get(
+                                        "HGR_TCP_SHIFT_CEILING", "3.0"
+                                    )
+                                    tcp_ceiling = float(ceiling_env)
+                                except Exception:
+                                    tcp_ceiling = 3.0
+                                raw_shift = max(1.0, float(tcp_accept_elapsed))
+                                if tcp_ceiling > 0:
+                                    tcp_shift = min(tcp_ceiling, raw_shift)
+                                else:
+                                    tcp_shift = raw_shift
                                 sys_first_sample += tcp_shift
                                 try:
                                     import sys as _sys
                                     _sys.stderr.write(
                                         f"[clip-audio] mic alignment: "
                                         f"tcp_accept={tcp_accept_elapsed:.3f}s "
-                                        f"-> shift={tcp_shift:.3f}s applied to "
-                                        f"sys_first_sample anchor\n"
+                                        f"raw_shift={raw_shift:.3f}s "
+                                        f"ceiling={tcp_ceiling:.3f}s "
+                                        f"-> applied_shift={tcp_shift:.3f}s\n"
                                     )
                                     _sys.stderr.flush()
                                 except Exception:
@@ -25473,6 +25504,31 @@ Admin elevation
                 # slot it's hundreds of seconds, and using its
                 # mtime as the close-delay reference is meaningless.
                 close_delay_est = 0.0
+                # Diagnostic: emit per-segment mtime cadence vs
+                # expected wall when HGR_CLIP_AUDIO_DEBUG=1. Helps
+                # future sync-tuning sessions identify rotation-drift
+                # sources without code changes. Zero-overhead when
+                # disabled (env var unset or != '1').
+                try:
+                    import os as _dos
+                    if _dos.environ.get("HGR_CLIP_AUDIO_DEBUG", "0") == "1" and a_anchor > 0 and audio_entries:
+                        import sys as _dsys
+                        for _i, _ce in enumerate(audio_entries):
+                            try:
+                                _et = float(_ce.get("end_time", 0.0) or 0.0)
+                                _mte = float(_ce.get("wall_end_mtime", 0.0) or 0.0)
+                                _exp = a_anchor + _et
+                                _delta = _mte - _exp if _mte > 0 else 0.0
+                                _dsys.stderr.write(
+                                    f"[clip-audio-debug] seg[{_i}] end_time={_et:.3f}s "
+                                    f"mtime={_mte:.3f} expected={_exp:.3f} "
+                                    f"delta={_delta:+.3f}s\n"
+                                )
+                            except Exception:
+                                pass
+                        _dsys.stderr.flush()
+                except Exception:
+                    pass
                 try:
                     if a_anchor > 0 and audio_entries:
                         for cand in audio_entries:
@@ -26537,6 +26593,31 @@ Admin elevation
                 # slot it's hundreds of seconds, and using its
                 # mtime as the close-delay reference is meaningless.
                 close_delay_est = 0.0
+                # Diagnostic: emit per-segment mtime cadence vs
+                # expected wall when HGR_CLIP_AUDIO_DEBUG=1. Helps
+                # future sync-tuning sessions identify rotation-drift
+                # sources without code changes. Zero-overhead when
+                # disabled (env var unset or != '1').
+                try:
+                    import os as _dos
+                    if _dos.environ.get("HGR_CLIP_AUDIO_DEBUG", "0") == "1" and a_anchor > 0 and audio_entries:
+                        import sys as _dsys
+                        for _i, _ce in enumerate(audio_entries):
+                            try:
+                                _et = float(_ce.get("end_time", 0.0) or 0.0)
+                                _mte = float(_ce.get("wall_end_mtime", 0.0) or 0.0)
+                                _exp = a_anchor + _et
+                                _delta = _mte - _exp if _mte > 0 else 0.0
+                                _dsys.stderr.write(
+                                    f"[clip-audio-debug] seg[{_i}] end_time={_et:.3f}s "
+                                    f"mtime={_mte:.3f} expected={_exp:.3f} "
+                                    f"delta={_delta:+.3f}s\n"
+                                )
+                            except Exception:
+                                pass
+                        _dsys.stderr.flush()
+                except Exception:
+                    pass
                 try:
                     if a_anchor > 0 and audio_entries:
                         for cand in audio_entries:

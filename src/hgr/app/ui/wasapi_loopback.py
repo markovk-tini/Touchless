@@ -561,12 +561,42 @@ class WasapiLoopbackWriter:
     def _drain_callback_queue(self) -> None:
         """Pull captured chunks off the callback queue and write
         them to stdin/socket. This is the only thread that writes
-        to the pipe in callback mode, so no IO sync needed."""
+        to the pipe in callback mode, so no IO sync needed.
+
+        BURST PROTECTION: under disk-IO pressure (especially during
+        a clip export's ffmpeg subprocess pulling cached segments
+        while this thread tries to write new ones), the queue can
+        grow from 0 to 100+ chunks (~2+ s of buffered mic). When
+        the pipe write catches back up, that backlog gets streamed
+        into ffmpeg's segment muxer faster than realtime, which
+        collapses the mtime cadence and shifts subsequent segments
+        EARLIER than the real wall they represent — surfacing as
+        mic drift in the saved clip.
+
+        Mitigation (HGR_MIC_BURST_DRAIN=0 to disable): when queue
+        depth exceeds threshold (8 chunks ~170 ms), DROP THE OLDEST
+        chunks down to a target floor (4 chunks ~85 ms). This is
+        the same shape as the sys polling-mode burst-drain at
+        line 1076, adapted for callback mode where the "buffer" is
+        a Python queue instead of a WASAPI client. The lost audio
+        is the OLDEST queued chunks — content already played in the
+        live mix that hasn't reached ffmpeg yet — so the audible
+        gap appears at the START of the stall window, before any
+        content the user is likely to clip-around.
+        """
+        import os as _os
         import time as _time
+        BURST_THRESHOLD_CHUNKS = 8   # ~170 ms backlog triggers drain
+        BURST_FLOOR_CHUNKS = 4       # drain down to ~85 ms backlog
+        MAX_DROP_PER_EVENT = 80      # safety: never drop > 80 chunks (~1.7 s) in one drain
+        burst_drain_enabled = (
+            _os.environ.get("HGR_MIC_BURST_DRAIN", "1") != "0"
+        )
         bytes_written = 0
         chunks_dropped = 0
         start_t = _time.time()
         next_log_at = start_t + 0.5
+        peak_qsize_since_log = 0
         q = self._callback_queue
         if q is None:
             return
@@ -580,6 +610,39 @@ class WasapiLoopbackWriter:
             except (BrokenPipeError, OSError, ValueError):
                 break
             bytes_written += len(data)
+            # Burst-drain check AFTER each successful write so we
+            # never block the write path itself. If the queue has
+            # grown above threshold, drop OLDEST queued chunks (= q.get)
+            # without writing them, bringing the buffer back to floor.
+            if burst_drain_enabled:
+                try:
+                    qsize_now = q.qsize()
+                except Exception:
+                    qsize_now = 0
+                if qsize_now > peak_qsize_since_log:
+                    peak_qsize_since_log = qsize_now
+                if qsize_now >= BURST_THRESHOLD_CHUNKS:
+                    drop_target = max(0, qsize_now - BURST_FLOOR_CHUNKS)
+                    drop_target = min(drop_target, MAX_DROP_PER_EVENT)
+                    dropped_this_event = 0
+                    while dropped_this_event < drop_target:
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+                        dropped_this_event += 1
+                    chunks_dropped += dropped_this_event
+                    if dropped_this_event > 0:
+                        try:
+                            sys.stderr.write(
+                                f"[wasapi-bridge] {self._label} (callback): "
+                                f"burst-drain dropped {dropped_this_event} "
+                                f"chunks (qsize was {qsize_now}, floor "
+                                f"target {BURST_FLOOR_CHUNKS})\n"
+                            )
+                            sys.stderr.flush()
+                        except Exception:
+                            pass
             now_t = _time.time()
             if now_t >= next_log_at:
                 try:
@@ -587,12 +650,15 @@ class WasapiLoopbackWriter:
                     qsize = q.qsize()
                     sys.stderr.write(
                         f"[wasapi-bridge] {self._label} (callback): "
-                        f"{kb} KB written, queue depth={qsize} "
+                        f"{kb} KB written, queue depth={qsize}, "
+                        f"peak={peak_qsize_since_log}, "
+                        f"chunks_dropped={chunks_dropped} "
                         f"(elapsed={now_t - start_t:.1f}s)\n"
                     )
                     sys.stderr.flush()
                 except Exception:
                     pass
+                peak_qsize_since_log = 0
                 next_log_at = now_t + 5.0
 
     def _run(self) -> None:
