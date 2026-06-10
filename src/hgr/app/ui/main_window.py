@@ -25249,6 +25249,62 @@ Admin elevation
                 )
             except Exception:
                 ffmpeg_anchor = 0.0
+            # NOTE on in-progress video segment: the latest entry in
+            # the manifest is the latest CLOSED segment; the cache is
+            # currently writing into segment N+1 which hasn't rotated.
+            # For a voice-anchored clip ("clip 2 minutes"), end_ts can
+            # be up to one segment_time (~10 s) AFTER the latest closed
+            # segment's mtime — so the clip cuts off the last ~10 s of
+            # footage. User reported this as "2-min clip timing
+            # extremely off".
+            #
+            # We do NOT extend latest_end here because:
+            # (1) including a partially-written .mkv as an ffmpeg input
+            #     is high-risk (mid-stream MKV can crash ffmpeg);
+            # (2) extending latest_end without including the file as
+            #     input creates audio-video misalignment (audio's
+            #     in-progress synth at the export aligner extends to
+            #     end_ts but video stops at the last closed segment,
+            #     producing audio that leads video by the gap).
+            # The clean fix requires the cache writer to force-rotate
+            # on demand, which is a bigger refactor. Diagnostic log
+            # below documents when this gap is observed.
+            try:
+                if entries:
+                    latest_seg_path = entries[-1].get("path")
+                    if latest_seg_path is not None:
+                        latest_path = Path(latest_seg_path)
+                        cache_dir = latest_path.parent
+                        stem = latest_path.stem
+                        prefix_parts = stem.rsplit("_", 1)
+                        if len(prefix_parts) == 2:
+                            session_prefix = prefix_parts[0]
+                            for cand in cache_dir.glob(f"{session_prefix}_[0-9][0-9][0-9].mkv"):
+                                try:
+                                    if str(cand) == str(latest_path):
+                                        continue
+                                    cs = cand.stat()
+                                    if cs.st_size < 1024:
+                                        continue
+                                    cs_mtime = float(cs.st_mtime)
+                                    prev_mt = float(entries[-1].get("wall_end_mtime", 0.0) or 0.0)
+                                    if cs_mtime > prev_mt + 0.05:
+                                        try:
+                                            import sys as _sys
+                                            _sys.stderr.write(
+                                                f"[clip-anchor] in-progress video segment "
+                                                f"observed: {cand.name} mtime_age_vs_latest_closed="
+                                                f"{cs_mtime - prev_mt:.2f}s -- NOT included "
+                                                f"(would risk ffmpeg crash on partial MKV)\n"
+                                            )
+                                            _sys.stderr.flush()
+                                        except Exception:
+                                            pass
+                                        break
+                                except Exception:
+                                    continue
+            except Exception:
+                pass
             latest_end_wall = (
                 ffmpeg_anchor + latest_end if ffmpeg_anchor > 0 else latest_end
             )
