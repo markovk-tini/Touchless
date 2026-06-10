@@ -32,7 +32,7 @@ class ThreadedCvCapture:
     """Async wrapper for cv2.VideoCapture. Drops blocking-read latency
     from main thread. Same API surface the engine consumes."""
 
-    def __init__(self, inner: cv2.VideoCapture, *, warmup_frames: int = 6) -> None:
+    def __init__(self, inner: cv2.VideoCapture, *, warmup_frames: int = 12) -> None:
         self._inner = inner
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
@@ -71,7 +71,7 @@ class ThreadedCvCapture:
         # prefix get the black-discard treatment. Empty / dim rooms
         # have noise (sensor read noise alone is > 2 % non-zero), so
         # this threshold doesn't false-positive on real content.
-        self._black_discard_remaining = 30
+        self._black_discard_remaining = 60
         if self._inner.isOpened():
             self._reader_thread = threading.Thread(
                 target=self._reader_loop,
@@ -131,15 +131,23 @@ class ThreadedCvCapture:
                 self._warmup_remaining -= 1
                 continue
             if self._black_discard_remaining > 0:
-                # Cheap check on the raw frame buffer: a fully-black
-                # / unsignaled camera returns nearly-all-zero arrays.
-                # Real scenes — even very dark ones — have sensor
-                # read-noise floor of ~2 % non-zero pixels minimum.
+                # Two-pronged check on the raw frame buffer:
+                # (1) non-zero-pixel ratio < 2 % = mostly-black
+                #     (sensor hasn't produced real signal yet).
+                # (2) standard deviation < 8 = "glitchy dots" failure
+                #     mode the user reported — frames have some
+                #     non-zero pixels but no actual scene structure,
+                #     just sparse uncorrelated noise.
+                # Real scenes — even dim ones — have std > 15 due to
+                # natural variance across pixels. < 8 is well below
+                # any legitimate scene and catches the dot-pattern
+                # camera-not-ready state.
                 try:
                     if frame is not None and frame.size > 0:
                         nonzero = int(np.count_nonzero(frame))
                         ratio = nonzero / float(frame.size)
-                        if ratio < 0.02:
+                        std = float(frame.std()) if frame.dtype.kind in ("u", "i", "f") else 0.0
+                        if ratio < 0.02 or std < 8.0:
                             self._black_discard_remaining -= 1
                             continue
                 except Exception:

@@ -3337,7 +3337,14 @@ class GestureWorker(QObject):
         landmarks = hand_reading.landmarks
         thumb_index_ratio = float(np.linalg.norm((landmarks[4] - landmarks[8])[:2])) / palm_scale
         thumb_out = (fingers["thumb"].state == "fully_open" and fingers["thumb"].openness >= 0.70 and fingers["thumb"].palm_distance >= 0.72)
-        folded_core = all(fingers[name].state in {"mostly_curled", "closed"} for name in ("index", "middle", "ring", "pinky"))
+        # Tightened core-fold check: require ALL four fingers to be
+        # in 'closed' state (not just 'mostly_curled'). User reported
+        # holding the mute (shaka) pose — thumb + pinky out, index/
+        # middle/ring curled — eventually triggered close-window
+        # because during the hold the pinky drifted from 'open' to
+        # 'mostly_curled' even though they didn't release the gesture.
+        # 'closed' is stricter and won't accept transient drift.
+        folded_core = all(fingers[name].state == "closed" for name in ("index", "middle", "ring", "pinky"))
         # Reject thumbs-up: the thumb tip (landmark 4) must NOT be higher on
         # screen than the middle finger's MCP base joint (landmark 9). Screen
         # Y grows downward, so "higher" means smaller Y. The close-window
