@@ -366,6 +366,18 @@ class AppConfig:
     # so tune empirically. Bounded [-50, 50] = ±5 %.
     clip_mic_atempo_per_mille: int = 0
 
+    # SAFETY NET: trim the video tail of an exported clip down to
+    # match the wall-clock window where audio is actually available.
+    # Eliminates the "audio is N seconds delayed at end of clip"
+    # perception that comes from apad-silence filling the tail when
+    # the cache's last rotated audio segment trails the latest video
+    # segment by N seconds. Trade-off: a 60-s requested clip may
+    # deliver 55-58 s; both streams end together with no apparent
+    # delay. Capped at min(duration * 0.25, 10s) so a totally-missing
+    # audio stream can't collapse the clip. Env override:
+    # HGR_CLIP_TRIM_VIDEO=0 disables, =1 enables.
+    clip_export_trim_video_to_audio: bool = True
+
     # SYS-only delay (ms) applied at cache spawn via adelay on the
     # sys chain BEFORE amix. Positive = sys audio shifts LATER in
     # the mixed output, used when sys leads mic + video (the

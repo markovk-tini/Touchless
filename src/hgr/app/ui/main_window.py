@@ -25946,6 +25946,80 @@ Admin elevation
                 audio_input_paths = audio_input_paths_filtered
             for p in audio_input_paths:
                 inputs.extend(["-i", str(p)])
+            # SAFETY NET (Option C): trim video tail to match audio
+            # coverage. The user-perceived "audio is N seconds late at
+            # end of clip" symptom is actually apad-silence at the
+            # END of the audio chain (audio cache's most recent
+            # rotated segment closed ~N s before end_ts; the
+            # in-progress segment isn't in the manifest yet). The
+            # downstream audio math (~line 26010+) pads that gap
+            # with silence — audio cuts out, video continues, user
+            # hears it as "audio delayed". Eliminate the perception
+            # by shortening the video tail so both streams end
+            # together. By construction `apad_ms` falls out to ~0
+            # because overlap_wall_end == new v_clip_wall_end ==
+            # a_seg_wall_end. None of the downstream audio chain
+            # math changes; this only changes inputs.
+            #
+            # Trade-off: 60-s request may deliver ~55-58 s. The user
+            # explicitly asked for sync, not exact duration. Cap
+            # shrink at min(duration * 0.25, 10s) so a totally
+            # missing audio stream cannot collapse the clip to ~0s.
+            # Gated by clip_export_trim_video_to_audio config
+            # (default True; revert with HGR_CLIP_TRIM_VIDEO=0 env
+            # or settings.json field).
+            _safety_net_shrink = 0.0
+            try:
+                import os as _trim_os
+                _trim_env = _trim_os.environ.get(
+                    "HGR_CLIP_TRIM_VIDEO", None
+                )
+                if _trim_env is not None:
+                    _trim_to_audio_enabled = (_trim_env == "1")
+                else:
+                    _trim_to_audio_enabled = bool(getattr(
+                        self.config,
+                        "clip_export_trim_video_to_audio",
+                        True,
+                    ))
+            except Exception:
+                _trim_to_audio_enabled = True
+            if (_trim_to_audio_enabled and has_audio
+                    and audio_selected and v_anchor > 0):
+                try:
+                    _a_last_wall = float(
+                        audio_selected[-1].get("wall_end", 0.0)
+                    )
+                    _v_end_wall = (
+                        v_anchor
+                        + float(selected[-1].get("end_time", 0.0))
+                        - tail_to_drop
+                    )
+                    if (_a_last_wall > 0 and _v_end_wall > 0
+                            and _a_last_wall < _v_end_wall):
+                        _shrink = _v_end_wall - _a_last_wall
+                        _max_shrink = min(
+                            float(duration_seconds) * 0.25, 10.0
+                        )
+                        _shrink = min(_shrink, _max_shrink)
+                        if _shrink > 0.05:
+                            new_trim = max(1e-3, trim_duration - _shrink)
+                            try:
+                                import sys as _sn_sys
+                                _sn_sys.stderr.write(
+                                    f"[clip-export] safety net: trimmed "
+                                    f"video tail by {_shrink:.3f}s to "
+                                    f"match audio coverage (delivered "
+                                    f"{new_trim:.2f}s of requested "
+                                    f"{duration_seconds}s clip)\n"
+                                )
+                                _sn_sys.stderr.flush()
+                            except Exception:
+                                pass
+                            trim_duration = new_trim
+                            _safety_net_shrink = _shrink
+                except Exception:
+                    pass
             # Video chain — concat all video segments, optional crop,
             # trim tail-to-drop seconds off the END, then keep
             # `duration_seconds`. Each step is comma-joined into one
@@ -25986,12 +26060,17 @@ Admin elevation
                     max(1e-3, float(e.get("end_time", 0.0)) - float(e.get("start_time", 0.0)))
                     for e in audio_selected
                 )
-                # Wall-clock window the video covers AFTER trim.
+                # Wall-clock window the video covers AFTER trim. Subtract
+                # _safety_net_shrink so the audio overlap math agrees
+                # with the (possibly shrunken) video trim_duration —
+                # otherwise audio_apad_ms would still fire on the original
+                # window even though we shortened video to fit.
                 v_clip_wall_end = (
-                    v_anchor + float(selected[-1].get("end_time", 0.0)) - tail_to_drop
+                    v_anchor + float(selected[-1].get("end_time", 0.0))
+                    - tail_to_drop - _safety_net_shrink
                     if v_anchor > 0 else 0.0
                 )
-                v_clip_wall_start = v_clip_wall_end - float(duration_seconds)
+                v_clip_wall_start = v_clip_wall_end - trim_duration
                 # Wall-clock window the SELECTED audio entries cover.
                 a_seg_wall_start = float(audio_selected[0].get("wall_start", 0.0))
                 a_seg_wall_end = float(audio_selected[-1].get("wall_end", 0.0))
@@ -26832,6 +26911,62 @@ Admin elevation
                 pass
             for entry in audio_selected:
                 inputs.extend(["-i", str(Path(entry["path"]).resolve())])
+            # Mirror of the safety-net block in _run_clip_export_ffmpeg.
+            # Same rationale: shrink video tail to match audio coverage
+            # so the user-perceived "audio late at end" symptom never
+            # appears even if the in-progress audio segment isn't in
+            # the manifest yet.
+            _safety_net_shrink2 = 0.0
+            try:
+                import os as _trim_os2
+                _trim_env2 = _trim_os2.environ.get(
+                    "HGR_CLIP_TRIM_VIDEO", None
+                )
+                if _trim_env2 is not None:
+                    _trim_to_audio_enabled2 = (_trim_env2 == "1")
+                else:
+                    _trim_to_audio_enabled2 = bool(getattr(
+                        self.config,
+                        "clip_export_trim_video_to_audio",
+                        True,
+                    ))
+            except Exception:
+                _trim_to_audio_enabled2 = True
+            if (_trim_to_audio_enabled2 and has_audio
+                    and audio_selected and v_anchor > 0):
+                try:
+                    _a_last_wall2 = float(
+                        audio_selected[-1].get("wall_end", 0.0)
+                    )
+                    _v_end_wall2 = (
+                        v_anchor
+                        + float(selected[-1].get("end_time", 0.0))
+                    )
+                    if (_a_last_wall2 > 0 and _v_end_wall2 > 0
+                            and _a_last_wall2 < _v_end_wall2):
+                        _shrink2 = _v_end_wall2 - _a_last_wall2
+                        _max_shrink2 = min(
+                            float(duration_seconds) * 0.25, 10.0
+                        )
+                        _shrink2 = min(_shrink2, _max_shrink2)
+                        if _shrink2 > 0.05:
+                            new_trim2 = max(1e-3, trim_duration - _shrink2)
+                            try:
+                                import sys as _sn2_sys
+                                _sn2_sys.stderr.write(
+                                    f"[clip-export] safety net (sync): "
+                                    f"trimmed video tail by {_shrink2:.3f}s "
+                                    f"to match audio coverage "
+                                    f"(delivered {new_trim2:.2f}s of "
+                                    f"requested {duration_seconds}s)\n"
+                                )
+                                _sn2_sys.stderr.flush()
+                            except Exception:
+                                pass
+                            trim_duration = new_trim2
+                            _safety_net_shrink2 = _shrink2
+                except Exception:
+                    pass
             concat_in_v = "".join(f"[{i}:v]" for i in range(n))
             v_chain = [f"{concat_in_v}concat=n={n}:v=1:a=0"]
             crop_filter = self._clip_crop_filter(capture_region, target_region)
@@ -26856,9 +26991,10 @@ Admin elevation
                 )
                 v_clip_wall_end = (
                     v_anchor + float(selected[-1].get("end_time", 0.0))
+                    - _safety_net_shrink2
                     if v_anchor > 0 else 0.0
                 )
-                v_clip_wall_start = v_clip_wall_end - float(duration_seconds)
+                v_clip_wall_start = v_clip_wall_end - trim_duration
                 a_seg_wall_start = float(audio_selected[0].get("wall_start", 0.0))
                 a_seg_wall_end = float(audio_selected[-1].get("wall_end", 0.0))
                 if a_seg_wall_start <= 0.0 or v_clip_wall_end <= 0.0:
