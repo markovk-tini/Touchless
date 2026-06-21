@@ -7763,6 +7763,60 @@ class MainWindow(QMainWindow):
                 SECTION_GENERAL,
                 self._general_controls.get("auto_start_on_login"),
             ),
+            # ---- Clip Presets card (formerly Clip & Record + Clip
+            # Audio — merged into one section). Search keywords cover
+            # BOTH old card names so users with muscle memory still
+            # find them.
+            (
+                "General: Clip Presets",
+                "clip presets clip record clip audio recording buffer voice clip that "
+                "clipping gesture monitor duration audio defaults",
+                SECTION_GENERAL,
+                self._general_controls.get("clip_default_monitor_index"),
+            ),
+            (
+                "General: Clip Monitor Choice",
+                "clip monitor choice display screen main primary auto detect "
+                "default record voice all monitors",
+                SECTION_GENERAL,
+                self._general_controls.get("clip_default_monitor_index"),
+            ),
+            (
+                "General: Clip Duration",
+                "clip duration length 1 minute 2 minutes 5 minutes default "
+                "voice gesture seconds time how long clipping",
+                SECTION_GENERAL,
+                self._general_controls.get("clip_default_duration_seconds"),
+            ),
+            (
+                "General: Clip System Audio (game / music / app sounds)",
+                "clip system audio record game music app sounds wasapi loopback "
+                "speakers streamer mode output device playback",
+                SECTION_GENERAL,
+                self._general_controls.get("clip_capture_system_audio"),
+            ),
+            (
+                "General: Clip Microphone (voice / commentary)",
+                "clip microphone record voice commentary mic recording streamer "
+                "mode capture talking",
+                SECTION_GENERAL,
+                self._general_controls.get("clip_capture_microphone"),
+            ),
+            (
+                "General: Clip Mic Noise Reduction",
+                "clip mic noise reduction noise gate keyboard mouse desk fan rumble "
+                "background sound filter light strong off afftdn denoiser",
+                SECTION_GENERAL,
+                self._general_controls.get("clip_mic_noise_reduction"),
+            ),
+            (
+                "General: Clipping Gesture (left-hand fist hold)",
+                "clipping gesture clip gesture left hand fist hold 0.5 seconds "
+                "trigger save buffer voice command alternative no voice cancel "
+                "priority dual purpose",
+                SECTION_GENERAL,
+                self._general_controls.get("clip_default_duration_seconds"),
+            ),
         ]
         # Save Locations: one entry per output kind (drawings, screenshots,
         # screen recordings, clips). The save-location panel iterates
