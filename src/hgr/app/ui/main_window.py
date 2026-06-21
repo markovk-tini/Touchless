@@ -22224,6 +22224,28 @@ Admin elevation
     def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: float | None = None) -> list[str]:
         encoder = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
         gop = max(1, int(round(float(fps) * float(segment_seconds if segment_seconds is not None else 2.0))))
+        # EXPORT-ONLY HIGH-QUALITY BRANCH (purpose=='clip_export').
+        # Cache (purpose='clip') and screen-record (purpose='record')
+        # paths fall through to the real-time args below — cache fps,
+        # GOP cadence, segment_time and segment_wrap stay byte-identical
+        # to today. Export is one-shot per clip, not real-time, so it
+        # can afford slow/high-quality presets and lower CRF for
+        # visually-lossless output. Env override
+        # HGR_CLIP_EXPORT_HQ=0 reverts to the original real-time args
+        # at export (also acts as the pre-Turing-NVENC escape hatch).
+        import os as _enc_os
+        if (purpose == "clip_export"
+                and _enc_os.environ.get("HGR_CLIP_EXPORT_HQ", "1") != "0"):
+            if encoder == "h264_nvenc":
+                return ["-c:v", "h264_nvenc", "-preset", "p6", "-rc", "vbr", "-cq:v", "19", "-b:v", "0", "-pix_fmt", "yuv420p"]
+            if encoder == "h264_amf":
+                return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "19", "-pix_fmt", "yuv420p"]
+            if encoder == "h264_qsv":
+                return ["-c:v", "h264_qsv", "-preset", "slower", "-global_quality", "19", "-look_ahead", "1", "-pix_fmt", "nv12"]
+            return ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p"]
+        # Real-time path (cache + record) — UNCHANGED from current
+        # shipping values. Preserves cache fps, GOP cadence, and
+        # segment timing.
         if encoder == "h264_nvenc":
             return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
         if encoder == "h264_amf":
@@ -24783,7 +24805,17 @@ Admin elevation
                 "-i", "pipe:0",
                 "-filter_complex", mic_filter,
                 "-map", "[aout]",
-                "-c:a", "aac", "-b:a", "192k",
+                # Mic bitrate bumped 192k -> 256k for cleaner voice
+                # encoding (insurance vs cascade AAC quality loss
+                # since export re-encodes). Env override
+                # HGR_CLIP_MIC_AAC_BITRATE reverts. Sys path stays at
+                # 192k (sys is loopback of already-compressed media,
+                # so extra bits don't help). +~2 MB per 60s clip on
+                # cache disk — negligible.
+                "-c:a", "aac",
+                "-b:a", __import__("os").environ.get(
+                    "HGR_CLIP_MIC_AAC_BITRATE", "256k"
+                ),
                 "-f", "segment",
                 "-segment_format", "adts",
                 "-segment_time", f"{float(self._clip_cache_segment_seconds):.3f}",
@@ -24801,6 +24833,23 @@ Admin elevation
             else:
                 self._spawn_ffmpeg_stderr_drain(mic_proc, "clip-audio-v2-mic")
                 try:
+                    # CRITICAL: callback mode for the mic writer.
+                    # V1 mic spawns (lines ~24457/24481) pass this
+                    # kwarg; the V2 refactor accidentally dropped it.
+                    # Polling mode on UVC mics (Kiyo Pro etc.) produces
+                    # frame-misaligned PCM = "garbled / scrambled /
+                    # choppy" audio per the bridge's own source comment
+                    # (wasapi_loopback.py:132-144) and project memory
+                    # project_wasapi_callback_vs_read.md. Callback mode
+                    # uses a different PortAudio code path that is
+                    # clean on the same hardware. Env override
+                    # HGR_CLIP_MIC_V2_CALLBACK=0 reverts to polling.
+                    import os as _v2_mic_os
+                    _v2_mic_callback = (
+                        _v2_mic_os.environ.get(
+                            "HGR_CLIP_MIC_V2_CALLBACK", "1"
+                        ) != "0"
+                    )
                     mic_writer = WasapiLoopbackWriter(
                         mic_proc.stdin,
                         device_index=mdev,
@@ -24809,6 +24858,7 @@ Admin elevation
                         on_error=_on_writer_err,
                         is_loopback=False,
                         label="WasapiMicInputV2",
+                        use_callback_mode=_v2_mic_callback,
                         close_stdin_on_exit=True,
                     )
                     if mic_writer.start():
@@ -29739,6 +29789,18 @@ def _detect_ffmpeg_capabilities(self) -> dict:
 def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: float | None = None) -> list[str]:
     encoder = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
     gop = max(1, int(round(float(fps) * float(segment_seconds if segment_seconds is not None else 2.0))))
+    # MIRROR of the instance method at main_window.py:22224. Both
+    # branches must stay in lockstep.
+    import os as _enc_os
+    if (purpose == "clip_export"
+            and _enc_os.environ.get("HGR_CLIP_EXPORT_HQ", "1") != "0"):
+        if encoder == "h264_nvenc":
+            return ["-c:v", "h264_nvenc", "-preset", "p6", "-rc", "vbr", "-cq:v", "19", "-b:v", "0", "-pix_fmt", "yuv420p"]
+        if encoder == "h264_amf":
+            return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "19", "-pix_fmt", "yuv420p"]
+        if encoder == "h264_qsv":
+            return ["-c:v", "h264_qsv", "-preset", "slower", "-global_quality", "19", "-look_ahead", "1", "-pix_fmt", "nv12"]
+        return ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p"]
     if encoder == "h264_nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
     if encoder == "h264_amf":
