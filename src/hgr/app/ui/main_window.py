@@ -7207,20 +7207,21 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # Re-home the floating General Save Changes button to the
-        # outer scroll's VIEWPORT (same trick as the gesture binds
-        # pills). Without this, the button is parented to the General
-        # panel and scrolls out of view with the content. On the
-        # viewport, it stays anchored to bottom-right of the visible
-        # settings area so users always see the lit "save my edits"
-        # affordance when any control changes.
+        # Re-home the existing top-right General Save Changes button
+        # to the outer scroll's VIEWPORT (same trick as the gesture
+        # binds pills). Originally the button lived inside the General
+        # panel's header_row, which meant it scrolled out of view with
+        # the content. Re-parenting to the viewport keeps it glued to
+        # top-right of the visible settings area so users always see
+        # the lit "save my edits" affordance, no matter how far they
+        # scroll. header_row keeps the title (the button just leaves
+        # the layout when re-parented — Qt handles that automatically).
         try:
             vp_btn = content_scroll.viewport()
-            fb = getattr(self, "_general_save_button_floating", None)
-            if fb is not None:
-                fb.setParent(vp_btn)
-                fb.setVisible(False)
-                # Toggle visibility based on the active settings panel.
+            sb = getattr(self, "_general_save_button_top", None)
+            if sb is not None:
+                sb.setParent(vp_btn)
+                sb.setVisible(False)
                 # Show ONLY on the General page (SECTION_GENERAL=10).
                 self.settings_content_stack.currentChanged.connect(
                     self._update_general_save_floating_visibility
@@ -7229,10 +7230,7 @@ class MainWindow(QMainWindow):
                     self.settings_content_stack.currentIndex()
                 )
                 self._position_general_save_floating_button()
-                # Track viewport resize so the button stays glued to
-                # bottom-right. Install the event filter on the
-                # viewport — the existing eventFilter at the bottom of
-                # this class watches for Resize on widget objects.
+                # Track viewport resize so the button stays anchored.
                 vp_btn.installEventFilter(self)
         except Exception:
             pass
@@ -8545,40 +8543,25 @@ class MainWindow(QMainWindow):
         self._general_save_button_top.setCursor(Qt.PointingHandCursor)
         self._general_save_button_top.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self._general_save_button_top.clicked.connect(self._save_general_changes)
-        header_row.addWidget(self._general_save_button_top, 0, Qt.AlignTop)
-        layout.insertLayout(0, header_row)
-
-        # FLOATING (sticky) Save Changes button. Identical look + click
-        # handler as the top-right one, but parented to the outer scroll's
-        # VIEWPORT later in __init__ so it stays anchored to the bottom-
-        # right of the visible settings area even when the user scrolls
-        # the long General panel. Without this, the user couldn't see the
-        # Save button after scrolling past the first ~600 px of content
-        # and had to scroll back up to find the lit "save my edits"
-        # affordance. Visibility: shown only on the General panel +
-        # only when there are pending changes (mirrors the top button's
-        # enabled state via _update_general_save_state).
-        self._general_save_button_floating = QPushButton("Save Changes")
-        self._general_save_button_floating.setObjectName("settingsSaveButton")
-        self._general_save_button_floating.setEnabled(False)
-        self._general_save_button_floating.setProperty("pendingSave", False)
-        self._general_save_button_floating.setCursor(Qt.PointingHandCursor)
-        self._general_save_button_floating.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
-        )
-        self._general_save_button_floating.clicked.connect(self._save_general_changes)
-        self._general_save_button_floating.setVisible(False)  # re-homed + shown later
-        # Drop shadow so the button reads as elevated above the
-        # scrolling content underneath it.
+        # Drop shadow so the floating button (re-homed later to the
+        # outer scroll's viewport) reads as elevated above scrolling
+        # content underneath it.
         try:
             from PySide6.QtWidgets import QGraphicsDropShadowEffect
-            _shadow = QGraphicsDropShadowEffect(self._general_save_button_floating)
+            _shadow = QGraphicsDropShadowEffect(self._general_save_button_top)
             _shadow.setBlurRadius(28)
             _shadow.setOffset(0, 4)
             _shadow.setColor(QColor(0, 0, 0, 200))
-            self._general_save_button_floating.setGraphicsEffect(_shadow)
+            self._general_save_button_top.setGraphicsEffect(_shadow)
         except Exception:
             pass
+        # Add to header_row INITIALLY so the title row reserves the
+        # right amount of width. The re-home block in __init__ then
+        # re-parents this button to the outer scroll's viewport so it
+        # stays sticky at top-right as the user scrolls the long
+        # General panel.
+        header_row.addWidget(self._general_save_button_top, 0, Qt.AlignTop)
+        layout.insertLayout(0, header_row)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -9055,33 +9038,32 @@ class MainWindow(QMainWindow):
 
     def _update_general_save_state(self) -> None:
         dirty = bool(self._general_pending)
-        # Three save buttons share the same state: legacy bottom
-        # (kept as None for back-compat), the top-right header
-        # button, and the new sticky floating button at viewport
-        # bottom-right that stays visible regardless of scroll
-        # position. All three light up + enable together when any
-        # control changes from baseline.
-        for attr in ("_general_save_button", "_general_save_button_top",
-                     "_general_save_button_floating"):
+        # Two save buttons share the same state: the legacy bottom
+        # one (kept as None for back-compat) and the top-right
+        # header button (now re-parented to the outer scroll's
+        # viewport so it stays sticky at top-right as the user
+        # scrolls the long General panel). Both light up + enable
+        # together when any control changes from baseline.
+        for attr in ("_general_save_button", "_general_save_button_top"):
             button = getattr(self, attr, None)
             if button is None:
                 continue
             button.setEnabled(dirty)
             self._set_settings_save_button_pending(button, dirty)
-        # Re-position the floating button after a state change so its
-        # geometry tracks any width change from font reflow.
+        # Re-position after a state change so the button geometry
+        # tracks any width change from font reflow.
         try:
             self._position_general_save_floating_button()
         except Exception:
             pass
 
     def _position_general_save_floating_button(self) -> None:
-        """Anchor the floating Save Changes button to the bottom-right
-        of the settings content viewport. Re-called on viewport resize
-        and on pending-state change so the button stays glued in place
-        no matter how the user resizes the window or how long the
-        button text grows."""
-        button = getattr(self, "_general_save_button_floating", None)
+        """Anchor the sticky General Save Changes button to the TOP-
+        RIGHT of the settings content viewport. Re-called on viewport
+        resize and on pending-state change so the button stays glued
+        in place no matter how the user resizes the window or how
+        long the button text grows."""
+        button = getattr(self, "_general_save_button_top", None)
         if button is None:
             return
         vp = button.parentWidget()
@@ -9093,20 +9075,21 @@ class MainWindow(QMainWindow):
         btn_w = max(140, hint.width())
         btn_h = max(36, hint.height())
         button.resize(btn_w, btn_h)
-        # 16-px padding from viewport's bottom-right edges. Extra 4-px
-        # safety for the scrollbar that may appear on the right.
+        # 28-px right padding (clearance for the scrollbar that may
+        # appear on the right) + 18-px top padding so the button
+        # aligns visually with the panel title row underneath it.
         pad_right = 28
-        pad_bottom = 22
+        pad_top = 18
         x = max(0, vp.width() - btn_w - pad_right)
-        y = max(0, vp.height() - btn_h - pad_bottom)
+        y = pad_top
         button.move(x, y)
         button.raise_()
 
     def _update_general_save_floating_visibility(self, index: int) -> None:
-        """Show the floating Save button ONLY when the active settings
+        """Show the sticky Save button ONLY when the active settings
         panel is General. On every other panel hide it so it doesn't
         clutter unrelated tabs."""
-        button = getattr(self, "_general_save_button_floating", None)
+        button = getattr(self, "_general_save_button_top", None)
         if button is None:
             return
         try:
@@ -19102,7 +19085,20 @@ Admin elevation
     def _refresh_microphone_class_badge(self) -> None:
         """Update the auto-detected mic-class label below the
         microphone dropdown. Classifies the currently-selected device
-        via `mic_profile.classify_mic` and shows a one-line summary."""
+        via `mic_profile.classify_mic` and shows a one-line summary.
+
+        UI CHANGE: badge is now permanently hidden per user request —
+        the "Detected: <mic name> — auto-boosted to X.X×" popup was
+        noisy on every dropdown change. The classification still runs
+        elsewhere (auto-gain logic, mic_profile callers) so internal
+        behavior is unchanged; only the visible badge is suppressed.
+        """
+        badge = getattr(self, "microphone_class_badge", None)
+        if badge is not None:
+            badge.setVisible(False)
+        return
+        # Original logic below kept commented for back-compat / easy
+        # restore if the user ever wants the badge back.
         badge = getattr(self, "microphone_class_badge", None)
         combo = getattr(self, "microphone_combo", None)
         if badge is None or combo is None:
