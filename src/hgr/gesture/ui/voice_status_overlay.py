@@ -95,6 +95,25 @@ class VoiceStatusOverlay(QWidget):
             self._place_on_screen()
         self.update()
 
+    def show_warming(self, status_text: str = "Get ready...") -> None:
+        """Mic warmup phase. Shows a STATIC microphone icon (no
+        animated sound waves) above the status text — visually
+        distinct from the listening mode so the user knows not to
+        speak yet. Auto-transitions to listening mode when the
+        voice command listener finishes its warmup phase and
+        emits status='listening'."""
+        self._mode = "warming"
+        self._status_text = str(status_text or "Get ready...")
+        self._command_text = ""
+        self._hint_text = ""
+        self._backend_label = ""
+        self._info_text = ""
+        self._visible_until = 0.0
+        self._command_started = 0.0
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setFixedSize(140, 124)
+        self._show_now()
+
     def show_processing(self, status_text: str, *, command_text: str = "") -> None:
         self._mode = "processing"
         self._status_text = str(status_text or "")
@@ -184,6 +203,18 @@ class VoiceStatusOverlay(QWidget):
         self.repaint()
         apply_overlay(self)
 
+    # Pill size envelope. Width is bounded so the pill doesn't run
+    # screen-edge to screen-edge on wide monitors; height grows
+    # without a hard cap so error/heard-text never gets truncated
+    # — the user explicitly asked for "stretch vertically up" when
+    # text doesn't fit horizontally. _MAX_HEIGHT is large enough to
+    # cover a multi-sentence error message but still bounded so a
+    # runaway string can't render off-screen.
+    _MAX_WIDTH = 540
+    _MIN_WIDTH = 160
+    _MAX_HEIGHT = 420
+    _MIN_HEIGHT_STATUS_ONLY = 60
+
     def _resize_for_status(self, status_text: str, command_text: str) -> None:
         status = str(status_text or "").strip()
         command = str(command_text or "").strip()
@@ -192,28 +223,76 @@ class VoiceStatusOverlay(QWidget):
         status_metrics = QFontMetrics(status_font)
         command_font = QFont("Segoe UI", 11)
         command_metrics = QFontMetrics(command_font)
+        # Layout chrome (must match paint exactly). Paint insets the
+        # widget rect by (8, 4, -8, -4), then text rects are inset by
+        # another 12 on each side. Net:
+        #   H padding (widget edge -> text):  8 + 12 = 20 per side = 40
+        #   V padding above dots (widget top -> dots): 4 (rect inset)
+        #   V padding below command (widget bot -> text bot): 4 + 12 = 16
+        # Tightened from the previous 52/18 to bring the pill snugly
+        # around its text — user reported too much empty space.
+        H_CHROME = 40
+        DOTS_AREA = 36                # was 48
+        BOTTOM_MARGIN = 12            # was 18
+        TEXT_GAP = 8                  # was 10
         status_width = status_metrics.horizontalAdvance(status or " ")
-        width = min(420, max(220, status_width + 48))
+        width = min(self._MAX_WIDTH, max(self._MIN_WIDTH, status_width + H_CHROME))
         command_height = 0
         if command:
             wrapped = command if "\n" in command else f'"{command}"'
-            available = max(180, width - 36)
-            command_rect = command_metrics.boundingRect(0, 0, available, 1000, int(Qt.TextWordWrap), wrapped)
-            width = min(420, max(width, min(420, command_rect.width() + 42)))
-            available = max(180, width - 36)
-            command_rect = command_metrics.boundingRect(0, 0, available, 1000, int(Qt.TextWordWrap), wrapped)
+            command_width_single = command_metrics.horizontalAdvance(wrapped)
+            width = min(
+                self._MAX_WIDTH,
+                max(width, command_width_single + H_CHROME),
+            )
+            available = max(140, width - H_CHROME)
+            command_rect = command_metrics.boundingRect(
+                0, 0, available, 10_000, int(Qt.TextWordWrap), wrapped,
+            )
             command_height = max(18, command_rect.height())
-        height = 78 + (command_height if command else 0)
-        self.setFixedSize(int(width), int(min(220, max(72, height))))
+        available_status = max(140, width - H_CHROME)
+        status_rect = status_metrics.boundingRect(
+            0, 0, available_status, 10_000, int(Qt.TextWordWrap), status or " ",
+        )
+        status_height = max(20, status_rect.height())
+        # Vertical: 4 (rect top inset) + DOTS_AREA + status_height +
+        # TEXT_GAP + command_height + BOTTOM_MARGIN + 4 (rect bottom).
+        gap = TEXT_GAP if command else 0
+        height = 4 + DOTS_AREA + status_height + gap + command_height + BOTTOM_MARGIN + 4
+        self.setFixedSize(
+            int(width),
+            int(min(self._MAX_HEIGHT, max(self._MIN_HEIGHT_STATUS_ONLY, height))),
+        )
 
     def _resize_for_info_hint(self, text: str) -> None:
         content = str(text or "").strip() or "Info"
         font = QFont("Segoe UI", 11)
         font.setBold(True)
         metrics = QFontMetrics(font)
-        rect = metrics.boundingRect(0, 0, 320, 1000, int(Qt.TextWordWrap), content)
-        width = min(360, max(220, rect.width() + 32))
-        height = min(112, max(68, rect.height() + 28))
+        # Layout chrome must match paint exactly. paintEvent insets
+        # widget.rect() by (8, 4, -8, -4), then hint_box is rect
+        # adjusted (8, 8, -8, -8), then text is hint_box adjusted
+        # (10, 8, -10, -8). Net chrome from widget edge to text:
+        #   Horizontal: 8 + 8 + 10 = 26 per side = 52 total
+        #   Vertical:   4 + 8 + 8 = 20 per side = 40 total
+        # Earlier resize budgeted 32/28 which under-counted by 20/12 —
+        # paint wrapped text tighter than expected and clipped
+        # "Mouse Mode: ON/OFF" mid-letter. Aligned now.
+        H_CHROME = 52
+        V_CHROME = 40
+        rect = metrics.boundingRect(
+            0, 0, self._MAX_WIDTH - H_CHROME, 10_000, int(Qt.TextWordWrap), content,
+        )
+        width = min(
+            self._MAX_WIDTH,
+            max(self._MIN_WIDTH, rect.width() + H_CHROME),
+        )
+        # Re-measure at the chosen width so the height reflects the
+        # final wrap shape.
+        rect = metrics.boundingRect(
+            0, 0, width - H_CHROME, 10_000, int(Qt.TextWordWrap), content,
+        )
+        height = min(self._MAX_HEIGHT, max(60, rect.height() + V_CHROME))
         self.setFixedSize(int(width), int(height))
 
     def _place_on_screen(self) -> None:
@@ -406,6 +485,37 @@ class VoiceStatusOverlay(QWidget):
             painter.setPen(QPen(QColor(240, 250, 255, int(248 * info_alpha / 255))))
             painter.drawText(hint_box.adjusted(10, 8, -10, -8), Qt.AlignCenter | Qt.TextWordWrap, self._info_text)
             return
+        if self._mode == "warming":
+            # Mic warmup phase. Same layout as the no-hint listening
+            # pill (mic icon + text pill below) but WITHOUT the
+            # animated sound waves — visually distinct so the user
+            # knows not to speak yet.
+            center_x = rect.center().x()
+            icon_center_y = rect.center().y() - 14
+            painter.setPen(Qt.NoPen)
+            self._draw_microphone(painter, center_x, icon_center_y, accent)
+            # NO _draw_sound_waves — that's the visible "listening" cue.
+            warming_font = QFont("Segoe UI", 9)
+            warming_font.setBold(True)
+            painter.setFont(warming_font)
+            warming_metrics = QFontMetrics(warming_font)
+            warming_text = self._status_text or "Get ready..."
+            warming_text_w = warming_metrics.horizontalAdvance(warming_text)
+            warming_w = min(rect.width() - 12, warming_text_w + 22)
+            warming_h = 20.0
+            warming_left = center_x - warming_w / 2.0
+            warming_top = icon_center_y + 38
+            warming_rect = QRectF(warming_left, warming_top, warming_w, warming_h)
+            # Amber-ish tint instead of the blue listening tint so the
+            # user can tell the two modes apart at a glance.
+            warming_fill = QColor(233, 145, 29, 92)
+            warming_border = QColor(233, 168, 29, 178)
+            painter.setPen(QPen(warming_border, 1.2))
+            painter.setBrush(warming_fill)
+            painter.drawRoundedRect(warming_rect, 9.0, 9.0)
+            painter.setPen(QPen(QColor(255, 248, 240, 248)))
+            painter.drawText(warming_rect, Qt.AlignCenter, warming_text)
+            return
         if self._mode == "listening":
             center_x = rect.center().x()
             if self._hint_text:
@@ -476,7 +586,11 @@ class VoiceStatusOverlay(QWidget):
         painter.drawRoundedRect(rect, 18.0, 18.0)
 
         center_x = rect.center().x()
-        icon_center_y = rect.top() + 22
+        # Tightened layout (must match _resize_for_status constants):
+        #   DOTS_AREA = 36 (dots vertical center at rect.top()+18)
+        #   Text rects use 12 px horizontal inset (was 18)
+        #   BOTTOM_MARGIN = 12 (was 18)
+        icon_center_y = rect.top() + 18
         painter.setPen(Qt.NoPen)
         self._draw_loading_dots(painter, center_x, icon_center_y, accent)
 
@@ -484,8 +598,31 @@ class VoiceStatusOverlay(QWidget):
         status_font.setBold(True)
         painter.setFont(status_font)
         painter.setPen(QPen(muted))
-        status_rect = QRectF(rect.left() + 18, rect.top() + 34, rect.width() - 36, 24)
-        painter.drawText(status_rect, Qt.AlignCenter, self._status_text)
+        status_metrics = QFontMetrics(status_font)
+        status_available = rect.width() - 24
+        status_natural = status_metrics.boundingRect(
+            0, 0, int(status_available), 10_000,
+            int(Qt.TextWordWrap), self._status_text or " ",
+        )
+        status_height = max(20, status_natural.height())
+        # When there is NO command_text, vertically center the status
+        # text in the space below the dots.
+        dot_area_bottom = rect.top() + 24
+        if not self._command_text:
+            available_top = dot_area_bottom + 4
+            available_bottom = rect.bottom() - 8
+            status_y = available_top + max(
+                0.0,
+                (available_bottom - available_top - status_height) / 2.0,
+            )
+        else:
+            status_y = rect.top() + 36
+        status_rect = QRectF(rect.left() + 12, status_y, status_available, status_height)
+        painter.drawText(
+            status_rect,
+            Qt.AlignCenter | Qt.TextWordWrap,
+            self._status_text,
+        )
 
         if self._command_text:
             command_alpha = self._command_alpha(now)
@@ -494,7 +631,14 @@ class VoiceStatusOverlay(QWidget):
             quote_pen = QPen(soft)
             quote_pen.setColor(QColor(soft.red(), soft.green(), soft.blue(), command_alpha))
             painter.setPen(quote_pen)
-            command_rect = QRectF(rect.left() + 18, rect.top() + 58, rect.width() - 36, rect.height() - 72)
+            # 8-px gap between status and command (matches resize TEXT_GAP).
+            command_top = status_rect.bottom() + 8
+            command_rect = QRectF(
+                rect.left() + 12,
+                command_top,
+                rect.width() - 24,
+                rect.bottom() - command_top - 12,
+            )
             painter.drawText(
                 command_rect,
                 Qt.AlignCenter | Qt.TextWordWrap,

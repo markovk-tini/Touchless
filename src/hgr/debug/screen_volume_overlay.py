@@ -17,7 +17,7 @@ class ScreenVolumeOverlay(QWidget):
         self._muted = False
         self._active = False
         self._message = "Idle"
-        self._title = "System Volume"
+        self._title = "Vol"
         self._dual_mode = False
         self._app_fraction = 0.0
         self._app_label = ""
@@ -41,7 +41,7 @@ class ScreenVolumeOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAutoFillBackground(False)
         self.setStyleSheet("background: transparent; border: none;")
-        self.setFixedSize(168, 320)
+        self.setFixedSize(100, 320)
         self.apply_theme(config)
 
     def attach_controller(self, controller) -> None:
@@ -82,8 +82,8 @@ class ScreenVolumeOverlay(QWidget):
         self._message = str(message)
         self._dual_mode = False
         self._set_fraction_from_level(level)
-        if self.width() != 168:
-            self.setFixedSize(168, 320)
+        if self.width() != 100:
+            self.setFixedSize(100, 320)
         self.update()
 
     def set_dual_level(
@@ -105,8 +105,8 @@ class ScreenVolumeOverlay(QWidget):
         self._bar_selected = str(selected_bar)
         self._app_fraction = max(0.0, min(1.0, float(app_level))) if app_level is not None else 0.0
         self._set_fraction_from_level(sys_level)
-        if self.width() != 220:
-            self.setFixedSize(220, 350)
+        if self.width() != 150:
+            self.setFixedSize(150, 350)
         self.update()
 
     def sync_visual_state(self) -> None:
@@ -140,7 +140,7 @@ class ScreenVolumeOverlay(QWidget):
         painter.setPen(QPen(self._accent))
         painter.drawText(
             QRectF(card_rect.left() + 14, card_rect.top() + 10, card_rect.width() - 28, 24),
-            Qt.AlignLeft | Qt.AlignVCenter,
+            Qt.AlignCenter,
             self._title,
         )
 
@@ -161,7 +161,7 @@ class ScreenVolumeOverlay(QWidget):
             painter.setBrush(self._accent)
             painter.drawRoundedRect(fill_rect, fill_radius, fill_radius)
 
-        level_font = QFont("Segoe UI", 22)
+        level_font = QFont("Segoe UI", 16)
         level_font.setBold(True)
         painter.setFont(level_font)
         painter.setPen(QPen(self._text))
@@ -173,25 +173,17 @@ class ScreenVolumeOverlay(QWidget):
             percent_text,
         )
 
-        state = "Muted" if self._muted else ("Adjusting" if self._active else "Idle")
-        status_font = QFont("Segoe UI", 11)
-        status_font.setBold(True)
-        painter.setFont(status_font)
-        painter.drawText(
-            QRectF(card_rect.left() + 16, bar_rect.bottom() + 48, card_rect.width() - 32, 18),
-            Qt.AlignCenter,
-            state,
-        )
-
-        message_font = QFont("Segoe UI", 10)
-        message_font.setBold(True)
-        painter.setFont(message_font)
-        painter.setPen(QPen(QColor(self._text.red(), self._text.green(), self._text.blue(), 208)))
-        painter.drawText(
-            QRectF(card_rect.left() + 16, bar_rect.bottom() + 66, card_rect.width() - 32, 28),
-            Qt.AlignCenter | Qt.TextWordWrap,
-            self._message,
-        )
+        # State badge: only rendered when muted. "Adjusting" / "Idle"
+        # were both removed — they were visual noise.
+        if self._muted:
+            status_font = QFont("Segoe UI", 11)
+            status_font.setBold(True)
+            painter.setFont(status_font)
+            painter.drawText(
+                QRectF(card_rect.left() + 16, bar_rect.bottom() + 48, card_rect.width() - 32, 18),
+                Qt.AlignCenter,
+                "Muted",
+            )
 
     def _paint_dual(self, painter: QPainter, card_rect: QRectF) -> None:
         bar_w = 36.0
@@ -254,7 +246,7 @@ class ScreenVolumeOverlay(QWidget):
                 painter.setBrush(accent)
                 painter.drawRoundedRect(fill_rect, fill_radius, fill_radius)
 
-        pct_font = QFont("Segoe UI", 14)
+        pct_font = QFont("Segoe UI", 11)
         pct_font.setBold(True)
         painter.setFont(pct_font)
         for bar_x, fraction, accent in (
@@ -269,16 +261,16 @@ class ScreenVolumeOverlay(QWidget):
                 f"{pct}%",
             )
 
-        state = "Muted" if self._muted else ("Adjusting" if self._active else "Idle")
-        status_font = QFont("Segoe UI", 10)
-        status_font.setBold(True)
-        painter.setFont(status_font)
-        painter.setPen(QPen(self._text))
-        painter.drawText(
-            QRectF(card_rect.left() + 16, state_top, card_rect.width() - 32, 20),
-            Qt.AlignCenter,
-            state,
-        )
+        if self._muted:
+            status_font = QFont("Segoe UI", 10)
+            status_font.setBold(True)
+            painter.setFont(status_font)
+            painter.setPen(QPen(self._text))
+            painter.drawText(
+                QRectF(card_rect.left() + 16, state_top, card_rect.width() - 32, 20),
+                Qt.AlignCenter,
+                "Muted",
+            )
 
     def _place_on_screen(self) -> None:
         screen = self.screen() or QGuiApplication.primaryScreen()
