@@ -6073,6 +6073,24 @@ class MainWindow(QMainWindow):
         self._clip_cache_audio_list_path: Path | None = None
         self._clip_cache_audio_segment_pattern: Path | None = None
         self._clip_cache_audio_started_at: float = 0.0
+        # V2 ARCHITECTURE — two independent ffmpeg encoder subprocesses,
+        # one per audio source (sys loopback, mic input). Each writes its
+        # own AAC segment ring buffer with its own CSV manifest. At export
+        # time, the muxer reads both streams, applies per-stream
+        # aresample=async drift correction, and amixes into the final
+        # output. This eliminates within-cache amix drift accumulation
+        # (the V1 single-amix design's structural limit). Matches OBS
+        # Studio's canonical per-stream-PTS architecture verified by
+        # research workflow whzz8fl3p.
+        self._clip_cache_audio_sys_process = None
+        self._clip_cache_audio_mic_process = None
+        self._clip_cache_audio_sys_list_path: Path | None = None
+        self._clip_cache_audio_mic_list_path: Path | None = None
+        self._clip_cache_audio_sys_segment_pattern: Path | None = None
+        self._clip_cache_audio_mic_segment_pattern: Path | None = None
+        self._clip_cache_audio_sys_started_at: float = 0.0
+        self._clip_cache_audio_mic_started_at: float = 0.0
+        self._clip_cache_v2_active: bool = False
         self._clip_cache_wrap_count = max(3, int(np.ceil(self._clip_cache_max_seconds / self._clip_cache_segment_seconds)) + 1)
         self._clip_cache_timer = QTimer(self)
         self._clip_cache_timer.setInterval(int(round(1000.0 / self._clip_cache_fps)))
@@ -22444,6 +22462,18 @@ Admin elevation
         # -segment_format mp4 and a moov atom per segment, which the
         # segment muxer doesn't produce cleanly mid-stream.
         return self._clip_cache_dir() / f"audio_{self._clip_cache_session_id()}_%03d.aac"
+    def _ffmpeg_clip_audio_sys_list_path(self) -> Path:
+        # V2 architecture: sys-only AAC manifest.
+        return self._clip_cache_dir() / f"audio_sys_segments_{self._clip_cache_session_id()}.csv"
+    def _ffmpeg_clip_audio_mic_list_path(self) -> Path:
+        # V2 architecture: mic-only AAC manifest.
+        return self._clip_cache_dir() / f"audio_mic_segments_{self._clip_cache_session_id()}.csv"
+    def _ffmpeg_clip_audio_sys_segment_pattern(self) -> Path:
+        # V2 architecture: sys-only AAC segments (no amix at cache).
+        return self._clip_cache_dir() / f"audio_sys_{self._clip_cache_session_id()}_%03d.aac"
+    def _ffmpeg_clip_audio_mic_segment_pattern(self) -> Path:
+        # V2 architecture: mic-only AAC segments (no amix at cache).
+        return self._clip_cache_dir() / f"audio_mic_{self._clip_cache_session_id()}_%03d.aac"
     def _kill_orphan_ffmpeg_for_clip_cache(self) -> int:
         """Find and kill any ffmpeg.exe processes that are using
         files in our clip cache directory. These are zombies from
@@ -22564,11 +22594,14 @@ Admin elevation
             "segments.csv",           # legacy fixed-name manifest
             "segments_*.csv",         # new timestamped manifests from prior aborted sessions
             "concat_*.txt",
-            "audio_*.aac",            # matches both legacy `audio_NNN.aac` and new `audio_SID_NNN.aac`
+            "audio_*.aac",            # matches V1 audio_SID_NNN.aac AND V2 audio_sys_SID_NNN.aac / audio_mic_SID_NNN.aac
             "audio_*.m4a",            # leftover from prior builds; clean up too
             "audio_segments.csv",     # legacy fixed-name manifest
-            "audio_segments_*.csv",   # new timestamped manifests from prior aborted sessions
+            "audio_segments_*.csv",   # V1 timestamped manifests
+            "audio_sys_segments_*.csv",  # V2 sys manifests
+            "audio_mic_segments_*.csv",  # V2 mic manifests
             "audio_concat_*.txt",
+            "hot_snapshot_v2_*.aac",  # V2 hot snapshots from prior aborted exports
         ):
             for path in cache_dir.glob(pattern):
                 try:
@@ -23706,11 +23739,14 @@ Admin elevation
         )
 
     def _parse_ffmpeg_clip_audio_manifest(self) -> list[dict]:
-        """Parse the audio segment CSV — same shape as
-        `_parse_ffmpeg_clip_manifest` but for the parallel audio
-        ffmpeg's output. Used by the export to pick which audio
-        segments overlap the video time window being saved."""
-        list_path = self._clip_cache_audio_list_path
+        """V1-compat wrapper that parses the legacy single-amix
+        manifest. V2 export reads per-stream manifests via
+        `_parse_ffmpeg_clip_audio_manifest_at`."""
+        return self._parse_ffmpeg_clip_audio_manifest_at(
+            self._clip_cache_audio_list_path
+        )
+
+    def _parse_ffmpeg_clip_audio_manifest_at(self, list_path: Path | None) -> list[dict]:
         if list_path is None or not list_path.exists():
             return []
         entries: list[dict] = []
@@ -23804,20 +23840,25 @@ Admin elevation
         return ordered
 
     def _start_clip_cache_audio(self) -> bool:
-        """Spawn a SECOND ffmpeg subprocess that captures system
-        audio (WASAPI loopback via the Python bridge) and/or the
-        mic (DirectShow), encodes to AAC, and writes its own segment
-        ring buffer. Decoupled from the video cache ffmpeg so an
-        audio stall can't backpressure or freeze video.
+        """Spawn audio cache subprocesses.
 
-        Returns True if the audio subprocess started AND at least
-        one audio source was actually wired up; False otherwise
-        (in which case the video cache continues, silently).
+        V2 ARCHITECTURE (default, set HGR_CLIP_AUDIO_V2=0 to force V1):
+        Spawns two independent ffmpeg encoders, one per audio source
+        (sys loopback, mic input). Matches OBS Studio's canonical
+        per-stream-PTS architecture. Eliminates within-cache amix
+        drift that V1 suffered from.
 
-        Every outcome — toggles off, probe failure, mic-name unset,
-        bridge failure, ffmpeg startup failure — also writes a short
-        line to the home debug log so users can see WHY their clips
-        have no audio without needing to read a console."""
+        V1 (legacy): Single ffmpeg subprocess amixing sys + mic into
+        one AAC segment ring. Kept as fallback while V2 stabilizes.
+
+        Returns True if at least one source's encoder started.
+        """
+        # V2 ARCHITECTURE GATE.
+        import os as _v2_os
+        v2_enabled = _v2_os.environ.get("HGR_CLIP_AUDIO_V2", "1") != "0"
+        if v2_enabled:
+            return self._start_clip_cache_audio_v2()
+
         def _log(msg: str) -> None:
             try:
                 self._append_home_debug_log(f"[clip-audio] {msg}")
@@ -24528,6 +24569,299 @@ Admin elevation
         _log("audio cache running")
         return True
 
+    def _start_clip_cache_audio_v2(self) -> bool:
+        """V2 ARCHITECTURE — two independent ffmpeg encoder subprocesses,
+        one per audio source.
+
+        Matches OBS Studio's canonical per-stream-PTS architecture
+        (verified by research workflow whzz8fl3p). Each source gets its
+        own encoder process, its own AAC segment ring, and its own CSV
+        manifest. At export time, the muxer reads both streams,
+        applies per-stream aresample=async drift correction, then
+        amixes into the final output. Eliminates the V1 within-cache
+        amix drift that produced the 1-5 s desync the user reported.
+
+        Returns True if at least one source's encoder + bridge started;
+        False if nothing wired.
+        """
+        def _log(msg: str) -> None:
+            try:
+                self._append_home_debug_log(f"[clip-audio-v2] {msg}")
+            except Exception:
+                pass
+            try:
+                import sys as _sys
+                _sys.stderr.write(f"[clip-audio-v2] {msg}\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
+
+        cfg = self.config
+        want_system = bool(getattr(cfg, "clip_capture_system_audio", False))
+        want_mic = bool(getattr(cfg, "clip_capture_microphone", False))
+        if not (want_system or want_mic):
+            _log("both audio toggles are off; clips will be silent")
+            return False
+        if not self._ffmpeg_ready():
+            _log("ffmpeg not ready; audio cache cannot start")
+            return False
+
+        # Probe each source ONCE. No shared TCP socket, no amix — each
+        # bridge owns its own ffmpeg's stdin pipe.
+        sys_pcm_format = None
+        mic_pcm_format = None
+        mic_name = ""
+        listener_index: int | None = None
+
+        if want_system:
+            sys_pcm_format = self._probe_wasapi_loopback_format()
+            if sys_pcm_format is not None:
+                _dev, rate, channels = sys_pcm_format
+                _log(f"system audio probe ok ({rate} Hz, {channels} ch)")
+            else:
+                _log(
+                    "system audio ON but no WASAPI loopback endpoint "
+                    "found — check Windows default playback device"
+                )
+
+        if want_mic:
+            mic_name = str(getattr(cfg, "preferred_microphone_name", "") or "").strip()
+            try:
+                if (self._worker is not None
+                        and getattr(self._worker, "voice_listener", None) is not None):
+                    if not mic_name:
+                        listener_mic = self._worker.voice_listener.input_device_name()
+                        if listener_mic:
+                            mic_name = str(listener_mic).strip()
+                    try:
+                        listener_index = self._worker.voice_listener.input_device_index()
+                    except Exception:
+                        listener_index = None
+                    if listener_index is None:
+                        try:
+                            import sounddevice as _sd
+                            default_pair = _sd.default.device
+                            if isinstance(default_pair, (tuple, list)) and default_pair:
+                                cand = default_pair[0]
+                                if isinstance(cand, int) and cand >= 0:
+                                    listener_index = int(cand)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                from hgr.app.ui.wasapi_loopback import probe_input_device_format
+                mic_pcm_format = probe_input_device_format(
+                    mic_name or None,
+                    device_index=listener_index,
+                    fallback_rate=48000,
+                    max_channels=1,
+                )
+                if mic_pcm_format is not None:
+                    _log(
+                        f"mic probe -> idx={mic_pcm_format[0]} "
+                        f"rate={mic_pcm_format[1]} ch={mic_pcm_format[2]}"
+                    )
+            except Exception as exc:
+                _log(f"mic probe failed: {exc}")
+
+        if sys_pcm_format is None and mic_pcm_format is None:
+            _log("no audio sources successfully wired; clips will be silent")
+            return False
+
+        # Allocate paths for each stream.
+        self._clip_cache_audio_sys_list_path = self._ffmpeg_clip_audio_sys_list_path()
+        self._clip_cache_audio_sys_segment_pattern = self._ffmpeg_clip_audio_sys_segment_pattern()
+        self._clip_cache_audio_mic_list_path = self._ffmpeg_clip_audio_mic_list_path()
+        self._clip_cache_audio_mic_segment_pattern = self._ffmpeg_clip_audio_mic_segment_pattern()
+
+        # Noise reduction preset for mic.
+        ns_mode = str(getattr(cfg, "clip_mic_noise_reduction", "light") or "light").lower()
+        if ns_mode not in self._CLIP_NOISE_PRESETS:
+            ns_mode = "light"
+        ns_filter = self._CLIP_NOISE_PRESETS[ns_mode]
+
+        try:
+            from hgr.app.ui.wasapi_loopback import WasapiLoopbackWriter
+        except Exception as exc:
+            _log(f"WASAPI bridge import failed: {exc}")
+            return False
+
+        def _on_writer_err(msg: str) -> None:
+            _log(msg)
+
+        sys_proc = None
+        mic_proc = None
+        sys_started_at = 0.0
+        mic_started_at = 0.0
+
+        # --- Spawn SYS encoder ---
+        if sys_pcm_format is not None:
+            sdev, srate, schans = sys_pcm_format
+            sys_filter = "[0:a]anull[aout]"
+            sys_cmd = [
+                self._ffmpeg_path,
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-thread_queue_size", "1024",
+                "-f", "s16le",
+                "-ar", str(srate),
+                "-ac", str(schans),
+                "-i", "pipe:0",
+                "-filter_complex", sys_filter,
+                "-map", "[aout]",
+                "-c:a", "aac", "-b:a", "192k",
+                "-f", "segment",
+                "-segment_format", "adts",
+                "-segment_time", f"{float(self._clip_cache_segment_seconds):.3f}",
+                "-segment_wrap", str(int(self._clip_cache_wrap_count)),
+                "-segment_list", str(self._clip_cache_audio_sys_list_path),
+                "-segment_list_type", "csv",
+                "-segment_list_size", str(int(self._clip_cache_wrap_count)),
+                "-reset_timestamps", "1",
+                str(self._clip_cache_audio_sys_segment_pattern),
+            ]
+            _log(f"spawning sys encoder ({srate} Hz, {schans} ch)")
+            sys_proc = self._start_ffmpeg_process(sys_cmd)
+            if sys_proc is None:
+                _log("sys encoder failed to start")
+            else:
+                self._spawn_ffmpeg_stderr_drain(sys_proc, "clip-audio-v2-sys")
+                # Spawn the sys WASAPI bridge.
+                try:
+                    sys_writer = WasapiLoopbackWriter(
+                        sys_proc.stdin,
+                        device_index=sdev,
+                        rate=srate,
+                        channels=schans,
+                        on_error=_on_writer_err,
+                        is_loopback=True,
+                        label="WasapiSysLoopbackV2",
+                        close_stdin_on_exit=True,
+                    )
+                    if sys_writer.start():
+                        self._wasapi_writer = sys_writer
+                        _log("sys bridge running")
+                        # Measure first-sample wall time for the anchor.
+                        deadline = time.time() + 2.5
+                        while (sys_writer.first_sample_at is None
+                               and time.time() < deadline):
+                            time.sleep(0.01)
+                        actual = getattr(sys_writer, "first_sample_at", None)
+                        if actual is not None:
+                            sys_started_at = float(actual)
+                        else:
+                            sys_started_at = time.time()
+                    else:
+                        _log("sys bridge failed to start")
+                        try:
+                            sys_proc.terminate()
+                        except Exception:
+                            pass
+                        sys_proc = None
+                except Exception as exc:
+                    _log(f"sys bridge spawn failed: {exc}")
+                    try:
+                        sys_proc.terminate()
+                    except Exception:
+                        pass
+                    sys_proc = None
+
+        # --- Spawn MIC encoder ---
+        if mic_pcm_format is not None:
+            mdev, mrate, mchans = mic_pcm_format
+            # Mic chain: noise reduction + light denoise. Per-stream
+            # PTS is preserved through the encoder; drift correction
+            # happens at export time via aresample=async.
+            mic_filter = f"[0:a]{ns_filter},afftdn=nr=10[aout]"
+            mic_cmd = [
+                self._ffmpeg_path,
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-thread_queue_size", "1024",
+                "-f", "s16le",
+                "-ar", str(mrate),
+                "-ac", str(mchans),
+                "-i", "pipe:0",
+                "-filter_complex", mic_filter,
+                "-map", "[aout]",
+                "-c:a", "aac", "-b:a", "192k",
+                "-f", "segment",
+                "-segment_format", "adts",
+                "-segment_time", f"{float(self._clip_cache_segment_seconds):.3f}",
+                "-segment_wrap", str(int(self._clip_cache_wrap_count)),
+                "-segment_list", str(self._clip_cache_audio_mic_list_path),
+                "-segment_list_type", "csv",
+                "-segment_list_size", str(int(self._clip_cache_wrap_count)),
+                "-reset_timestamps", "1",
+                str(self._clip_cache_audio_mic_segment_pattern),
+            ]
+            _log(f"spawning mic encoder ({mrate} Hz, {mchans} ch)")
+            mic_proc = self._start_ffmpeg_process(mic_cmd)
+            if mic_proc is None:
+                _log("mic encoder failed to start")
+            else:
+                self._spawn_ffmpeg_stderr_drain(mic_proc, "clip-audio-v2-mic")
+                try:
+                    mic_writer = WasapiLoopbackWriter(
+                        mic_proc.stdin,
+                        device_index=mdev,
+                        rate=mrate,
+                        channels=mchans,
+                        on_error=_on_writer_err,
+                        is_loopback=False,
+                        label="WasapiMicInputV2",
+                        close_stdin_on_exit=True,
+                    )
+                    if mic_writer.start():
+                        self._wasapi_mic_writer = mic_writer
+                        _log("mic bridge running")
+                        deadline = time.time() + 2.5
+                        while (mic_writer.first_sample_at is None
+                               and time.time() < deadline):
+                            time.sleep(0.01)
+                        actual = getattr(mic_writer, "first_sample_at", None)
+                        if actual is not None:
+                            mic_started_at = float(actual)
+                        else:
+                            mic_started_at = time.time()
+                    else:
+                        _log("mic bridge failed to start")
+                        try:
+                            mic_proc.terminate()
+                        except Exception:
+                            pass
+                        mic_proc = None
+                except Exception as exc:
+                    _log(f"mic bridge spawn failed: {exc}")
+                    try:
+                        mic_proc.terminate()
+                    except Exception:
+                        pass
+                    mic_proc = None
+
+        if sys_proc is None and mic_proc is None:
+            _log("V2 cache failed to start any encoder; clips will be silent")
+            return False
+
+        # Persist process handles + anchors.
+        self._clip_cache_audio_sys_process = sys_proc
+        self._clip_cache_audio_mic_process = mic_proc
+        self._clip_cache_audio_sys_started_at = sys_started_at
+        self._clip_cache_audio_mic_started_at = mic_started_at
+        # Mark cache as having audio so the export path engages.
+        self._clip_cache_has_audio = True
+        self._clip_cache_v2_active = True
+        # Use the EARLIER of the two anchors as the unified audio anchor
+        # (for legacy code that checks _clip_cache_audio_started_at).
+        candidates = [t for t in (sys_started_at, mic_started_at) if t > 0]
+        if candidates:
+            self._clip_cache_audio_started_at = min(candidates)
+        _log(
+            f"V2 cache running: sys={'yes' if sys_proc else 'no'} "
+            f"mic={'yes' if mic_proc else 'no'} "
+            f"sys_anchor={sys_started_at:.3f} mic_anchor={mic_started_at:.3f}"
+        )
+        return True
+
     def _stop_clip_cache_audio(self, *, delete_files: bool = True) -> None:
         """Tear down the audio cache process. Drains BOTH WASAPI
         bridge threads (system loopback + mic) FIRST so they exit
@@ -24559,10 +24893,26 @@ Admin elevation
         self._clip_cache_audio_process = None
         if process is not None:
             self._stop_ffmpeg_process(process)
+        # V2: reap both sys + mic encoder processes.
+        sys_proc = self._clip_cache_audio_sys_process
+        self._clip_cache_audio_sys_process = None
+        if sys_proc is not None:
+            self._stop_ffmpeg_process(sys_proc)
+        mic_proc = self._clip_cache_audio_mic_process
+        self._clip_cache_audio_mic_process = None
+        if mic_proc is not None:
+            self._stop_ffmpeg_process(mic_proc)
         if delete_files:
             self._clip_cache_audio_list_path = None
             self._clip_cache_audio_segment_pattern = None
             self._clip_cache_audio_started_at = 0.0
+            self._clip_cache_audio_sys_list_path = None
+            self._clip_cache_audio_mic_list_path = None
+            self._clip_cache_audio_sys_segment_pattern = None
+            self._clip_cache_audio_mic_segment_pattern = None
+            self._clip_cache_audio_sys_started_at = 0.0
+            self._clip_cache_audio_mic_started_at = 0.0
+        self._clip_cache_v2_active = False
 
     def _restart_clip_cache_if_running(self) -> None:
         """Stop+restart the clip cache so a recent settings change
@@ -25542,6 +25892,23 @@ Admin elevation
                 slop = max(0.5, float(self._clip_cache_segment_seconds))
                 a_window_wall_start = requested_start_wall - slop
                 a_window_wall_end = requested_end_wall + slop
+                # V2 ARCHITECTURE DETECTION.
+                v2_sys_entries: list[dict] = []
+                v2_mic_entries: list[dict] = []
+                v2_active_for_export = bool(
+                    getattr(self, "_clip_cache_v2_active", False)
+                    or (self._clip_cache_audio_sys_list_path is not None
+                        and self._clip_cache_audio_sys_list_path.exists())
+                    or (self._clip_cache_audio_mic_list_path is not None
+                        and self._clip_cache_audio_mic_list_path.exists())
+                )
+                if v2_active_for_export:
+                    v2_sys_entries = self._parse_ffmpeg_clip_audio_manifest_at(
+                        self._clip_cache_audio_sys_list_path
+                    )
+                    v2_mic_entries = self._parse_ffmpeg_clip_audio_manifest_at(
+                        self._clip_cache_audio_mic_list_path
+                    )
                 _saved_audio_list_path = self._clip_cache_audio_list_path
                 if audio_list_path_snapshot is not None:
                     self._clip_cache_audio_list_path = audio_list_path_snapshot
@@ -25837,11 +26204,185 @@ Admin elevation
             # are snapshotted, not just freshly-written ones.
             audio_input_paths: list[Path] = []
             audio_hot_copies: list[Path] = []
+            # ─── V2 ARCHITECTURE AUDIO PATH ──────────────────────
+            # When V2 is active, sys and mic each have their own
+            # segment manifest. We build a dual-stream filter graph
+            # with per-stream aresample=async drift correction +
+            # amix at export. Matches OBS Studio's canonical
+            # per-stream-PTS architecture. The V1 paths below are
+            # skipped entirely when v2_chain_built is True.
+            v2_chain_built = False
+            v2_audio_filter_complex_str = ""
+            if v2_active_for_export and (v2_sys_entries or v2_mic_entries):
+                try:
+                    import shutil as _v2_shutil
+                except Exception:
+                    _v2_shutil = None
+
+                def _v2_in_window(e: dict) -> bool:
+                    we = float(e.get("wall_end_mtime", 0.0) or 0.0)
+                    ws = float(e.get("wall_start_mtime", 0.0) or 0.0)
+                    if we <= 0 or ws <= 0:
+                        return False
+                    if we < a_window_wall_start:
+                        return False
+                    if ws > a_window_wall_end:
+                        return False
+                    return True
+
+                v2_sys_sel = [e for e in v2_sys_entries if _v2_in_window(e)]
+                v2_mic_sel = [e for e in v2_mic_entries if _v2_in_window(e)]
+
+                def _v2_hot_snap(src_path: Path) -> Path:
+                    if _v2_shutil is None:
+                        return src_path
+                    try:
+                        age = time.time() - src_path.stat().st_mtime
+                        if age > 10.0:
+                            return src_path
+                        snap = (self._clip_cache_dir()
+                                / f"hot_snapshot_v2_{time.time_ns()}.aac")
+                        _v2_shutil.copyfile(str(src_path), str(snap))
+                        if snap.stat().st_size > 256:
+                            audio_hot_copies.append(snap)
+                            return snap
+                    except Exception:
+                        pass
+                    return src_path
+
+                v2_sys_paths = [
+                    _v2_hot_snap(Path(e["path"]).resolve()) for e in v2_sys_sel
+                ]
+                v2_mic_paths = [
+                    _v2_hot_snap(Path(e["path"]).resolve()) for e in v2_mic_sel
+                ]
+                # Filter to existing/non-empty files (AAC sanity).
+                v2_sys_paths = [
+                    p for p in v2_sys_paths
+                    if p.exists() and p.stat().st_size > 256
+                ]
+                v2_mic_paths = [
+                    p for p in v2_mic_paths
+                    if p.exists() and p.stat().st_size > 256
+                ]
+                v2_ns = len(v2_sys_paths)
+                v2_nm = len(v2_mic_paths)
+
+                if v2_ns > 0 or v2_nm > 0:
+                    # Per-stream wall windows. Use the FIRST selected
+                    # entry's wall_start as the stream's wall anchor
+                    # (= file_pts=0 of the stream's concat).
+                    v2_sys_wall_start = (
+                        float(v2_sys_sel[0]["wall_start_mtime"])
+                        if v2_sys_sel else 0.0
+                    )
+                    v2_sys_wall_end = (
+                        float(v2_sys_sel[-1]["wall_end_mtime"])
+                        if v2_sys_sel else 0.0
+                    )
+                    v2_mic_wall_start = (
+                        float(v2_mic_sel[0]["wall_start_mtime"])
+                        if v2_mic_sel else 0.0
+                    )
+                    v2_mic_wall_end = (
+                        float(v2_mic_sel[-1]["wall_end_mtime"])
+                        if v2_mic_sel else 0.0
+                    )
+
+                    v2_clip_wall_start = requested_end_wall - float(duration_seconds)
+                    v2_clip_wall_end = requested_end_wall
+                    v2_clip_dur = max(1e-3, v2_clip_wall_end - v2_clip_wall_start)
+
+                    # Build inputs list. Video uses [0..n), then sys
+                    # uses [n..n+v2_ns), then mic uses [n+v2_ns..end).
+                    audio_input_paths = v2_sys_paths + v2_mic_paths
+
+                    v2_parts: list[str] = []
+                    v2_sys_label = None
+                    v2_mic_label = None
+                    if v2_ns > 0:
+                        sys_inputs_str = "".join(
+                            f"[{n + i}:a]" for i in range(v2_ns)
+                        )
+                        sys_atrim_start = max(
+                            0.0, v2_clip_wall_start - v2_sys_wall_start
+                        )
+                        sys_avail = max(
+                            0.0, v2_sys_wall_end - v2_sys_wall_start - sys_atrim_start
+                        )
+                        sys_atrim_dur = max(1e-3, min(v2_clip_dur, sys_avail))
+                        # aresample=async=1000 lets ffmpeg stretch/squeeze
+                        # samples up to 1000/s to align timestamps with
+                        # the requested PTS — the canonical drift fix.
+                        v2_parts.append(
+                            f"{sys_inputs_str}concat=n={v2_ns}:v=0:a=1,"
+                            f"aresample=async=1000:first_pts=0,"
+                            f"atrim=start={sys_atrim_start:.3f}:"
+                            f"duration={sys_atrim_dur:.3f},"
+                            f"asetpts=PTS-STARTPTS,"
+                            f"apad=whole_dur={v2_clip_dur:.3f}[asysv2]"
+                        )
+                        v2_sys_label = "asysv2"
+                    if v2_nm > 0:
+                        mic_inputs_str = "".join(
+                            f"[{n + v2_ns + i}:a]" for i in range(v2_nm)
+                        )
+                        mic_atrim_start = max(
+                            0.0, v2_clip_wall_start - v2_mic_wall_start
+                        )
+                        mic_avail = max(
+                            0.0, v2_mic_wall_end - v2_mic_wall_start - mic_atrim_start
+                        )
+                        mic_atrim_dur = max(1e-3, min(v2_clip_dur, mic_avail))
+                        v2_parts.append(
+                            f"{mic_inputs_str}concat=n={v2_nm}:v=0:a=1,"
+                            f"aresample=async=1000:first_pts=0,"
+                            f"atrim=start={mic_atrim_start:.3f}:"
+                            f"duration={mic_atrim_dur:.3f},"
+                            f"asetpts=PTS-STARTPTS,"
+                            f"apad=whole_dur={v2_clip_dur:.3f}[amicv2]"
+                        )
+                        v2_mic_label = "amicv2"
+                    if v2_sys_label and v2_mic_label:
+                        v2_parts.append(
+                            f"[{v2_sys_label}][{v2_mic_label}]"
+                            f"amix=inputs=2:duration=longest:"
+                            f"dropout_transition=0:weights=2 3[aout]"
+                        )
+                    elif v2_sys_label:
+                        v2_parts.append(f"[{v2_sys_label}]anull[aout]")
+                    else:
+                        v2_parts.append(f"[{v2_mic_label}]anull[aout]")
+                    v2_audio_filter_complex_str = ";".join(v2_parts)
+                    has_audio = True
+                    v2_chain_built = True
+                    try:
+                        import sys as _v2_diag_sys
+                        _v2_diag_sys.stderr.write(
+                            f"[clip-export-v2] sys_segs={v2_ns} "
+                            f"mic_segs={v2_nm} clip_dur={v2_clip_dur:.2f}s "
+                            f"sys_wall=[{v2_sys_wall_start:.2f},{v2_sys_wall_end:.2f}] "
+                            f"mic_wall=[{v2_mic_wall_start:.2f},{v2_mic_wall_end:.2f}] "
+                            f"clip_wall=[{v2_clip_wall_start:.2f},{v2_clip_wall_end:.2f}]\n"
+                        )
+                        _v2_diag_sys.stderr.flush()
+                    except Exception:
+                        pass
+
+            if v2_chain_built:
+                # V2 PATH: skip V1 hot-snapshot loop entirely.
+                pass
+            else:
+                # V1 PATH (legacy, executed when V2 cache is inactive
+                # OR V2 produced no usable entries) — original code
+                # below builds audio_input_paths from audio_selected
+                # with hot snapshots, gap insertion, etc.
+                pass
             try:
                 import shutil as _shutil_aud
             except Exception:
                 _shutil_aud = None
-            for entry in audio_selected:
+            for entry in (audio_selected if not v2_chain_built else []):
                 src = Path(entry["path"]).resolve()
                 audio_input_paths.append(src)
                 if _shutil_aud is None:
@@ -26035,7 +26576,10 @@ Admin elevation
             v_chain.append("setpts=PTS-STARTPTS")
             video_complex = ",".join(v_chain) + "[vout]"
             filter_complex = video_complex
-            if has_audio:
+            # V2 PATH: append the dual-stream audio chain (no V1 logic).
+            if v2_chain_built:
+                filter_complex = video_complex + ";" + v2_audio_filter_complex_str
+            if has_audio and not v2_chain_built:
                 # WALL-CLOCK-ANCHORED audio chain.
                 #
                 # Old math assumed audio's last sample lines up with
@@ -26439,6 +26983,7 @@ Admin elevation
                 for pattern in (
                     "hot_snapshot_*.mkv",
                     "hot_snapshot_audio_*.aac",
+                    "hot_snapshot_v2_*.aac",
                     "concat_*.txt",
                     "audio_concat_*.txt",
                 ):
