@@ -22224,28 +22224,52 @@ Admin elevation
     def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: float | None = None) -> list[str]:
         encoder = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
         gop = max(1, int(round(float(fps) * float(segment_seconds if segment_seconds is not None else 2.0))))
-        # EXPORT-ONLY HIGH-QUALITY BRANCH (purpose=='clip_export').
-        # Cache (purpose='clip') and screen-record (purpose='record')
-        # paths fall through to the real-time args below — cache fps,
-        # GOP cadence, segment_time and segment_wrap stay byte-identical
-        # to today. Export is one-shot per clip, not real-time, so it
-        # can afford slow/high-quality presets and lower CRF for
-        # visually-lossless output. Env override
-        # HGR_CLIP_EXPORT_HQ=0 reverts to the original real-time args
-        # at export (also acts as the pre-Turing-NVENC escape hatch).
         import os as _enc_os
+        # EXPORT-ONLY VERY-HIGH-QUALITY BRANCH (purpose=='clip_export').
+        # Bumped from CRF 18 / CQ 19 to CRF 17 / CQ 17 — the lower
+        # bound of visually-lossless for x264 and NVENC. Export runs
+        # one-shot per clip so cost is irrelevant. Env override
+        # HGR_CLIP_EXPORT_HQ=0 reverts to the real-time args below
+        # (= pre-Turing-NVENC escape hatch / emergency revert).
         if (purpose == "clip_export"
                 and _enc_os.environ.get("HGR_CLIP_EXPORT_HQ", "1") != "0"):
+            try:
+                import sys as _hq_sys
+                _hq_sys.stderr.write(
+                    f"[clip-export] HQ encoder branch active: {encoder}\n"
+                )
+                _hq_sys.stderr.flush()
+            except Exception:
+                pass
             if encoder == "h264_nvenc":
-                return ["-c:v", "h264_nvenc", "-preset", "p6", "-rc", "vbr", "-cq:v", "19", "-b:v", "0", "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr", "-cq:v", "17", "-b:v", "0", "-pix_fmt", "yuv420p"]
             if encoder == "h264_amf":
-                return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "19", "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "16", "-qp_p", "17", "-pix_fmt", "yuv420p"]
             if encoder == "h264_qsv":
-                return ["-c:v", "h264_qsv", "-preset", "slower", "-global_quality", "19", "-look_ahead", "1", "-pix_fmt", "nv12"]
-            return ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p"]
-        # Real-time path (cache + record) — UNCHANGED from current
-        # shipping values. Preserves cache fps, GOP cadence, and
-        # segment timing.
+                return ["-c:v", "h264_qsv", "-preset", "veryslow", "-global_quality", "17", "-look_ahead", "1", "-pix_fmt", "nv12"]
+            return ["-c:v", "libx264", "-preset", "slow", "-crf", "17", "-pix_fmt", "yuv420p"]
+        # CACHE HIGH-QUALITY BRANCH (purpose=='clip'). Bump CRF/CQ
+        # for a better source the export reads from — export's slow
+        # preset can preserve detail but not recreate it if cache
+        # threw it away. Preset stays at veryfast / p4 / quality so
+        # cache encoder keeps up with real-time screen capture
+        # (preset is the speed knob; CRF/CQ are independent quality
+        # knobs). Env override HGR_CLIP_CACHE_HQ=0 reverts to the
+        # original real-time args (= slow-disk / low-end-CPU escape).
+        # Disk-size impact: per-segment .mkv grows ~30-50%. With
+        # segment_wrap bounded ring, total cache disk is still bounded.
+        if (purpose == "clip"
+                and _enc_os.environ.get("HGR_CLIP_CACHE_HQ", "1") != "0"):
+            if encoder == "h264_nvenc":
+                return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
+            if encoder == "h264_amf":
+                return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "19", "-qp_p", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
+            if encoder == "h264_qsv":
+                return ["-c:v", "h264_qsv", "-global_quality", "21", "-look_ahead", "0", "-g", str(gop), "-pix_fmt", "nv12"]
+            return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-g", str(gop), "-pix_fmt", "yuv420p"]
+        # Real-time path (record + cache-HQ-disabled fallback) —
+        # UNCHANGED from original shipping values. Preserves cache
+        # fps, GOP cadence, and segment timing.
         if encoder == "h264_nvenc":
             return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
         if encoder == "h264_amf":
@@ -29997,12 +30021,21 @@ def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: flo
     if (purpose == "clip_export"
             and _enc_os.environ.get("HGR_CLIP_EXPORT_HQ", "1") != "0"):
         if encoder == "h264_nvenc":
-            return ["-c:v", "h264_nvenc", "-preset", "p6", "-rc", "vbr", "-cq:v", "19", "-b:v", "0", "-pix_fmt", "yuv420p"]
+            return ["-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr", "-cq:v", "17", "-b:v", "0", "-pix_fmt", "yuv420p"]
         if encoder == "h264_amf":
-            return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "19", "-pix_fmt", "yuv420p"]
+            return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "16", "-qp_p", "17", "-pix_fmt", "yuv420p"]
         if encoder == "h264_qsv":
-            return ["-c:v", "h264_qsv", "-preset", "slower", "-global_quality", "19", "-look_ahead", "1", "-pix_fmt", "nv12"]
-        return ["-c:v", "libx264", "-preset", "slow", "-crf", "18", "-pix_fmt", "yuv420p"]
+            return ["-c:v", "h264_qsv", "-preset", "veryslow", "-global_quality", "17", "-look_ahead", "1", "-pix_fmt", "nv12"]
+        return ["-c:v", "libx264", "-preset", "slow", "-crf", "17", "-pix_fmt", "yuv420p"]
+    if (purpose == "clip"
+            and _enc_os.environ.get("HGR_CLIP_CACHE_HQ", "1") != "0"):
+        if encoder == "h264_nvenc":
+            return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
+        if encoder == "h264_amf":
+            return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "19", "-qp_p", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
+        if encoder == "h264_qsv":
+            return ["-c:v", "h264_qsv", "-global_quality", "21", "-look_ahead", "0", "-g", str(gop), "-pix_fmt", "nv12"]
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-g", str(gop), "-pix_fmt", "yuv420p"]
     if encoder == "h264_nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
     if encoder == "h264_amf":
