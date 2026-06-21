@@ -26289,8 +26289,27 @@ Admin elevation
                         if v2_mic_sel else 0.0
                     )
 
-                    v2_clip_wall_start = requested_end_wall - float(duration_seconds)
-                    v2_clip_wall_end = requested_end_wall
+                    # CRITICAL: V2 audio MUST anchor to the SAME wall
+                    # window as video. The video chain ends at
+                    # (v_anchor + selected[-1].end_time - tail_to_drop),
+                    # which is the latest CLOSED video segment's
+                    # close wall — typically ~5 s BEFORE end_ts
+                    # because the in-progress video segment isn't in
+                    # the manifest yet. If V2 audio used end_ts as
+                    # its anchor, audio content would be from ~5 s
+                    # LATER wall than video shows at any clip_t —
+                    # exactly the user-reported "audio is 5 s early"
+                    # symptom. Pinning V2 audio to video's actual
+                    # wall window keeps both streams internally
+                    # consistent (clip's last few seconds may not
+                    # reach end_ts but A/V is in perfect sync).
+                    v2_video_clip_wall_end = (
+                        v_anchor + float(selected[-1].get("end_time", 0.0))
+                        - tail_to_drop
+                        if v_anchor > 0 else requested_end_wall
+                    )
+                    v2_clip_wall_end = v2_video_clip_wall_end
+                    v2_clip_wall_start = v2_clip_wall_end - float(duration_seconds)
                     v2_clip_dur = max(1e-3, v2_clip_wall_end - v2_clip_wall_start)
 
                     # Build inputs list. Video uses [0..n), then sys
@@ -26580,12 +26599,26 @@ Admin elevation
                     ))
             except Exception:
                 _trim_to_audio_enabled = True
+            # Safety net works for V1 (audio_selected) OR V2 (v2_*_sel).
+            _safety_net_audio_last_wall = 0.0
+            if audio_selected:
+                _safety_net_audio_last_wall = float(
+                    audio_selected[-1].get("wall_end", 0.0)
+                )
+            elif v2_chain_built:
+                # V2: use the MINIMUM of sys and mic last-wall (= whichever
+                # stream covers less, that's the binding constraint).
+                _candidates = []
+                if v2_sys_sel:
+                    _candidates.append(float(v2_sys_sel[-1].get("wall_end_mtime", 0.0)))
+                if v2_mic_sel:
+                    _candidates.append(float(v2_mic_sel[-1].get("wall_end_mtime", 0.0)))
+                if _candidates:
+                    _safety_net_audio_last_wall = min(_candidates)
             if (_trim_to_audio_enabled and has_audio
-                    and audio_selected and v_anchor > 0):
+                    and _safety_net_audio_last_wall > 0 and v_anchor > 0):
                 try:
-                    _a_last_wall = float(
-                        audio_selected[-1].get("wall_end", 0.0)
-                    )
+                    _a_last_wall = _safety_net_audio_last_wall
                     _v_end_wall = (
                         v_anchor
                         + float(selected[-1].get("end_time", 0.0))
@@ -26631,9 +26664,93 @@ Admin elevation
             v_chain.append("setpts=PTS-STARTPTS")
             video_complex = ",".join(v_chain) + "[vout]"
             filter_complex = video_complex
-            # V2 PATH: append the dual-stream audio chain (no V1 logic).
+            # V2 PATH: rebuild the dual-stream audio chain using the
+            # FINAL trim_duration (= duration_seconds minus the safety-
+            # net shrink, if any). Audio anchored to video's wall
+            # window to keep both streams internally consistent.
             if v2_chain_built:
+                v2_video_clip_wall_end_final = (
+                    v_anchor + float(selected[-1].get("end_time", 0.0))
+                    - tail_to_drop
+                    if v_anchor > 0 else 0.0
+                )
+                v2_clip_wall_end_final = v2_video_clip_wall_end_final
+                v2_clip_wall_start_final = v2_clip_wall_end_final - trim_duration
+                v2_clip_dur_final = max(1e-3, trim_duration)
+                v2_parts_final: list[str] = []
+                v2_sys_label_final = None
+                v2_mic_label_final = None
+                if v2_ns > 0:
+                    sys_inputs_str_f = "".join(
+                        f"[{n + i}:a]" for i in range(v2_ns)
+                    )
+                    sys_atrim_start_f = max(
+                        0.0, v2_clip_wall_start_final - v2_sys_wall_start
+                    )
+                    sys_avail_f = max(
+                        0.0, v2_sys_wall_end - v2_sys_wall_start - sys_atrim_start_f
+                    )
+                    sys_atrim_dur_f = max(1e-3, min(v2_clip_dur_final, sys_avail_f))
+                    sys_atempo_f = ""
+                    if abs(sys_rate - 1.0) > 0.005:
+                        sys_atempo_f = f"atempo={sys_rate:.5f},"
+                    v2_parts_final.append(
+                        f"{sys_inputs_str_f}concat=n={v2_ns}:v=0:a=1,"
+                        f"{sys_atempo_f}"
+                        f"atrim=start={sys_atrim_start_f:.3f}:"
+                        f"duration={sys_atrim_dur_f:.3f},"
+                        f"asetpts=PTS-STARTPTS,"
+                        f"apad=whole_dur={v2_clip_dur_final:.3f}[asysv2]"
+                    )
+                    v2_sys_label_final = "asysv2"
+                if v2_nm > 0:
+                    mic_inputs_str_f = "".join(
+                        f"[{n + v2_ns + i}:a]" for i in range(v2_nm)
+                    )
+                    mic_atrim_start_f = max(
+                        0.0, v2_clip_wall_start_final - v2_mic_wall_start
+                    )
+                    mic_avail_f = max(
+                        0.0, v2_mic_wall_end - v2_mic_wall_start - mic_atrim_start_f
+                    )
+                    mic_atrim_dur_f = max(1e-3, min(v2_clip_dur_final, mic_avail_f))
+                    mic_atempo_f = ""
+                    if abs(mic_rate - 1.0) > 0.005:
+                        mic_atempo_f = f"atempo={mic_rate:.5f},"
+                    v2_parts_final.append(
+                        f"{mic_inputs_str_f}concat=n={v2_nm}:v=0:a=1,"
+                        f"{mic_atempo_f}"
+                        f"atrim=start={mic_atrim_start_f:.3f}:"
+                        f"duration={mic_atrim_dur_f:.3f},"
+                        f"asetpts=PTS-STARTPTS,"
+                        f"apad=whole_dur={v2_clip_dur_final:.3f}[amicv2]"
+                    )
+                    v2_mic_label_final = "amicv2"
+                if v2_sys_label_final and v2_mic_label_final:
+                    v2_parts_final.append(
+                        f"[{v2_sys_label_final}][{v2_mic_label_final}]"
+                        f"amix=inputs=2:duration=longest:"
+                        f"dropout_transition=0:weights=2 3[aout]"
+                    )
+                elif v2_sys_label_final:
+                    v2_parts_final.append(f"[{v2_sys_label_final}]anull[aout]")
+                elif v2_mic_label_final:
+                    v2_parts_final.append(f"[{v2_mic_label_final}]anull[aout]")
+                v2_audio_filter_complex_str = ";".join(v2_parts_final)
                 filter_complex = video_complex + ";" + v2_audio_filter_complex_str
+                try:
+                    import sys as _v2_final_sys
+                    _v2_final_sys.stderr.write(
+                        f"[clip-export-v2] FINAL chain: clip_wall="
+                        f"[{v2_clip_wall_start_final:.2f},"
+                        f"{v2_clip_wall_end_final:.2f}] "
+                        f"clip_dur={v2_clip_dur_final:.2f}s "
+                        f"sys_atempo={sys_rate if abs(sys_rate-1.0)>0.005 else 'skipped'} "
+                        f"mic_atempo={mic_rate if abs(mic_rate-1.0)>0.005 else 'skipped'}\n"
+                    )
+                    _v2_final_sys.stderr.flush()
+                except Exception:
+                    pass
             if has_audio and not v2_chain_built:
                 # WALL-CLOCK-ANCHORED audio chain.
                 #
