@@ -8499,38 +8499,60 @@ class GestureWorker(QObject):
         self._start_voice_command()
 
     def _handle_left_hand_clip_gesture(self, prediction, hand_reading, now: float) -> None:
-        """Hold LEFT-hand THUMBS UP for 0.5 s to trigger a clip with
-        the user's configured default duration from Settings →
-        Clip Presets → Duration.
+        """LEFT-hand FIST with dual semantics:
 
-        Mirrors the voice "clip that" pipeline so the saved clip
-        ends at the moment of gesture detection (not at the much-
-        later moment the export actually runs). Cooldown of 3 s
-        after a trigger prevents accidental double-clipping from
-        a held pose flicker.
+          PRIMARY (preserves original behavior):
+            If any voice / dictation / save-prompt / selection-prompt
+            is active, fist CANCELS it. _handle_left_hand_voice runs
+            FIRST in the dispatcher and does the cancel (setting
+            _voice_latched_label = "fist"). This handler then sees
+            the latch and skips — no clip triggered.
 
-        Skipped during voice/dictation/save-prompt/selection-prompt
-        states — those need to drain first (and the left-hand fist
-        cancel may be active in those states).
+          SECONDARY (new):
+            If NOTHING is cancellable when fist appears, holding the
+            fist for 0.5 s triggers a clip with the user's default
+            duration from Settings → Clip Presets → Duration.
+
+        The two semantics never collide because the voice handler
+        runs first and latches `_voice_latched_label = "fist"` ONLY
+        when it actually cancels something. A bare fist with no
+        cancellable state leaves the latch unset, freeing this
+        handler to run.
+
+        After a clip triggers, a 3-s cooldown prevents the held
+        pose from re-triggering.
         """
         if prediction is None or hand_reading is None:
             self._clip_gesture_candidate_since = 0.0
             return
-        # Higher-priority left-hand states block clip-gesture detection.
+        if now < self._clip_gesture_cooldown_until:
+            return
+        # PRIORITY GUARD #1: voice handler just cancelled something
+        # via this fist. The latch stays set until the user releases
+        # the pose (cleared at _handle_left_hand_voice line ~8431).
+        # Don't double-fire as a clip.
+        if self._voice_latched_label == "fist":
+            self._clip_gesture_candidate_since = 0.0
+            return
+        # PRIORITY GUARD #2: cancellable state is currently active.
+        # Voice handler should have set latch above; this is belt-
+        # and-braces for the racy case where the cancellable state
+        # appeared between the voice handler's check and this one.
         if (self._voice_listening or self._dictation_active
                 or self._save_prompt_active or self._selection_prompt_active):
             self._clip_gesture_candidate_since = 0.0
             return
-        if now < self._clip_gesture_cooldown_until:
-            return
-        # Derive the routed label — promotes fist/neutral with
-        # thumb-above-wrist to "thumb_up".
+        # Check the LEFT-hand stable label directly. `fist` is the
+        # static recognizer's base label for a closed hand. We do
+        # NOT call _derive_app_static_label here because that would
+        # promote thumb_up (which we don't want to bind) and the
+        # raw stable_label is sufficient for the fist check.
         try:
-            routed_label = self._derive_app_static_label(prediction, hand_reading)
+            stable_label = str(getattr(prediction, "stable_label", "neutral") or "neutral")
         except Exception:
             self._clip_gesture_candidate_since = 0.0
             return
-        if routed_label != "thumb_up":
+        if stable_label != "fist":
             self._clip_gesture_candidate_since = 0.0
             return
         # First detection — start the hold timer.
@@ -8579,8 +8601,9 @@ class GestureWorker(QObject):
         try:
             import sys as _cg_sys, time as _cg_time
             _cg_sys.stderr.write(
-                f"[clip-gesture] left-thumbs-up triggered at {now:.3f} "
-                f"duration={duration_s}s -> queueing clip_gesture\n"
+                f"[clip-gesture] left-fist hold triggered at {now:.3f} "
+                f"duration={duration_s}s -> queueing clip_gesture "
+                f"(nothing was cancellable, fist re-purposed for clip)\n"
             )
             _cg_sys.stderr.flush()
         except Exception:
