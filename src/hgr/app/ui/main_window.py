@@ -26297,6 +26297,51 @@ Admin elevation
                     # uses [n..n+v2_ns), then mic uses [n+v2_ns..end).
                     audio_input_paths = v2_sys_paths + v2_mic_paths
 
+                    # PER-STREAM RATE COMPENSATION. The cache writes
+                    # AAC at nominal 48 kHz, but the actual content
+                    # captured per file second can drift (mic at
+                    # ~95 % of nominal device rate, sys silence-
+                    # padded to ~100 %). The user's 60-s test
+                    # confirmed this: audio ended 1 s EARLY because
+                    # 60 s of mic file content represented ~63 s of
+                    # real wall — audio played FUTURE content
+                    # relative to video.
+                    #
+                    # aresample=async=1000 CANNOT see this drift
+                    # (file timestamps internally assume 48 kHz).
+                    # The canonical fix is atempo with the measured
+                    # rate: atempo=file_dur_total/wall_span stretches
+                    # the audio output to match wall time. After
+                    # atempo, output_pts maps DIRECTLY to wall
+                    # offset from segment start, so the atrim
+                    # positions are in wall-clock seconds.
+                    def _compute_rate(sel: list[dict]) -> float:
+                        if len(sel) < 1:
+                            return 1.0
+                        try:
+                            file_total = sum(
+                                max(1e-3,
+                                    float(e.get("end_time", 0.0))
+                                    - float(e.get("start_time", 0.0)))
+                                for e in sel
+                            )
+                            wall_total = (
+                                float(sel[-1].get("wall_end_mtime", 0.0))
+                                - float(sel[0].get("wall_start_mtime", 0.0))
+                            )
+                            if wall_total <= 0 or file_total <= 0:
+                                return 1.0
+                            r = file_total / wall_total
+                            # Clamp to atempo's [0.5, 2.0] range with
+                            # a tighter [0.5, 1.5] bound for safety
+                            # (real device drift rarely exceeds 5 %).
+                            return max(0.5, min(1.5, r))
+                        except Exception:
+                            return 1.0
+
+                    sys_rate = _compute_rate(v2_sys_sel)
+                    mic_rate = _compute_rate(v2_mic_sel)
+
                     v2_parts: list[str] = []
                     v2_sys_label = None
                     v2_mic_label = None
@@ -26304,6 +26349,9 @@ Admin elevation
                         sys_inputs_str = "".join(
                             f"[{n + i}:a]" for i in range(v2_ns)
                         )
+                        # After atempo=sys_rate, output PTS = wall
+                        # offset from v2_sys_wall_start. So atrim
+                        # positions are in WALL CLOCK.
                         sys_atrim_start = max(
                             0.0, v2_clip_wall_start - v2_sys_wall_start
                         )
@@ -26311,12 +26359,15 @@ Admin elevation
                             0.0, v2_sys_wall_end - v2_sys_wall_start - sys_atrim_start
                         )
                         sys_atrim_dur = max(1e-3, min(v2_clip_dur, sys_avail))
-                        # aresample=async=1000 lets ffmpeg stretch/squeeze
-                        # samples up to 1000/s to align timestamps with
-                        # the requested PTS — the canonical drift fix.
+                        # Skip atempo entirely if rate is within 0.5 %
+                        # of nominal (no audible benefit, avoids the
+                        # mild pitch shift atempo introduces).
+                        sys_atempo_clause = ""
+                        if abs(sys_rate - 1.0) > 0.005:
+                            sys_atempo_clause = f"atempo={sys_rate:.5f},"
                         v2_parts.append(
                             f"{sys_inputs_str}concat=n={v2_ns}:v=0:a=1,"
-                            f"aresample=async=1000:first_pts=0,"
+                            f"{sys_atempo_clause}"
                             f"atrim=start={sys_atrim_start:.3f}:"
                             f"duration={sys_atrim_dur:.3f},"
                             f"asetpts=PTS-STARTPTS,"
@@ -26334,9 +26385,12 @@ Admin elevation
                             0.0, v2_mic_wall_end - v2_mic_wall_start - mic_atrim_start
                         )
                         mic_atrim_dur = max(1e-3, min(v2_clip_dur, mic_avail))
+                        mic_atempo_clause = ""
+                        if abs(mic_rate - 1.0) > 0.005:
+                            mic_atempo_clause = f"atempo={mic_rate:.5f},"
                         v2_parts.append(
                             f"{mic_inputs_str}concat=n={v2_nm}:v=0:a=1,"
-                            f"aresample=async=1000:first_pts=0,"
+                            f"{mic_atempo_clause}"
                             f"atrim=start={mic_atrim_start:.3f}:"
                             f"duration={mic_atrim_dur:.3f},"
                             f"asetpts=PTS-STARTPTS,"
@@ -26361,6 +26415,7 @@ Admin elevation
                         _v2_diag_sys.stderr.write(
                             f"[clip-export-v2] sys_segs={v2_ns} "
                             f"mic_segs={v2_nm} clip_dur={v2_clip_dur:.2f}s "
+                            f"sys_rate={sys_rate:.5f} mic_rate={mic_rate:.5f} "
                             f"sys_wall=[{v2_sys_wall_start:.2f},{v2_sys_wall_end:.2f}] "
                             f"mic_wall=[{v2_mic_wall_start:.2f},{v2_mic_wall_end:.2f}] "
                             f"clip_wall=[{v2_clip_wall_start:.2f},{v2_clip_wall_end:.2f}]\n"
