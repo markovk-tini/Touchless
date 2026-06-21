@@ -8566,7 +8566,6 @@ class MainWindow(QMainWindow):
         inner_layout.addWidget(self._build_general_handedness_section())
         inner_layout.addWidget(self._build_general_mouse_section())
         inner_layout.addWidget(self._build_general_clip_section())
-        inner_layout.addWidget(self._build_general_clip_audio_section())
         inner_layout.addWidget(self._build_general_overlay_section())
         inner_layout.addWidget(self._build_general_system_modes_section())
         inner_layout.addWidget(self._build_general_voice_upgrade_section())
@@ -9243,29 +9242,56 @@ class MainWindow(QMainWindow):
         return card
 
     def _build_general_clip_section(self) -> "QFrame":
+        """Settings → General → Clip Presets.
+
+        Merged section: monitor choice + duration default + audio
+        capture toggles + mic noise reduction. Previously split into
+        two sibling sections (Clip & Record + Clip Audio) but the
+        audio toggles are conceptually part of clip presets — folding
+        them together keeps the settings panel concise.
+        """
         card, body = self._make_general_section(
-            "Clip & Record",
-            "Pick which monitor the \"clip that\" voice command captures by default.",
+            "Clip Presets",
+            "Used for when saying \"clip that\" or doing the clipping gesture.",
             details=(
-                "On a multi-monitor setup the voice trigger used to grab "
-                "the full virtual desktop, which made the clips include "
-                "the off-screen secondary monitor. Set this to your main "
-                "monitor (or whichever one your game / main app lives on) "
-                "and \"clip that\" will record only that screen — no "
-                "monitor-picker dialog interrupting the moment. Choose "
-                "All Monitors here if you really want the stitched union."
+                "These presets drive the buffered-clip recorder — what "
+                "monitor to capture, how long the clip should be, and "
+                "what audio (system, mic, or both) to include. Voice "
+                "triggers like \"clip that\" / \"clip last 2 minutes\" / "
+                "\"clip last 5 minutes\" and the clipping gesture both "
+                "use these defaults.\n\n"
+                "Monitor: on a multi-monitor setup, picking the main "
+                "monitor here records only that screen instead of the "
+                "stitched virtual desktop. Choose All Monitors for the "
+                "full union.\n\n"
+                "Duration: when you say a bare \"clip that\" (no length "
+                "specified) this is the length recorded.\n\n"
+                "Audio toggles capture system audio and/or your "
+                "microphone into the saved clip. Both are independent — "
+                "enable either, both, or neither. Mic noise reduction "
+                "filters keyboard/mouse/fan noise from your voice track. "
+                "Heads-up: system-audio records EVERYTHING playing on "
+                "your speakers including Discord / Zoom voices — get "
+                "participant consent before sharing.\n\n"
+                "Audio toggle changes restart the clip cache so they "
+                "take effect immediately."
             ),
         )
         text_color = str(self.config.text_color or "#E5F6FF")
         body.setSpacing(10)
+        text_qss = self._general_text_qss()
+        checkbox_qss = self._general_checkbox_qss()
+        from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel
+
+        # ============================================================
+        # MONITOR CHOICE
+        # ============================================================
+        monitor_label = QLabel("Monitor choice:")
+        monitor_label.setStyleSheet(text_qss)
+        body.addWidget(monitor_label)
 
         clip_monitor_combo = QComboBox()
-        clip_monitor_combo.setStyleSheet(self._general_text_qss())
-        # Primary monitor is the default. The combo always offers
-        # Primary first so the dropdown reads naturally when scanned
-        # top-to-bottom; specific screens follow in QGuiApplication
-        # order; All Monitors at the bottom for users who want the
-        # stitched union.
+        clip_monitor_combo.setStyleSheet(text_qss)
         clip_monitor_combo.addItem("Main Monitor (auto-detect)", None)
         try:
             for index, screen in enumerate(QGuiApplication.screens() or []):
@@ -9300,6 +9326,215 @@ class MainWindow(QMainWindow):
         clip_monitor_combo.currentIndexChanged.connect(_on_clip_monitor_changed)
         body.addWidget(clip_monitor_combo)
         self._general_controls["clip_default_monitor_index"] = clip_monitor_combo
+
+        # ============================================================
+        # DURATION
+        # ============================================================
+        duration_label = QLabel("Duration:")
+        duration_label.setStyleSheet(text_qss)
+        body.addWidget(duration_label)
+
+        duration_combo = QComboBox()
+        duration_combo.setStyleSheet(text_qss)
+        duration_combo.addItem("1 minute", 60)
+        duration_combo.addItem("2 minutes", 120)
+        duration_combo.addItem("5 minutes", 300)
+        try:
+            initial_duration = int(
+                getattr(self.config, "clip_default_duration_seconds", 60) or 60
+            )
+        except Exception:
+            initial_duration = 60
+        # Snap to the nearest supported value if a stale persisted
+        # value is something else (e.g., 30 from an older build).
+        supported = [60, 120, 300]
+        if initial_duration not in supported:
+            initial_duration = min(supported, key=lambda v: abs(v - initial_duration))
+        duration_combo.setCurrentIndex(supported.index(initial_duration))
+        self._register_general_baseline("clip_default_duration_seconds", initial_duration)
+
+        def _on_duration_changed(_idx: int) -> None:
+            data = duration_combo.currentData()
+            try:
+                value = int(data) if data is not None else 60
+            except Exception:
+                value = 60
+            self._on_general_control_changed("clip_default_duration_seconds", value)
+
+        duration_combo.currentIndexChanged.connect(_on_duration_changed)
+        body.addWidget(duration_combo)
+        self._general_controls["clip_default_duration_seconds"] = duration_combo
+
+        # ============================================================
+        # AUDIO (merged from old Clip Audio section)
+        # ============================================================
+        audio_header = QLabel("Audio:")
+        audio_header.setStyleSheet(text_qss + " QLabel { font-weight: 600; padding-top: 8px; }")
+        body.addWidget(audio_header)
+
+        # ---- System audio (Python WASAPI loopback bridge) ----
+        sys_current = bool(getattr(self.config, "clip_capture_system_audio", False))
+        sys_row = QHBoxLayout()
+        sys_row.setSpacing(10)
+        sys_checkbox = QCheckBox("Record system audio (game, music, app sounds)")
+        sys_checkbox.setStyleSheet(checkbox_qss)
+        sys_checkbox.setToolTip(
+            "Captures whatever is playing through your default Windows "
+            "playback device via the Python WASAPI loopback bridge. No "
+            "driver install needed."
+        )
+        sys_checkbox.setChecked(sys_current)
+        self._register_general_baseline("clip_capture_system_audio", sys_current)
+
+        def _on_sys_toggled(state: int) -> None:
+            new_value = bool(state)
+            saved_ok = False
+            try:
+                self.config.clip_capture_system_audio = new_value
+                save_config(self.config)
+                saved_ok = True
+            except Exception:
+                pass
+            self._register_general_baseline("clip_capture_system_audio", new_value)
+            cache_was_running = (
+                self._clip_cache_process is not None
+                and self._clip_cache_process.poll() is None
+            )
+            self._restart_clip_cache_if_running()
+            try:
+                self._append_home_debug_log(
+                    f"[clip-audio] system audio = {new_value} "
+                    f"(saved={saved_ok}, cache restart="
+                    f"{'fired' if cache_was_running else 'deferred — will pick up new value on next worker start'})"
+                )
+            except Exception:
+                pass
+
+        sys_checkbox.stateChanged.connect(_on_sys_toggled)
+        sys_row.addWidget(sys_checkbox)
+        sys_row.addStretch(1)
+        body.addLayout(sys_row)
+        self._general_controls["clip_capture_system_audio"] = sys_checkbox
+
+        # Inline status line under the system-audio checkbox.
+        sys_status_label = QLabel("")
+        sys_status_label.setStyleSheet(
+            "color: #d97777; font-size: 11px; padding-left: 22px;"
+        )
+        sys_status_label.setWordWrap(True)
+        sys_status_label.hide()
+        body.addWidget(sys_status_label)
+
+        def _refresh_sys_status() -> None:
+            try:
+                fmt = self._probe_wasapi_loopback_format(force_refresh=True)
+            except Exception:
+                fmt = None
+            if sys_checkbox.isChecked() and fmt is None:
+                sys_status_label.setText(
+                    "⚠ No system-audio device detected — clips will be "
+                    "silent for system audio. Check that a playback "
+                    "device is set as default in Windows Sound settings."
+                )
+                sys_status_label.show()
+            else:
+                sys_status_label.hide()
+
+        sys_checkbox.stateChanged.connect(lambda _s: _refresh_sys_status())
+        _refresh_sys_status()
+
+        # ---- Microphone ----
+        mic_current = bool(getattr(self.config, "clip_capture_microphone", False))
+        mic_row = QHBoxLayout()
+        mic_row.setSpacing(10)
+        mic_checkbox = QCheckBox("Record microphone (your voice / commentary)")
+        mic_checkbox.setStyleSheet(checkbox_qss)
+        mic_checkbox.setToolTip(
+            "Captures your preferred microphone (the same one used for "
+            "voice commands). Set the mic in the Voice tab. If you "
+            "enable both this and system audio, the two are mixed "
+            "together in the saved clip."
+        )
+        mic_checkbox.setChecked(mic_current)
+        self._register_general_baseline("clip_capture_microphone", mic_current)
+
+        def _on_mic_toggled(state: int) -> None:
+            new_value = bool(state)
+            saved_ok = False
+            try:
+                self.config.clip_capture_microphone = new_value
+                save_config(self.config)
+                saved_ok = True
+            except Exception:
+                pass
+            self._register_general_baseline("clip_capture_microphone", new_value)
+            cache_was_running = (
+                self._clip_cache_process is not None
+                and self._clip_cache_process.poll() is None
+            )
+            self._restart_clip_cache_if_running()
+            try:
+                self._append_home_debug_log(
+                    f"[clip-audio] microphone = {new_value} "
+                    f"(saved={saved_ok}, cache restart="
+                    f"{'fired' if cache_was_running else 'deferred — will pick up new value on next worker start'})"
+                )
+            except Exception:
+                pass
+
+        mic_checkbox.stateChanged.connect(_on_mic_toggled)
+        mic_row.addWidget(mic_checkbox)
+        mic_row.addStretch(1)
+        body.addLayout(mic_row)
+        self._general_controls["clip_capture_microphone"] = mic_checkbox
+
+        # ---- Microphone noise reduction (dropdown) ----
+        ns_row = QHBoxLayout()
+        ns_row.setSpacing(10)
+        ns_label = QLabel("Microphone noise reduction:")
+        ns_label.setStyleSheet(text_qss + " QLabel { padding-left: 22px; }")
+        ns_row.addWidget(ns_label)
+
+        ns_current = str(
+            getattr(self.config, "clip_mic_noise_reduction", "light") or "light"
+        ).lower()
+        if ns_current not in ("off", "light", "strong"):
+            ns_current = "light"
+
+        ns_combo = QComboBox()
+        ns_combo.setStyleSheet(text_qss)
+        ns_combo.addItem("Off — record mic as-is", "off")
+        ns_combo.addItem("Light — recommended for gaming (default)", "light")
+        ns_combo.addItem("Strong — aggressive (may clip word tails)", "strong")
+        ns_combo.setCurrentIndex(["off", "light", "strong"].index(ns_current))
+        ns_combo.setToolTip(
+            "Off: no filtering — your mic is captured verbatim, "
+            "including keyboard and mouse clicks.\n"
+            "Light: removes desk/fan rumble and silences keyboard/mouse "
+            "clicks during speaking pauses. Recommended.\n"
+            "Strong: same as Light but with a tighter noise gate. Cuts "
+            "more background noise but may chop quiet word endings."
+        )
+        ns_combo.setEnabled(mic_checkbox.isChecked())
+        self._register_general_baseline("clip_mic_noise_reduction", ns_current)
+
+        def _on_ns_changed(idx: int) -> None:
+            new_value = ns_combo.itemData(idx) or "light"
+            try:
+                self.config.clip_mic_noise_reduction = str(new_value)
+                save_config(self.config)
+            except Exception:
+                pass
+            self._register_general_baseline("clip_mic_noise_reduction", new_value)
+            self._restart_clip_cache_if_running()
+
+        ns_combo.currentIndexChanged.connect(_on_ns_changed)
+        ns_row.addWidget(ns_combo)
+        ns_row.addStretch(1)
+        body.addLayout(ns_row)
+        self._general_controls["clip_mic_noise_reduction"] = ns_combo
+
+        mic_checkbox.stateChanged.connect(lambda s: ns_combo.setEnabled(bool(s)))
 
         return card
 
@@ -9583,240 +9818,6 @@ class MainWindow(QMainWindow):
         top_row.addStretch(1)
         body.addLayout(top_row)
         self._general_controls["show_recognizer_top_scores"] = top_checkbox
-        return card
-
-    def _build_general_clip_audio_section(self) -> "QFrame":
-        """Settings → General → Clip Audio (Streamer Mode). Two
-        independent toggles + a mic noise-reduction dropdown that
-        fold WASAPI loopback (system audio, captured in Python via
-        wasapi_loopback.py) and/or microphone capture into the clip
-        cache's ffmpeg segment writer. Both audio toggles default
-        OFF for privacy — opt-in is required. The dropdown defaults
-        to "light" so the moment a user enables their mic they get
-        keyboard/mouse click suppression."""
-        card, body = self._make_general_section(
-            "Clip Audio (Streamer Mode)",
-            "Record system audio and/or your microphone with saved clips.",
-            details=(
-                "When the buffered-clip recorder is running, Touchless "
-                "can additionally capture audio and mix it into every "
-                "exported clip — no third-party driver required. "
-                "**System audio** records whatever is currently playing "
-                "on your default output (games, music, browser, voice "
-                "chat that's coming out of your speakers). **Microphone** "
-                "records the input device you've already selected for "
-                "voice commands. **Mic noise reduction** filters out "
-                "keyboard, mouse, fan and desk-thump noise from your "
-                "voice track while leaving game and music audio "
-                "untouched — Light is recommended for most gaming "
-                "setups, Strong cuts more aggressively but may clip "
-                "the tails of soft words. "
-                "Both audio toggles are independent — enable either, "
-                "both, or neither. If you enable both, the two streams "
-                "are mixed automatically so you get game audio and your "
-                "commentary in the same clip. "
-                "Heads up: system-audio capture records EVERYTHING "
-                "playing on your speakers — including voices from "
-                "people in Discord / Zoom / etc. Make sure participants "
-                "consent before sharing clips that contain their voices. "
-                "Changes take effect the next time the clip cache "
-                "restarts (toggle the recorder off and back on, or "
-                "restart Touchless)."
-            ),
-        )
-        from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel
-        checkbox_qss = self._general_checkbox_qss()
-
-        # ---- System audio (Python WASAPI loopback bridge) ----
-        sys_current = bool(getattr(self.config, "clip_capture_system_audio", False))
-        sys_row = QHBoxLayout()
-        sys_row.setSpacing(10)
-        sys_checkbox = QCheckBox("Record system audio (game, music, app sounds)")
-        sys_checkbox.setStyleSheet(checkbox_qss)
-        sys_checkbox.setToolTip(
-            "Captures whatever is playing through your default Windows "
-            "playback device via the Python WASAPI loopback bridge. No "
-            "driver install needed. Adds a small CPU cost while clips "
-            "are buffering."
-        )
-        sys_checkbox.setChecked(sys_current)
-        self._register_general_baseline("clip_capture_system_audio", sys_current)
-
-        def _on_sys_toggled(state: int) -> None:
-            new_value = bool(state)
-            saved_ok = False
-            try:
-                self.config.clip_capture_system_audio = new_value
-                save_config(self.config)
-                saved_ok = True
-            except Exception:
-                pass
-            self._register_general_baseline("clip_capture_system_audio", new_value)
-            # Restart the cache so audio capture starts (or stops)
-            # mid-session. Without this, the user has to wait for the
-            # next cache restart (manual gesture / app restart) for
-            # their first audio-enabled clip to capture sound.
-            cache_was_running = (
-                self._clip_cache_process is not None
-                and self._clip_cache_process.poll() is None
-            )
-            self._restart_clip_cache_if_running()
-            # Surface what just happened to the Detailed Log so the
-            # user can verify the click registered without reading
-            # source. Settings in this section save IMMEDIATELY (the
-            # global Save Changes button never lights up for them
-            # because the baseline is updated in place) — that's a
-            # well-known confusion point.
-            try:
-                self._append_home_debug_log(
-                    f"[clip-audio] system audio = {new_value} "
-                    f"(saved={saved_ok}, cache restart="
-                    f"{'fired' if cache_was_running else 'deferred — will pick up new value on next worker start'})"
-                )
-            except Exception:
-                pass
-
-        sys_checkbox.stateChanged.connect(_on_sys_toggled)
-        sys_row.addWidget(sys_checkbox)
-        sys_row.addStretch(1)
-        body.addLayout(sys_row)
-        self._general_controls["clip_capture_system_audio"] = sys_checkbox
-
-        # Inline status line under the system-audio checkbox. Shows a
-        # red note when the WASAPI loopback probe fails (no default
-        # playback endpoint, pyaudiowpatch missing, RDP / headless
-        # session). Without this the user enables the toggle, gets a
-        # silent clip, and has no UI hint why.
-        sys_status_label = QLabel("")
-        sys_status_label.setStyleSheet(
-            "color: #d97777; font-size: 11px; padding-left: 22px;"
-        )
-        sys_status_label.setWordWrap(True)
-        sys_status_label.hide()
-        body.addWidget(sys_status_label)
-
-        def _refresh_sys_status() -> None:
-            try:
-                fmt = self._probe_wasapi_loopback_format(force_refresh=True)
-            except Exception:
-                fmt = None
-            if sys_checkbox.isChecked() and fmt is None:
-                sys_status_label.setText(
-                    "⚠ No system-audio device detected — clips will be "
-                    "silent for system audio. Check that a playback "
-                    "device is set as default in Windows Sound settings."
-                )
-                sys_status_label.show()
-            else:
-                sys_status_label.hide()
-
-        sys_checkbox.stateChanged.connect(lambda _s: _refresh_sys_status())
-        _refresh_sys_status()
-
-        # ---- Microphone (DirectShow) ----
-        mic_current = bool(getattr(self.config, "clip_capture_microphone", False))
-        mic_row = QHBoxLayout()
-        mic_row.setSpacing(10)
-        mic_checkbox = QCheckBox("Record microphone (your voice / commentary)")
-        mic_checkbox.setStyleSheet(checkbox_qss)
-        mic_checkbox.setToolTip(
-            "Captures your preferred microphone (the same one used for "
-            "voice commands). Set the mic in the Voice tab. If you "
-            "enable both this and system audio, the two are mixed "
-            "together in the saved clip."
-        )
-        mic_checkbox.setChecked(mic_current)
-        self._register_general_baseline("clip_capture_microphone", mic_current)
-
-        def _on_mic_toggled(state: int) -> None:
-            new_value = bool(state)
-            saved_ok = False
-            try:
-                self.config.clip_capture_microphone = new_value
-                save_config(self.config)
-                saved_ok = True
-            except Exception:
-                pass
-            self._register_general_baseline("clip_capture_microphone", new_value)
-            cache_was_running = (
-                self._clip_cache_process is not None
-                and self._clip_cache_process.poll() is None
-            )
-            self._restart_clip_cache_if_running()
-            try:
-                self._append_home_debug_log(
-                    f"[clip-audio] microphone = {new_value} "
-                    f"(saved={saved_ok}, cache restart="
-                    f"{'fired' if cache_was_running else 'deferred — will pick up new value on next worker start'})"
-                )
-            except Exception:
-                pass
-
-        mic_checkbox.stateChanged.connect(_on_mic_toggled)
-        mic_row.addWidget(mic_checkbox)
-        mic_row.addStretch(1)
-        body.addLayout(mic_row)
-        self._general_controls["clip_capture_microphone"] = mic_checkbox
-
-        # ---- Microphone noise reduction (dropdown) ----
-        # Saves immediately like the two sibling checkboxes — does
-        # NOT route through _general_pending (the section's existing
-        # convention is direct-save on change).
-        ns_row = QHBoxLayout()
-        ns_row.setSpacing(10)
-        # Use the panel-wide combo/label QSS so text + dropdown
-        # popup are legible against the dark settings surface.
-        # Default Qt combo on Windows renders black-on-black against
-        # this panel's dark background.
-        text_qss = self._general_text_qss()
-        ns_label = QLabel("Microphone noise reduction:")
-        ns_label.setStyleSheet(text_qss + " QLabel { padding-left: 22px; }")
-        ns_row.addWidget(ns_label)
-
-        ns_current = str(
-            getattr(self.config, "clip_mic_noise_reduction", "light") or "light"
-        ).lower()
-        if ns_current not in ("off", "light", "strong"):
-            ns_current = "light"
-
-        ns_combo = QComboBox()
-        ns_combo.setStyleSheet(text_qss)
-        ns_combo.addItem("Off — record mic as-is", "off")
-        ns_combo.addItem("Light — recommended for gaming (default)", "light")
-        ns_combo.addItem("Strong — aggressive (may clip word tails)", "strong")
-        ns_combo.setCurrentIndex(["off", "light", "strong"].index(ns_current))
-        ns_combo.setToolTip(
-            "Off: no filtering — your mic is captured verbatim, "
-            "including keyboard and mouse clicks.\n"
-            "Light: removes desk/fan rumble and silences keyboard/mouse "
-            "clicks during speaking pauses. Recommended.\n"
-            "Strong: same as Light but with a tighter noise gate. Cuts "
-            "more background noise but may chop quiet word endings."
-        )
-        ns_combo.setEnabled(mic_checkbox.isChecked())
-        self._register_general_baseline("clip_mic_noise_reduction", ns_current)
-
-        def _on_ns_changed(idx: int) -> None:
-            new_value = ns_combo.itemData(idx) or "light"
-            try:
-                self.config.clip_mic_noise_reduction = str(new_value)
-                save_config(self.config)
-            except Exception:
-                pass
-            self._register_general_baseline("clip_mic_noise_reduction", new_value)
-            self._restart_clip_cache_if_running()
-
-        ns_combo.currentIndexChanged.connect(_on_ns_changed)
-        ns_row.addWidget(ns_combo)
-        ns_row.addStretch(1)
-        body.addLayout(ns_row)
-        self._general_controls["clip_mic_noise_reduction"] = ns_combo
-
-        # Gate the dropdown on the mic checkbox — single-line lambda
-        # rather than wrapping _on_mic_toggled keeps the existing
-        # save handler untouched (Qt fires all connected slots).
-        mic_checkbox.stateChanged.connect(lambda s: ns_combo.setEnabled(bool(s)))
-
         return card
 
     def _build_general_system_modes_section(self) -> "QFrame":
@@ -20075,6 +20076,17 @@ Admin elevation
                     camera_index_override=worker_override,
                     progress_callback=self._set_starting_splash_progress,
                 )
+                # Wire the processing pill to know about the voice
+                # status pill so it can stack ABOVE it when both are
+                # visible (e.g. "Processing 60 s clip" + "Executing
+                # command") and smoothly fall back down when the
+                # voice pill hides.
+                try:
+                    self.processing_overlay.set_voice_status_anchor(
+                        self._worker.voice_status_overlay
+                    )
+                except Exception:
+                    pass
             except Exception as exc:
                 import traceback as _tb
                 tb_text = _tb.format_exc()
