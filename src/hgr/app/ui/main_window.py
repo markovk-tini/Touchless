@@ -25869,19 +25869,46 @@ Admin elevation
                 import shutil as _shutil
             except Exception:
                 _shutil = None
+            # SNAPSHOT-ALL: pin EVERY selected video segment to an
+            # immutable inode before the export ffmpeg opens it. The
+            # legacy behavior only snapshotted the LAST selected
+            # segment when age <= 1.5 s, leaving ~29 of 30 selected
+            # segments exposed to cache-writer wrap rotation. For
+            # 5-min HQ exports the export wall time (30-60 s) exceeds
+            # the writer's overwrite-margin (20 s on a 32-slot ring
+            # with 30 selected) and the cache O_TRUNC'd a segment
+            # the export was concurrently reading = AVERROR_EOF or
+            # full-app crash on torn MKV cluster mid-read.
+            #
+            # Kill switch: HGR_CLIP_VIDEO_SNAP_ALL=0 restores the
+            # legacy last-segment-only / age <= 1.5 s behavior.
+            import os as _vid_snap_os
+            _vid_snap_all = _vid_snap_os.environ.get(
+                "HGR_CLIP_VIDEO_SNAP_ALL", "1"
+            ) != "0"
             for i, entry in enumerate(selected):
                 src = Path(entry["path"]).resolve()
                 input_paths.append(src)
-                # Only the LAST selected segment can be the hot one
-                # (segments are chronological after sort).
-                if i != len(selected) - 1 or _shutil is None:
+                is_last = (i == len(selected) - 1)
+                if _shutil is None:
                     continue
-                try:
-                    mtime_age = now_ts - src.stat().st_mtime
-                except Exception:
-                    mtime_age = 999.0
-                if mtime_age > 1.5:
+                # Legacy gate: skip non-last segments when SNAP_ALL
+                # is disabled. With SNAP_ALL enabled (default) we
+                # snapshot every segment unconditionally.
+                if not _vid_snap_all and not is_last:
                     continue
+                if not _vid_snap_all:
+                    try:
+                        mtime_age = now_ts - src.stat().st_mtime
+                    except Exception:
+                        mtime_age = 999.0
+                    if mtime_age > 1.5:
+                        continue
+                else:
+                    try:
+                        mtime_age = now_ts - src.stat().st_mtime
+                    except Exception:
+                        mtime_age = 999.0
                 # Snapshot to a temp copy.
                 try:
                     snap = (self._clip_cache_dir()
@@ -25890,16 +25917,22 @@ Admin elevation
                     if snap.stat().st_size > 0:
                         input_paths[-1] = snap
                         hot_copies.append(snap)
-                        try:
-                            _sys = __import__("sys")
-                            _sys.stderr.write(
-                                f"[clip-export] hot-segment snapshot: "
-                                f"{src.name} (mtime_age={mtime_age:.2f}s) "
-                                f"-> {snap.name} ({snap.stat().st_size} B)\n"
-                            )
-                            _sys.stderr.flush()
-                        except Exception:
-                            pass
+                        # Only log the last (= youngest) per-export
+                        # to avoid noise — the snap-all loop would
+                        # spam 30 lines per 5-min export otherwise.
+                        if is_last:
+                            try:
+                                _sys = __import__("sys")
+                                _sys.stderr.write(
+                                    f"[clip-export] snapshotted "
+                                    f"{len(hot_copies)} video segment(s) "
+                                    f"(last: {src.name} "
+                                    f"mtime_age={mtime_age:.2f}s -> "
+                                    f"{snap.name} {snap.stat().st_size}B)\n"
+                                )
+                                _sys.stderr.flush()
+                            except Exception:
+                                pass
                 except Exception as exc:
                     try:
                         _sys = __import__("sys")
@@ -26481,13 +26514,33 @@ Admin elevation
                 v2_sys_sel = [e for e in v2_sys_entries if _v2_in_window(e)]
                 v2_mic_sel = [e for e in v2_mic_entries if _v2_in_window(e)]
 
+                # SNAPSHOT-ALL: pin EVERY selected V2 audio segment
+                # to an immutable inode before the export ffmpeg
+                # opens it. Eliminates the wrap-collision race where
+                # cache's -segment_wrap rotation O_TRUNC'd an
+                # actively-read segment mid-export (= AVERROR_EOF
+                # crash on 5-min HQ exports). Previously only files
+                # with age <= 10 s were snapshotted; the other ~28
+                # of 30 selected segments were read live from disk
+                # where the cache writer could overwrite them after
+                # ~20 s of writer headroom (32-slot ring × 10 s
+                # segment_time - 30 selected segments = 20 s margin
+                # < 30-60 s HQ export wall time).
+                #
+                # Kill switch: HGR_CLIP_V2_SNAP_ALL=0 restores the
+                # legacy age>10s gate.
+                import os as _v2_snap_os
+                _v2_snap_all = _v2_snap_os.environ.get(
+                    "HGR_CLIP_V2_SNAP_ALL", "1"
+                ) != "0"
                 def _v2_hot_snap(src_path: Path) -> Path:
                     if _v2_shutil is None:
                         return src_path
                     try:
-                        age = time.time() - src_path.stat().st_mtime
-                        if age > 10.0:
-                            return src_path
+                        if not _v2_snap_all:
+                            age = time.time() - src_path.stat().st_mtime
+                            if age > 10.0:
+                                return src_path
                         snap = (self._clip_cache_dir()
                                 / f"hot_snapshot_v2_{time.time_ns()}.aac")
                         _v2_shutil.copyfile(str(src_path), str(snap))
