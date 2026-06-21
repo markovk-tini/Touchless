@@ -26269,6 +26269,180 @@ Admin elevation
                 except Exception:
                     _v2_shutil = None
 
+                # IN-PROGRESS AUDIO SEGMENT DETECTION (per V2 stream).
+                # Each stream's cache ffmpeg writes a segment_N file
+                # then rotates to segment_(N+1) on segment_time. The
+                # CSV manifest only records CLOSED segments — the
+                # currently-writing file (segment_N+1) is NOT in the
+                # manifest until rotation completes. For a clip taken
+                # mid-rotation, this gap can be up to one segment_time
+                # (= 10 s) of "missing" audio at the tail. Without
+                # detection, the safety-net (now capped at 2 s)
+                # cannot fully close the gap and the clip ends with
+                # silence at the tail.
+                #
+                # Fix: glob each stream's cache dir for files whose
+                # mtime is newer than the last manifest entry. If
+                # found, hot-snapshot the file, estimate its audio
+                # duration from byte size at the encoder's bitrate
+                # (192k sys = 24000 B/s; 256k mic = 32000 B/s by
+                # default but configurable via HGR_CLIP_MIC_AAC_BITRATE),
+                # and append a synthetic entry to the stream's
+                # entries list so the downstream V2 builder picks it
+                # up as the last entry. Wall coverage:
+                #   wall_start_mtime = last manifest entry's wall_end
+                #   wall_end_mtime   = NOW (= wall when snap was taken)
+                # This extends the stream's wall coverage past the
+                # last rotated segment, eliminating the structural
+                # gap that previously forced the safety net to shrink
+                # the clip by 5-10 s.
+                def _v2_detect_in_progress(
+                    entries: list[dict],
+                    segment_pattern: Path | None,
+                    bitrate_bytes_per_sec: float,
+                    stream_label: str,
+                ) -> list[dict]:
+                    if (segment_pattern is None or _v2_shutil is None
+                            or not entries):
+                        return entries
+                    try:
+                        cache_dir = self._clip_cache_dir()
+                        if not cache_dir.exists():
+                            return entries
+                        glob_pat = segment_pattern.name.replace(
+                            "%03d", "[0-9][0-9][0-9]"
+                        )
+                        last_mt_end = max(
+                            (float(e.get("wall_end_mtime", 0.0) or 0.0)
+                             for e in entries),
+                            default=0.0,
+                        )
+                        if last_mt_end <= 0:
+                            return entries
+                        last_end_rel = max(
+                            (float(e.get("end_time", 0.0))
+                             for e in entries),
+                            default=0.0,
+                        )
+                        manifest_paths = {
+                            str(Path(e.get("path", "")).resolve())
+                            for e in entries
+                        }
+                        # Find candidate in-progress files: not in
+                        # manifest, mtime newer than last manifest
+                        # mtime by at least 50 ms (filesystem
+                        # rounding tolerance), size >= 256 B (= more
+                        # than an ADTS header).
+                        wall_now = time.time()
+                        candidates: list[tuple[Path, float, int]] = []
+                        for path in cache_dir.glob(glob_pat):
+                            try:
+                                st = path.stat()
+                            except Exception:
+                                continue
+                            if st.st_size < 256:
+                                continue
+                            if str(path.resolve()) in manifest_paths:
+                                continue
+                            if st.st_mtime <= last_mt_end + 0.05:
+                                continue
+                            candidates.append((path, st.st_mtime, st.st_size))
+                        if not candidates:
+                            return entries
+                        # Pick the candidate with the LARGEST mtime
+                        # (= the file currently being written).
+                        candidates.sort(key=lambda t: t[1], reverse=True)
+                        ip_path, ip_mtime, ip_size = candidates[0]
+                        # Hot-snapshot. Read mtime+size AGAIN after
+                        # snapshot for accuracy (file may have grown).
+                        try:
+                            snap_path = (
+                                cache_dir
+                                / f"hot_snapshot_v2_inprogress_{time.time_ns()}.aac"
+                            )
+                            _v2_shutil.copyfile(str(ip_path), str(snap_path))
+                            snap_size = snap_path.stat().st_size
+                            if snap_size < 256:
+                                snap_path.unlink(missing_ok=True)
+                                return entries
+                        except Exception:
+                            return entries
+                        # Estimate audio duration from snapshot size.
+                        # Cache encoder is AAC at known bitrate. The
+                        # ADTS framing overhead is ~7 B per frame at
+                        # 1024 samples → negligible at second-scale.
+                        est_file_dur = max(
+                            0.0,
+                            float(snap_size) / max(1.0, bitrate_bytes_per_sec),
+                        )
+                        if est_file_dur < 0.05:
+                            try:
+                                snap_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                            return entries
+                        # Synthetic entry. Wall_start chained to last
+                        # manifest's wall_end (= when this segment
+                        # started being written). Wall_end = NOW.
+                        synthetic_entry = {
+                            "path": snap_path,
+                            "start_time": last_end_rel,
+                            "end_time": last_end_rel + est_file_dur,
+                            "file_duration": est_file_dur,
+                            "wall_end_mtime": wall_now,
+                            "wall_start_mtime": last_mt_end,
+                            "_v2_in_progress": True,
+                            "_v2_snap_path": snap_path,
+                        }
+                        audio_hot_copies.append(snap_path)
+                        try:
+                            import sys as _ip_sys
+                            _ip_sys.stderr.write(
+                                f"[clip-export-v2] in-progress {stream_label}: "
+                                f"{ip_path.name} size={snap_size}B "
+                                f"est_dur={est_file_dur:.2f}s "
+                                f"wall=[{last_mt_end:.2f},{wall_now:.2f}]"
+                                f" extends coverage by "
+                                f"{wall_now - last_mt_end:.2f}s\n"
+                            )
+                            _ip_sys.stderr.flush()
+                        except Exception:
+                            pass
+                        return list(entries) + [synthetic_entry]
+                    except Exception:
+                        return entries
+
+                # Bitrate estimates (B/s) for each stream's encoder.
+                # Sys is hardcoded 192k at line ~24712. Mic uses
+                # HGR_CLIP_MIC_AAC_BITRATE (default 256k) at line
+                # ~24786. Decoded bytes_per_sec = bitrate_kbps * 1000
+                # / 8.
+                import os as _v2_bitrate_os
+                _v2_sys_bps = 192000 / 8  # = 24000
+                try:
+                    _v2_mic_bitrate_str = _v2_bitrate_os.environ.get(
+                        "HGR_CLIP_MIC_AAC_BITRATE", "256k"
+                    )
+                    _v2_mic_kbps = int(
+                        "".join(c for c in _v2_mic_bitrate_str if c.isdigit())
+                    )
+                    _v2_mic_bps = _v2_mic_kbps * 1000 / 8
+                except Exception:
+                    _v2_mic_bps = 32000.0
+
+                v2_sys_entries = _v2_detect_in_progress(
+                    v2_sys_entries,
+                    self._clip_cache_audio_sys_segment_pattern,
+                    _v2_sys_bps,
+                    "sys",
+                )
+                v2_mic_entries = _v2_detect_in_progress(
+                    v2_mic_entries,
+                    self._clip_cache_audio_mic_segment_pattern,
+                    _v2_mic_bps,
+                    "mic",
+                )
+
                 def _v2_in_window(e: dict) -> bool:
                     we = float(e.get("wall_end_mtime", 0.0) or 0.0)
                     ws = float(e.get("wall_start_mtime", 0.0) or 0.0)
@@ -26677,9 +26851,17 @@ Admin elevation
                     if (_a_last_wall > 0 and _v_end_wall > 0
                             and _a_last_wall < _v_end_wall):
                         _shrink = _v_end_wall - _a_last_wall
-                        _max_shrink = min(
-                            float(duration_seconds) * 0.25, 10.0
-                        )
+                        # Cap at 2 s max per user requirement: a 60-s
+                        # request must deliver 60 s (same for 2-min,
+                        # 5-min). Larger gaps are now handled by the
+                        # V2 in-progress segment detection earlier in
+                        # the export path, which extends each stream's
+                        # wall coverage past the last rotated entry.
+                        # If audio coverage is still short of video
+                        # after that, apad fills the residual silence
+                        # at end (max 2 s = under typical perception
+                        # threshold for "end of clip" content).
+                        _max_shrink = 2.0
                         _shrink = min(_shrink, _max_shrink)
                         if _shrink > 0.05:
                             new_trim = max(1e-3, trim_duration - _shrink)
