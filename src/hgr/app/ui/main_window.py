@@ -7207,6 +7207,36 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # Re-home the floating General Save Changes button to the
+        # outer scroll's VIEWPORT (same trick as the gesture binds
+        # pills). Without this, the button is parented to the General
+        # panel and scrolls out of view with the content. On the
+        # viewport, it stays anchored to bottom-right of the visible
+        # settings area so users always see the lit "save my edits"
+        # affordance when any control changes.
+        try:
+            vp_btn = content_scroll.viewport()
+            fb = getattr(self, "_general_save_button_floating", None)
+            if fb is not None:
+                fb.setParent(vp_btn)
+                fb.setVisible(False)
+                # Toggle visibility based on the active settings panel.
+                # Show ONLY on the General page (SECTION_GENERAL=10).
+                self.settings_content_stack.currentChanged.connect(
+                    self._update_general_save_floating_visibility
+                )
+                self._update_general_save_floating_visibility(
+                    self.settings_content_stack.currentIndex()
+                )
+                self._position_general_save_floating_button()
+                # Track viewport resize so the button stays glued to
+                # bottom-right. Install the event filter on the
+                # viewport — the existing eventFilter at the bottom of
+                # this class watches for Resize on widget objects.
+                vp_btn.installEventFilter(self)
+        except Exception:
+            pass
+
         # Walk-through pill + Next button — both are FLOATING overlay
         # children of the settings page. Anchored to the top-right of
         # whichever panel is active so the pill sits between the panel
@@ -8518,6 +8548,38 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self._general_save_button_top, 0, Qt.AlignTop)
         layout.insertLayout(0, header_row)
 
+        # FLOATING (sticky) Save Changes button. Identical look + click
+        # handler as the top-right one, but parented to the outer scroll's
+        # VIEWPORT later in __init__ so it stays anchored to the bottom-
+        # right of the visible settings area even when the user scrolls
+        # the long General panel. Without this, the user couldn't see the
+        # Save button after scrolling past the first ~600 px of content
+        # and had to scroll back up to find the lit "save my edits"
+        # affordance. Visibility: shown only on the General panel +
+        # only when there are pending changes (mirrors the top button's
+        # enabled state via _update_general_save_state).
+        self._general_save_button_floating = QPushButton("Save Changes")
+        self._general_save_button_floating.setObjectName("settingsSaveButton")
+        self._general_save_button_floating.setEnabled(False)
+        self._general_save_button_floating.setProperty("pendingSave", False)
+        self._general_save_button_floating.setCursor(Qt.PointingHandCursor)
+        self._general_save_button_floating.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Fixed
+        )
+        self._general_save_button_floating.clicked.connect(self._save_general_changes)
+        self._general_save_button_floating.setVisible(False)  # re-homed + shown later
+        # Drop shadow so the button reads as elevated above the
+        # scrolling content underneath it.
+        try:
+            from PySide6.QtWidgets import QGraphicsDropShadowEffect
+            _shadow = QGraphicsDropShadowEffect(self._general_save_button_floating)
+            _shadow.setBlurRadius(28)
+            _shadow.setOffset(0, 4)
+            _shadow.setColor(QColor(0, 0, 0, 200))
+            self._general_save_button_floating.setGraphicsEffect(_shadow)
+        except Exception:
+            pass
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
@@ -8993,19 +9055,68 @@ class MainWindow(QMainWindow):
 
     def _update_general_save_state(self) -> None:
         dirty = bool(self._general_pending)
-        for attr in ("_general_save_button", "_general_save_button_top"):
+        # Three save buttons share the same state: legacy bottom
+        # (kept as None for back-compat), the top-right header
+        # button, and the new sticky floating button at viewport
+        # bottom-right that stays visible regardless of scroll
+        # position. All three light up + enable together when any
+        # control changes from baseline.
+        for attr in ("_general_save_button", "_general_save_button_top",
+                     "_general_save_button_floating"):
             button = getattr(self, attr, None)
             if button is None:
                 continue
-            # Save button is DISABLED when nothing is pending — it
-            # reads as greyed/off, doesn't respond to hover, and
-            # makes it obvious there's nothing to save. Becomes
-            # ENABLED + lit (primary blue) the moment any control
-            # changes from baseline. The shared helper applies the
-            # pending stylesheet (or clears it) so the visual lit/
-            # neutral state is in sync with the enabled flag.
             button.setEnabled(dirty)
             self._set_settings_save_button_pending(button, dirty)
+        # Re-position the floating button after a state change so its
+        # geometry tracks any width change from font reflow.
+        try:
+            self._position_general_save_floating_button()
+        except Exception:
+            pass
+
+    def _position_general_save_floating_button(self) -> None:
+        """Anchor the floating Save Changes button to the bottom-right
+        of the settings content viewport. Re-called on viewport resize
+        and on pending-state change so the button stays glued in place
+        no matter how the user resizes the window or how long the
+        button text grows."""
+        button = getattr(self, "_general_save_button_floating", None)
+        if button is None:
+            return
+        vp = button.parentWidget()
+        if vp is None:
+            return
+        # Use the button's sizeHint so it doesn't get squashed when
+        # disabled (Qt sometimes reports 0 width pre-show).
+        hint = button.sizeHint()
+        btn_w = max(140, hint.width())
+        btn_h = max(36, hint.height())
+        button.resize(btn_w, btn_h)
+        # 16-px padding from viewport's bottom-right edges. Extra 4-px
+        # safety for the scrollbar that may appear on the right.
+        pad_right = 28
+        pad_bottom = 22
+        x = max(0, vp.width() - btn_w - pad_right)
+        y = max(0, vp.height() - btn_h - pad_bottom)
+        button.move(x, y)
+        button.raise_()
+
+    def _update_general_save_floating_visibility(self, index: int) -> None:
+        """Show the floating Save button ONLY when the active settings
+        panel is General. On every other panel hide it so it doesn't
+        clutter unrelated tabs."""
+        button = getattr(self, "_general_save_button_floating", None)
+        if button is None:
+            return
+        try:
+            on_general = (int(index) == SECTION_GENERAL)
+        except Exception:
+            on_general = False
+        button.setVisible(on_general)
+        if on_general:
+            self._position_general_save_floating_button()
+            button.raise_()
 
     def _save_general_changes(self) -> None:
         """Apply every pending change to self.config in one shot,
@@ -29788,6 +29899,17 @@ Admin elevation
                         return True
                 except Exception:
                     pass
+        # Reposition the floating General Save Changes button when
+        # the settings scroll viewport resizes. The button is
+        # parented to the viewport, so it tracks the visible area
+        # regardless of where the user has scrolled the panel.
+        if event.type() in (QEvent.Resize, QEvent.Show):
+            scroll = getattr(self, "_settings_content_scroll", None)
+            if scroll is not None and obj is scroll.viewport():
+                try:
+                    self._position_general_save_floating_button()
+                except Exception:
+                    pass
         # Walk-through overlay: re-anchor the pill + Next button
         # whenever the page or content stack resizes / moves so the
         # overlay stays parked over the active panel's top-right.
@@ -31364,6 +31486,17 @@ def _stop_screen_recording(self) -> bool:
                     if stack.currentIndex() in self._SETTINGS_OUTER_SCROLL_OFF:
                         event.accept()
                         return True
+                except Exception:
+                    pass
+        # Reposition the floating General Save Changes button when
+        # the settings scroll viewport resizes. The button is
+        # parented to the viewport, so it tracks the visible area
+        # regardless of where the user has scrolled the panel.
+        if event.type() in (QEvent.Resize, QEvent.Show):
+            scroll = getattr(self, "_settings_content_scroll", None)
+            if scroll is not None and obj is scroll.viewport():
+                try:
+                    self._position_general_save_floating_button()
                 except Exception:
                     pass
         # Walk-through overlay: re-anchor the pill + Next button

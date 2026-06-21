@@ -1163,6 +1163,21 @@ class ProcessingOverlay(QWidget):
         self.setAutoFillBackground(False)
         self.setStyleSheet("background: transparent; border: none;")
         self._label = "Processing"
+        # Optional reference to the voice status overlay. When set,
+        # this pill positions itself ABOVE the voice pill (with a
+        # small gap) whenever the voice pill is visible and rendering
+        # a result / processing / listening state. When the voice
+        # pill hides, this pill smoothly slides DOWN to its default
+        # bottom-of-screen position. Wired via
+        # set_voice_status_anchor() — None until set, in which case
+        # the pill always uses its default placement.
+        self._voice_status_anchor = None
+        self._y_current: float | None = None  # animated Y position
+        self._y_target: float | None = None   # goal Y from _compute_target_y
+        # Gap between this pill's bottom and the voice pill's top
+        # when stacked. Small enough to read them as related, large
+        # enough to not look fused.
+        self._STACK_GAP = 12
         # Two progress fields: _progress_target is the goal pushed
         # by set_progress() callers at each init checkpoint, and
         # _progress is the currently-rendered fraction. _tick eases
@@ -1190,10 +1205,54 @@ class ProcessingOverlay(QWidget):
         self._timer.timeout.connect(self._tick)
         self.resize(self._PILL_WIDTH, self._PILL_HEIGHT)
 
+    def set_voice_status_anchor(self, overlay) -> None:
+        """Tell this pill about the voice status overlay so it can
+        stack ABOVE it when both are visible. Pass None to disable
+        stacking. Called by main_window after both overlays exist."""
+        self._voice_status_anchor = overlay
+
+    def _voice_pill_top_y(self) -> int | None:
+        """Top-y of the voice status pill if it's currently visible
+        in a state that should push us up (result / processing /
+        listening / warming). Returns None if not stacking."""
+        v = self._voice_status_anchor
+        if v is None:
+            return None
+        try:
+            if not v.isVisible():
+                return None
+            mode = getattr(v, "_mode", "")
+            # Stack only for modes that occupy bottom-center space.
+            # "selection" (large picker) and "hidden" don't trigger.
+            if mode not in ("result", "processing", "listening", "warming", "info_hint"):
+                return None
+            geo = v.geometry()
+            return int(geo.top())
+        except Exception:
+            return None
+
+    def _compute_target_y(self) -> int:
+        """Compute the goal Y for this pill. Default: just above
+        the screen-bottom gap. Stacked: above the voice pill's top
+        with _STACK_GAP between."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return 40
+        geo = screen.availableGeometry()
+        default_y = geo.bottom() - self._PILL_HEIGHT - self._SCREEN_BOTTOM_GAP
+        v_top = self._voice_pill_top_y()
+        if v_top is None:
+            return int(default_y)
+        # Stack above the voice pill. Clamp so we don't go off-screen
+        # if the voice pill is unusually tall.
+        stacked_y = v_top - self._STACK_GAP - self._PILL_HEIGHT
+        return int(max(geo.top() + 8, stacked_y))
+
     def _place_on_screen(self) -> None:
         # Bottom-center of the primary screen — same pattern the
         # voice status overlay uses, so the user reads them as
-        # related.
+        # related. When the voice pill is also visible, stack above
+        # it (see _compute_target_y + _tick animation).
         screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is None:
             self.move(40, 40)
@@ -1201,8 +1260,13 @@ class ProcessingOverlay(QWidget):
         geo = screen.availableGeometry()
         self.resize(self._PILL_WIDTH, self._PILL_HEIGHT)
         x = geo.center().x() - self._PILL_WIDTH // 2
-        y = geo.bottom() - self._PILL_HEIGHT - self._SCREEN_BOTTOM_GAP
-        self.move(x, y)
+        target_y = self._compute_target_y()
+        # Initialize animation state on first placement so the
+        # initial show doesn't slide in from elsewhere.
+        if self._y_current is None:
+            self._y_current = float(target_y)
+        self._y_target = float(target_y)
+        self.move(x, int(round(self._y_current)))
 
     def _tick(self) -> None:
         # Smooth-easing tick: nudge _progress toward _progress_target,
@@ -1241,6 +1305,37 @@ class ProcessingOverlay(QWidget):
             self._timer.stop()
             self.hide()
             return
+        # Y-position animation: recompute target each tick (so when
+        # the voice pill hides we slide back down smoothly), then
+        # ease _y_current toward it. Same exponential easing as the
+        # progress bar so the motion looks consistent.
+        target_y = float(self._compute_target_y())
+        if self._y_current is None:
+            self._y_current = target_y
+        else:
+            y_delta = target_y - self._y_current
+            if abs(y_delta) > 0.5:
+                dt_capped = min(dt, 0.04)
+                # Faster easing for position than progress — the eye
+                # picks up on bar drag; we want the slide to read as
+                # decisive but not jumpy. e^(-12 * 0.016) ≈ 0.82, so
+                # 18% of the gap is closed every 16ms.
+                factor = 1.0 - math.exp(-12.0 * dt_capped)
+                self._y_current += y_delta * factor
+                screen = self.screen() or QGuiApplication.primaryScreen()
+                if screen is not None:
+                    geo = screen.availableGeometry()
+                    x = geo.center().x() - self._PILL_WIDTH // 2
+                    self.move(int(x), int(round(self._y_current)))
+            elif abs(y_delta) > 0.0:
+                # Snap the last fractional pixel to avoid jitter.
+                self._y_current = target_y
+                screen = self.screen() or QGuiApplication.primaryScreen()
+                if screen is not None:
+                    geo = screen.availableGeometry()
+                    x = geo.center().x() - self._PILL_WIDTH // 2
+                    self.move(int(x), int(round(self._y_current)))
+        self._y_target = target_y
         self.repaint()
 
     def set_progress(self, fraction: float) -> None:
@@ -1392,6 +1487,7 @@ class SavedLocationOverlay(QWidget):
 
     _PILL_HEIGHT = 56
     _PILL_PADDING_X = 28
+    _PILL_PADDING_Y = 14
     _SCREEN_BOTTOM_GAP = 64
     # Vertical offset so this pill stacks ABOVE the standard
     # processing / voice-status pill row instead of overlapping with
@@ -1401,6 +1497,7 @@ class SavedLocationOverlay(QWidget):
     _STACK_ABOVE_OFFSET = 110
     _MIN_WIDTH = 280
     _MAX_WIDTH_FRAC = 0.80  # of screen width
+    _MAX_HEIGHT = 240  # vertical growth cap for very long paths
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1436,10 +1533,26 @@ class SavedLocationOverlay(QWidget):
         self._fade_timer.timeout.connect(self._tick_fade)
         self._fade_total_ms = 600
         self._fade_remaining_ms = 0
+        # Slide-down entrance animation. The pill starts 60 px ABOVE
+        # its resting y, slides down to rest over _SLIDE_TOTAL_MS with
+        # ease-out cubic so it lands smoothly instead of snapping.
+        self._slide_total_ms = 280
+        self._slide_elapsed_ms = 0
+        self._slide_start_y = 0
+        self._slide_target_y = 0
+        self._slide_x = 0
+        self._slide_timer = QTimer(self)
+        self._slide_timer.setInterval(16)
+        self._slide_timer.timeout.connect(self._tick_slide)
         self.resize(self._MIN_WIDTH, self._PILL_HEIGHT)
 
     def show_saved(self, text: str, *, total_ms: int = 3000, fade_ms: int = 600, click_target: Path | None = None) -> None:
         """Show the saved-location pill above the standard pill row.
+
+        Animates a slide-down entrance: pill starts ~60 px above its
+        resting position and slides down with ease-out cubic over
+        ~280 ms so users see it ARRIVE instead of just popping in.
+        After total_ms - fade_ms hold, fades out over fade_ms.
 
         If `click_target` is supplied (recommended for every save
         outcome), the user can click the pill to open the file in
@@ -1454,9 +1567,17 @@ class SavedLocationOverlay(QWidget):
         # cleanly.
         self._hold_timer.stop()
         self._fade_timer.stop()
+        self._slide_timer.stop()
         self._fade_remaining_ms = 0
+        self._slide_elapsed_ms = 0
         self._fit_to_text()
+        # _place_on_screen now sets self._slide_target_y / _slide_x
+        # but DOES NOT move the widget — _tick_slide handles the
+        # frame-by-frame position from start_y to target_y.
         self._place_on_screen()
+        # Position the pill at the START of the slide (above rest).
+        self._slide_start_y = self._slide_target_y - 60
+        self.move(self._slide_x, self._slide_start_y)
         self.setWindowOpacity(1.0)
         self.show()
         self.raise_()
@@ -1469,6 +1590,11 @@ class SavedLocationOverlay(QWidget):
         self._fade_total_ms = max(50, int(fade_ms))
         hold_ms = max(0, int(total_ms) - self._fade_total_ms)
         self._hold_timer.start(hold_ms)
+        # Kick off the slide. Runs in parallel with the hold timer —
+        # slide finishes in ~280 ms, hold typically lasts ~2400 ms,
+        # so the pill rests for a long beat at the bottom before fading.
+        self._slide_elapsed_ms = 0
+        self._slide_timer.start()
 
     def mousePressEvent(self, event):  # noqa: N802
         """Left-click → open the saved file (or its folder if the
@@ -1494,6 +1620,7 @@ class SavedLocationOverlay(QWidget):
         # while the OS opens the file.
         self._hold_timer.stop()
         self._fade_timer.stop()
+        self._slide_timer.stop()
         self.hide()
         event.accept()
 
@@ -1511,31 +1638,41 @@ class SavedLocationOverlay(QWidget):
         self.setWindowOpacity(max(0.0, self._fade_remaining_ms / float(self._fade_total_ms)))
 
     def _fit_to_text(self) -> None:
-        # Compute pill width from the rendered text width, with
-        # min/max bounds. If the text exceeds the max, switch to
-        # middle-elision so we keep the drive prefix + the file
-        # name visible.
+        # Compute pill size from the rendered text. Width grows up
+        # to ~80% of the screen; if the text STILL doesn't fit on
+        # one line, the pill grows VERTICALLY by word-wrapping
+        # instead of middle-eliding so the user can read the whole
+        # path / error / message. Height is capped at _MAX_HEIGHT so
+        # a runaway string can't render off-screen.
         screen = self.screen() or QGuiApplication.primaryScreen()
         screen_w = screen.availableGeometry().width() if screen is not None else 1280
         max_pill_w = max(self._MIN_WIDTH, int(screen_w * self._MAX_WIDTH_FRAC))
         font = QFont("Segoe UI", 12)
         font.setBold(True)
         metrics = QFontMetrics(font)
-        full_w = metrics.horizontalAdvance(self._text) + 2 * self._PILL_PADDING_X
-        if full_w <= max_pill_w:
-            self._displayed_text = self._text
-            self.resize(max(self._MIN_WIDTH, full_w), self._PILL_HEIGHT)
+        self._displayed_text = self._text
+        single_line_w = metrics.horizontalAdvance(self._text) + 2 * self._PILL_PADDING_X
+        if single_line_w <= max_pill_w:
+            self.resize(max(self._MIN_WIDTH, single_line_w), self._PILL_HEIGHT)
             return
-        # Too long: elide middle so leading drive + trailing name
-        # both stay visible.
+        # Doesn't fit single-line — wrap to multiple lines at max
+        # width and grow the pill vertically to match.
         target_text_w = max_pill_w - 2 * self._PILL_PADDING_X
-        self._displayed_text = metrics.elidedText(self._text, Qt.ElideMiddle, target_text_w)
-        self.resize(max_pill_w, self._PILL_HEIGHT)
+        wrap_rect = metrics.boundingRect(
+            0, 0, target_text_w, 10_000,
+            int(Qt.TextWordWrap), self._text,
+        )
+        wrapped_h = wrap_rect.height() + 2 * self._PILL_PADDING_Y
+        height = min(self._MAX_HEIGHT, max(self._PILL_HEIGHT, wrapped_h))
+        self.resize(max_pill_w, int(height))
 
     def _place_on_screen(self) -> None:
         screen = self.screen() or QGuiApplication.primaryScreen()
         if screen is None:
-            self.move(40, 40)
+            # Degenerate path — no screen detected. Store sentinel
+            # and rely on caller to skip animation.
+            self._slide_x = 40
+            self._slide_target_y = 40
             return
         geo = screen.availableGeometry()
         x = geo.center().x() - self.width() // 2
@@ -1545,7 +1682,27 @@ class SavedLocationOverlay(QWidget):
         # "Executing command", producing a visible overlap on every
         # save flow that involved either of those pills.
         y = geo.bottom() - self.height() - self._SCREEN_BOTTOM_GAP - self._STACK_ABOVE_OFFSET
-        self.move(x, y)
+        # Store the resting position; the slide animation will
+        # interpolate the y from start_y down to this target.
+        self._slide_x = x
+        self._slide_target_y = y
+
+    def _tick_slide(self) -> None:
+        """Per-frame slide-down position update with ease-out cubic.
+        Stops the timer when the pill reaches its resting y."""
+        self._slide_elapsed_ms += self._slide_timer.interval()
+        if self._slide_elapsed_ms >= self._slide_total_ms:
+            # Snap to final position to avoid sub-pixel drift, then stop.
+            self.move(self._slide_x, self._slide_target_y)
+            self._slide_timer.stop()
+            return
+        # Ease-out cubic: t in [0, 1], y_offset = 1 - (1-t)^3.
+        t = max(0.0, min(1.0, self._slide_elapsed_ms / float(self._slide_total_ms)))
+        eased = 1.0 - (1.0 - t) ** 3
+        cur_y = int(round(
+            self._slide_start_y + (self._slide_target_y - self._slide_start_y) * eased
+        ))
+        self.move(self._slide_x, cur_y)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -1567,7 +1724,11 @@ class SavedLocationOverlay(QWidget):
         font.setBold(True)
         painter.setFont(font)
         painter.setPen(QPen(text_color))
-        painter.drawText(rect, Qt.AlignCenter, self._displayed_text)
+        # Word-wrap so multi-line text (paths too long for a single
+        # line) renders all lines instead of clipping. AlignCenter
+        # both vertically and horizontally keeps short text centered
+        # in the larger pill envelope.
+        painter.drawText(rect, Qt.AlignCenter | Qt.TextWordWrap, self._displayed_text)
 
 
 class TrackingQualityPill(QWidget):
