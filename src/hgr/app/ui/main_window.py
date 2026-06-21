@@ -26716,16 +26716,36 @@ Admin elevation
             filter_complex = video_complex
             # V2 PATH: rebuild the dual-stream audio chain using the
             # FINAL trim_duration (= duration_seconds minus the safety-
-            # net shrink, if any). Audio anchored to video's wall
-            # window to keep both streams internally consistent.
+            # net shrink, if any). Audio anchored to VIDEO'S ACTUAL
+            # RENDERED WALL WINDOW — when the safety net shrinks
+            # trim_duration, video's `trim=start=start_trim:duration=
+            # trim_duration` filter keeps START fixed and moves END
+            # earlier. The V2 audio MUST follow the same convention,
+            # else audio shifts forward relative to video and the
+            # user perceives audio as N seconds early (exactly the
+            # bug that caused commit 3381ef6's 9-s-early report on
+            # the user's stalled-sys session).
+            #
+            # Compute video's rendered wall coverage from the same
+            # inputs the video chain uses:
+            #   v_video_wall_start = v_anchor + selected[0].start_time + start_trim
+            #   v_video_wall_end   = v_video_wall_start + trim_duration
             if v2_chain_built:
-                v2_video_clip_wall_end_final = (
-                    v_anchor + float(selected[-1].get("end_time", 0.0))
-                    - tail_to_drop
-                    if v_anchor > 0 else 0.0
-                )
-                v2_clip_wall_end_final = v2_video_clip_wall_end_final
-                v2_clip_wall_start_final = v2_clip_wall_end_final - trim_duration
+                if v_anchor > 0:
+                    v2_video_first_seg_start_rel = float(
+                        selected[0].get("start_time", 0.0)
+                    )
+                    v2_clip_wall_start_final = (
+                        v_anchor + v2_video_first_seg_start_rel + start_trim
+                    )
+                    v2_clip_wall_end_final = (
+                        v2_clip_wall_start_final + trim_duration
+                    )
+                else:
+                    # Degenerate fallback — preserve old behavior when
+                    # no video anchor available.
+                    v2_clip_wall_end_final = 0.0
+                    v2_clip_wall_start_final = -trim_duration
                 v2_clip_dur_final = max(1e-3, trim_duration)
                 v2_parts_final: list[str] = []
                 v2_sys_label_final = None
