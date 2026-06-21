@@ -29527,6 +29527,56 @@ Admin elevation
                         self._worker._pending_clip_voice_end_ts = None
                 except Exception:
                     pass
+            elif utility_request_action == "clip_gesture":
+                # LEFT-HAND THUMBS-UP CLIP GESTURE. Engine sets
+                # _pending_clip_voice_end_ts to the moment the
+                # hold completed (0.5 s after the pose first
+                # appeared) so the saved clip ends at user intent,
+                # not the much-later export dispatch moment. Reuses
+                # the same _export_recent_clip pipeline as voice
+                # "clip that" with the configured default duration
+                # from Settings → Clip Presets → Duration.
+                _gesture_end_ts = (
+                    getattr(self._worker, "_pending_clip_voice_end_ts", None)
+                    if self._worker is not None else None
+                )
+                try:
+                    _gesture_duration = int(
+                        getattr(self.config, "clip_default_duration_seconds", 60) or 60
+                    )
+                except Exception:
+                    _gesture_duration = 60
+                # Snap to supported set so a stale persisted value
+                # doesn't propagate. Supported = 60 / 120 / 300.
+                _supported = (60, 120, 300)
+                if _gesture_duration not in _supported:
+                    _gesture_duration = min(
+                        _supported, key=lambda v: abs(v - _gesture_duration)
+                    )
+                try:
+                    import sys as _sys, time as _time
+                    _sys.stderr.write(
+                        f"[clip-anchor] main_window clip_gesture "
+                        f"end_ts={_gesture_end_ts} duration={_gesture_duration}s "
+                        f"(now={_time.time():.3f}, "
+                        f"lag={(_time.time() - _gesture_end_ts):.2f}s)\n"
+                        if _gesture_end_ts is not None else
+                        f"[clip-anchor] main_window clip_gesture "
+                        f"end_ts=None duration={_gesture_duration}s — using 'now' anchor\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                utility_handled = self._export_recent_clip(
+                    _gesture_duration,
+                    auto_save=True, auto_select_monitor=True,
+                    end_ts=_gesture_end_ts,
+                )
+                try:
+                    if self._worker is not None:
+                        self._worker._pending_clip_voice_end_ts = None
+                except Exception:
+                    pass
             if utility_handled:
                 self._last_utility_request_token = utility_request_token
                 if self._worker is not None and hasattr(self._worker, "acknowledge_utility_request"):

@@ -1053,6 +1053,15 @@ class GestureWorker(QObject):
         self._voice_cooldown_until = 0.0
         self._voice_latched_label: str | None = None
         self._voice_one_two_triggered_at: float = 0.0
+        # Left-hand thumbs-up CLIP GESTURE state. Hold thumbs-up on
+        # the left hand for 0.5 s to trigger a clip with the user's
+        # configured default duration (Settings → Clip Presets).
+        # Mirrors the voice "clip that" pipeline; uses the same
+        # _pending_clip_voice_end_ts anchor so the saved clip ends
+        # at the moment of gesture detection. Cooldown prevents
+        # accidental double-trigger from a held pose flicker.
+        self._clip_gesture_candidate_since: float = 0.0
+        self._clip_gesture_cooldown_until: float = 0.0
         self._left_hand_prediction = None
         # Cached LEFT-hand reading (landmarks + finger states). Set
         # alongside _left_hand_prediction each frame so other systems
@@ -6805,6 +6814,16 @@ class GestureWorker(QObject):
 
         if self._left_hand_prediction is not None:
             self._handle_left_hand_voice(self._left_hand_prediction, now)
+            # CLIP GESTURE — runs alongside voice handler. Voice
+            # handler returns early on fist/one/two; clip gesture
+            # only fires on routed_label="thumb_up" so the two
+            # never collide. Order doesn't matter (no shared state
+            # mutation between them).
+            self._handle_left_hand_clip_gesture(
+                self._left_hand_prediction,
+                self._left_hand_reading,
+                now,
+            )
             if hand_handedness != "Right":
                 self._update_youtube_wheel(prediction=None, hand_reading=None, now=now, active=False)
                 self._update_chrome_wheel(prediction=None, hand_reading=None, now=now, active=False)
@@ -8478,6 +8497,102 @@ class GestureWorker(QObject):
             self._start_voice_capture(mode="selection", preferred_app=None)
             return
         self._start_voice_command()
+
+    def _handle_left_hand_clip_gesture(self, prediction, hand_reading, now: float) -> None:
+        """Hold LEFT-hand THUMBS UP for 0.5 s to trigger a clip with
+        the user's configured default duration from Settings →
+        Clip Presets → Duration.
+
+        Mirrors the voice "clip that" pipeline so the saved clip
+        ends at the moment of gesture detection (not at the much-
+        later moment the export actually runs). Cooldown of 3 s
+        after a trigger prevents accidental double-clipping from
+        a held pose flicker.
+
+        Skipped during voice/dictation/save-prompt/selection-prompt
+        states — those need to drain first (and the left-hand fist
+        cancel may be active in those states).
+        """
+        if prediction is None or hand_reading is None:
+            self._clip_gesture_candidate_since = 0.0
+            return
+        # Higher-priority left-hand states block clip-gesture detection.
+        if (self._voice_listening or self._dictation_active
+                or self._save_prompt_active or self._selection_prompt_active):
+            self._clip_gesture_candidate_since = 0.0
+            return
+        if now < self._clip_gesture_cooldown_until:
+            return
+        # Derive the routed label — promotes fist/neutral with
+        # thumb-above-wrist to "thumb_up".
+        try:
+            routed_label = self._derive_app_static_label(prediction, hand_reading)
+        except Exception:
+            self._clip_gesture_candidate_since = 0.0
+            return
+        if routed_label != "thumb_up":
+            self._clip_gesture_candidate_since = 0.0
+            return
+        # First detection — start the hold timer.
+        if self._clip_gesture_candidate_since <= 0.0:
+            self._clip_gesture_candidate_since = now
+            return
+        # Hold satisfied? Threshold matches voice trigger hold
+        # (0.5 s) for muscle-memory parity.
+        if now - self._clip_gesture_candidate_since < 0.5:
+            return
+        # Trigger. Reset candidate and arm cooldown so the same
+        # held pose doesn't fire again.
+        self._clip_gesture_candidate_since = 0.0
+        self._clip_gesture_cooldown_until = now + 3.0
+        # Resolve duration from config (snap to supported set).
+        try:
+            duration_s = int(
+                getattr(self.config, "clip_default_duration_seconds", 60) or 60
+            )
+        except Exception:
+            duration_s = 60
+        # Stash end_ts so main_window's dispatch can pin the clip
+        # to the moment the gesture confirmed (= NOW). Mirrors the
+        # voice "clip that" path at noop_engine.py:9336.
+        try:
+            self._pending_clip_voice_end_ts = float(now)
+        except Exception:
+            self._pending_clip_voice_end_ts = None
+        # Toast + diag log so the user knows the gesture registered
+        # before the export wall-time (~10-30 s for HQ encode).
+        try:
+            mins = duration_s // 60
+            if mins >= 2:
+                label_text = f"Clipping last {mins} minutes"
+            elif mins == 1:
+                label_text = "Clipping last 1 minute"
+            else:
+                label_text = f"Clipping last {duration_s} seconds"
+            self.voice_status_overlay.show_info_hint(label_text, duration=2.5)
+        except Exception:
+            pass
+        try:
+            self.command_detected.emit(label_text)
+        except Exception:
+            pass
+        try:
+            import sys as _cg_sys, time as _cg_time
+            _cg_sys.stderr.write(
+                f"[clip-gesture] left-thumbs-up triggered at {now:.3f} "
+                f"duration={duration_s}s -> queueing clip_gesture\n"
+            )
+            _cg_sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            self._queue_utility_request("clip_gesture")
+        except Exception:
+            pass
+        try:
+            self._record_action("clip_gesture", label_text)
+        except Exception:
+            pass
 
     def _reset_voice_candidate(self, now: float) -> None:
         self._voice_candidate = "neutral"
