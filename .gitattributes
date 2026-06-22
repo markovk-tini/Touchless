@@ -1,0 +1,7 @@
+# Shell scripts MUST stay LF or they break on macOS/Linux with
+#   "bad interpreter: /usr/bin/env bash^M".
+# These are the macOS-port build/run scripts (and any future *.sh).
+*.sh text eol=lf
+
+# macOS plist / installer XML are fine as LF too.
+*.plist text eol=lf

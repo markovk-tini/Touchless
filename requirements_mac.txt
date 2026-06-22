@@ -1,0 +1,96 @@
+# Touchless — macOS (Apple Silicon / arm64) runtime dependencies.
+#
+# NEW, SEPARATE file for the macOS port. The Windows requirements.txt is left
+# UNTOUCHED. Install on a Mac with:
+#     python3 -m pip install -r requirements_mac.txt
+# (run_mac.sh does this for you inside a dedicated .venv-mac.)
+#
+# See docs/MACOS_PORT.md for the full Windows->macOS dependency mapping and the
+# rationale behind every swap below.
+
+# ---- Core UI + vision pipeline (identical to Windows; arm64 wheels) --------
+PySide6
+psutil
+Pillow
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.21          # Ships a macosx_11_0_universal2 (arm64) wheel for
+                            # cp39–cp312, so this pin installs cleanly on Apple
+                            # Silicon. (mediapipe also constrains protobuf<5 and
+                            # numpy<2 and pulls jax/jaxlib + matplotlib + sounddevice
+                            # transitively — numpy==1.26.4 satisfies <2.)
+matplotlib
+sounddevice                 # PortAudio -> CoreAudio host API on macOS
+faster-whisper              # CTranslate2 arm64 wheels (CPU/Accelerate); CUDA->CPU
+
+# ---- GPU / ML inference ----------------------------------------------------
+# Windows uses onnxruntime-directml (DirectX 12). macOS has NO DirectML; use the
+# plain onnxruntime wheel, which ships the CoreMLExecutionProvider (Apple Neural
+# Engine / GPU) plus a CPU fallback. Same ONNX model files in assets/models/.
+# IMPORTANT: never install onnxruntime-directml on macOS, and never have BOTH
+# `onnxruntime` and `onnxruntime-directml` installed (they share the import name
+# and silently shadow each other).
+onnxruntime
+
+# ---- macOS platform frameworks (pyobjc) — replaces pywin32/comtypes/pycaw ---
+# native_overlay.py already imports `objc` + `AppKit` (from pyobjc-framework-Cocoa)
+# for the click-through always-on-top overlay. Quartz powers CGEvent cursor/
+# keyboard synthesis + screen capture in later phases. Only Cocoa is strictly
+# required for the BASE build to launch; the rest are listed so the cursor/
+# volume/screen phases install cleanly. pyobjc frameworks are imported lazily,
+# so listing them now is harmless.
+pyobjc-core
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+pyobjc-framework-ApplicationServices
+pyobjc-framework-AVFoundation
+pyobjc-framework-CoreAudio
+pyobjc-framework-ScreenCaptureKit   # macOS 13+ (Iris screen vision / OCR, Phase 4)
+
+# ---- OCR for Iris click_text_on_screen (Phase 4 — NOT in the base build) ----
+# Iris (hgr.live_api) is excluded from the base build, so OCR isn't needed yet.
+# When you enable it, DO NOT add `rapidocr-onnxruntime` to this plain list:
+# its metadata depends on `opencv-python`, which installs a SECOND cv2/ on top
+# of opencv-contrib-python above and breaks both. Install it deps-free instead:
+#     pip install --no-deps rapidocr-onnxruntime
+#     pip install pyclipper shapely pyyaml six   # rapidocr's real runtime deps
+# (numpy / opencv-contrib / Pillow / onnxruntime above already satisfy the rest.)
+# Left commented so the base install stays clean and conflict-free:
+# pyclipper
+# shapely
+# pyyaml
+# six
+
+# ---- Document readers (Iris read_file) -------------------------------------
+pypdf
+python-docx
+
+# ---- Phone camera over WebRTC (QtWebEngine ships with PySide6) --------------
+aiohttp
+
+# ---- Optional Live API connectors (cloud; pure-Python; cross-platform) ------
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+httplib2
+mcp
+msal
+websocket-client
+
+# ---- macOS secret storage (replaces Windows DPAPI in Iris secret_vault) -----
+keyring                     # -> macOS Keychain (Phase 4); harmless until used
+
+# ---- send-to-trash safe delete (Iris) --------------------------------------
+send2trash                  # supports the macOS Trash natively
+
+# ===========================================================================
+# EXCLUDED on macOS (Windows-only; no macOS equivalent — see docs/MACOS_PORT.md):
+#   pycaw                 -> CoreAudio (system volume only; per-app volume N/A)
+#   comtypes / pywin32    -> pyobjc + AppleScript, per call-site
+#   onnxruntime-directml  -> onnxruntime (CoreML), above
+#   pyaudiowpatch         -> ScreenCaptureKit audio (Phase 4)
+#   winsdk / winrt        -> private MediaRemote.framework (now-playing)
+#   win11toast            -> NSUserNotification / UserNotifications
+#   uiautomation          -> Accessibility AXUIElement (Phase 4)
+# ===========================================================================

@@ -33,6 +33,10 @@ installers/*
 !installers/windows/
 installers/windows/*
 !installers/windows/*.iss
+# macOS installer SOURCE (build scripts, distribution.xml, welcome/license HTML).
+# Re-including the dir is enough — installers/macos holds only source; the built
+# .pkg/.dmg go to dist/ (already ignored above).
+!installers/macos/
 *.spec.bak
 
 # PyInstaller distribution staging

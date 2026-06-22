@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Touchless macOS installer distribution definition (productbuild).
+  NEW, SEPARATE from the Windows Inno Setup script.
+
+  Requires Apple Silicon (the app ships arm64-only). The referenced component
+  pkg (Touchless-component.pkg) is produced by build_pkg.sh via pkgbuild.
+
+  Optional UI resources (welcome.html / license.html / conclusion.html) live in
+  installers/macos/resources/ and are wired in by build_pkg.sh when present.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>Touchless</title>
+    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+
+    <!-- Apple Silicon only (the bundle is arm64). Floor is 14.0 to match the
+         onnxruntime arm64 wheel; keep in sync with the spec's
+         LSMinimumSystemVersion. -->
+    <volume-check>
+        <allowed-os-versions>
+            <os-version min="14.0"/>
+        </allowed-os-versions>
+    </volume-check>
+
+    <welcome    file="welcome.html"    mime-type="text/html"/>
+    <license    file="license.html"    mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.touchless.app.pkg"/>
+        </line>
+    </choices-outline>
+
+    <choice id="default"/>
+    <choice id="com.touchless.app.pkg" visible="false">
+        <pkg-ref id="com.touchless.app.pkg"/>
+    </choice>
+
+    <pkg-ref id="com.touchless.app.pkg">Touchless-component.pkg</pkg-ref>
+</installer-gui-script>
