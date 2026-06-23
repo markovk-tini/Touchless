@@ -12297,32 +12297,52 @@ class MainWindow(QMainWindow):
         Without the rebuild, inline styles created during the
         previous theme stay baked in and a switch back to the other
         mode leaves stale text colors all over the place."""
+        # Deferred-save: clicking the Light/Dark button now stages
+        # the palette preset in self.config WITHOUT persisting it or
+        # applying the theme. The Apply Changes button at the bottom
+        # of the Colors panel lights up so the user can commit the
+        # preset (or pair it with manual color tweaks) in one click.
+        # This keeps the Colors panel consistent with every other
+        # settings page: any change requires Apply Changes to stick.
         if self._is_light_mode_active():
-            # Switch back to the original dark palette.
-            self.config.primary_color = ORIGINAL_PRIMARY_COLOR
-            self.config.accent_color = ORIGINAL_ACCENT_COLOR
-            self.config.surface_color = ORIGINAL_SURFACE_COLOR
-            self.config.text_color = ORIGINAL_TEXT_COLOR
+            new_palette = {
+                "primary_color": ORIGINAL_PRIMARY_COLOR,
+                "accent_color": ORIGINAL_ACCENT_COLOR,
+                "surface_color": ORIGINAL_SURFACE_COLOR,
+                "text_color": ORIGINAL_TEXT_COLOR,
+            }
         else:
-            for attr, value in self._LIGHT_MODE_COLORS.items():
-                setattr(self.config, attr, value)
-        save_config(self.config)
-        self._rebuild_settings_page_for_theme_change()
-        self.apply_theme()
-        # Re-render any custom action-history rows so their inline
-        # styles pick up the new text color too.
-        try:
-            worker = getattr(self, "_worker", None)
-            history = list(getattr(worker, "action_history", []) or []) if worker is not None else []
-            self._on_action_history_changed(history)
-        except Exception:
-            pass
-        # Update the button label to reflect the NEW state. The
-        # rebuild above replaced the old button reference.
+            new_palette = dict(self._LIGHT_MODE_COLORS)
+        # Write to config in-memory only (same pattern as the color
+        # picker's _on_picked handler) so the snapshot-vs-config
+        # comparison flips to "pending".
+        for attr, value in new_palette.items():
+            setattr(self.config, attr, value)
+        # Refresh the color picker swatches so the user sees the
+        # preset land visually (without applying the theme yet).
+        picker_attrs = (
+            ("primary_picker", "primary_color"),
+            ("accent_picker", "accent_color"),
+            ("surface_picker", "surface_color"),
+            ("text_picker", "text_color"),
+        )
+        for picker_attr, color_attr in picker_attrs:
+            picker = getattr(self, picker_attr, None)
+            if picker is not None and hasattr(picker, "set_color"):
+                try:
+                    picker.set_color(new_palette[color_attr])
+                except Exception:
+                    pass
+        # Flip the button label to reflect the staged state (the
+        # _is_light_mode_active heuristic reads self.config, which
+        # we just updated, so it reports the staged palette).
         if hasattr(self, "light_mode_button"):
             self.light_mode_button.setText(
                 "Dark Mode" if self._is_light_mode_active() else "Light Mode"
             )
+        # Arm the Apply Changes button. Persisting + apply_theme
+        # happen in apply_current_settings when the user clicks it.
+        self._refresh_colors_save_state()
 
     def _rebuild_settings_page_for_theme_change(self) -> None:
         """Tear down the current settings page and build a fresh one
@@ -12578,10 +12598,20 @@ class MainWindow(QMainWindow):
                 check_path=_checkmark_image_path(),
             )
         )
-        self.camera_already_mirrored_checkbox.setChecked(
-            not bool(getattr(self.config, "camera_source_is_mirrored", False))
+        # Baseline for the deferred-save flow: the saved value of
+        # camera_source_is_mirrored at panel build. Toggling the
+        # checkbox no longer writes config immediately — it only arms
+        # the Save Changes button. _save_live_view_overlay_changes
+        # applies the new value when the user clicks Save.
+        self._camera_mirrored_baseline = bool(
+            getattr(self.config, "camera_source_is_mirrored", False)
         )
-        self.camera_already_mirrored_checkbox.toggled.connect(self._on_camera_already_mirrored_toggled)
+        self.camera_already_mirrored_checkbox.setChecked(
+            not self._camera_mirrored_baseline
+        )
+        self.camera_already_mirrored_checkbox.toggled.connect(
+            lambda _checked: self._refresh_camera_settings_save_state()
+        )
         preview_row.addWidget(self.camera_already_mirrored_checkbox)
         preview_row.addStretch(1)
         box_layout.addLayout(preview_row)
@@ -13164,14 +13194,14 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_camera_already_mirrored_toggled(self, checked: bool) -> None:
-        self.config.camera_source_is_mirrored = not bool(checked)
-        save_config(self.config)
-        if hasattr(self, "last_action_label"):
-            self.last_action_label.setText(
-                "Last action: camera flip on" if checked else "Last action: camera flip off"
-            )
-        # Takes effect on the very next frame the engine reads — no camera
-        # restart needed, since the flip decision is re-evaluated every tick.
+        # Deferred-save: kept as a thin compatibility shim. The
+        # checkbox's `toggled` signal is now wired directly to
+        # `_refresh_camera_settings_save_state` (see panel build),
+        # so this method is no longer called for the user click.
+        # Left in place because external code paths still reference
+        # the symbol via getattr-style lookups; route to the same
+        # save-state refresh just in case.
+        self._refresh_camera_settings_save_state()
 
     def _on_phone_camera_toggled(self, checked: bool) -> None:
         self.config.phone_camera_enabled = bool(checked)
@@ -14672,7 +14702,16 @@ class MainWindow(QMainWindow):
             path_edit.setMinimumHeight(40)
             path_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             path_edit.setStyleSheet(save_location_input_style)
-            path_edit.returnPressed.connect(lambda kind=output_kind, editor=path_edit: self._apply_save_location(kind, editor))
+            # Enter inside the path editor used to call _apply_save_location
+            # directly, bypassing the Save Changes button. Route Enter
+            # through Save Changes instead for cross-panel consistency
+            # (every settings edit requires a Save Changes click).
+            path_edit.returnPressed.connect(
+                lambda: self.save_locations_button.click()
+                if getattr(self, "save_locations_button", None) is not None
+                and self.save_locations_button.isEnabled()
+                else None
+            )
             # Edits to a save-location path mark Save Changes pending
             # so the user knows to click it for the change to land.
             # Without this signal the user could re-type a path and
@@ -14733,7 +14772,19 @@ class MainWindow(QMainWindow):
             name_edit.setMinimumHeight(40)
             name_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             name_edit.setStyleSheet(save_location_input_style)
-            name_edit.returnPressed.connect(lambda kind=output_kind, editor=name_edit: self._apply_save_name(kind, editor))
+            # Enter inside the name editor used to call _apply_save_name
+            # directly, which bypassed the Save Changes button and
+            # persisted the new name silently. That broke the cross-
+            # panel rule that EVERY edit must arm Save Changes and the
+            # user must click it to commit. Route Enter through the
+            # Save Changes button instead so the existing
+            # _save_all_save_location_settings flow runs.
+            name_edit.returnPressed.connect(
+                lambda: self.save_locations_button.click()
+                if getattr(self, "save_locations_button", None) is not None
+                and self.save_locations_button.isEnabled()
+                else None
+            )
             # Same dirty-tracking signal as the path field above.
             name_edit.textChanged.connect(self._refresh_save_locations_save_state)
             self._save_name_inputs[output_kind] = name_edit
@@ -17150,6 +17201,15 @@ Admin elevation
                     checkbox.blockSignals(True)
                     checkbox.setChecked(desired)
                     checkbox.blockSignals(False)
+        # Mirroring checkbox revert — same pattern as overlays.
+        mirrored_cb = getattr(self, "camera_already_mirrored_checkbox", None)
+        if mirrored_cb is not None and hasattr(self, "_camera_mirrored_baseline"):
+            # checkbox shows "not mirrored" — invert when restoring.
+            desired = not bool(self._camera_mirrored_baseline)
+            if bool(mirrored_cb.isChecked()) != desired:
+                mirrored_cb.blockSignals(True)
+                mirrored_cb.setChecked(desired)
+                mirrored_cb.blockSignals(False)
         try:
             self._set_settings_save_button_pending(button, False)
         except Exception:
@@ -17284,6 +17344,14 @@ Admin elevation
                     picker.set_color(saved)
                 except Exception:
                     pass
+        # Resync the Light/Dark button label to the restored config.
+        if hasattr(self, "light_mode_button"):
+            try:
+                self.light_mode_button.setText(
+                    "Dark Mode" if self._is_light_mode_active() else "Light Mode"
+                )
+            except Exception:
+                pass
         button = getattr(self, "_colors_apply_button", None)
         if button is not None:
             try:
@@ -18528,6 +18596,15 @@ Admin elevation
                 if bool(checkbox.isChecked()) != bool(baseline.get(key, False)):
                     pending = True
                     break
+        # Mirroring checkbox uses deferred-save too — see
+        # _camera_mirrored_baseline at panel build. The checkbox is
+        # "checked = NOT mirrored" so the comparison inverts.
+        if not pending:
+            mirrored_cb = getattr(self, "camera_already_mirrored_checkbox", None)
+            if mirrored_cb is not None and hasattr(self, "_camera_mirrored_baseline"):
+                want_mirrored = not bool(mirrored_cb.isChecked())
+                if want_mirrored != bool(self._camera_mirrored_baseline):
+                    pending = True
         self._set_settings_save_button_pending(button, pending)
 
     def _on_camera_settings_selection_changed(self, _index: int) -> None:
@@ -19063,7 +19140,8 @@ Admin elevation
     def _save_live_view_overlay_changes(self) -> bool:
         """Apply the three Live View Overlay checkboxes to config,
         persist, and re-broadcast the new visibility state to any
-        open live-view / mini-view windows. Returns True if any
+        open live-view / mini-view windows. Also commits the
+        mirroring checkbox (deferred-save). Returns True if any
         value actually changed."""
         baseline = getattr(self, "_live_view_overlay_baseline", None)
         if baseline is None:
@@ -19082,6 +19160,16 @@ Admin elevation
                 changed = True
             setattr(self.config, key, new_value)
             baseline[key] = new_value
+        # Apply the deferred mirroring checkbox too. The user-facing
+        # checkbox reads "Check this box to flip the camera view, if
+        # not mirroring" — meaning checked = NOT mirrored, so invert.
+        mirrored_cb = getattr(self, "camera_already_mirrored_checkbox", None)
+        if mirrored_cb is not None and hasattr(self, "_camera_mirrored_baseline"):
+            want_mirrored = not bool(mirrored_cb.isChecked())
+            if want_mirrored != bool(self._camera_mirrored_baseline):
+                changed = True
+            self.config.camera_source_is_mirrored = want_mirrored
+            self._camera_mirrored_baseline = want_mirrored
         if changed:
             # Persist off the UI thread so the click handler returns
             # instantly (config in-memory is already up to date).
