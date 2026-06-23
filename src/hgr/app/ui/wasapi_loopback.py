@@ -723,6 +723,18 @@ class WasapiLoopbackWriter:
         # nominal rate — ffmpeg starved, no segments completed,
         # the clip had no audio at all (the user-reported "no
         # audio from anything" symptom).
+        # REVERTED 3.0 → 0.5 s. The 3.0 s value caused a clip-export
+        # sync regression: with 3 s of skip-write tolerance, the
+        # AAC segment file accumulated FEWER samples than its
+        # wall-clock span (the bridge was silent for up to 3 s
+        # during quiet music passages). The export's safety-net
+        # trim then saw "audio shorter than video", trimmed video,
+        # and the resulting clip had audio CONTENT shifted by the
+        # missing-bytes amount — perceptible as a 2-3 s delay
+        # of sys vs video. The 0.5 s value (which v1.1.4 and the
+        # entire pre-2026-06-23 clip-V2 era used) keeps every
+        # wall-clock moment covered by either a real or silence
+        # sample, so audio and video PTS align bit-for-bit.
         long_stall_threshold = 0.5
         tick_seconds = 1024.0 / max(1.0, float(self.rate))
         last_real_at = _time.time()

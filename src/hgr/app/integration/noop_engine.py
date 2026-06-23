@@ -8606,9 +8606,17 @@ class GestureWorker(QObject):
             duration_s = 60
         # Stash end_ts so main_window's dispatch can pin the clip
         # to the moment the gesture confirmed (= NOW). Mirrors the
-        # voice "clip that" path at noop_engine.py:9336.
+        # voice "clip that" path at noop_engine.py:9474, which
+        # stores result.speech_end_ts — a WALL-CLOCK timestamp
+        # (time.time()). The caller's `now` is time.monotonic()
+        # (seconds since boot), not wall-clock. Storing monotonic
+        # here was the v1.1.4 fist-clip bug: main_window's export
+        # computed `tail_to_drop = now_wall - end_ts` and got
+        # ~56 YEARS, clamping trim_duration to 0 → single-frame
+        # output. Always use time.time() for cross-clock anchors.
         try:
-            self._pending_clip_voice_end_ts = float(now)
+            import time as _cg_time
+            self._pending_clip_voice_end_ts = float(_cg_time.time())
         except Exception:
             self._pending_clip_voice_end_ts = None
         # Toast + diag log so the user knows the gesture registered

@@ -347,7 +347,18 @@ class VoiceCommandListener:
         input_gain: float = 1.0,
         input_gain_auto: bool = True,
     ) -> None:
-        self._available = platform.system() == "Windows"
+        if platform.system() == "Windows":
+            self._available = True
+        else:
+            # macOS / Linux: the listener runs on the portable stack —
+            # sounddevice (CoreAudio/ALSA) capture + faster-whisper transcription.
+            # The Windows-only whisper.cpp .exe batch path simply isn't used here
+            # (_transcribe_file falls back to faster-whisper). Gate on
+            # faster-whisper being importable so we degrade cleanly if absent
+            # rather than instantly returning "command not understood".
+            import importlib.util
+
+            self._available = importlib.util.find_spec("faster_whisper") is not None
         self._message = "voice idle"
         # Wall-clock time.time() captured at VAD end-of-speech for the
         # most-recent listen() call. Used downstream to anchor time-
@@ -847,6 +858,20 @@ class VoiceCommandListener:
         voice_started = False
         voice_blocks = 0
         silence_blocks = 0
+        # Count of consecutive blocks where rms was BELOW trigger_threshold
+        # AFTER voice_started. This is the "time since last loud peak"
+        # counter — silence_blocks++ ONLY accumulates after this counter
+        # exceeds SILENCE_GRACE_BLOCKS, so natural inter-word gaps (which
+        # are below silence_threshold for quiet mics) don't get
+        # mis-counted as end-of-utterance silence. A quiet mic where
+        # speech RMS is ~0.005-0.008 produces sub-trigger blocks during
+        # every consonant + inter-word gap; this counter prevents those
+        # from accumulating to 75 (3 s) and ending VAD mid-phrase.
+        blocks_since_trigger_peak = 0
+        # 1 second of grace — enough that natural inter-word gaps don't
+        # accumulate silence, but quick enough that real end-of-speech
+        # (3 s of nothing) still fires at speech_end + 4 s total.
+        SILENCE_GRACE_BLOCKS = max(1, int(1.0 / self._block_duration))
         ambient_levels: list[float] = []
         chunks: list[np.ndarray] = []
         # Preroll: how much pre-trigger audio to prepend when VAD
@@ -1115,20 +1140,18 @@ class VoiceCommandListener:
                 # 1.8x with an absolute 0.006 floor leaves a comfortable
                 # gap below the 2.0x trigger so a returning whisper of
                 # the same level doesn't accidentally re-activate VAD.
-                # Raised from (1.8x, 0.006) to (3.0x, 0.012). Real
-                # ambient (breath into the mic, mouse clicks, the
-                # very-quiet room hum a Kiyo Pro picks up) sits in
-                # the 0.005-0.010 band; the earlier 0.006 floor put
-                # the silence threshold INTO that ambient band, so
-                # every ambient blip looked like speech to VAD and
-                # the end-of-speech counter never accumulated to
-                # the 75 blocks (3s) needed to fire end-of-utterance.
-                # The user observed this as "8 seconds of listening
-                # after I finished speaking". 0.012 sits above the
-                # ambient ceiling but well below typical speech RMS
-                # (0.04-0.08), so VAD-end fires within ~3-4s of the
-                # last actual word.
-                silence_threshold = max(noise_floor * 3.0, _s_floor, 0.012)
+                # Dropped multiplier 3.0 → 2.0 and the absolute floor
+                # 0.006 → 0.0035. With the quieter mic the user is now
+                # running, the 0.006 floor put 'last five minutes'-class
+                # trailing-soft-speech BELOW the silence bar, so VAD
+                # treated 'clip last five minutes' as 'clip <silence>'
+                # and Whisper only ever heard 'Clip'.
+                # The lower bar (~0.0035-0.005 for typical Kiyo Pro
+                # noise floors) sits above ambient but BELOW even
+                # whispered-trailing-syllable RMS, so quiet continued
+                # speech keeps the silence counter at 0. The hysteresis
+                # below absorbs single-block ambient blips.
+                silence_threshold = max(noise_floor * 2.0, _s_floor, 0.0035)
                 final_noise_floor = noise_floor
                 final_trigger_threshold = trigger_threshold
                 if rms > max_rms_seen:
@@ -1137,18 +1160,46 @@ class VoiceCommandListener:
                 if voice_started:
                     chunks.append(mono.copy())
                     voice_blocks += 1
-                    # Simple binary silence counter (no hysteresis).
-                    # The earlier "decrement by 3 on borderline noise"
-                    # branch caused the user's 8-second hang because
-                    # sustained ambient at 0.006-0.015 kept eating
-                    # into the silence counter. With silence_threshold
-                    # raised to 0.012 above, ambient now sits below it
-                    # and binary accumulation works correctly — VAD-end
-                    # fires within 3s of the last actual word.
-                    if rms <= silence_threshold:
-                        silence_blocks += 1
-                    else:
+                    # SILENCE COUNTING WITH LOUD-PEAK GRACE.
+                    #
+                    # Problem this solves: the user's mic captures
+                    # speech at ~0.005-0.008 peak RMS today. With
+                    # silence_threshold tuned anywhere realistic
+                    # (~0.005), the *quiet* portions of a phrase
+                    # (consonants, inter-word gaps, trailing
+                    # syllables) all fall BELOW the silence bar, so
+                    # the old "silence_blocks++ whenever rms <
+                    # threshold" logic accumulated 75 blocks (3 s)
+                    # within seconds — VAD fired end-of-utterance
+                    # in the middle of "open youtube on google
+                    # chrome", capturing only "Open".
+                    #
+                    # New logic: silence_blocks ONLY accumulates
+                    # AFTER we've seen no trigger-crossing peak for
+                    # SILENCE_GRACE_BLOCKS (1 s). Any rms above
+                    # trigger_threshold resets the grace counter
+                    # AND zeroes silence_blocks. Quiet inter-word
+                    # gaps don't accumulate — they're protected by
+                    # the grace window. Real "user stopped" only
+                    # fires after 1 s grace + 3 s genuine silence
+                    # = 4 s total end-of-speech latency, which
+                    # matches the user's "3 s pause tolerance"
+                    # rule once we account for the grace.
+                    if rms > trigger_threshold:
+                        blocks_since_trigger_peak = 0
                         silence_blocks = 0
+                    else:
+                        blocks_since_trigger_peak += 1
+                        if blocks_since_trigger_peak > SILENCE_GRACE_BLOCKS:
+                            if rms <= silence_threshold:
+                                silence_blocks += 1
+                            elif rms <= silence_threshold * 2.0:
+                                silence_blocks = max(0, silence_blocks - 1)
+                            else:
+                                silence_blocks = 0
+                        # else: still in grace window, freeze the
+                        # silence counter wherever it is (don't add,
+                        # don't subtract).
                     active_seconds = voice_blocks * self._block_duration
                     required_silence = self._adaptive_end_silence_seconds(active_seconds, transcript_mode=transcript_mode)
                     # Local sounddevice mic: tighter end-silence

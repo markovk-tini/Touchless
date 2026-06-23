@@ -9288,6 +9288,23 @@ class MainWindow(QMainWindow):
         values (e.g., applying the new mini-viewer visibility)."""
         if not self._general_pending:
             return
+        # Snapshot the settings scroll position BEFORE any save side-
+        # effects run. _apply_general_runtime_changes downstream
+        # rebuilds parts of the panel (clip-cache restart triggers
+        # _restart_clip_cache_if_running -> control resync ->
+        # layout invalidation) which can yank QScrollArea back to
+        # the top, shoving the user's view off whatever they were
+        # editing. Restore the position on the next event-loop pass
+        # so the layout has settled before we set scrollbar value.
+        _scroll_before_save = 0
+        try:
+            scroll_area = getattr(self, "_settings_content_scroll", None)
+            if scroll_area is not None:
+                vbar = scroll_area.verticalScrollBar()
+                if vbar is not None:
+                    _scroll_before_save = int(vbar.value())
+        except Exception:
+            pass
         previous = {key: getattr(self.config, key, None) for key in self._general_pending.keys()}
         for key, value in self._general_pending.items():
             try:
@@ -9309,6 +9326,25 @@ class MainWindow(QMainWindow):
         # Side-effects: apply runtime consequences of the toggles
         # (mini viewer visibility, popup gating recomputation, etc.).
         self._apply_general_runtime_changes(applied_keys, previous)
+        # Restore the scroll position the user had when they clicked
+        # Save. The runtime-changes path above may rebuild controls
+        # and inadvertently reset the QScrollArea — without this
+        # the user gets yanked to the top of Settings every save.
+        # QTimer.singleShot(0, ...) defers until the layout has
+        # processed the rebuild so the setValue actually sticks.
+        try:
+            scroll_area = getattr(self, "_settings_content_scroll", None)
+            if scroll_area is not None:
+                def _restore_scroll():
+                    try:
+                        vbar = scroll_area.verticalScrollBar()
+                        if vbar is not None:
+                            vbar.setValue(_scroll_before_save)
+                    except Exception:
+                        pass
+                QTimer.singleShot(0, _restore_scroll)
+        except Exception:
+            pass
 
     def _apply_general_runtime_changes(
         self, applied_keys: list[str], previous: dict[str, object]
@@ -14357,16 +14393,10 @@ class MainWindow(QMainWindow):
         # the whole point of the "test mic" slider. The listener's
         # set_input_gain also flips its in-memory auto flag off so
         # the runtime doesn't fight the manual tuning during the
-        # session.
-        #
-        # Config persistence is DEFERRED to Save Changes. This
-        # handler intentionally does NOT write self.config.mic_input_gain
-        # or call save_config — those happen in
-        # save_microphone_preference_from_settings when the user
-        # clicks the Save Changes button at the top-right of the
-        # Microphone panel. Same deferred-save model as every
-        # other settings control: drag → button lights up
-        # primary-blue → click to keep.
+        # session. Config persistence is DEFERRED to the Save
+        # Changes button click (see save_microphone_preference_from_settings)
+        # so this slider behaves consistently with every other
+        # settings control: drag → button arms → click to keep.
         worker = getattr(self, "_worker", None)
         listener = getattr(worker, "voice_listener", None) if worker is not None else None
         if listener is not None:
@@ -14388,9 +14418,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         # Arm the Save Changes button. _microphone_settings_gain_matches_saved
-        # compares the slider value to the SAVED config.mic_input_gain;
-        # since we no longer write the slider value into config here,
-        # the comparison sees a mismatch and the button lights up.
+        # compares the slider value to config.mic_input_gain, so as
+        # long as the drag value differs from the saved gain, the
+        # button lights up primary-blue. Clicking Save then writes
+        # config.mic_input_gain + config.mic_input_gain_auto in
+        # save_microphone_preference_from_settings.
         self._refresh_microphone_settings_save_state()
 
     def _selected_mic_test_device(self):
@@ -19524,7 +19556,7 @@ Admin elevation
             # so the chosen value survives a worker restart and isn't
             # overridden by mic auto-classification on the next mic
             # swap. Matches the runtime auto-flag flip that
-            # set_input_gain does on the live listener during drag.
+            # set_input_gain does on the live listener.
             try:
                 if getattr(self.config, "mic_input_gain_auto", True):
                     self.config.mic_input_gain_auto = False
@@ -24191,7 +24223,7 @@ Admin elevation
                     f"[{sys_idx}:a]anull[asys];"
                     f"[{mic_idx}:a]{ns},afftdn=nr=10[amic];"
                     "[asys][amic]amix=inputs=2:duration=longest:"
-                    "dropout_transition=0:weights=2 3[aout]"
+                    "dropout_transition=0:weights=1 1:normalize=0[aout]"
                 ),
             ],
             ["-map", "0:v", "-map", "[aout]"],
@@ -24621,15 +24653,21 @@ Admin elevation
             if mic_atempo_pm != 0:
                 atempo_factor = 1.0 + (mic_atempo_pm / 1000.0)
                 atempo_clause = f",atempo={atempo_factor:.4f}"
+            # +18 dB mic boost on the legacy (V1) cache filter so
+            # cache builds that pre-date V2 also benefit from the
+            # quiet-consumer-mic compensation. Volume filter is
+            # timing-neutral.
             if mic_latency_ms > 0:
                 mic_chain = (
                     f"[{mic_idx}:a]{ns},{denoise}{atempo_clause},"
+                    f"volume=18dB,"
                     f"atrim=start={mic_latency_s:.3f},"
                     f"asetpts=PTS-STARTPTS[amic]"
                 )
             else:
                 mic_chain = (
-                    f"[{mic_idx}:a]{ns},{denoise}{atempo_clause}[amic]"
+                    f"[{mic_idx}:a]{ns},{denoise}{atempo_clause},"
+                    f"volume=18dB[amic]"
                 )
             # Sys-only delay. The TCP-accept-floor (max(1.0,
             # tcp_elapsed)) used to align the mic bridge leaves sys
@@ -24659,7 +24697,7 @@ Admin elevation
                     f"{sys_chain};"
                     f"{mic_chain};"
                     "[asys][amic]amix=inputs=2:duration=longest:"
-                    "dropout_transition=0:weights=2 3[aout]"
+                    "dropout_transition=0:weights=1 1:normalize=0[aout]"
                 ),
                 "-map", "[aout]",
             ]
@@ -27134,9 +27172,20 @@ Admin elevation
                         mic_atempo_clause = ""
                         if abs(mic_rate - 1.0) > 0.005:
                             mic_atempo_clause = f"atempo={mic_rate:.5f},"
+                        # +18 dB volume boost on the mic chain. User
+                        # reported the mic was audibly too quiet in
+                        # clips even after a healthy capture, because
+                        # consumer mic levels (Kiyo Pro, headset)
+                        # come out 10-15 dB below speaker output and
+                        # the amix weights alone don't close that
+                        # gap. 18 dB ≈ 7.943× linear — noticeable but
+                        # well below the headroom for normal speech
+                        # so clipping risk is low. Volume filter
+                        # only changes amplitude; timing is untouched.
                         v2_parts.append(
                             f"{mic_inputs_str}concat=n={v2_nm}:v=0:a=1,"
                             f"{mic_atempo_clause}"
+                            f"volume=18dB,"
                             f"atrim=start={mic_atrim_start:.3f}:"
                             f"duration={mic_atrim_dur:.3f},"
                             f"asetpts=PTS-STARTPTS,"
@@ -27147,7 +27196,7 @@ Admin elevation
                         v2_parts.append(
                             f"[{v2_sys_label}][{v2_mic_label}]"
                             f"amix=inputs=2:duration=longest:"
-                            f"dropout_transition=0:weights=2 3[aout]"
+                            f"dropout_transition=0:weights=1 1:normalize=0[aout]"
                         )
                     elif v2_sys_label:
                         v2_parts.append(f"[{v2_sys_label}]anull[aout]")
@@ -27472,9 +27521,14 @@ Admin elevation
                     mic_atempo_f = ""
                     if abs(mic_rate - 1.0) > 0.005:
                         mic_atempo_f = f"atempo={mic_rate:.5f},"
+                    # +18 dB mic boost — matches the primary V2 path
+                    # above. Quiet consumer mics sit ~10-15 dB below
+                    # speaker output; this closes some of that gap
+                    # without timing impact.
                     v2_parts_final.append(
                         f"{mic_inputs_str_f}concat=n={v2_nm}:v=0:a=1,"
                         f"{mic_atempo_f}"
+                        f"volume=18dB,"
                         f"atrim=start={mic_atrim_start_f:.3f}:"
                         f"duration={mic_atrim_dur_f:.3f},"
                         f"asetpts=PTS-STARTPTS,"
@@ -27485,7 +27539,7 @@ Admin elevation
                     v2_parts_final.append(
                         f"[{v2_sys_label_final}][{v2_mic_label_final}]"
                         f"amix=inputs=2:duration=longest:"
-                        f"dropout_transition=0:weights=2 3[aout]"
+                        f"dropout_transition=0:weights=1 1:normalize=0[aout]"
                     )
                 elif v2_sys_label_final:
                     v2_parts_final.append(f"[{v2_sys_label_final}]anull[aout]")
