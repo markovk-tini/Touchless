@@ -9258,6 +9258,31 @@ class MainWindow(QMainWindow):
         game detector if gaming-mode changed, sync any duplicated
         controls in other panels (Camera, Save Locations) so they
         don't show stale values, etc."""
+        # CLIP PRESETS — Audio toggles & noise reduction. Any change
+        # requires a clip-cache restart so the running ffmpeg
+        # subprocesses pick up the new audio capture flags / filter
+        # chain. _restart_clip_cache_if_running is a no-op when no
+        # cache is running, so it's always safe to call.
+        if any(k in applied_keys for k in (
+            "clip_capture_system_audio",
+            "clip_capture_microphone",
+            "clip_mic_noise_reduction",
+        )):
+            try:
+                self._restart_clip_cache_if_running()
+            except Exception:
+                pass
+            try:
+                cache_running = (
+                    self._clip_cache_process is not None
+                    and self._clip_cache_process.poll() is None
+                )
+                self._append_home_debug_log(
+                    f"[clip-audio] settings applied (cache restart "
+                    f"{'fired' if cache_running else 'deferred — will pick up new values on next worker start'})"
+                )
+            except Exception:
+                pass
         if "overlay_camera_view_enabled" in applied_keys or "overlay_gaming_live_view_disabled" in applied_keys:
             try:
                 self._reapply_mini_viewer_visibility()
@@ -9488,8 +9513,11 @@ class MainWindow(QMainWindow):
                 "Heads-up: system-audio records EVERYTHING playing on "
                 "your speakers including Discord / Zoom voices — get "
                 "participant consent before sharing.\n\n"
-                "Audio toggle changes restart the clip cache so they "
-                "take effect immediately."
+                "Any change here arms the Save Changes button at the "
+                "top-right of this panel. Click it to apply — the "
+                "clip cache restarts automatically so the new audio "
+                "capture flags take effect on the running app without "
+                "needing a relaunch."
             ),
         )
         text_color = str(self.config.text_color or "#E5F6FF")
@@ -9602,28 +9630,11 @@ class MainWindow(QMainWindow):
         self._register_general_baseline("clip_capture_system_audio", sys_current)
 
         def _on_sys_toggled(state: int) -> None:
-            new_value = bool(state)
-            saved_ok = False
-            try:
-                self.config.clip_capture_system_audio = new_value
-                save_config(self.config)
-                saved_ok = True
-            except Exception:
-                pass
-            self._register_general_baseline("clip_capture_system_audio", new_value)
-            cache_was_running = (
-                self._clip_cache_process is not None
-                and self._clip_cache_process.poll() is None
-            )
-            self._restart_clip_cache_if_running()
-            try:
-                self._append_home_debug_log(
-                    f"[clip-audio] system audio = {new_value} "
-                    f"(saved={saved_ok}, cache restart="
-                    f"{'fired' if cache_was_running else 'deferred — will pick up new value on next worker start'})"
-                )
-            except Exception:
-                pass
+            # DEFERRED-SAVE: route through _on_general_control_changed
+            # so the floating Save Changes button lights up. Save +
+            # cache restart happens when the user clicks the button
+            # (handled in _apply_general_runtime_changes).
+            self._on_general_control_changed("clip_capture_system_audio", bool(state))
 
         sys_checkbox.stateChanged.connect(_on_sys_toggled)
         sys_row.addWidget(sys_checkbox)
@@ -9674,28 +9685,8 @@ class MainWindow(QMainWindow):
         self._register_general_baseline("clip_capture_microphone", mic_current)
 
         def _on_mic_toggled(state: int) -> None:
-            new_value = bool(state)
-            saved_ok = False
-            try:
-                self.config.clip_capture_microphone = new_value
-                save_config(self.config)
-                saved_ok = True
-            except Exception:
-                pass
-            self._register_general_baseline("clip_capture_microphone", new_value)
-            cache_was_running = (
-                self._clip_cache_process is not None
-                and self._clip_cache_process.poll() is None
-            )
-            self._restart_clip_cache_if_running()
-            try:
-                self._append_home_debug_log(
-                    f"[clip-audio] microphone = {new_value} "
-                    f"(saved={saved_ok}, cache restart="
-                    f"{'fired' if cache_was_running else 'deferred — will pick up new value on next worker start'})"
-                )
-            except Exception:
-                pass
+            # DEFERRED-SAVE: see _on_sys_toggled above.
+            self._on_general_control_changed("clip_capture_microphone", bool(state))
 
         mic_checkbox.stateChanged.connect(_on_mic_toggled)
         mic_row.addWidget(mic_checkbox)
@@ -9735,13 +9726,10 @@ class MainWindow(QMainWindow):
 
         def _on_ns_changed(idx: int) -> None:
             new_value = ns_combo.itemData(idx) or "light"
-            try:
-                self.config.clip_mic_noise_reduction = str(new_value)
-                save_config(self.config)
-            except Exception:
-                pass
-            self._register_general_baseline("clip_mic_noise_reduction", new_value)
-            self._restart_clip_cache_if_running()
+            # DEFERRED-SAVE: see _on_sys_toggled above.
+            self._on_general_control_changed(
+                "clip_mic_noise_reduction", str(new_value)
+            )
 
         ns_combo.currentIndexChanged.connect(_on_ns_changed)
         ns_row.addWidget(ns_combo)
