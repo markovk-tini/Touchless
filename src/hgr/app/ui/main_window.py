@@ -7302,6 +7302,29 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # Same floating-button treatment for the Save Locations panel
+        # so its Save Changes affordance is visible no matter how far
+        # the user has scrolled. Mirrors the General-panel pattern
+        # above: re-parent to the viewport, hide by default, show via
+        # currentChanged when the user lands on the Save Locations
+        # tab. The shared eventFilter on the viewport drives
+        # repositioning on resize.
+        try:
+            vp_btn_sl = content_scroll.viewport()
+            sl_btn = getattr(self, "save_locations_button", None)
+            if sl_btn is not None:
+                sl_btn.setParent(vp_btn_sl)
+                sl_btn.setVisible(False)
+                self.settings_content_stack.currentChanged.connect(
+                    self._update_save_locations_floating_visibility
+                )
+                self._update_save_locations_floating_visibility(
+                    self.settings_content_stack.currentIndex()
+                )
+                self._position_save_locations_floating_button()
+        except Exception:
+            pass
+
         # Walk-through pill + Next button — both are FLOATING overlay
         # children of the settings page. Anchored to the top-right of
         # whichever panel is active so the pill sits between the panel
@@ -9220,6 +9243,43 @@ class MainWindow(QMainWindow):
         button.setVisible(on_general)
         if on_general:
             self._position_general_save_floating_button()
+            button.raise_()
+
+    def _position_save_locations_floating_button(self) -> None:
+        """Anchor the sticky Save Locations Save Changes button to the
+        top-right of the settings content viewport. Mirrors
+        _position_general_save_floating_button — see that doc for the
+        rationale."""
+        button = getattr(self, "save_locations_button", None)
+        if button is None:
+            return
+        vp = button.parentWidget()
+        if vp is None:
+            return
+        hint = button.sizeHint()
+        btn_w = max(140, hint.width())
+        btn_h = max(36, hint.height())
+        button.resize(btn_w, btn_h)
+        pad_right = 28
+        pad_top = 18
+        x = max(0, vp.width() - btn_w - pad_right)
+        y = pad_top
+        button.move(x, y)
+        button.raise_()
+
+    def _update_save_locations_floating_visibility(self, index: int) -> None:
+        """Show the sticky Save Locations Save Changes button ONLY
+        when the active settings panel is Save Locations."""
+        button = getattr(self, "save_locations_button", None)
+        if button is None:
+            return
+        try:
+            on_save_locations = (int(index) == SECTION_SAVE_LOCATIONS)
+        except Exception:
+            on_save_locations = False
+        button.setVisible(on_save_locations)
+        if on_save_locations:
+            self._position_save_locations_floating_button()
             button.raise_()
 
     def _save_general_changes(self) -> None:
@@ -30153,6 +30213,13 @@ Admin elevation
                     self._position_general_save_floating_button()
                 except Exception:
                     pass
+                # Save Locations floating button uses the same
+                # viewport as General — re-anchor it on the same
+                # resize/show event so it stays glued to top-right.
+                try:
+                    self._position_save_locations_floating_button()
+                except Exception:
+                    pass
         # Walk-through overlay: re-anchor the pill + Next button
         # whenever the page or content stack resizes / moves so the
         # overlay stays parked over the active panel's top-right.
@@ -31740,6 +31807,13 @@ def _stop_screen_recording(self) -> bool:
             if scroll is not None and obj is scroll.viewport():
                 try:
                     self._position_general_save_floating_button()
+                except Exception:
+                    pass
+                # Save Locations floating button uses the same
+                # viewport as General — re-anchor it on the same
+                # resize/show event so it stays glued to top-right.
+                try:
+                    self._position_save_locations_floating_button()
                 except Exception:
                     pass
         # Walk-through overlay: re-anchor the pill + Next button
