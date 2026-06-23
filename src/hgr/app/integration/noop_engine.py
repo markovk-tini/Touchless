@@ -2035,16 +2035,20 @@ class GestureWorker(QObject):
         moves within a forearm-sized patch. Square in normalized coords
         keeps motion undistorted on a 16:9 frame/canvas.
         """
-        # Default enlarged 0.45 -> 0.72: a small patch mapped to the whole
-        # canvas meant high gain, so the cursor flew (0.45=~2.2x, 0.60=~1.7x
-        # still felt too fast). 0.72 (~1.4x gain) makes the cursor noticeably
-        # slower/steadier; the tradeoff is a bit more hand travel to reach the
-        # canvas edges. Not user-configurable today, so this default is the
-        # effective value (a Settings slider can expose it if finer tuning helps).
-        size = float(getattr(self.config, "drawing_control_box_size", 0.72))
+        # Default enlarged 0.45 -> 0.72 -> 0.90: a small patch mapped to
+        # the whole canvas meant high gain (0.45=~2.2x, 0.60=~1.7x,
+        # 0.72=~1.4x all still felt disconnected from the monitor —
+        # small hand motion = big cursor jump). 0.90 (~1.11x) maps
+        # the camera frame ~1:1 to the monitor with a 10% edge buffer
+        # so the hand stays in frame at the corners; centered to match
+        # the user's natural reach across the full monitor width.
+        # Effective when the user is on the new defaults; explicit
+        # tunings are preserved by the settings.json migration in
+        # app_config (see `drawing_control_box_size` migration block).
+        size = float(getattr(self.config, "drawing_control_box_size", 0.90))
         size = max(0.15, min(1.0, size))
-        cx = float(getattr(self.config, "drawing_control_box_center_x", 0.82))
-        cy = float(getattr(self.config, "drawing_control_box_center_y", 0.55))
+        cx = float(getattr(self.config, "drawing_control_box_center_x", 0.50))
+        cy = float(getattr(self.config, "drawing_control_box_center_y", 0.50))
         half = size * 0.5
         min_x = min(max(cx - half, 0.0), 1.0 - size)
         min_y = min(max(cy - half, 0.0), 1.0 - size)
@@ -7054,6 +7058,18 @@ class GestureWorker(QObject):
                 self.command_detected.emit(snapshot.control_text)
                 self._record_action(snapshot.last_action, snapshot.control_text)
 
+    def _any_gesture_wheel_visible(self) -> bool:
+        """True when any radial gesture-wheel UI is up. Used to gate
+        the OS cursor so that the user's directional hand motion
+        (selecting a wedge) doesn't also drag the desktop cursor."""
+        return bool(
+            getattr(self, "_chrome_wheel_visible", False)
+            or getattr(self, "_spotify_wheel_visible", False)
+            or getattr(self, "_youtube_wheel_visible", False)
+            or getattr(self, "_drawing_wheel_visible", False)
+            or getattr(self, "_utility_wheel_visible", False)
+        )
+
     def _handle_mouse_control(self, prediction, hand_reading, hand_handedness: str | None, now: float) -> bool:
         # Tutorial isolation: in tutorial mode, only the mouse_mode
         # step is allowed to engage the mouse pipeline at all. On
@@ -7126,8 +7142,22 @@ class GestureWorker(QObject):
             self._tutorial_mode_enabled
             and self._tutorial_step_key == "mouse_mode"
         )
+        # Gesture wheels (chrome / spotify / youtube / drawing /
+        # utility) need the OS cursor to FREEZE while the user is
+        # picking a wedge: the user moves their hand directionally
+        # to select a slice, and without this gate that hand motion
+        # also drags the desktop cursor across the screen, leaving
+        # them on a random app the moment they release the pose.
+        # The wheel overlay already shows a local pointer inside the
+        # ring, so the user has visual feedback without OS cursor
+        # movement. Clicks/scrolls stay gated only by tutorial_demo_only
+        # — the wheel itself owns selection, so a stray pinch/scroll
+        # during wheel pose shouldn't reach the OS either, but the
+        # mouse-tracker's update typically won't produce them anyway
+        # when the active pose is the wheel-pose (not pinch).
+        wheel_locked = self._any_gesture_wheel_visible()
         if not tutorial_demo_only:
-            if update.cursor_position is not None:
+            if update.cursor_position is not None and not wheel_locked:
                 cx, cy = self._cursor_to_active_monitor(*update.cursor_position)
                 self.mouse_controller.move_normalized(cx, cy)
             if update.left_press:

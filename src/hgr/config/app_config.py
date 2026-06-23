@@ -162,9 +162,18 @@ class AppConfig:
     # sweeping the full frame. Square in normalized coords keeps motion
     # undistorted on a 16:9 frame/canvas. Right-shifted to match where
     # the drawing hand naturally rests in the mirrored view.
-    drawing_control_box_center_x: float = 0.82
-    drawing_control_box_center_y: float = 0.55
-    drawing_control_box_size: float = 0.45
+    # Drawing-mode control box now maps ~1:1 with the monitor: the
+    # box covers ~90% of the camera frame and is centered, so the
+    # user's hand position translates almost directly to the cursor
+    # position on the monitor. The remaining 10% acts as an edge
+    # buffer so the hand can still be tracked when the user reaches
+    # the corners of the frame. Was 0.82/0.55/0.45 (a small forearm-
+    # patch with ~2.2x gain) which made the cursor "fly" relative to
+    # hand motion and felt disconnected from the monitor's actual
+    # bounds. See _map_drawing_control_box in noop_engine.py.
+    drawing_control_box_center_x: float = 0.50
+    drawing_control_box_center_y: float = 0.50
+    drawing_control_box_size: float = 0.90
     # Which monitor mouse-mode controls. None = all monitors (the
     # full virtual desktop, the historical default). 0..N-1 = a
     # specific monitor's index in QGuiApplication.screens(). The
@@ -964,6 +973,27 @@ def load_config() -> AppConfig:
         # user specifically requested.
         if abs(float(values.get("mouse_control_box_aspect_power", 0.0)) - 0.40) < 1e-6:
             values["mouse_control_box_aspect_power"] = DEFAULT_CONFIG.mouse_control_box_aspect_power
+        # Drawing control box: old defaults were a small forearm-sized
+        # patch (size=0.45, center_x=0.82) that gave the cursor a ~2.2x
+        # gain — felt disconnected from the monitor since a small
+        # hand motion crossed half the screen. New defaults map ~1:1
+        # with the monitor (size=0.90, centered) with a 10% edge
+        # buffer so the hand stays in frame at the corners. Users
+        # who never opened the drawing tool, or accepted the old
+        # defaults silently, get the new mapping; users who tuned
+        # the box manually (rare — no UI exposes it) keep their value.
+        if abs(float(values.get("drawing_control_box_size", 0.0)) - 0.45) < 1e-6:
+            values["drawing_control_box_size"] = DEFAULT_CONFIG.drawing_control_box_size
+        # Also bump the older 0.72 default that lived in the engine's
+        # getattr fallback (used when settings.json didn't carry the
+        # field at all). Same migration semantics — explicit user
+        # values are preserved.
+        if abs(float(values.get("drawing_control_box_size", 0.0)) - 0.72) < 1e-6:
+            values["drawing_control_box_size"] = DEFAULT_CONFIG.drawing_control_box_size
+        if abs(float(values.get("drawing_control_box_center_x", 0.0)) - 0.82) < 1e-6:
+            values["drawing_control_box_center_x"] = DEFAULT_CONFIG.drawing_control_box_center_x
+        if abs(float(values.get("drawing_control_box_center_y", 0.0)) - 0.55) < 1e-6:
+            values["drawing_control_box_center_y"] = DEFAULT_CONFIG.drawing_control_box_center_y
 
         return AppConfig(**values)
     except Exception:
