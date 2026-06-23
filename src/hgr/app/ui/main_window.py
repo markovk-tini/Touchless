@@ -14293,9 +14293,20 @@ class MainWindow(QMainWindow):
             self.mic_test_gain_value_label.setText(f"{gain:.1f}x")
         # Live-push to the running voice listener(s) so the slider
         # actually changes voice-command recognition as the user
-        # drags — set_input_gain() also flips input_gain_auto → False
-        # so the next mic-change doesn't silently override their
-        # manual tuning.
+        # drags — they can HEAR the new gain instantly, which is
+        # the whole point of the "test mic" slider. The listener's
+        # set_input_gain also flips its in-memory auto flag off so
+        # the runtime doesn't fight the manual tuning during the
+        # session.
+        #
+        # Config persistence is DEFERRED to Save Changes. This
+        # handler intentionally does NOT write self.config.mic_input_gain
+        # or call save_config — those happen in
+        # save_microphone_preference_from_settings when the user
+        # clicks the Save Changes button at the top-right of the
+        # Microphone panel. Same deferred-save model as every
+        # other settings control: drag → button lights up
+        # primary-blue → click to keep.
         worker = getattr(self, "_worker", None)
         listener = getattr(worker, "voice_listener", None) if worker is not None else None
         if listener is not None:
@@ -14310,21 +14321,16 @@ class MainWindow(QMainWindow):
                 tut_listener.set_input_gain(gain)
             except Exception:
                 pass
-        # Persist that the user explicitly touched the slider so the
-        # auto-suggested-gain logic stays out of their way across
-        # restarts. Save lazily — the existing settings-save flow
-        # bundles this with the dropdown change.
-        try:
-            if getattr(self.config, "mic_input_gain_auto", True):
-                self.config.mic_input_gain_auto = False
-        except Exception:
-            pass
         # Update the class badge so the "auto vs manual" note tracks
         # the slider state in real time.
         try:
             self._refresh_microphone_class_badge()
         except Exception:
             pass
+        # Arm the Save Changes button. _microphone_settings_gain_matches_saved
+        # compares the slider value to the SAVED config.mic_input_gain;
+        # since we no longer write the slider value into config here,
+        # the comparison sees a mismatch and the button lights up.
         self._refresh_microphone_settings_save_state()
 
     def _selected_mic_test_device(self):
@@ -19454,6 +19460,16 @@ Admin elevation
         if gain_dirty:
             gain = max(0.1, min(10.0, float(self.mic_test_gain_slider.value()) / 100.0))
             self.config.mic_input_gain = gain
+            # Manual tuning -> flip the auto-suggested-gain logic off
+            # so the chosen value survives a worker restart and isn't
+            # overridden by mic auto-classification on the next mic
+            # swap. Matches the runtime auto-flag flip that
+            # set_input_gain does on the live listener during drag.
+            try:
+                if getattr(self.config, "mic_input_gain_auto", True):
+                    self.config.mic_input_gain_auto = False
+            except Exception:
+                pass
             save_config(self.config)
             if self._worker is not None:
                 try:
