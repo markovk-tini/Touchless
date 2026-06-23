@@ -2102,48 +2102,50 @@ class GestureGuideCard(QFrame):
                 )
         except Exception:
             pass
-        # Width-aware media scaling so the expanded card never overflows
-        # the settings panel horizontally.
+        # Width-aware media scaling AND card-width cap. The card must
+        # NEVER exceed the parent column width — without the cap, the
+        # card's natural sizeHint (image + un-wrapped text label
+        # width) can exceed the viewport on narrow windows, producing
+        # the right-edge-cutoff bug the user reported in the Control
+        # Guide. Applies in BOTH collapsed and expanded states (the
+        # earlier code only capped on expand and explicitly cleared
+        # on collapse — that's the bug).
         media_scale = self._EXPANDED_MEDIA_SCALE if is_expanded else self._COLLAPSED_MEDIA_SCALE
-        if is_expanded:
-            try:
-                # Walk up the parent chain to find a widget with a
-                # known width (panel column). At construction time
-                # parents may be 0; once the user clicks expand the
-                # layout has settled so this returns a real value.
-                available_w = 0
-                walker = self.parentWidget()
-                for _ in range(8):
-                    if walker is None:
-                        break
-                    w = walker.width()
-                    if w > 100:
-                        available_w = w
-                        break
-                    walker = walker.parentWidget()
-                if available_w <= 0:
-                    available_w = self.width() or 800
-                # Cap the card itself so its geometry never exceeds
-                # the available width when expanded. Cleared on
-                # collapse below so the card returns to natural sizing.
-                self.setMaximumWidth(available_w)
+        try:
+            # Walk up the parent chain to find a widget with a known
+            # width (panel column). At construction time parents may
+            # be 0; the resizeEvent override re-applies once the
+            # layout settles so the cap eventually lands correctly
+            # even when first computed pre-layout.
+            available_w = 0
+            walker = self.parentWidget()
+            for _ in range(8):
+                if walker is None:
+                    break
+                w = walker.width()
+                if w > 100:
+                    available_w = w
+                    break
+                walker = walker.parentWidget()
+            if available_w <= 0:
+                # Pre-layout fallback. 600 is a conservative typical
+                # settings-panel width that prevents the very-first
+                # render from overflowing on a default-sized window;
+                # the resizeEvent re-apply corrects this once Qt
+                # finishes the initial layout pass.
+                available_w = self.width() or 600
+            self.setMaximumWidth(available_w)
+            if is_expanded:
+                # Expanded media also respects the chrome budget so
+                # the image doesn't fill the entire row.
                 chrome_budget = 32 + 260
                 media_max_w = max(120, available_w - chrome_budget)
                 native_w = max(1, getattr(self._media, "_native_width", 240))
                 width_limited_scale = media_max_w / native_w
                 media_scale = max(self._COLLAPSED_MEDIA_SCALE,
                                   min(media_scale, width_limited_scale))
-            except Exception:
-                pass
-        else:
-            # Clear any maximumWidth cap left from a prior expanded
-            # state so the collapsed card uses its natural column
-            # width (default Preferred horizontal). 16777215 is Qt's
-            # "no maximum" sentinel.
-            try:
-                self.setMaximumWidth(16777215)
-            except Exception:
-                pass
+        except Exception:
+            pass
         try:
             self._media.set_scale_factor(media_scale)
         except Exception:
@@ -2179,6 +2181,41 @@ class GestureGuideCard(QFrame):
             self.updateGeometry()
         except Exception:
             pass
+
+    def _apply_width_cap(self) -> None:
+        """Light helper: walk parent chain for an available width
+        and update setMaximumWidth. NO font / media / updateGeometry
+        side-effects (those belong in _apply_states). Safe to call
+        from resizeEvent — no resize-loop risk."""
+        try:
+            available_w = 0
+            walker = self.parentWidget()
+            for _ in range(8):
+                if walker is None:
+                    break
+                w = walker.width()
+                if w > 100:
+                    available_w = w
+                    break
+                walker = walker.parentWidget()
+            if available_w <= 0:
+                return
+            # Only update if the cap actually changed — avoids
+            # unnecessary geometry invalidation.
+            if self.maximumWidth() != available_w:
+                self.setMaximumWidth(available_w)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):  # noqa: N802
+        """Re-apply the parent-width cap whenever the card is
+        resized. Without this, the cap computed in _apply_states
+        uses a stale or zero parent width (the parent isn't laid
+        out yet at card-construction time) and the card overflows
+        on narrow windows — exactly the Control Guide right-edge-
+        cutoff bug the user reported."""
+        super().resizeEvent(event)
+        self._apply_width_cap()
 
 
 class VoiceCommandCard(QFrame):
@@ -2222,6 +2259,36 @@ class VoiceCommandCard(QFrame):
             bullet.setObjectName("gestureCardBody")
             bullet.setWordWrap(True)
             layout.addWidget(bullet)
+
+    def _apply_width_cap(self) -> None:
+        """Mirror of GestureGuideCard._apply_width_cap so voice cards
+        don't overflow narrow Control Guide viewports either. Walks
+        the parent chain for an available width and caps maximumWidth.
+        """
+        try:
+            available_w = 0
+            walker = self.parentWidget()
+            for _ in range(8):
+                if walker is None:
+                    break
+                w = walker.width()
+                if w > 100:
+                    available_w = w
+                    break
+                walker = walker.parentWidget()
+            if available_w <= 0:
+                return
+            if self.maximumWidth() != available_w:
+                self.setMaximumWidth(available_w)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):  # noqa: N802
+        """Re-cap on resize so word-wrap labels reflow correctly when
+        the user resizes the settings window narrower than the cards'
+        natural sizeHint."""
+        super().resizeEvent(event)
+        self._apply_width_cap()
 
 
 def _build_voice_command_cards() -> list[VoiceCommandCard]:
@@ -16970,6 +17037,10 @@ Admin elevation
             self._reapply_marked_panel_button_styles()
         except Exception:
             pass
+        try:
+            self._apply_action_history_legend_style()
+        except Exception:
+            pass
         self.title_bar.refresh()
         if self.debugger_window is not None:
             self.debugger_window.apply_theme(self.config)
@@ -18770,11 +18841,7 @@ Admin elevation
         legend = QWidget()
         legend.setObjectName("actionHistoryLegend")
         legend.setAttribute(Qt.WA_StyledBackground, True)
-        legend.setStyleSheet(
-            "QWidget#actionHistoryLegend { background: transparent; }"
-            f" QLabel {{ color: {self.config.text_color}; background: transparent;"
-            "  font-size: 11px; }}"
-        )
+        self._apply_action_history_legend_style(legend)
         row = QHBoxLayout(legend)
         row.setContentsMargins(6, 4, 6, 4)
         row.setSpacing(12)
@@ -18804,6 +18871,27 @@ Admin elevation
             row.addWidget(cell)
         row.addStretch(1)
         return legend
+
+    def _apply_action_history_legend_style(self, legend: "QWidget | None" = None) -> None:
+        """(Re)apply the action-history legend's local stylesheet from the
+        current text color.
+
+        The legend sets its OWN per-widget QLabel color, which the global
+        apply_theme() stylesheet does not override and — on macOS especially —
+        is not repolished when the parent stylesheet changes. Without this the
+        legend text keeps a stale color after a theme change / "revert to
+        original colors" (the legend was the one home-page element that didn't
+        revert to white on macOS). Mirrors the nav-button / Control-Guide
+        force-restyle pattern in apply_theme()."""
+        legend = legend if legend is not None else getattr(self, "action_history_legend", None)
+        if legend is None:
+            return
+        legend.setStyleSheet(
+            "QWidget#actionHistoryLegend { background: transparent; }"
+            f" QLabel {{ color: {self.config.text_color}; background: transparent;"
+            "  font-size: 11px; }}"
+        )
+        self._repolish_widget(legend)
 
     def _prompt_for_camera_choice(self, cameras: list[CameraInfo], prompt_text: str) -> Optional[tuple[int, bool]]:
         dialog = CameraSelectionDialog(self.config, cameras, prompt_text, self)
@@ -26141,6 +26229,16 @@ Admin elevation
             a_window_wall_end = 0.0
             audio_entries_wall: list[dict] = []
             window_fallback_used = False
+            # Initialize V2 architecture flags BEFORE the
+            # had_audio_at_export branch. These get checked again
+            # ~300 lines below at line ~26517 regardless of whether
+            # audio was captured — without initialization here, an
+            # export with no audio (system-audio probe failed +
+            # mic disabled, or both audio toggles off) hits
+            # UnboundLocalError on `v2_active_for_export`.
+            v2_active_for_export = False
+            v2_sys_entries: list[dict] = []
+            v2_mic_entries: list[dict] = []
             v_anchor = float(getattr(self, "_clip_cache_ffmpeg_started_at", 0.0) or 0.0)
             a_anchor = audio_anchor_snapshot
             if had_audio_at_export:
@@ -26172,9 +26270,12 @@ Admin elevation
                 slop = max(0.5, float(self._clip_cache_segment_seconds))
                 a_window_wall_start = requested_start_wall - slop
                 a_window_wall_end = requested_end_wall + slop
-                # V2 ARCHITECTURE DETECTION.
-                v2_sys_entries: list[dict] = []
-                v2_mic_entries: list[dict] = []
+                # V2 ARCHITECTURE DETECTION. Variables are
+                # pre-initialized to safe defaults above (before
+                # the had_audio_at_export branch) so the export
+                # path is crash-free when audio wasn't captured.
+                # This overwrites them with the real values when
+                # audio IS available.
                 v2_active_for_export = bool(
                     getattr(self, "_clip_cache_v2_active", False)
                     or (self._clip_cache_audio_sys_list_path is not None
