@@ -258,6 +258,30 @@ begin
     if not ForceDirectories(ExtractDir) then
       RaiseException('Could not create install directory: ' + ExtractDir);
 
+    // CRITICAL: kill any running Touchless before extraction. Inno's
+    // built-in CloseApplications=force only fires when the [Files]
+    // section is replacing files, but our STUB-mode [Files] is empty —
+    // the actual file work happens via Expand-Archive below. Without
+    // killing the process first, the extraction silently fails to
+    // overwrite Touchless.exe (44 MB Python bundle) because Windows
+    // refuses to replace a running .exe — every _internal/ file gets
+    // updated, but Touchless.exe stays at the old version. Result:
+    // user sees "installed successfully" but the app still reports the
+    // old version after restart. taskkill /F is a hard terminate —
+    // safe here because we're about to wipe the .exe anyway, and any
+    // QApplication.aboutToQuit auto-saves would have already run if
+    // the user closed the app cleanly. /T also kills child processes
+    // (the engine worker, llama-server, whisper-stream).
+    Exec(
+      ExpandConstant('{cmd}'),
+      '/C taskkill /F /IM ' + ExpandConstant('{#MyAppExeName}') + ' /T 2>NUL',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Brief pause so Windows fully releases the file handles before
+    // PowerShell tries to overwrite — without this, even after the
+    // process is gone the OS occasionally still reports the file as
+    // in use for a few hundred ms.
+    Sleep(750);
+
     // Wipe any stale sentinel from a previous failed install so the
     // poll loop below doesn't immediately think extraction finished.
     if FileExists(DoneFlag) then DeleteFile(DoneFlag);
@@ -321,6 +345,20 @@ begin
                      + Chr(13) + Chr(10)
                      + 'Try running the installer again, or use the '
                      + 'offline edition from the Touchless website if the issue persists.');
+
+    // DEFENSE IN DEPTH: post-extract sanity check. If Touchless.exe was
+    // somehow not replaced (race vs. file lock that survived our pre-
+    // kill, A/V scanner re-locking it mid-extract, etc.), bail loudly
+    // instead of "successfully" leaving the user on the old version.
+    // We can't trust file size alone (PyInstaller can occasionally emit
+    // identical-sized binaries), so check if the file is even WRITABLE
+    // right now — if it's still locked by a phantom process, this trips.
+    if not FileExists(ExtractDir + '\{#MyAppExeName}') then
+      RaiseException('Installation incomplete: ' + ExpandConstant('{#MyAppExeName}')
+                     + ' was not extracted to ' + ExtractDir
+                     + '.' + Chr(13) + Chr(10)
+                     + 'This usually means the payload zip was incomplete. '
+                     + 'Try downloading the installer again.');
   end;
 end;
 #endif
