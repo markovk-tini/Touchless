@@ -333,13 +333,17 @@ class VoiceCommandListener:
         block_duration: float = 0.04,
         min_voice_seconds: float = 0.32,
         min_command_seconds: float = 0.68,
-        # Trailing silence to declare end-of-utterance. 3.0s gives
-        # the user room to think mid-sentence — "play... uh...
-        # spotify" — without the listener cutting them off. The
-        # earlier 0.8s was tuned for snap-responsiveness but the
-        # user prioritized natural speech tolerance (pauses,
-        # stutters, recovery from misspeaking).
-        end_silence_seconds: float = 3.0,
+        # Trailing silence to declare end-of-utterance.
+        # History:
+        #   0.8s  → too snappy, cut off mid-phrase commands like
+        #           "open youtube on google chrome"
+        #   3.0s  → tolerated mid-sentence pauses but every command
+        #           felt slow — user reported 4-5 s before action.
+        #   1.5s  → middle ground. Still tolerates pauses up to 1.0 s
+        #           between words (combined with the loud-peak grace
+        #           counter below, which holds silence_blocks at 0
+        #           during the first 0.5 s after any speech peak).
+        end_silence_seconds: float = 1.5,
         start_timeout_seconds: float = 5.0,
         whisper_cpp_command: tuple[str, ...] | None = None,
         whisper_cpp_model_path: Path | None = None,
@@ -868,10 +872,14 @@ class VoiceCommandListener:
         # every consonant + inter-word gap; this counter prevents those
         # from accumulating to 75 (3 s) and ending VAD mid-phrase.
         blocks_since_trigger_peak = 0
-        # 1 second of grace — enough that natural inter-word gaps don't
-        # accumulate silence, but quick enough that real end-of-speech
-        # (3 s of nothing) still fires at speech_end + 4 s total.
-        SILENCE_GRACE_BLOCKS = max(1, int(1.0 / self._block_duration))
+        # 0.5 second of grace — still tolerates inter-word gaps for
+        # quiet mics (consonants + word boundaries) but no longer adds
+        # a full extra second of dead air to every command. Combined
+        # with the shorter end_silence_seconds=1.5 above, total
+        # post-speech wait drops from ~4.0 s to ~2.0 s on a typical
+        # command. Speed-up: ~2 s per command, measurable as snappier
+        # dispatch.
+        SILENCE_GRACE_BLOCKS = max(1, int(0.5 / self._block_duration))
         ambient_levels: list[float] = []
         chunks: list[np.ndarray] = []
         # Preroll: how much pre-trigger audio to prepend when VAD
@@ -1035,7 +1043,15 @@ class VoiceCommandListener:
         # from external.read() (phone path).
         _audio_accum = np.empty(0, dtype=np.float32)
         import time as _time_mod
+        import sys as _vsys
+        # macOS hang diagnostic: pinpoint whether an intermittent "listens
+        # forever" is the CoreAudio stream __enter__ blocking vs the callback
+        # never delivering. If only the first line prints, the stream start
+        # hung; if both print but no "callback: first piece", the callback
+        # never fired.
+        print(f"[voice] opening input stream rate={sample_rate} device={stream_kwargs.get('device')} external={external is not None}", file=_vsys.stderr, flush=True)
         with stream_ctx as stream:
+            print("[voice] input stream open — entering capture loop", file=_vsys.stderr, flush=True)
             for block_index in range(max_blocks):
                 if stop_event is not None and stop_event.is_set():
                     stop_event_fired = True
@@ -1557,6 +1573,15 @@ class VoiceCommandListener:
         # OpenAI's reference Whisper uses (0.0, 0.2, 0.4, 0.6, 0.8,
         # 1.0); we keep just the first three for latency.
         temp_ladder = (0.0, 0.2, 0.4)
+        # Wall-clock timing around the Whisper call. Adversarial review
+        # of the VAD-timing tuning flagged that the temperature ladder
+        # silently 2-3x's wall-clock on borderline audio (when temp=0.0
+        # fails log_prob_threshold and falls through to 0.2 and 0.4).
+        # Logging the actual inference time per command gives us
+        # ground-truth data for future tuning, AND surfaces ladder-
+        # escalation events as anomalously high values in logs.
+        import time as _t
+        _whisper_t0 = _t.monotonic()
         segments, _info = model.transcribe(
             str(audio_path),
             language="en",
@@ -1593,6 +1618,19 @@ class VoiceCommandListener:
             log_prob_threshold=-1.0,
             compression_ratio_threshold=2.2,
         )
+        # IMPORTANT: faster-whisper returns a GENERATOR. The actual
+        # decode work happens when you iterate it. So we need to
+        # materialize before stopping the timer below — otherwise the
+        # timing would just record the generator-construction cost
+        # (microseconds) and miss the real inference.
+        segments = list(segments)
+        try:
+            _whisper_ms = int((_t.monotonic() - _whisper_t0) * 1000)
+            import sys as _sys
+            _sys.stderr.write(f"[voice] whisper_inference_ms={_whisper_ms}\n")
+            _sys.stderr.flush()
+        except Exception:
+            pass
         # All non-empty segments pass through. The earlier per-segment
         # avg_logprob<-1.0 filter was hiding what Whisper actually
         # transcribed — user got "command not understood" with no

@@ -9407,6 +9407,17 @@ class MainWindow(QMainWindow):
                         refresh()
                 except Exception:
                     pass
+            # Push value to the live worker so the engine actually swaps —
+            # previously the Save-Changes path only resynced the (legacy)
+            # button widget and the engine kept running its old config
+            # until the next app restart. Same bug class as the mic gain
+            # slider. Deferred to next event-loop tick because the worker
+            # call rebuilds the HandDetector + re-tunes capture (hundreds
+            # of ms of UI-thread work).
+            try:
+                QTimer.singleShot(0, self._apply_low_fps_mode_to_worker)
+            except Exception:
+                pass
         if "lite_mode" in applied_keys:
             button = getattr(self, "lite_mode_button", None)
             if button is not None:
@@ -9417,6 +9428,21 @@ class MainWindow(QMainWindow):
                         refresh()
                 except Exception:
                     pass
+            # Push value to the live worker (mirrors low_fps_mode above).
+            try:
+                QTimer.singleShot(0, self._apply_lite_mode_to_worker)
+            except Exception:
+                pass
+            # Flip the "Lite" badge on the live + mini viewers immediately —
+            # the legacy Camera-tab handler did this inline; replicate so
+            # the General-Save path is visually equivalent.
+            for viewer_attr in ("live_view_window", "mini_live_viewer"):
+                viewer = getattr(self, viewer_attr, None)
+                if viewer is not None and hasattr(viewer, "set_lite_mode_active"):
+                    try:
+                        viewer.set_lite_mode_active(bool(self.config.lite_mode))
+                    except Exception:
+                        pass
         if "gpu_mode" in applied_keys:
             button = getattr(self, "gpu_mode_button", None)
             if button is not None:
@@ -9427,6 +9453,11 @@ class MainWindow(QMainWindow):
                         refresh()
                 except Exception:
                     pass
+            # Push value to the live worker (mirrors low_fps_mode above).
+            try:
+                QTimer.singleShot(0, self._apply_gpu_mode_to_worker)
+            except Exception:
+                pass
         # Save Locations panel's mouse-monitor combo, if it exists.
         if "mouse_active_monitor_index" in applied_keys:
             combo = getattr(self, "_save_locations_mouse_monitor_combo", None)

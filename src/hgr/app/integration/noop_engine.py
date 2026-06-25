@@ -647,6 +647,18 @@ class GestureWorker(QObject):
     _LOW_FPS_AUTO_THRESHOLD = 18.0
     _LOW_FPS_AUTO_ENTER_SECONDS = 4.0
     _LOW_FPS_AUTO_EXIT_SECONDS = 6.0
+    # CRITICAL-FPS auto-engage: on slow desktops (no fullscreen game),
+    # engage low-fps mode anyway when FPS stays below 12 for 6 s. This
+    # rescues users on older hardware (GTX 960 / similar) who get ~7 fps
+    # by default and would otherwise need to manually find + toggle
+    # Lite Mode. Exit threshold uses ASYMMETRIC hysteresis: must stay
+    # above 28 fps for 8 s before disengaging, otherwise the bump from
+    # lite_mode (which lifts 7 → ~25 fps on such hardware) would oscillate
+    # right at the normal-mode threshold of 18 fps.
+    _CRITICAL_FPS_THRESHOLD = 12.0
+    _CRITICAL_FPS_ENTER_SECONDS = 6.0
+    _CRITICAL_FPS_EXIT_THRESHOLD = 28.0
+    _CRITICAL_FPS_EXIT_SECONDS = 8.0
     _FORCED_TEST_FPS_TARGET = 10.0
     _NORMAL_PROCESS_WIDTH = 960
     _LOW_FPS_PROCESS_WIDTH = 384
@@ -3773,33 +3785,68 @@ class GestureWorker(QObject):
     def _maybe_auto_toggle_low_fps(self, now: float) -> None:
         if getattr(self.config, "low_fps_mode", False):
             return
-        # Only auto-engage when a fullscreen app (typically a game) has
-        # foreground focus and is starving us of CPU. Without this gate,
-        # transient stalls during normal desktop use would thrash the engine.
-        fullscreen = self._fullscreen_foreground_active
-        if not fullscreen:
-            if self._low_fps_auto_engaged:
-                self._disengage_auto_low_fps()
-            else:
-                self._low_fps_below_since = None
-                self._low_fps_above_since = None
-            return
         fps = self._fps
         if fps <= 0.0:
             return
-        if fps < self._LOW_FPS_AUTO_THRESHOLD:
+        # Two-tier auto-engage:
+        # 1. FULLSCREEN-GATED tier (existing behavior): when a fullscreen
+        #    app has foreground focus and FPS < 18, engage after 4 s. Exit
+        #    when FPS >= 18 for 6 s.
+        # 2. CRITICAL-FPS tier (new): regardless of fullscreen, when FPS
+        #    stays below 12 for 6 s, engage. Targets users on slower
+        #    hardware (older iGPUs / GTX 9xx era discrete) who would
+        #    otherwise be stuck at 7 fps on the desktop. Uses an
+        #    ASYMMETRIC exit threshold (28 fps for 8 s) to prevent thrash
+        #    when lite_mode lifts FPS from 7 → ~25 fps but not above the
+        #    normal 18 fps gate.
+        fullscreen = self._fullscreen_foreground_active
+        # Critical-fps threshold (applies regardless of fullscreen).
+        if fps < self._CRITICAL_FPS_THRESHOLD:
             self._low_fps_above_since = None
             if self._low_fps_below_since is None:
                 self._low_fps_below_since = now
-            elif not self._low_fps_auto_engaged and (now - self._low_fps_below_since) >= self._LOW_FPS_AUTO_ENTER_SECONDS:
+            elif not self._low_fps_auto_engaged and (now - self._low_fps_below_since) >= self._CRITICAL_FPS_ENTER_SECONDS:
                 self._engage_auto_low_fps()
-        else:
-            self._low_fps_below_since = None
-            if self._low_fps_auto_engaged:
+            return
+        # Fullscreen-gated tier: same shape as before, but only when
+        # focus is on a fullscreen app.
+        if fullscreen:
+            if fps < self._LOW_FPS_AUTO_THRESHOLD:
+                self._low_fps_above_since = None
+                if self._low_fps_below_since is None:
+                    self._low_fps_below_since = now
+                elif not self._low_fps_auto_engaged and (now - self._low_fps_below_since) >= self._LOW_FPS_AUTO_ENTER_SECONDS:
+                    self._engage_auto_low_fps()
+                return
+            # FPS above normal threshold + fullscreen — proceed to the
+            # exit-condition path below.
+        # Exit condition: handle both tiers' "disengage" cases.
+        # - If we were auto-engaged via the critical tier, require fps >=
+        #   28 for 8 s before disengaging (so a slight bump from lite mode
+        #   doesn't thrash).
+        # - If we were auto-engaged via the fullscreen tier, require fps
+        #   >= 18 for 6 s (existing behavior).
+        # - If fps recovered above critical but is below the symmetric
+        #   exit threshold and we engaged via the critical path, hold.
+        if self._low_fps_auto_engaged:
+            # Determine which tier engaged. Use the asymmetric (higher)
+            # exit threshold by default for safety — disengaging too
+            # eagerly causes thrash; disengaging slowly only costs the
+            # user a brief period of suboptimal mode.
+            exit_threshold = self._CRITICAL_FPS_EXIT_THRESHOLD if not fullscreen else self._LOW_FPS_AUTO_THRESHOLD
+            exit_seconds = self._CRITICAL_FPS_EXIT_SECONDS if not fullscreen else self._LOW_FPS_AUTO_EXIT_SECONDS
+            if fps >= exit_threshold:
                 if self._low_fps_above_since is None:
                     self._low_fps_above_since = now
-                elif (now - self._low_fps_above_since) >= self._LOW_FPS_AUTO_EXIT_SECONDS and fps >= self._LOW_FPS_AUTO_THRESHOLD:
+                elif (now - self._low_fps_above_since) >= exit_seconds:
                     self._disengage_auto_low_fps()
+            else:
+                self._low_fps_above_since = None
+        else:
+            # Not engaged + above critical + not below fullscreen tier:
+            # reset both counters so a future dip starts cleanly.
+            self._low_fps_below_since = None
+            self._low_fps_above_since = None
 
     def _maybe_offer_low_fps_suggestion(self, now: float) -> None:
         """Track sustained low FPS and show the suggestion overlay when warranted.
