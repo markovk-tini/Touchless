@@ -22610,8 +22610,27 @@ Admin elevation
     def _locate_ffmpeg_executable(self, tool_name: str) -> str | None:
         candidates: list[Path] = []
         exe_name = tool_name + (".exe" if sys.platform.startswith("win") else "")
+        # PyInstaller onedir lays binaries under <root>/_internal/, but
+        # `sys.executable.with_name(...)` only looks at <root>/. Search
+        # both: case-insensitive match handles the spec's "ffmpeg.EXE"
+        # casing vs. Inno Setup re-casing on install. Without this,
+        # ffmpeg is only found via PATH — fine on dev machines but
+        # silently breaks clip recording on end-user installs.
         try:
-            candidates.append(Path(sys.executable).resolve().with_name(exe_name))
+            exe_path = Path(sys.executable).resolve()
+            candidates.append(exe_path.with_name(exe_name))
+            internal_dir = exe_path.parent / "_internal"
+            if internal_dir.is_dir():
+                # Case-insensitive match for the binary inside _internal/.
+                try:
+                    for entry in internal_dir.iterdir():
+                        if entry.is_file() and entry.name.lower() == exe_name.lower():
+                            candidates.append(entry)
+                            break
+                except Exception:
+                    pass
+                # Also a direct lookup in case the dir scan above misses.
+                candidates.append(internal_dir / exe_name)
         except Exception:
             pass
         try:

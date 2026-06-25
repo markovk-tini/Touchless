@@ -108,11 +108,16 @@ hiddenimports += [
     "mcp",  # MCP bridge core SDK
     "mcp.client",
     "mcp.client.stdio",
+    "httplib2",
+    "google_auth_httplib2",
+    # Phase-1 trust substrate: Recycle Bin routing for delete_file so
+    # destructive ops are RECOVERABLE. Required by safety_gate.
+    "send2trash",
 ]
 # Pull every submodule of the listed optional deps so dynamic / lazy
 # imports inside them work in a frozen build (winsdk in particular has
 # a huge surface area of generated submodules).
-for _opt in ("winsdk", "winrt", "uiautomation", "win11toast", "mcp"):
+for _opt in ("winsdk", "winrt", "uiautomation", "win11toast", "mcp", "pycaw", "comtypes", "pyaudiowpatch"):
     try:
         hiddenimports += collect_submodules(_opt)
     except Exception:

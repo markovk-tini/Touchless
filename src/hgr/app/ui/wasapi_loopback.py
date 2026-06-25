@@ -1753,9 +1753,20 @@ def probe_default_loopback_format() -> Optional[tuple[int, int, int]]:
     """
     try:
         import pyaudiowpatch as pa  # type: ignore
-    except Exception:
+    except Exception as exc:
+        try:
+            import sys as _s
+            _s.stderr.write(f"[wasapi-probe] pyaudiowpatch import failed: {exc}\n")
+        except Exception:
+            pass
         return None
     friendly = _query_default_render_friendly_name_via_com()
+    if friendly is None:
+        try:
+            import sys as _s
+            _s.stderr.write("[wasapi-probe] COM friendly-name lookup returned None (pycaw missing or COM error)\n")
+        except Exception:
+            pass
     p = None
     try:
         p = pa.PyAudio()
