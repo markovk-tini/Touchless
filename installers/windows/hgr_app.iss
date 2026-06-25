@@ -240,18 +240,44 @@ begin
   end;
 end;
 
+// Escape a path for embedding inside a PowerShell single-quoted
+// string literal. PS rule: ' is escaped by doubling it ('').
+// Without this, any user whose install dir or username contains an
+// apostrophe (O'Brien, D'Angelo, "Tom's Apps") silently breaks the
+// Expand-Archive command line — PS sees the path as terminated and
+// the rest of the command as garbage. This was a 100%-failure-rate
+// latent bug for users with apostrophes in their paths.
+function PsQuoteEscape(const s: String): String;
+var
+  i: Integer;
+begin
+  Result := '';
+  for i := 1 to Length(s) do begin
+    if s[i] = '''' then
+      Result := Result + ''''''
+    else
+      Result := Result + s[i];
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
   FileCount: Integer;
   TotalFiles: Integer;
-  ZipPath, ExtractDir, DoneFlag, PsCmd, StatusText: String;
+  ZipPath, ExtractDir, DoneFlag, PsCmd, StatusText, ErrorMsg: String;
+  TouchlessExePath, RenameTestPath: String;
   ResultStr: AnsiString;
+  Attempt: Integer;
+  TouchlessExeSize: LongInt;
+  ExeFindRec: TFindRec;
+  ExtractOK: Boolean;
 begin
   if CurStep = ssInstall then begin
     ZipPath := ExpandConstant('{tmp}\{#PAYLOAD_FILE}');
     ExtractDir := ExpandConstant('{app}');
     DoneFlag := ExpandConstant('{tmp}\extract_done.flag');
+    TouchlessExePath := ExtractDir + '\' + ExpandConstant('{#MyAppExeName}');
     TotalFiles := {#PAYLOAD_FILE_COUNT};
     if TotalFiles < 1 then TotalFiles := 1;
 
@@ -260,105 +286,147 @@ begin
 
     // CRITICAL: kill any running Touchless before extraction. Inno's
     // built-in CloseApplications=force only fires when the [Files]
-    // section is replacing files, but our STUB-mode [Files] is empty —
-    // the actual file work happens via Expand-Archive below. Without
+    // section is replacing files, but our STUB-mode [Files] is empty
+    // — the actual file work happens via Expand-Archive below. Without
     // killing the process first, the extraction silently fails to
     // overwrite Touchless.exe (44 MB Python bundle) because Windows
     // refuses to replace a running .exe — every _internal/ file gets
     // updated, but Touchless.exe stays at the old version. Result:
     // user sees "installed successfully" but the app still reports the
-    // old version after restart. taskkill /F is a hard terminate —
-    // safe here because we're about to wipe the .exe anyway, and any
-    // QApplication.aboutToQuit auto-saves would have already run if
-    // the user closed the app cleanly. /T also kills child processes
-    // (the engine worker, llama-server, whisper-stream).
+    // old version after restart. /F = hard terminate, /T = kill the
+    // whole process tree (engine worker, llama-server, whisper-stream).
+    // Trailing `& exit 0`: taskkill returns nonzero when the process
+    // wasn't running ("not found"), which is FINE; we don't want to
+    // abort the install over that.
     Exec(
       ExpandConstant('{cmd}'),
-      '/C taskkill /F /IM ' + ExpandConstant('{#MyAppExeName}') + ' /T 2>NUL',
+      '/C taskkill /F /IM ' + ExpandConstant('{#MyAppExeName}') + ' /T 2>NUL & exit 0',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    // Brief pause so Windows fully releases the file handles before
-    // PowerShell tries to overwrite — without this, even after the
-    // process is gone the OS occasionally still reports the file as
-    // in use for a few hundred ms.
-    Sleep(750);
-
-    // Wipe any stale sentinel from a previous failed install so the
-    // poll loop below doesn't immediately think extraction finished.
-    if FileExists(DoneFlag) then DeleteFile(DoneFlag);
+    // Pause so Windows fully releases the file handles + AV finishes
+    // its post-mortem scan of the killed process. Bumped 750 -> 1500 ms
+    // because the workflow audit flagged that slow systems with real-
+    // time AV scanning can still hold the handle past 750 ms.
+    Sleep(1500);
 
     // Reconfigure Inno's progress bar to track real extraction state.
-    // ProgressGauge.Style stays the default (smooth, determinate);
-    // we drive Position from a recursive file count of {app} on a
-    // 500 ms poll. Without this the bar sits frozen at 0% because
-    // STUB mode has an empty [Files] section — Inno has nothing of
-    // its own to count.
     WizardForm.ProgressGauge.Min := 0;
     WizardForm.ProgressGauge.Max := TotalFiles;
     WizardForm.ProgressGauge.Position := 0;
     WizardForm.StatusLabel.Caption := 'Extracting payload (0 / ' + IntToStr(TotalFiles) + ' files)...';
     WizardForm.FilenameLabel.Caption := '';
 
-    // Run Expand-Archive asynchronously, and have PowerShell write a
-    // sentinel file when it's done (so the Inno side can poll for
-    // completion — Exec(ewNoWait) doesn't return a process handle
-    // we could WaitForSingleObject on). On success the sentinel
-    // contains the literal "OK"; on failure it contains the
-    // exception message so we can surface it to the user.
+    // Build the PowerShell command once. PATHS ARE APOSTROPHE-ESCAPED
+    // so usernames / install dirs containing ' (O'Brien, Tom's Apps)
+    // don't break the PS single-quoted string literal.
     PsCmd :=
       '-NoProfile -NonInteractive -ExecutionPolicy Bypass ' +
-      '-Command "try { Expand-Archive -LiteralPath ''' + ZipPath + ''' ' +
-      '-DestinationPath ''' + ExtractDir + ''' -Force; ' +
-      '''OK'' | Out-File -LiteralPath ''' + DoneFlag + ''' -Encoding ascii } ' +
-      'catch { $_.Exception.Message | Out-File -LiteralPath ''' + DoneFlag + ''' -Encoding ascii }"';
+      '-Command "try { Expand-Archive -LiteralPath ''' + PsQuoteEscape(ZipPath) + ''' ' +
+      '-DestinationPath ''' + PsQuoteEscape(ExtractDir) + ''' -Force; ' +
+      '''OK'' | Out-File -LiteralPath ''' + PsQuoteEscape(DoneFlag) + ''' -Encoding ascii } ' +
+      'catch { $_.Exception.Message | Out-File -LiteralPath ''' + PsQuoteEscape(DoneFlag) + ''' -Encoding ascii }"';
 
-    if not Exec('powershell.exe', PsCmd, '', SW_HIDE, ewNoWait, ResultCode) then
-      RaiseException('Could not launch PowerShell to extract payload.');
+    // EXTRACT RETRY LOOP (3 attempts, 3s pause between). Antivirus
+    // scanners + slow disks can race the file replace — Expand-Archive
+    // may report overall success while having silently failed on a
+    // specific locked file. Retry catches transient locks. Mirrors
+    // the build-side payload retry loop in build_windows.bat.
+    ExtractOK := False;
+    ErrorMsg := '';
+    for Attempt := 1 to 3 do begin
+      // Wipe any stale sentinel from a previous attempt.
+      if FileExists(DoneFlag) then DeleteFile(DoneFlag);
 
-    // Poll until the sentinel appears. Cap the displayed count at
-    // TotalFiles so a slightly-off PAYLOAD_FILE_COUNT define doesn't
-    // overshoot the bar (or stall it at 99% if undershoot).
-    while not FileExists(DoneFlag) do begin
-      FileCount := CountFilesRecursive(ExtractDir);
-      if FileCount > TotalFiles then FileCount := TotalFiles;
-      WizardForm.ProgressGauge.Position := FileCount;
-      StatusText := 'Extracting payload (' + IntToStr(FileCount) + ' / ' +
-                    IntToStr(TotalFiles) + ' files)...';
-      WizardForm.StatusLabel.Caption := StatusText;
+      WizardForm.StatusLabel.Caption := 'Extracting payload (attempt ' +
+        IntToStr(Attempt) + ' of 3)...';
       WizardForm.Update;
-      Sleep(500);
+
+      if not Exec('powershell.exe', PsCmd, '', SW_HIDE, ewNoWait, ResultCode) then begin
+        ErrorMsg := 'Could not launch PowerShell. Check AppLocker / WDAC policy.';
+        Break;
+      end;
+
+      // Poll until the sentinel appears.
+      while not FileExists(DoneFlag) do begin
+        FileCount := CountFilesRecursive(ExtractDir);
+        if FileCount > TotalFiles then FileCount := TotalFiles;
+        WizardForm.ProgressGauge.Position := FileCount;
+        StatusText := 'Extracting payload (' + IntToStr(FileCount) + ' / ' +
+                      IntToStr(TotalFiles) + ' files, attempt ' +
+                      IntToStr(Attempt) + ')...';
+        WizardForm.StatusLabel.Caption := StatusText;
+        WizardForm.Update;
+        Sleep(500);
+      end;
+      WizardForm.ProgressGauge.Position := TotalFiles;
+      WizardForm.Update;
+
+      LoadStringFromFile(DoneFlag, ResultStr);
+      DeleteFile(DoneFlag);
+      if Trim(String(ResultStr)) = 'OK' then begin
+        ExtractOK := True;
+        Break;
+      end;
+      ErrorMsg := Trim(String(ResultStr));
+      if Attempt < 3 then begin
+        WizardForm.StatusLabel.Caption :=
+          'Extract attempt ' + IntToStr(Attempt) +
+          ' failed — retrying in 3 seconds...';
+        WizardForm.Update;
+        Sleep(3000);
+      end;
     end;
-    // One final update so the bar hits 100% even if the last poll
-    // didn't catch the last few files.
-    WizardForm.ProgressGauge.Position := TotalFiles;
-    WizardForm.Update;
 
-    // Read PowerShell outcome from the sentinel and surface failures.
-    LoadStringFromFile(DoneFlag, ResultStr);
-    DeleteFile(DoneFlag);
-    if Trim(String(ResultStr)) <> 'OK' then
-      // CRLF spelled out with Chr() instead of #13#10 because the
-      // Inno preprocessor treats any line whose first non-whitespace
-      // character is '#' as a directive, and breaking the string
-      // before #13#10 made it fail with 'Unknown preprocessor
-      // directive' at compile time.
-      RaiseException('Payload extraction failed: ' + Trim(String(ResultStr))
+    if not ExtractOK then
+      RaiseException('Payload extraction failed after 3 attempts: ' + ErrorMsg
                      + Chr(13) + Chr(10)
-                     + 'Try running the installer again, or use the '
-                     + 'offline edition from the Touchless website if the issue persists.');
+                     + 'This is usually caused by antivirus software locking '
+                     + 'files during install. Add ' + ExtractDir
+                     + ' to Windows Defender exclusions and re-run the installer, '
+                     + 'or use the offline edition from the Touchless website.');
 
-    // DEFENSE IN DEPTH: post-extract sanity check. If Touchless.exe was
-    // somehow not replaced (race vs. file lock that survived our pre-
-    // kill, A/V scanner re-locking it mid-extract, etc.), bail loudly
-    // instead of "successfully" leaving the user on the old version.
-    // We can't trust file size alone (PyInstaller can occasionally emit
-    // identical-sized binaries), so check if the file is even WRITABLE
-    // right now — if it's still locked by a phantom process, this trips.
-    if not FileExists(ExtractDir + '\{#MyAppExeName}') then
-      RaiseException('Installation incomplete: ' + ExpandConstant('{#MyAppExeName}')
-                     + ' was not extracted to ' + ExtractDir
-                     + '.' + Chr(13) + Chr(10)
-                     + 'This usually means the payload zip was incomplete. '
-                     + 'Try downloading the installer again.');
+    // POST-EXTRACT VERIFICATION — three layered checks.
+    //
+    //   1) FileExists: catches "extract produced nothing at target"
+    //      (corrupt / empty zip).
+    //   2) SIZE check: a v1.1.5 Touchless.exe is 44,467,736 bytes; a
+    //      v1.1.6 is 44,883,936. Any v1.1.x is in the 40-50 MB range.
+    //      If size is outside [40 MB, 60 MB] something is wrong.
+    //   3) Writability probe: rename Touchless.exe to a temp name and
+    //      back. If AV / another process is holding the handle, the
+    //      rename fails — catches the "fresh file but still locked"
+    //      race that would block the user's first launch.
+    if not FileExists(TouchlessExePath) then
+      RaiseException(ExpandConstant('{#MyAppExeName}')
+                     + ' was not extracted to ' + ExtractDir + '.'
+                     + Chr(13) + Chr(10)
+                     + 'The payload zip may be corrupt. Re-download the installer.');
+
+    if FindFirst(TouchlessExePath, ExeFindRec) then begin
+      // Touchless.exe is ~44 MB, well under 2 GB. SizeLow alone is
+      // safe (would overflow only if the binary ever exceeded 2 GB).
+      TouchlessExeSize := ExeFindRec.SizeLow;
+      FindClose(ExeFindRec);
+      if (TouchlessExeSize < 40000000) or (TouchlessExeSize > 60000000) then
+        RaiseException(ExpandConstant('{#MyAppExeName}')
+                       + ' has an unexpected size (' + IntToStr(TouchlessExeSize)
+                       + ' bytes) after install — extraction likely incomplete.'
+                       + Chr(13) + Chr(10)
+                       + 'Re-download the installer and try again.');
+    end;
+
+    // Writability probe: rename Touchless.exe to a temp name and back.
+    // If anyone is holding the file open, RenameFile fails.
+    RenameTestPath := TouchlessExePath + '.locktest';
+    if FileExists(RenameTestPath) then DeleteFile(RenameTestPath);
+    if RenameFile(TouchlessExePath, RenameTestPath) then
+      RenameFile(RenameTestPath, TouchlessExePath)
+    else
+      RaiseException(ExpandConstant('{#MyAppExeName}')
+                     + ' is locked by another process and may not launch '
+                     + 'correctly.' + Chr(13) + Chr(10)
+                     + 'Wait a moment for any antivirus scan to finish, then '
+                     + 'try launching Touchless. If the app fails to start, '
+                     + 'reboot and launch again.');
   end;
 end;
 #endif
