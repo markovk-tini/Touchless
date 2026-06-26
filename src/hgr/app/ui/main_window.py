@@ -23770,9 +23770,46 @@ Admin elevation
         self._set_worker_utility_capture_selection_active(False)
         self.last_action_label.setText("Last action: capture area canceled")
     def _clip_cache_dir(self) -> Path:
-        target_dir = Path(tempfile.gettempdir()) / "hgr_clip_cache"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        return target_dir
+        # Primary: %TEMP%\hgr_clip_cache. Most reliable per-user write
+        # target. Fallback: %LOCALAPPDATA%\Touchless\clip_cache when
+        # %TEMP% is unwritable (corporate Storage Sense purge, OneDrive
+        # Known-Folder-Move redirecting Temp into a sync layer that
+        # locks files mid-write, antivirus quarantine, full disk, or
+        # a managed-laptop policy that scrubs %TEMP% on logon).
+        # Without the fallback the symptom is "Touchless silently never
+        # records a clip" — exact root cause untestable from the user side.
+        primary = Path(tempfile.gettempdir()) / "hgr_clip_cache"
+        try:
+            primary.mkdir(parents=True, exist_ok=True)
+            # Writability canary so a "mkdir succeeded" but "writes
+            # blocked" condition (CFA / AV interception) is caught here
+            # instead of silently producing 0-byte segments.
+            canary = primary / f".cache_writable_{os.getpid()}.tmp"
+            with open(canary, "wb") as _cf:
+                _cf.write(b"ok")
+            canary.unlink(missing_ok=True)
+            return primary
+        except Exception as primary_exc:
+            try:
+                import sys as _cd_sys
+                _cd_sys.stderr.write(
+                    f"[clip-cache] PRIMARY cache dir {primary} failed: "
+                    f"{type(primary_exc).__name__}: {primary_exc}. Falling back "
+                    "to %LOCALAPPDATA%\\Touchless\\clip_cache.\n"
+                )
+                _cd_sys.stderr.flush()
+            except Exception:
+                pass
+            fallback_root = os.environ.get("LOCALAPPDATA") or str(Path.home())
+            fallback = Path(fallback_root) / "Touchless" / "clip_cache"
+            try:
+                fallback.mkdir(parents=True, exist_ok=True)
+                return fallback
+            except Exception:
+                # Last-ditch: use the primary path anyway and let
+                # whatever happens happen — re-raising hides the
+                # original mkdir failure context.
+                return primary
     def _clip_cache_output_path(self) -> Path:
         return self._clip_cache_dir() / f"clip_cache_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}.avi"
     def _clip_output_specs(self, duration_seconds: int) -> list[tuple[Path, str]]:
@@ -25674,7 +25711,113 @@ Admin elevation
                 self._start_audio_liveness_watchdog()
             except Exception:
                 pass
+        # SEGMENT-ARRIVAL WATCHDOG: ffmpeg's spawn liveness probe only
+        # checks the first ~150 ms (process is alive, didn't insta-crash).
+        # If ffmpeg dies AFTER that — invalid encoder preset (NVENC p4
+        # on pre-Turing despite our probe), driver crash, capture-source
+        # mismatch on HiDPI/disconnected-monitor setups, antivirus
+        # intercepting writes mid-stream — the cache silently produces
+        # zero segments and the user sees "Clip not ready yet — buffer
+        # warming up" forever with no diagnostic. Schedule a one-shot
+        # check at T + segment_seconds + 3s: if the segment list file
+        # still doesn't exist OR has zero entries, surface a clear
+        # error AND dump the last 20 lines of ffmpeg stderr to the log.
+        try:
+            from PySide6.QtCore import QTimer as _CacheWatchdogTimer
+            check_after_ms = int((float(self._clip_cache_segment_seconds) + 3.0) * 1000)
+            _CacheWatchdogTimer.singleShot(check_after_ms, self._check_clip_cache_segment_arrival)
+        except Exception:
+            pass
         return True
+
+    def _check_clip_cache_segment_arrival(self) -> None:
+        """Post-spawn watchdog: verify segments are actually being written.
+
+        Fired ~segment_seconds + 3 s after _start_clip_cache_ffmpeg. By
+        that time at least one .mkv segment file should exist on disk
+        AND the segment_list.csv should contain at least one row.
+        If neither happens, log the failure mode (so the user sees
+        WHY clipping doesn't work instead of mystery "buffer warming
+        up") and stash the diagnostic for the next clip-attempt error
+        dialog.
+        """
+        try:
+            list_path = self._clip_cache_list_path
+        except Exception:
+            return
+        if list_path is None:
+            return  # cache was torn down before the watchdog fired
+        try:
+            cache_dir = self._clip_cache_dir()
+        except Exception:
+            return
+        # Count actual segment files on disk (.mkv) AND check the list
+        # CSV. Either being populated means ffmpeg is working.
+        seg_count_disk = 0
+        try:
+            seg_count_disk = sum(
+                1 for p in cache_dir.iterdir()
+                if p.is_file() and p.suffix.lower() == ".mkv" and p.stat().st_size > 0
+            )
+        except Exception:
+            pass
+        list_rows = 0
+        try:
+            if Path(list_path).exists():
+                list_rows = len([
+                    ln for ln in Path(list_path).read_text(
+                        encoding="utf-8", errors="ignore"
+                    ).splitlines() if ln.strip()
+                ])
+        except Exception:
+            pass
+        if seg_count_disk > 0 or list_rows > 0:
+            try:
+                import sys as _sa_sys
+                _sa_sys.stderr.write(
+                    f"[clip-cache] watchdog: cache healthy — "
+                    f"{seg_count_disk} segment file(s) on disk, "
+                    f"{list_rows} row(s) in list CSV\n"
+                )
+                _sa_sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        # NOT HEALTHY — diagnostic dump.
+        try:
+            proc = getattr(self, "_clip_cache_process", None)
+            proc_alive = bool(proc is not None and proc.poll() is None)
+            startup_err = getattr(self, "_last_ffmpeg_startup_error", "") or ""
+            startup_err_short = startup_err.strip()[-500:] if startup_err else "(none captured)"
+            import sys as _sa_sys
+            _sa_sys.stderr.write(
+                "[clip-cache] WATCHDOG FAILURE — no segments arrived after "
+                f"{self._clip_cache_segment_seconds + 3.0:.1f}s. "
+                f"Process alive={proc_alive}. Cache dir={cache_dir}. "
+                f"Likely causes: (1) ffmpeg encoder error (preset mismatch / "
+                f"GPU driver), (2) antivirus blocking ffmpeg write to cache "
+                f"dir, (3) disk full, (4) capture source unavailable (HiDPI, "
+                f"missing monitor, screen-recording denied).\n"
+                f"[clip-cache] last ffmpeg stderr: {startup_err_short}\n"
+            )
+            _sa_sys.stderr.flush()
+            # Stash a user-facing hint that the next clip attempt's
+            # error dialog can surface (instead of the generic
+            # "buffer warming up" message).
+            self._clip_cache_health_warning = (
+                "Clip cache isn't producing any video segments. "
+                "This is usually caused by:\n"
+                "  • Antivirus or Windows Defender blocking the bundled "
+                "ffmpeg.exe (try adding the Touchless install folder to "
+                "Defender exclusions).\n"
+                "  • Disk full on the volume holding %TEMP%.\n"
+                "  • Encoder driver issue (older GPU + modern encoder presets).\n"
+                "Check %USERPROFILE%\\.touchless\\touchless_debug.log "
+                "for [clip-cache] WATCHDOG FAILURE entries."
+            )
+        except Exception:
+            pass
+
     def _stop_clip_cache_ffmpeg(self, *, delete_files: bool) -> None:
         # Stop the liveness watchdog FIRST (it can call into the
         # endpoint watchdog's swap path which we're about to tear
@@ -29104,12 +29247,25 @@ Admin elevation
                 and getattr(self._worker, "is_running", False)
             )
             if engine_running:
-                msg = (
-                    f"Clip not ready yet — Touchless needs to record at least "
-                    f"{seg_seconds} seconds of footage before a clip can be saved. "
-                    "Keep using the app for a few more seconds, then try again."
-                )
-                title = "Clip — buffer warming up"
+                # If the segment-arrival watchdog fired and identified
+                # a cache failure mode (encoder rejected, AV blocking,
+                # disk full), surface THAT specific message instead of
+                # the generic "buffer warming up" — which misleads the
+                # user into thinking they just need to wait longer.
+                health_warn = getattr(self, "_clip_cache_health_warning", None)
+                if health_warn:
+                    msg = (
+                        f"Clip can't be saved — the cache isn't producing "
+                        f"video segments.\n\n{health_warn}"
+                    )
+                    title = "Clip — cache not writing"
+                else:
+                    msg = (
+                        f"Clip not ready yet — Touchless needs to record at least "
+                        f"{seg_seconds} seconds of footage before a clip can be saved. "
+                        "Keep using the app for a few more seconds, then try again."
+                    )
+                    title = "Clip — buffer warming up"
             else:
                 msg = (
                     "Touchless can only save a clip while the engine is running. "
@@ -31069,9 +31225,46 @@ def _clip_crop_filter(self, capture_region: QRect, target_region: QRect) -> str:
         self.last_action_label.setText("Last action: capture area canceled")
 
     def _clip_cache_dir(self) -> Path:
-        target_dir = Path(tempfile.gettempdir()) / "hgr_clip_cache"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        return target_dir
+        # Primary: %TEMP%\hgr_clip_cache. Most reliable per-user write
+        # target. Fallback: %LOCALAPPDATA%\Touchless\clip_cache when
+        # %TEMP% is unwritable (corporate Storage Sense purge, OneDrive
+        # Known-Folder-Move redirecting Temp into a sync layer that
+        # locks files mid-write, antivirus quarantine, full disk, or
+        # a managed-laptop policy that scrubs %TEMP% on logon).
+        # Without the fallback the symptom is "Touchless silently never
+        # records a clip" — exact root cause untestable from the user side.
+        primary = Path(tempfile.gettempdir()) / "hgr_clip_cache"
+        try:
+            primary.mkdir(parents=True, exist_ok=True)
+            # Writability canary so a "mkdir succeeded" but "writes
+            # blocked" condition (CFA / AV interception) is caught here
+            # instead of silently producing 0-byte segments.
+            canary = primary / f".cache_writable_{os.getpid()}.tmp"
+            with open(canary, "wb") as _cf:
+                _cf.write(b"ok")
+            canary.unlink(missing_ok=True)
+            return primary
+        except Exception as primary_exc:
+            try:
+                import sys as _cd_sys
+                _cd_sys.stderr.write(
+                    f"[clip-cache] PRIMARY cache dir {primary} failed: "
+                    f"{type(primary_exc).__name__}: {primary_exc}. Falling back "
+                    "to %LOCALAPPDATA%\\Touchless\\clip_cache.\n"
+                )
+                _cd_sys.stderr.flush()
+            except Exception:
+                pass
+            fallback_root = os.environ.get("LOCALAPPDATA") or str(Path.home())
+            fallback = Path(fallback_root) / "Touchless" / "clip_cache"
+            try:
+                fallback.mkdir(parents=True, exist_ok=True)
+                return fallback
+            except Exception:
+                # Last-ditch: use the primary path anyway and let
+                # whatever happens happen — re-raising hides the
+                # original mkdir failure context.
+                return primary
 
     def _clip_cache_output_path(self) -> Path:
         return self._clip_cache_dir() / f"clip_cache_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}.avi"
