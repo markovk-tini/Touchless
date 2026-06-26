@@ -22711,6 +22711,89 @@ Admin elevation
         devices_text = self._run_external_probe(self._ffmpeg_path, "-hide_banner", "-devices")
         if "gdigrab" in devices_text:
             capabilities["devices"].add("gdigrab")
+        # Probe encoder presets BEFORE selecting a preferred encoder.
+        # ffmpeg's -encoders output lists what was COMPILED IN, NOT what
+        # the GPU actually supports. h264_nvenc with -preset p4/p7
+        # (Turing-era preset names, 2018+) is rejected on Maxwell (GTX 9xx)
+        # and older — ffmpeg crashes immediately at cache spawn, no
+        # segments written, user sees perpetual "Clip not ready yet —
+        # buffer warming up". This was dad's-PC root cause #2.
+        # The probe: try to encode a single 64x64 black frame with the
+        # modern preset to a null sink. If it succeeds, we know the GPU
+        # supports modern presets. If it fails (any nonzero exit), fall
+        # back to legacy preset names (medium / slow) which work on all
+        # NVENC generations from Kepler onward.
+        capabilities["nvenc_modern_presets"] = False
+        if "h264_nvenc" in capabilities["encoders"]:
+            probe_args = (
+                self._ffmpeg_path,
+                "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=black:s=64x64:d=0.04:r=25",
+                "-c:v", "h264_nvenc", "-preset", "p4",
+                "-frames:v", "1", "-f", "null", "-",
+            )
+            try:
+                completed = subprocess.run(
+                    list(probe_args),
+                    capture_output=True, text=True, timeout=8.0,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if completed.returncode == 0:
+                    capabilities["nvenc_modern_presets"] = True
+                    sys.stderr.write(
+                        "[ffmpeg-caps] h264_nvenc modern presets (p1-p7) supported "
+                        "— using high-quality cache + export encoder args\n"
+                    )
+                else:
+                    sys.stderr.write(
+                        "[ffmpeg-caps] h264_nvenc modern presets (p1-p7) REJECTED "
+                        "by GPU — falling back to legacy preset names "
+                        "(medium/slow). This is normal on GTX 9xx and older.\n"
+                        f"[ffmpeg-caps] probe stderr: {completed.stderr.strip()[:200]}\n"
+                    )
+            except Exception as exc:
+                sys.stderr.write(
+                    f"[ffmpeg-caps] h264_nvenc probe failed ({exc!r}) "
+                    "— assuming legacy presets\n"
+                )
+            sys.stderr.flush()
+        # Probe h264_nvenc end-to-end one more time with the CHOSEN
+        # preset (modern or legacy depending on the probe above) to
+        # catch driver-level failures that might still kill the encoder
+        # at cache-spawn time. If even the legacy preset rejects, demote
+        # to libx264 entirely.
+        if "h264_nvenc" in capabilities["encoders"]:
+            preset_for_validation = "p4" if capabilities["nvenc_modern_presets"] else "medium"
+            validate_args = (
+                self._ffmpeg_path,
+                "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=black:s=64x64:d=0.04:r=25",
+                "-c:v", "h264_nvenc", "-preset", preset_for_validation,
+                "-frames:v", "1", "-f", "null", "-",
+            )
+            try:
+                completed = subprocess.run(
+                    list(validate_args),
+                    capture_output=True, text=True, timeout=8.0,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if completed.returncode != 0:
+                    capabilities["encoders"].discard("h264_nvenc")
+                    sys.stderr.write(
+                        "[ffmpeg-caps] h264_nvenc FAILED end-to-end probe even "
+                        "with legacy preset — driver issue? — demoting to "
+                        "libx264. Clips will encode on CPU (still works, just "
+                        "slower).\n"
+                        f"[ffmpeg-caps] probe stderr: {completed.stderr.strip()[:200]}\n"
+                    )
+                    sys.stderr.flush()
+            except Exception as exc:
+                capabilities["encoders"].discard("h264_nvenc")
+                sys.stderr.write(
+                    f"[ffmpeg-caps] h264_nvenc validation hung/threw ({exc!r}) "
+                    "— demoting to libx264\n"
+                )
+                sys.stderr.flush()
         for preferred in ("h264_nvenc", "h264_amf", "h264_qsv", "libx264"):
             if preferred in capabilities["encoders"]:
                 capabilities["preferred_encoder"] = preferred
@@ -22719,6 +22802,19 @@ Admin elevation
     def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: float | None = None) -> list[str]:
         encoder = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
         gop = max(1, int(round(float(fps) * float(segment_seconds if segment_seconds is not None else 2.0))))
+        # NVENC preset selection: modern (p1-p7) only if the startup
+        # probe verified the GPU accepts them. Maxwell (GTX 9xx) and
+        # older fall through to legacy names (slow/medium) which work
+        # across all NVENC generations from Kepler onward. Without this,
+        # cache encoder spawn crashes immediately on older GPUs and
+        # the user sees "Clip not ready yet — buffer warming up"
+        # forever.
+        _nvenc_modern = bool(self._ffmpeg_capabilities.get("nvenc_modern_presets", False))
+        # Map (modern preset) -> (legacy preset) for the 3 used here.
+        # p7 = highest quality        -> slow
+        # p4 = medium speed/quality   -> medium
+        _nvenc_p7 = "p7" if _nvenc_modern else "slow"
+        _nvenc_p4 = "p4" if _nvenc_modern else "medium"
         import os as _enc_os
         # EXPORT-ONLY VERY-HIGH-QUALITY BRANCH (purpose=='clip_export').
         # Bumped from CRF 18 / CQ 19 to CRF 17 / CQ 17 — the lower
@@ -22737,7 +22833,7 @@ Admin elevation
             except Exception:
                 pass
             if encoder == "h264_nvenc":
-                return ["-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr", "-cq:v", "17", "-b:v", "0", "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_nvenc", "-preset", _nvenc_p7, "-rc", "vbr", "-cq:v", "17", "-b:v", "0", "-pix_fmt", "yuv420p"]
             if encoder == "h264_amf":
                 return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "16", "-qp_p", "17", "-pix_fmt", "yuv420p"]
             if encoder == "h264_qsv":
@@ -22756,7 +22852,7 @@ Admin elevation
         if (purpose == "clip"
                 and _enc_os.environ.get("HGR_CLIP_CACHE_HQ", "1") != "0"):
             if encoder == "h264_nvenc":
-                return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_nvenc", "-preset", _nvenc_p4, "-cq:v", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
             if encoder == "h264_amf":
                 return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "19", "-qp_p", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
             if encoder == "h264_qsv":
@@ -22766,7 +22862,7 @@ Admin elevation
         # UNCHANGED from original shipping values. Preserves cache
         # fps, GOP cadence, and segment timing.
         if encoder == "h264_nvenc":
-            return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
+            return ["-c:v", "h264_nvenc", "-preset", _nvenc_p4, "-cq:v", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
         if encoder == "h264_amf":
             return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "22", "-qp_p", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
         if encoder == "h264_qsv":
@@ -30666,13 +30762,16 @@ def _detect_ffmpeg_capabilities(self) -> dict:
 def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: float | None = None) -> list[str]:
     encoder = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
     gop = max(1, int(round(float(fps) * float(segment_seconds if segment_seconds is not None else 2.0))))
-    # MIRROR of the instance method at main_window.py:22224. Both
+    # MIRROR of the instance method at main_window.py:22719. Both
     # branches must stay in lockstep.
+    _nvenc_modern = bool(self._ffmpeg_capabilities.get("nvenc_modern_presets", False))
+    _nvenc_p7 = "p7" if _nvenc_modern else "slow"
+    _nvenc_p4 = "p4" if _nvenc_modern else "medium"
     import os as _enc_os
     if (purpose == "clip_export"
             and _enc_os.environ.get("HGR_CLIP_EXPORT_HQ", "1") != "0"):
         if encoder == "h264_nvenc":
-            return ["-c:v", "h264_nvenc", "-preset", "p7", "-rc", "vbr", "-cq:v", "17", "-b:v", "0", "-pix_fmt", "yuv420p"]
+            return ["-c:v", "h264_nvenc", "-preset", _nvenc_p7, "-rc", "vbr", "-cq:v", "17", "-b:v", "0", "-pix_fmt", "yuv420p"]
         if encoder == "h264_amf":
             return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "16", "-qp_p", "17", "-pix_fmt", "yuv420p"]
         if encoder == "h264_qsv":
@@ -30681,14 +30780,14 @@ def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: flo
     if (purpose == "clip"
             and _enc_os.environ.get("HGR_CLIP_CACHE_HQ", "1") != "0"):
         if encoder == "h264_nvenc":
-            return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
+            return ["-c:v", "h264_nvenc", "-preset", _nvenc_p4, "-cq:v", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
         if encoder == "h264_amf":
             return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "19", "-qp_p", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
         if encoder == "h264_qsv":
             return ["-c:v", "h264_qsv", "-global_quality", "21", "-look_ahead", "0", "-g", str(gop), "-pix_fmt", "nv12"]
         return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-g", str(gop), "-pix_fmt", "yuv420p"]
     if encoder == "h264_nvenc":
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq:v", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
+        return ["-c:v", "h264_nvenc", "-preset", _nvenc_p4, "-cq:v", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
     if encoder == "h264_amf":
         return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "22", "-qp_p", "24", "-g", str(gop), "-pix_fmt", "yuv420p"]
     if encoder == "h264_qsv":
