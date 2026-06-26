@@ -23778,13 +23778,19 @@ Admin elevation
         # a managed-laptop policy that scrubs %TEMP% on logon).
         # Without the fallback the symptom is "Touchless silently never
         # records a clip" — exact root cause untestable from the user side.
+        # Local import — module-level `os` is not in scope here.
+        # (Found via dad's PC debug log: prior version raised
+        # `NameError: name 'os' is not defined` on every cache start,
+        # which crashed _start_clip_cache before NVENC was even tried,
+        # silently preventing all clipping.)
+        import os as _cd_os
         primary = Path(tempfile.gettempdir()) / "hgr_clip_cache"
         try:
             primary.mkdir(parents=True, exist_ok=True)
             # Writability canary so a "mkdir succeeded" but "writes
             # blocked" condition (CFA / AV interception) is caught here
             # instead of silently producing 0-byte segments.
-            canary = primary / f".cache_writable_{os.getpid()}.tmp"
+            canary = primary / f".cache_writable_{_cd_os.getpid()}.tmp"
             with open(canary, "wb") as _cf:
                 _cf.write(b"ok")
             canary.unlink(missing_ok=True)
@@ -23800,7 +23806,7 @@ Admin elevation
                 _cd_sys.stderr.flush()
             except Exception:
                 pass
-            fallback_root = os.environ.get("LOCALAPPDATA") or str(Path.home())
+            fallback_root = _cd_os.environ.get("LOCALAPPDATA") or str(Path.home())
             fallback = Path(fallback_root) / "Touchless" / "clip_cache"
             try:
                 fallback.mkdir(parents=True, exist_ok=True)
@@ -31233,13 +31239,19 @@ def _clip_crop_filter(self, capture_region: QRect, target_region: QRect) -> str:
         # a managed-laptop policy that scrubs %TEMP% on logon).
         # Without the fallback the symptom is "Touchless silently never
         # records a clip" — exact root cause untestable from the user side.
+        # Local import — module-level `os` is not in scope here.
+        # (Found via dad's PC debug log: prior version raised
+        # `NameError: name 'os' is not defined` on every cache start,
+        # which crashed _start_clip_cache before NVENC was even tried,
+        # silently preventing all clipping.)
+        import os as _cd_os
         primary = Path(tempfile.gettempdir()) / "hgr_clip_cache"
         try:
             primary.mkdir(parents=True, exist_ok=True)
             # Writability canary so a "mkdir succeeded" but "writes
             # blocked" condition (CFA / AV interception) is caught here
             # instead of silently producing 0-byte segments.
-            canary = primary / f".cache_writable_{os.getpid()}.tmp"
+            canary = primary / f".cache_writable_{_cd_os.getpid()}.tmp"
             with open(canary, "wb") as _cf:
                 _cf.write(b"ok")
             canary.unlink(missing_ok=True)
@@ -31255,7 +31267,7 @@ def _clip_crop_filter(self, capture_region: QRect, target_region: QRect) -> str:
                 _cd_sys.stderr.flush()
             except Exception:
                 pass
-            fallback_root = os.environ.get("LOCALAPPDATA") or str(Path.home())
+            fallback_root = _cd_os.environ.get("LOCALAPPDATA") or str(Path.home())
             fallback = Path(fallback_root) / "Touchless" / "clip_cache"
             try:
                 fallback.mkdir(parents=True, exist_ok=True)

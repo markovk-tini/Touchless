@@ -4538,16 +4538,22 @@ class GestureWorker(QObject):
             except Exception:
                 pass
 
-        if self._low_fps_active:
-            _log("skipped: low_fps_mode is active")
-            return open_result
-        # Camera-side ffmpeg/MJPG swap fires for either Lite Mode
-        # or GPU Mode â€” without this, a user who enabled only GPU
-        # Mode would keep OpenCV's YUY2 30 fps camera ceiling and
-        # the GPU inference speedup couldn't materialize as more
-        # live FPS. See _perf_optimisations_enabled.
-        if not self._perf_optimisations_enabled():
-            _log("skipped: lite_mode + gpu_mode both off")
+        # Camera-side ffmpeg/MJPG swap fires for Lite Mode, GPU Mode,
+        # OR Low FPS Mode (manual or auto-engaged). Without this, a
+        # user on slow hardware who hits the auto-engage path
+        # (CRITICAL_FPS_THRESHOLD < 12 fps) gets the MediaPipe
+        # complexity drop but keeps OpenCV's YUY2 30 fps camera
+        # ceiling — and at the YUY2 bandwidth cap, the camera often
+        # only delivers 8-10 fps at 720p, which then becomes the
+        # actual frame ceiling regardless of inference speedup.
+        # Adding low_fps to the gate is what makes auto-engage on
+        # dad's-PC-class hardware (GTX 960, no GPU mode set, fps
+        # auto-degraded to low_fps) actually translate the inference
+        # speedup into more live FPS. Previously the ffmpeg upgrade
+        # was EXPLICITLY skipped when low_fps was active — that
+        # branch is now removed.
+        if not (self._perf_optimisations_enabled() or self._low_fps_active):
+            _log("skipped: lite_mode + gpu_mode + low_fps_mode all off")
             return open_result
         if not isinstance(open_result, tuple) or len(open_result) < 2:
             _log("skipped: open_result not in (info, cap) shape")
