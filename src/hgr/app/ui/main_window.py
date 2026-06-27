@@ -23014,6 +23014,25 @@ Admin elevation
                         _sys.stderr.flush()
                     except Exception:
                         pass
+                    # Capture error-shaped lines into the user-facing
+                    # diagnostic so the watchdog dialog can surface the
+                    # actual cause instead of "(none captured)". ffmpeg
+                    # emits errors with consistent prefixes — match
+                    # broadly so we don't miss capture-source errors,
+                    # codec errors, file-permission errors.
+                    try:
+                        low = text.lower()
+                        if (
+                            "error" in low
+                            or "could not" in low
+                            or "failed" in low
+                            or "permission" in low
+                            or "not found" in low
+                            or "invalid" in low
+                        ):
+                            self._last_ffmpeg_startup_error = f"[{tag}] {text}"
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -25673,11 +25692,35 @@ Admin elevation
             "-reset_timestamps", "1",
             str(self._clip_cache_segment_pattern),
         ]
+        # Log the spawn command so the user can reproduce / diagnose
+        # ffmpeg failures from the log file. Useful when something
+        # specific to the user's hardware (HiDPI screen, missing
+        # monitor for screen capture, encoder driver mismatch) kills
+        # the cache spawn.
+        try:
+            import sys as _spawn_sys
+            _spawn_sys.stderr.write(
+                f"[clip-cache] spawning ffmpeg: cmd={command!r}\n"
+            )
+            _spawn_sys.stderr.flush()
+        except Exception:
+            pass
         process = self._start_ffmpeg_process(command)
         if process is None:
             return False
         self._clip_cache_process = process
         self._clip_cache_backend = "ffmpeg"
+        # Drain stderr so post-startup ffmpeg errors (capture device
+        # going away mid-stream, encoder driver crash, segment write
+        # permission denied) actually land in the debug log. Without
+        # this, the 64 KB Windows pipe buffer fills and ffmpeg blocks
+        # — AND any error message ffmpeg emitted is invisible to the
+        # user. The clip-cache watchdog uses _last_ffmpeg_startup_error
+        # to surface the actual cause in the "Clip — cache not writing"
+        # dialog. Without the drain feeding that field, the dialog just
+        # says "(none captured)" — exactly what dad's first watchdog
+        # log showed.
+        self._spawn_ffmpeg_stderr_drain(process, "clip-cache-video")
         # Anchor wall-clock to ffmpeg's t=0. ffmpeg's segment list CSV
         # records start_time/end_time as RELATIVE seconds since the
         # encoder started — when we later need to align with the voice
