@@ -25672,6 +25672,53 @@ Admin elevation
         self._clip_cache_list_path = self._ffmpeg_clip_list_path()
         self._clip_cache_segment_pattern = self._ffmpeg_clip_segment_pattern()
         self._clip_cache_has_audio = False
+        # NVENC H.264 has a hardware-enforced 4096x4096 maximum input
+        # resolution on EVERY GPU generation (Maxwell through Ada).
+        # Users with multi-monitor setups whose virtual desktop exceeds
+        # 4096 in either dimension (e.g. dad's GTX 960 + dual monitors
+        # = 4240x1440) hit "No capable devices found" from h264_nvenc
+        # the moment ffmpeg tries to open the encoder, and the cache
+        # crashes silently producing zero segments. The startup probe
+        # at _detect_ffmpeg_capabilities uses a 64x64 test source which
+        # always passes — it doesn't catch the resolution-limit case.
+        # Solution: for this specific clip-cache spawn, if the region
+        # exceeds 4096 in either dimension, force libx264 (CPU encoder,
+        # arbitrary resolution support). The user gets a working cache
+        # at the cost of higher CPU usage. NVENC stays selected for
+        # smaller-region exports (single-monitor captures, e.g. when
+        # the user picks just one monitor via the capture picker).
+        encoder_args = self._ffmpeg_encoder_args(
+            purpose="clip",
+            fps=self._clip_cache_fps,
+            segment_seconds=self._clip_cache_segment_seconds,
+        )
+        if (
+            region.width() > 4096 or region.height() > 4096
+        ) and any("h264_nvenc" in a for a in encoder_args):
+            try:
+                import sys as _enc_sys
+                _enc_sys.stderr.write(
+                    f"[clip-cache] capture region {region.width()}x{region.height()} "
+                    "exceeds NVENC's 4096x4096 H.264 limit — forcing libx264 "
+                    "(CPU encoder) for this session. Multi-monitor users on any "
+                    "NVENC GPU hit this.\n"
+                )
+                _enc_sys.stderr.flush()
+            except Exception:
+                pass
+            # libx264 -preset veryfast -crf 20 -g <gop> -pix_fmt yuv420p
+            # mirrors the CACHE HQ branch's CPU-encoder choice.
+            gop = max(
+                1,
+                int(round(float(self._clip_cache_fps) * float(self._clip_cache_segment_seconds))),
+            )
+            encoder_args = [
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "20",
+                "-g", str(gop),
+                "-pix_fmt", "yuv420p",
+            ]
         # Video-only command. Audio capture runs in a SEPARATE ffmpeg
         # subprocess (see _start_clip_cache_audio) so a stalled audio
         # source can never backpressure the video pipeline and produce
@@ -25681,7 +25728,7 @@ Admin elevation
             "-hide_banner", "-loglevel", "error", "-y",
             *self._ffmpeg_capture_input_args(region, fps=self._clip_cache_fps, prefer_low_overhead=False),
             "-an",
-            *self._ffmpeg_encoder_args(purpose="clip", fps=self._clip_cache_fps, segment_seconds=self._clip_cache_segment_seconds),
+            *encoder_args,
             "-force_key_frames", f"expr:gte(t,n_forced*{float(self._clip_cache_segment_seconds):.3f})",
             "-f", "segment",
             "-segment_time", f"{float(self._clip_cache_segment_seconds):.3f}",
