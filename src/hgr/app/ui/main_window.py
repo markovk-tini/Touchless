@@ -5820,32 +5820,69 @@ class _WheelScrollGuard(QObject):
 
     def eventFilter(self, watched, event) -> bool:
         try:
-            if event.type() != QEvent.Wheel:
+            # ALSO catch Show events for first-time focus-policy fix.
+            # When a guarded widget first becomes visible, set its
+            # focusPolicy to StrongFocus (no wheel focus) so Qt's
+            # default propagation handles wheel events correctly —
+            # they bubble up to whatever parent (QScrollArea, plain
+            # QWidget with a scroll bar, etc.) is set up to handle
+            # them. This is the Qt-native approach and works without
+            # us having to find/forward to a specific scroll area
+            # ancestor (which doesn't always exist in our layout).
+            etype = event.type()
+            if etype not in (QEvent.Wheel, QEvent.Show):
                 return False
-            # Cheap class-name check avoids importing every widget
-            # type at module load. Walks the MRO so a custom subclass
-            # of QSlider still matches.
+            is_guarded = False
             for klass in type(watched).__mro__:
                 if klass.__name__ in self._GUARDED_TYPES:
+                    is_guarded = True
                     break
-            else:
+            if not is_guarded:
                 return False
-            try:
-                if watched.hasFocus():
-                    return False  # let it work normally when explicitly focused
-            except Exception:
-                pass
-            # Forward the wheel event to the parent so it bubbles up
-            # to the scroll area. Without this, ignoring + returning
-            # True would just swallow the scroll.
-            try:
-                parent = watched.parentWidget()
-                if parent is not None:
-                    from PySide6.QtWidgets import QApplication as _QApp
+            if etype == QEvent.Show:
+                # First-time show — fix focus policy so wheel events
+                # don't focus the widget. Cheap: just sets an int.
+                try:
+                    watched.setFocusPolicy(Qt.StrongFocus)
+                except Exception:
+                    pass
+                return False  # let normal show processing continue
+            # etype == QEvent.Wheel. ALWAYS consume — even if focused.
+            # Users expect scroll-over-slider to scroll the page, not
+            # change the value. Widget stays interactable via click +
+            # drag + arrow keys.
+            #
+            # Strategy: walk up the parent chain and post the wheel
+            # event to the first ancestor we find that's either a
+            # QAbstractScrollArea OR a generic widget under which
+            # wheel events would scroll the page. Posting to the
+            # top-level window's viewport-equivalent ensures the
+            # scroll bar moves regardless of how the settings UI
+            # is laid out.
+            from PySide6.QtWidgets import (
+                QApplication as _QApp,
+                QAbstractScrollArea,
+            )
+            parent = watched.parentWidget()
+            while parent is not None:
+                if isinstance(parent, QAbstractScrollArea):
+                    try:
+                        _QApp.sendEvent(parent.viewport(), event)
+                    except Exception:
+                        pass
+                    return True
+                parent = parent.parentWidget()
+            # No scroll area ancestor — find ANY parent that's not
+            # the guarded widget and forward. This handles layouts
+            # where the scroll happens via a plain QWidget +
+            # scrollbar (less common but possible).
+            parent = watched.parentWidget()
+            if parent is not None:
+                try:
                     _QApp.sendEvent(parent, event)
-            except Exception:
-                pass
-            return True  # consume on this widget so its value doesn't change
+                except Exception:
+                    pass
+            return True
         except Exception:
             return False
 
@@ -22869,10 +22906,90 @@ Admin elevation
                     "— demoting to libx264\n"
                 )
                 sys.stderr.flush()
+        # AMF (AMD) probe — uses the SAME pix_fmt + multi-frame
+        # rendering that production cache uses, not a token 1-frame
+        # null encode. A naive 1-frame probe just exercises encoder
+        # init (which can succeed even when runtime hardware paths
+        # fail). 5 frames + pix_fmt yuv420p mirrors the cache spawn,
+        # catching the half-broken case where init succeeds but
+        # actual frame encoding fails (verified in the user's QSV
+        # log: 1 file appeared on disk but the CSV manifest never
+        # populated because the encoder stalled after init).
+        if "h264_amf" in capabilities["encoders"]:
+            try:
+                completed = subprocess.run(
+                    [
+                        self._ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", "color=black:s=320x180:d=0.5:r=10",
+                        "-c:v", "h264_amf", "-quality", "speed",
+                        "-pix_fmt", "yuv420p",
+                        "-frames:v", "5", "-f", "null", "-",
+                    ],
+                    capture_output=True, text=True, timeout=10.0,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if completed.returncode != 0:
+                    capabilities["encoders"].discard("h264_amf")
+                    sys.stderr.write(
+                        "[ffmpeg-caps] h264_amf failed runtime probe (amfrt64.dll likely "
+                        "missing or AMD driver path unavailable — normal on NVIDIA-only "
+                        "or Intel-only PCs). Demoting.\n"
+                        f"[ffmpeg-caps] amf probe stderr: {completed.stderr.strip()[:200]}\n"
+                    )
+                    sys.stderr.flush()
+            except Exception as exc:
+                capabilities["encoders"].discard("h264_amf")
+                sys.stderr.write(
+                    f"[ffmpeg-caps] h264_amf probe hung/threw ({exc!r}) — demoting\n"
+                )
+                sys.stderr.flush()
+        # QSV (Intel) probe — same pattern. Probe with nv12 (the
+        # production pix_fmt for QSV) and 5 frames so we catch the
+        # case where libmfx initialises but the underlying iGPU
+        # path is disabled or unavailable (common on NVIDIA-discrete-
+        # only systems where the iGPU is BIOS-disabled).
+        if "h264_qsv" in capabilities["encoders"]:
+            try:
+                completed = subprocess.run(
+                    [
+                        self._ffmpeg_path, "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", "color=black:s=320x180:d=0.5:r=10",
+                        "-c:v", "h264_qsv", "-preset", "veryfast",
+                        "-pix_fmt", "nv12",
+                        "-frames:v", "5", "-f", "null", "-",
+                    ],
+                    capture_output=True, text=True, timeout=10.0,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if completed.returncode != 0:
+                    capabilities["encoders"].discard("h264_qsv")
+                    sys.stderr.write(
+                        "[ffmpeg-caps] h264_qsv failed runtime probe (Intel iGPU path "
+                        "unavailable — normal on discrete-GPU-only systems with iGPU "
+                        "disabled in BIOS). Demoting.\n"
+                        f"[ffmpeg-caps] qsv probe stderr: {completed.stderr.strip()[:200]}\n"
+                    )
+                    sys.stderr.flush()
+            except Exception as exc:
+                capabilities["encoders"].discard("h264_qsv")
+                sys.stderr.write(
+                    f"[ffmpeg-caps] h264_qsv probe hung/threw ({exc!r}) — demoting\n"
+                )
+                sys.stderr.flush()
         for preferred in ("h264_nvenc", "h264_amf", "h264_qsv", "libx264"):
             if preferred in capabilities["encoders"]:
                 capabilities["preferred_encoder"] = preferred
                 break
+        # Log final selection so the user / dev can see at a glance
+        # which encoder will be used after all the probes.
+        try:
+            sys.stderr.write(
+                f"[ffmpeg-caps] FINAL preferred_encoder={capabilities['preferred_encoder']} "
+                f"available={sorted(capabilities['encoders'])!r}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         return capabilities
     def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: float | None = None) -> list[str]:
         encoder = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
@@ -25767,33 +25884,51 @@ Admin elevation
             fps=self._clip_cache_fps,
             segment_seconds=self._clip_cache_segment_seconds,
         )
-        if (
-            region.width() > 4096 or region.height() > 4096
-        ) and any("h264_nvenc" in a for a in encoder_args):
+        # Resolution-fit handling. Hardware encoders all have hard
+        # input-dimension limits at the silicon level:
+        #   NVENC H.264:  4096x4096 max
+        #   AMF H.264:    4096x4096 max
+        #   QSV H.264:    4096x4096 max
+        # Multi-monitor users with virtual desktops wider than 4096 hit
+        # this every time. Two cases to handle:
+        #
+        # (a) PREFERRED ENCODER IS A HARDWARE ENCODER (the common case
+        #     for any GPU-equipped PC): inject a scale filter to cap
+        #     the input at 4096 in either dimension while preserving
+        #     aspect ratio. The clip is then slightly downscaled vs.
+        #     the user's native screen, but encoding stays fast on the
+        #     GPU instead of slamming the CPU with libx264 at 4240x1440
+        #     (which on a mid-tier CPU steals ~50% of frame budget and
+        #     drops self._fps to ~half ceiling).
+        #
+        # (b) PREFERRED ENCODER IS ALREADY libx264: no resolution
+        #     limit, no scale needed. CPU encoding handles arbitrary
+        #     dimensions.
+        scale_filter_args: list[str] = []
+        oversize = region.width() > 4096 or region.height() > 4096
+        using_hw_encoder = any(
+            tag in encoder_args
+            for tag in ("h264_nvenc", "h264_amf", "h264_qsv")
+        )
+        if oversize and using_hw_encoder:
+            # scale=4096:-2 forces width to 4096 and computes height
+            # divisible by 2 (yuv420p requirement) while preserving
+            # aspect. If height is the limiting axis, swap to scale=-2:4096.
+            if region.width() >= region.height():
+                scale_filter_args = ["-vf", "scale=4096:-2"]
+            else:
+                scale_filter_args = ["-vf", "scale=-2:4096"]
             try:
                 import sys as _enc_sys
                 _enc_sys.stderr.write(
                     f"[clip-cache] capture region {region.width()}x{region.height()} "
-                    "exceeds NVENC's 4096x4096 H.264 limit — forcing libx264 "
-                    "(CPU encoder) for this session. Multi-monitor users on any "
-                    "NVENC GPU hit this.\n"
+                    "exceeds 4096x4096 hardware encoder limit — auto-scaling "
+                    f"input to fit ({scale_filter_args[1]}). Keeps NVENC/AMF/QSV "
+                    "active instead of slamming CPU with libx264.\n"
                 )
                 _enc_sys.stderr.flush()
             except Exception:
                 pass
-            # libx264 -preset veryfast -crf 20 -g <gop> -pix_fmt yuv420p
-            # mirrors the CACHE HQ branch's CPU-encoder choice.
-            gop = max(
-                1,
-                int(round(float(self._clip_cache_fps) * float(self._clip_cache_segment_seconds))),
-            )
-            encoder_args = [
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "20",
-                "-g", str(gop),
-                "-pix_fmt", "yuv420p",
-            ]
         # Video-only command. Audio capture runs in a SEPARATE ffmpeg
         # subprocess (see _start_clip_cache_audio) so a stalled audio
         # source can never backpressure the video pipeline and produce
@@ -25803,6 +25938,7 @@ Admin elevation
             "-hide_banner", "-loglevel", "error", "-y",
             *self._ffmpeg_capture_input_args(region, fps=self._clip_cache_fps, prefer_low_overhead=False),
             "-an",
+            *scale_filter_args,
             *encoder_args,
             "-force_key_frames", f"expr:gte(t,n_forced*{float(self._clip_cache_segment_seconds):.3f})",
             "-f", "segment",
@@ -25942,7 +26078,15 @@ Admin elevation
                 ])
         except Exception:
             pass
-        if seg_count_disk > 0 or list_rows > 0:
+        # Need BOTH segment files on disk AND rows in the CSV manifest
+        # for the export to actually work. The CSV is what
+        # _clip_export_v2 reads to discover segments — disk files
+        # without manifest rows are invisible to it. (User's QSV log
+        # showed exactly this case: 1 .mkv on disk, 0 CSV rows,
+        # encoder stalled mid-write so the manifest never got
+        # populated. Previously the watchdog OR'd these and reported
+        # 'healthy' — a false positive that hid the real failure.)
+        if seg_count_disk > 0 and list_rows > 0:
             try:
                 import sys as _sa_sys
                 _sa_sys.stderr.write(
@@ -25986,6 +26130,62 @@ Admin elevation
                 "Check %USERPROFILE%\\.touchless\\touchless_debug.log "
                 "for [clip-cache] WATCHDOG FAILURE entries."
             )
+        except Exception:
+            pass
+        # AUTO-RECOVERY: if the preferred encoder isn't already
+        # libx264, demote to libx264 and restart the cache. Hardware
+        # encoders fail silently in too many ways (DLL missing,
+        # resolution mismatch, driver state, encoder pipeline stall
+        # without stderr output — the user's QSV case had ZERO stderr
+        # output despite producing zero segments). libx264 is the
+        # universal fallback that always works on any CPU at any
+        # resolution. Cost: higher CPU, slightly slower encoding.
+        # Worth it for "clip ALWAYS works" guarantee.
+        try:
+            current_pref = str(
+                self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264"
+            )
+            if current_pref != "libx264":
+                try:
+                    import sys as _fb_sys
+                    _fb_sys.stderr.write(
+                        f"[clip-cache] AUTO-RECOVERY: demoting "
+                        f"preferred_encoder={current_pref} -> libx264 and "
+                        "restarting cache. Hardware encoder produced no "
+                        "segments despite ffmpeg process running — fallback "
+                        "to CPU encoding to guarantee cache works.\n"
+                    )
+                    _fb_sys.stderr.flush()
+                except Exception:
+                    pass
+                # Remove the failing hw encoder from capabilities so the
+                # next selection picks the next-best (eventually libx264).
+                self._ffmpeg_capabilities["encoders"].discard(current_pref)
+                self._ffmpeg_capabilities["preferred_encoder"] = "libx264"
+                # Tear down the dead cache + restart with the new
+                # encoder. delete_files=False keeps any audio segments
+                # already buffered (which CAN be valid even when video
+                # cache is dead).
+                try:
+                    self._stop_clip_cache_ffmpeg(delete_files=False)
+                except Exception:
+                    pass
+                try:
+                    self._start_clip_cache_ffmpeg()
+                    # Clear the stashed health warning so the next clip
+                    # attempt's dialog doesn't surface stale fear text.
+                    self._clip_cache_health_warning = None
+                    import sys as _fb_sys2
+                    _fb_sys2.stderr.write(
+                        "[clip-cache] AUTO-RECOVERY: cache restarted with libx264\n"
+                    )
+                    _fb_sys2.stderr.flush()
+                except Exception as exc:
+                    import sys as _fb_sys2
+                    _fb_sys2.stderr.write(
+                        f"[clip-cache] AUTO-RECOVERY restart failed: {exc!r}\n"
+                    )
+                    _fb_sys2.stderr.flush()
         except Exception:
             pass
 
