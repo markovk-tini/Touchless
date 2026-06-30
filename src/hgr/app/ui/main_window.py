@@ -5790,6 +5790,66 @@ class _CurrentSizedStack(QStackedWidget):
             pass
 
 
+class _WheelScrollGuard(QObject):
+    """Global event filter — stops sliders / combos / spinboxes from
+    consuming wheel events when they're not focused. Without this,
+    scrolling a settings page while the cursor hovers over a slider
+    or combo changes the widget's value instead of scrolling the
+    page — a common Qt papercut on scroll-area-heavy UIs.
+
+    Standard Qt recipe: forward unfocused wheel events to the parent
+    so they bubble up to the QScrollArea, which handles them as
+    scroll. Focused widgets retain wheel behaviour (so a deliberately
+    focused slider can still be wheeled).
+
+    Installed once on the QApplication in MainWindow.__init__ so it
+    covers EVERY current and future settings widget without per-widget
+    plumbing.
+    """
+    _GUARDED_TYPES = (
+        "QSlider",
+        "QComboBox",
+        "QSpinBox",
+        "QDoubleSpinBox",
+        "QFontComboBox",
+        "QDateEdit",
+        "QTimeEdit",
+        "QDateTimeEdit",
+        "QAbstractSpinBox",
+    )
+
+    def eventFilter(self, watched, event) -> bool:
+        try:
+            if event.type() != QEvent.Wheel:
+                return False
+            # Cheap class-name check avoids importing every widget
+            # type at module load. Walks the MRO so a custom subclass
+            # of QSlider still matches.
+            for klass in type(watched).__mro__:
+                if klass.__name__ in self._GUARDED_TYPES:
+                    break
+            else:
+                return False
+            try:
+                if watched.hasFocus():
+                    return False  # let it work normally when explicitly focused
+            except Exception:
+                pass
+            # Forward the wheel event to the parent so it bubbles up
+            # to the scroll area. Without this, ignoring + returning
+            # True would just swallow the scroll.
+            try:
+                parent = watched.parentWidget()
+                if parent is not None:
+                    from PySide6.QtWidgets import QApplication as _QApp
+                    _QApp.sendEvent(parent, event)
+            except Exception:
+                pass
+            return True  # consume on this widget so its value doesn't change
+        except Exception:
+            return False
+
+
 class MainWindow(QMainWindow):
     # Cross-thread bridge for the off-thread clip export. The
     # worker thread emits this signal after stashing its result on
@@ -5825,6 +5885,21 @@ class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig):
         super().__init__()
         self.config = config
+        # Install the global wheel-scroll guard FIRST, before any
+        # settings widgets get instantiated. It intercepts wheel
+        # events on QSlider/QComboBox/QSpinBox etc. so scrolling a
+        # settings page doesn't accidentally change values when the
+        # cursor is hovering over a widget. Filter is owned by MainWindow
+        # so it persists for the whole app lifetime; held on self so
+        # it doesn't get garbage-collected.
+        try:
+            self._wheel_scroll_guard = _WheelScrollGuard(self)
+            from PySide6.QtWidgets import QApplication as _WheelApp
+            app_instance = _WheelApp.instance()
+            if app_instance is not None:
+                app_instance.installEventFilter(self._wheel_scroll_guard)
+        except Exception:
+            pass
         # Telemetry: ensure an anonymous install UUID exists, then
         # construct the singleton client. Both this constructor and
         # `track(...)` are no-ops when no API key is configured —

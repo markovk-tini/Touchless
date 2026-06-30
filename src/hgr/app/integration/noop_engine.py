@@ -3769,18 +3769,43 @@ class GestureWorker(QObject):
                 pass
 
     def _engage_auto_low_fps(self) -> None:
+        # Log auto-engage so we can see in the debug log when slow
+        # hardware tripped the threshold. Previously this was silent
+        # which made it impossible to tell whether dad's PC ever
+        # actually engaged the perf pipeline.
+        try:
+            sys.stderr.write(
+                f"[perf-auto] auto-engaging low_fps (current fps={self._fps:.1f}, threshold={self._CRITICAL_FPS_THRESHOLD})\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         self._low_fps_auto_engaged = True
         self._swap_engine_safely()
         if self._cap is not None:
             self._apply_low_fps_capture_tuning(self._cap)
+        # Also reopen camera in ffmpeg-MJPG mode — without this the
+        # auto-engage just changes MediaPipe complexity but the camera
+        # stays in slow OpenCV-YUY2 mode, so the perceived FPS doesn't
+        # improve at all (the camera's hardware rate is now the cap).
+        self._apply_perf_camera_path(want_ffmpeg=True)
 
     def _disengage_auto_low_fps(self) -> None:
+        try:
+            sys.stderr.write(
+                f"[perf-auto] auto-disengaging low_fps (current fps={self._fps:.1f})\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         self._low_fps_auto_engaged = False
         self._low_fps_below_since = None
         self._low_fps_above_since = None
         self._swap_engine_safely()
         if self._cap is not None and not self._low_fps_active:
             self._restore_normal_capture_tuning(self._cap)
+        # Restore OpenCV cap unless another perf mode is still active.
+        self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
 
     def _maybe_auto_toggle_low_fps(self, now: float) -> None:
         if getattr(self.config, "low_fps_mode", False):
@@ -3911,19 +3936,116 @@ class GestureWorker(QObject):
                 pass
 
     def _perf_optimisations_enabled(self) -> bool:
-        # Lite Mode and GPU Mode are independent toggles, but both
-        # imply "the user opted into the performance pipeline" â€”
-        # ffmpeg-MJPG capture, skip-frame inference, throttled
-        # debug-frame emit, and the per-frame timing diagnostic.
-        # Without this, a user who enables only GPU Mode keeps the
-        # OpenCV YUY2 30 fps camera ceiling, which masks the GPU
-        # inference speedup behind a hard camera-rate cap.
-        # Returning True for either toggle is the foot-gun-free
-        # behaviour the user reported wanting.
+        # Lite Mode, GPU Mode, AND Low FPS Mode (manual or auto-engaged)
+        # all imply "the user opted into the performance pipeline" -
+        # ffmpeg-MJPG capture, skip-frame inference, throttled debug-
+        # frame emit, and the per-frame timing diagnostic. Returning
+        # True for ANY of them is what dad's-PC-class hardware needs:
+        # auto-engaged low_fps must drop into the same fast pipeline as
+        # the manual toggles, otherwise the live camera stays in the
+        # 8-10 fps YUY2 ceiling no matter what the engine does.
         return (
             bool(getattr(self.config, "lite_mode", False))
             or bool(getattr(self.config, "gpu_mode", False))
+            or self._low_fps_active
         )
+
+    def _any_perf_mode_active(self) -> bool:
+        """True if ANY of lite, gpu, low_fps (manual or auto) is on.
+        Used by the camera reopen helper below to decide whether
+        ffmpeg-MJPG should be the active capture path."""
+        return (
+            bool(getattr(self.config, "lite_mode", False))
+            or bool(getattr(self.config, "gpu_mode", False))
+            or bool(getattr(self.config, "low_fps_mode", False))
+            or self._low_fps_auto_engaged
+        )
+
+    def _apply_perf_camera_path(self, *, want_ffmpeg: bool) -> None:
+        """Idempotent: reopen the camera in the requested codec path.
+        want_ffmpeg=True -> swap to ffmpeg-MJPG dshow capture (breaks
+        the OpenCV YUY2 8-30 fps ceiling, requires Windows local USB
+        webcam).
+        want_ffmpeg=False -> drop back to OpenCV (default).
+
+        Used by set_lite_mode, set_low_fps_mode, set_gpu_mode,
+        _engage_auto_low_fps, _disengage_auto_low_fps. Centralises the
+        previously-duplicated reopen blocks so a future toggle can't
+        accidentally skip the camera path.
+
+        Logs the decision + outcome to stderr so live-fps regressions
+        are diagnosable from the log file alone.
+        """
+        def _log(msg: str) -> None:
+            try:
+                sys.stderr.write(f"[perf-camera] {msg}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+        if not self._running or self._cap is None:
+            _log(f"skipped: running={self._running} cap_set={self._cap is not None}")
+            return
+        info = self._camera_info
+        if info is None:
+            _log("skipped: no camera_info")
+            return
+        index = getattr(info, "index", None)
+        if index is None or int(index) < 0:
+            _log(f"skipped: index={index!r} (phone-camera path)")
+            return
+        if not sys.platform.startswith("win"):
+            _log("skipped: non-Windows")
+            return
+        currently_ffmpeg = "FfmpegMjpegCapture" in type(self._cap).__name__
+        if want_ffmpeg and currently_ffmpeg:
+            _log("noop: already on ffmpeg-MJPG")
+            return
+        if not want_ffmpeg and not currently_ffmpeg:
+            _log("noop: already on OpenCV")
+            return
+        old_cap = self._cap
+        self._cap = None
+        try:
+            old_cap.release()
+        except Exception:
+            pass
+        if want_ffmpeg:
+            from ..camera.ffmpeg_capture import (
+                FfmpegMjpegCapture,  # noqa: F401 - keep import for currently_ffmpeg check
+                resolve_dshow_device_for_index,
+            )
+            device_name = resolve_dshow_device_for_index(
+                int(index),
+                qt_name_hint=str(getattr(info, "display_name", "") or ""),
+            )
+            if not device_name:
+                _log("ffmpeg path: resolve_dshow_device_for_index returned empty - falling back to OpenCV")
+                recovered = open_camera_by_index(int(index), max_index=self.config.camera_scan_limit)
+                if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
+                    self._cap = recovered[1]
+                return
+            ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
+                device_name, width=1280, height=720
+            )
+            if ffmpeg_cap is not None and ffmpeg_cap.isOpened():
+                self._cap = ffmpeg_cap
+                _log(f"engaged ffmpeg-MJPG cap for device={device_name!r}")
+                return
+            if ffmpeg_cap is not None:
+                try:
+                    ffmpeg_cap.release()
+                except Exception:
+                    pass
+            _log(f"ffmpeg cap failed for device={device_name!r}, falling back to OpenCV")
+            recovered = open_camera_by_index(int(index), max_index=self.config.camera_scan_limit)
+            if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
+                self._cap = recovered[1]
+        else:
+            recovered = open_camera_by_index(int(index), max_index=self.config.camera_scan_limit)
+            if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
+                self._cap = recovered[1]
+                _log("restored OpenCV cap")
 
     def _build_engine_for_fps_mode(self) -> GestureRecognitionEngine:
         self._low_fps_active = bool(getattr(self.config, "low_fps_mode", False)) or self._low_fps_auto_engaged
@@ -3987,156 +4109,41 @@ class GestureWorker(QObject):
                     self._apply_low_fps_capture_tuning(self._cap)
                 else:
                     self._restore_normal_capture_tuning(self._cap)
+            # Critical: reopen camera with ffmpeg-MJPG when ANY perf
+            # mode is active. Previously set_low_fps_mode only tuned
+            # the existing OpenCV cap, which means a user enabling
+            # Low FPS Mode on slow hardware stayed on the YUY2 8-10
+            # fps ceiling and the mode produced no noticeable effect.
+            self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
 
     def set_lite_mode(self, enabled: bool) -> None:
-        # User-driven lite-model toggle. Rebuilds the engine with
-        # the lite landmark model + downsampled inference and, when
-        # enabled, also swaps the camera capture for the
-        # ffmpeg-MJPG path so we can break the 30 fps YUY2 ceiling
-        # OpenCV can't get past on Windows. Toggling off restores
-        # the OpenCV path. Phone-camera sources (index < 0) skip
-        # the swap because their frames already arrive
-        # MJPG-compressed over the wire.
-        was_enabled = bool(self.config.lite_mode)
+        # Lite-model toggle. Rebuilds engine with lite landmark model +
+        # downsampled inference and, if no faster perf mode wins, swaps
+        # the camera capture to ffmpeg-MJPG via _apply_perf_camera_path.
         self.config.lite_mode = bool(enabled)
         if not self._running:
             return
         self._swap_engine_safely()
         self._fps = 0.0
-        if self._cap is None or self._low_fps_active:
-            return
-        if bool(enabled) == was_enabled:
-            return
-        info = self._camera_info
-        if info is None:
-            return
-        index = getattr(info, "index", None)
-        if index is None or int(index) < 0:
-            return
-        if not sys.platform.startswith("win"):
-            return
-        if enabled:
-            # Turn ON: try to upgrade the live cap to ffmpeg-MJPG.
-            device_name = resolve_dshow_device_for_index(
-                int(index),
-                qt_name_hint=str(getattr(info, "display_name", "") or ""),
-            )
-            if not device_name:
-                return
-            # Release the OpenCV cap before launching ffmpeg so the
-            # camera isn't held open by two processes (Windows
-            # serialises capture access â€” the second open would
-            # fail).
-            old_cap = self._cap
-            self._cap = None
-            try:
-                old_cap.release()
-            except Exception:
-                pass
-            ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                device_name, width=1280, height=720
-            )
-            if ffmpeg_cap is not None and ffmpeg_cap.isOpened():
-                self._cap = ffmpeg_cap
-                return
-            # ffmpeg failed â€” fall back to a fresh OpenCV cap so the
-            # live view doesn't die on us.
-            try:
-                ffmpeg_cap.release()
-            except Exception:
-                pass
-            recovered = open_camera_by_index(int(index), max_index=self.config.camera_scan_limit)
-            if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
-                self._cap = recovered[1]
-        else:
-            # Turn OFF: drop ffmpeg-MJPG cap, recover with OpenCV.
-            old_cap = self._cap
-            self._cap = None
-            try:
-                old_cap.release()
-            except Exception:
-                pass
-            recovered = open_camera_by_index(int(index), max_index=self.config.camera_scan_limit)
-            if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
-                self._cap = recovered[1]
+        # Reopen camera in fast path if ANY perf mode is active (lite,
+        # gpu, low_fps manual, or low_fps auto-engaged). Previously this
+        # function would early-return when _low_fps_active was already
+        # True, leaving dad's-PC-class hardware stuck on the OpenCV YUY2
+        # ceiling even after the toggle "succeeded."
+        self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
 
     def set_gpu_mode(self, enabled: bool) -> None:
-        # User-driven GPU-acceleration toggle. Rebuilds the engine
-        # with prefer_gpu set so the runtime loader either lights
-        # up the GPU inference path or transparently falls back to
-        # CPU MediaPipe when no GPU path is reachable on this
-        # machine. Mid-session toggling mirrors set_lite_mode's
-        # pattern: we rebuild HandDetector on the fly + swap the
-        # camera capture to ffmpeg/MJPG so the GPU inference
-        # speedup actually translates to higher live FPS instead
-        # of being masked by the OpenCV/YUY2 30 fps camera ceiling.
-        was_enabled = bool(getattr(self.config, "gpu_mode", False))
+        # GPU-acceleration toggle. Threads prefer_gpu through to the
+        # detector + reopens camera in fast path via
+        # _apply_perf_camera_path so the inference speedup actually
+        # translates to higher live FPS instead of being masked by
+        # the OpenCV YUY2 ceiling.
         self.config.gpu_mode = bool(enabled)
         if not self._running:
             return
         self._swap_engine_safely()
         self._fps = 0.0
-        # Don't re-swap the camera if Lite Mode is also on â€” set_lite
-        # _mode already manages the ffmpeg cap and we'd just thrash
-        # the device. Only fire when GPU Mode flips and Lite Mode
-        # isn't itself driving the same camera path.
-        if (
-            self._cap is None
-            or self._low_fps_active
-            or bool(getattr(self.config, "lite_mode", False))
-            or bool(enabled) == was_enabled
-        ):
-            return
-        info = self._camera_info
-        if info is None:
-            return
-        index = getattr(info, "index", None)
-        if index is None or int(index) < 0:
-            return
-        if not sys.platform.startswith("win"):
-            return
-        if enabled:
-            from ..camera.ffmpeg_capture import (
-                FfmpegMjpegCapture,
-                resolve_dshow_device_for_index,
-            )
-
-            device_name = resolve_dshow_device_for_index(
-                int(index),
-                qt_name_hint=str(getattr(info, "display_name", "") or ""),
-            )
-            if not device_name:
-                return
-            old_cap = self._cap
-            self._cap = None
-            try:
-                old_cap.release()
-            except Exception:
-                pass
-            ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                device_name, width=1280, height=720
-            )
-            if ffmpeg_cap is not None and ffmpeg_cap.isOpened():
-                self._cap = ffmpeg_cap
-                return
-            if ffmpeg_cap is not None:
-                try:
-                    ffmpeg_cap.release()
-                except Exception:
-                    pass
-            recovered = open_camera_by_index(int(index), max_index=self.config.camera_scan_limit)
-            if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
-                self._cap = recovered[1]
-        else:
-            old_cap = self._cap
-            self._cap = None
-            try:
-                old_cap.release()
-            except Exception:
-                pass
-            recovered = open_camera_by_index(int(index), max_index=self.config.camera_scan_limit)
-            if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
-                self._cap = recovered[1]
+        self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
 
     def set_force_ten_fps_test_mode(self, enabled: bool) -> None:
         self.config.force_ten_fps_test_mode = bool(enabled)
