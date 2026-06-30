@@ -101,10 +101,14 @@ class INPUT(ctypes.Structure):
 
 class TextInputController:
     def __init__(self) -> None:
-        self._available = platform.system() == "Windows"
+        self._win = platform.system() == "Windows"
+        self._mac = platform.system() == "Darwin"
+        # macOS types into the frontmost app via Quartz CGEvent (no HWND focus
+        # tracking); see platform_compat.mac_input. Requires Accessibility.
+        self._available = self._win or self._mac
         self._message = "text input ready" if self._available else "text input unavailable on this platform"
-        self._user32 = ctypes.windll.user32 if self._available else None
-        self._kernel32 = ctypes.windll.kernel32 if self._available else None
+        self._user32 = ctypes.windll.user32 if self._win else None
+        self._kernel32 = ctypes.windll.kernel32 if self._win else None
         self._target_hwnd: int | None = None
         self._last_external_hwnd: int | None = None
         self._own_pid: int = int(self._kernel32.GetCurrentProcessId()) if self._kernel32 is not None else 0
@@ -169,6 +173,11 @@ class TextInputController:
         return self._message
 
     def capture_target_window(self) -> bool:
+        if self._mac:
+            # macOS inserts into whatever app is frontmost at insert time, so
+            # there's no window handle to capture — this is a no-op success.
+            self._message = "dictation target captured"
+            return True
         if not self._available or self._user32 is None:
             self._message = "text input unavailable on this platform"
             return False
@@ -211,6 +220,22 @@ class TextInputController:
         return ok
     def insert_text(self, text: str, *, prefer_paste: bool = True) -> bool:
         with self._io_lock:
+            if self._mac:
+                from ..platform_compat import mac_input
+
+                payload = str(text or "")
+                if not payload:
+                    self._message = "dictation text missing"
+                    return False
+                ok = mac_input.paste_text(payload) if prefer_paste else mac_input.type_text(payload)
+                if not ok and prefer_paste:
+                    ok = mac_input.type_text(payload)
+                if ok:
+                    self._message = f"inserted dictated text ({len(payload)} chars)"
+                    self._publish_to_iris_bridge(payload)
+                else:
+                    self._message = "could not insert dictated text (grant Accessibility)"
+                return ok
             if not self._available or self._user32 is None:
                 self._message = "text input unavailable on this platform"
                 return False
@@ -224,6 +249,7 @@ class TextInputController:
             time.sleep(0.06)
             if prefer_paste and self._paste_text(payload):
                 self._message = f"inserted dictated text ({len(payload)} chars)"
+                self._publish_to_iris_bridge(payload)
                 return True
 
             inputs = self._text_to_inputs(payload)
@@ -235,11 +261,55 @@ class TextInputController:
                 self._message = "could not insert dictated text"
                 return False
             self._message = f"inserted dictated text ({len(payload)} chars)"
+            self._publish_to_iris_bridge(payload)
             return True
+
+    def _publish_to_iris_bridge(self, text: str) -> None:
+        """Phase-3 wiring: tell Iris what was just dictated so the
+        manager / planner can answer 'summarize what I just typed'
+        without copy-paste. Best-effort; never block the dictation
+        path on a bridge failure."""
+        if not text:
+            return
+        try:
+            from hgr.live_api.dictation_bridge import global_bridge
+            from hgr.live_api.incognito import is_incognito
+            if is_incognito():
+                return  # private mode: don't leak typed text
+            window_title = self._get_target_window_title()
+            global_bridge().publish_dictation_text(
+                text, window_title=window_title)
+        except Exception:
+            pass  # bridge optional — never break dictation
+
+    def _get_target_window_title(self) -> str:
+        """Best-effort window title for the current dictation target.
+        Empty string when unavailable."""
+        try:
+            if (self._user32 is None or self._target_hwnd is None
+                    or int(self._target_hwnd) <= 0):
+                return ""
+            import ctypes
+            buf = ctypes.create_unicode_buffer(256)
+            self._user32.GetWindowTextW(self._target_hwnd, buf, 256)
+            return buf.value or ""
+        except Exception:
+            return ""
 
 
     def remove_text(self, char_count: int) -> bool:
         with self._io_lock:
+            if self._mac:
+                from ..platform_compat import mac_input
+
+                count = max(0, int(char_count))
+                if count <= 0:
+                    self._message = "nothing to remove"
+                    return True
+                ok = mac_input.backspace(count)
+                self._message = (f"updated dictated text (-{count} chars)" if ok
+                                 else "could not update dictated text")
+                return ok
             if not self._available or self._user32 is None:
                 self._message = "text input unavailable on this platform"
                 return False
@@ -267,6 +337,21 @@ class TextInputController:
             if prior == replacement:
                 self._message = "updated dictated text"
                 return True
+            if self._mac:
+                from ..platform_compat import mac_input
+
+                left_moves, backspaces, ins_text, right_moves = _compute_replace_edit(prior, replacement)
+                ok = True
+                for _ in range(left_moves):
+                    ok = mac_input.tap("left") and ok
+                if backspaces:
+                    ok = mac_input.backspace(backspaces) and ok
+                if ins_text:
+                    ok = (mac_input.paste_text(ins_text) or mac_input.type_text(ins_text)) and ok
+                for _ in range(right_moves):
+                    ok = mac_input.tap("right") and ok
+                self._message = "updated dictated text" if ok else "could not update dictated text"
+                return ok
             if not self._available or self._user32 is None:
                 self._message = "text input unavailable on this platform"
                 return False
@@ -506,6 +591,8 @@ class TextInputController:
             return 0
 
     def _restore_target_window(self) -> bool:
+        if self._mac:
+            return True  # frontmost app is the target; nothing to restore
         if not self._available or self._user32 is None or self._kernel32 is None:
             return False
         target_hwnd = int(self._target_hwnd or self._last_external_hwnd or 0)

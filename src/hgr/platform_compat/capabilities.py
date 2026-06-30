@@ -65,3 +65,36 @@ def needs_screen_recording() -> bool:
 #: per-target Automation grant on first Apple Event.
 def needs_automation() -> bool:
     return IS_MACOS
+
+
+def is_accessibility_trusted(prompt: bool = False) -> bool:
+    """macOS: is this process trusted for the Accessibility permission?
+
+    Accessibility gates ALL synthetic mouse/keyboard input (CGEventPost) and
+    AXUIElement reads. If ``prompt`` is True and the process is untrusted,
+    macOS shows the grant prompt and registers the app under System Settings >
+    Privacy & Security > Accessibility — the user must then toggle it on AND
+    RESTART the app for it to take effect (it cannot be granted
+    programmatically). Always returns True off macOS.
+
+    For an ad-hoc-signed build the grant is keyed to the (unstable) code hash,
+    so it resets on every rebuild — a stable signing identity fixes that."""
+    if not IS_MACOS:
+        return True
+    try:
+        from ApplicationServices import AXIsProcessTrustedWithOptions  # type: ignore
+
+        try:
+            from ApplicationServices import kAXTrustedCheckOptionPrompt  # type: ignore
+
+            key = kAXTrustedCheckOptionPrompt
+        except Exception:
+            key = "AXTrustedCheckOptionPrompt"
+        return bool(AXIsProcessTrustedWithOptions({key: bool(prompt)}))
+    except Exception:
+        try:
+            from ApplicationServices import AXIsProcessTrusted  # type: ignore
+
+            return bool(AXIsProcessTrusted())
+        except Exception:
+            return False

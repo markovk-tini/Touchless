@@ -31,7 +31,12 @@ class MiniLiveViewer(QWidget):
         # Driven by GestureWorker.frozen_state_changed.
         self._frozen = False
 
-        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setWindowFlags(
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+        )
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.resize(360, 250)
 
@@ -61,6 +66,27 @@ class MiniLiveViewer(QWidget):
         SWP_NOMOVE / SWP_NOSIZE / SWP_NOACTIVATE so the window keeps
         its current position/size and doesn't steal focus."""
         import sys
+        if sys.platform == "darwin":
+            # macOS: make this a NON-ACTIVATING floating panel that joins all
+            # Spaces and does NOT hide when another app is focused. Qt.Tool maps
+            # to an NSPanel whose hidesOnDeactivate defaults to True, so without
+            # this the mini viewer vanishes the instant you click another app,
+            # and show()/raise_() pull focus off the app you're trying to control.
+            # native_overlay.apply_overlay sets NonactivatingPanel +
+            # CanJoinAllSpaces + setHidesOnDeactivate_(False) + a high window
+            # level, and orders it front WITHOUT activating.
+            try:
+                from . import native_overlay
+
+                ok = native_overlay.apply_overlay(widget)
+                if not getattr(widget, "_overlay_logged", False):
+                    import sys as _s
+
+                    print(f"[overlay] mini viewer apply_overlay -> {ok}", file=_s.stderr, flush=True)
+                    widget._overlay_logged = True
+            except Exception:
+                pass
+            return
         if sys.platform != "win32":
             return
         try:
@@ -98,10 +124,15 @@ class MiniLiveViewer(QWidget):
         # Re-raise + re-pin topmost on every show. Qt sometimes drops
         # the WindowStaysOnTopHint after hide/show cycles or when
         # another window grabs focus aggressively.
-        try:
-            self.raise_()
-        except Exception:
-            pass
+        import sys
+        if sys.platform != "darwin":
+            # raise_() steals focus on macOS (Qt activates the app). There,
+            # _pin_topmost_native -> native_overlay orderFront_ handles z-order
+            # without activating, so the app you're controlling keeps focus.
+            try:
+                self.raise_()
+            except Exception:
+                pass
         self._pin_topmost_native(self)
 
     def _build_ui(self) -> None:
@@ -362,7 +393,11 @@ class MiniLiveViewer(QWidget):
         if not self._user_positioned:
             self._move_to_default_corner()
         self.show()
-        self.raise_()
+        import sys
+        if sys.platform != "darwin":
+            # macOS: raise_() steals focus; showEvent's native_overlay pass
+            # orders the panel front non-activating instead.
+            self.raise_()
         self._sync_hover_state()
 
     def _move_to_default_corner(self) -> None:

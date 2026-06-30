@@ -371,7 +371,13 @@ class DesktopController:
     }
 
     def __init__(self, *, outlook_paths: tuple[Path, ...] | None = None) -> None:
-        self._available = platform.system() == "Windows"
+        system = platform.system()
+        self._win = system == "Windows"
+        self._mac = system == "Darwin"
+        # macOS: open apps/files/folders via the `open` command (see _mac_open).
+        # Window-control (min/max/close of the active window) stays Windows-only
+        # for now and reports "unavailable" on macOS rather than running win32.
+        self._available = self._win or self._mac
         self._message = "desktop idle"
         self._outlook_paths = outlook_paths or self._default_outlook_paths()
         self._app_catalog: list[DesktopAppEntry] | None = None
@@ -884,6 +890,22 @@ class DesktopController:
         if not self._available:
             self._message = "application launch unavailable on this platform"
             return False
+        if self._mac:
+            spoken = " ".join((app_name or "").split()).strip()
+            if not spoken:
+                self._message = "no app name given"
+                return False
+            # Prefer the scanned catalog (proper display name + alias match),
+            # then fall back to LaunchServices fuzzy matching via `open -a`.
+            resolved = self._resolve_application(spoken)
+            if resolved is not None and self._launch_path_or_command(resolved.target):
+                self._message = f"opened app: {resolved.display_name}"
+                return True
+            if self._mac_open(spoken, as_app=True):
+                self._message = f"opened app: {spoken}"
+                return True
+            self._message = f"could not open app: {spoken}"
+            return False
         resolved = self._resolve_application(app_name)
         if resolved is None:
             self._message = f"could not find app: {' '.join((app_name or '').split()).strip()}"
@@ -982,8 +1004,12 @@ class DesktopController:
             "downloads": home / "Downloads",
             "music": home / "Music",
             "pictures": home / "Pictures",
-            "videos": home / "Videos",
+            # macOS uses ~/Movies for video; there is no ~/Videos by default.
+            "videos": (home / "Movies") if self._mac else (home / "Videos"),
+            "movies": home / "Movies",
             "onedrive": home / "OneDrive",
+            "applications": Path("/Applications") if self._mac else home,
+            "home": home,
         }
         for name, path in known_paths.items():
             if name in normalized:
@@ -1949,6 +1975,9 @@ try {
     def _application_catalog(self) -> list[DesktopAppEntry]:
         if self._app_catalog is not None:
             return self._app_catalog
+        if self._mac:
+            self._app_catalog = self._build_mac_catalog()
+            return self._app_catalog
         shared = type(self)._shared_app_catalog
         if shared is not None:
             self._app_catalog = list(shared)
@@ -1993,6 +2022,9 @@ try {
 
     def _quick_application_catalog(self) -> list[DesktopAppEntry]:
         if self._quick_app_catalog is not None:
+            return self._quick_app_catalog
+        if self._mac:
+            self._quick_app_catalog = self._build_mac_catalog()
             return self._quick_app_catalog
         entries: dict[str, DesktopAppEntry] = {}
         for iterator in (
@@ -2648,6 +2680,12 @@ try {
         return shutil.which(str(target)) is not None
 
     def _launch_path_or_command(self, target: str) -> bool:
+        if self._mac:
+            # An existing path (e.g. a .app bundle or a file) -> `open <path>`;
+            # otherwise treat it as an app name -> `open -a <name>`.
+            if Path(target).exists():
+                return self._mac_open(target)
+            return self._mac_open(target, as_app=True)
         if Path(target).exists():
             return self._launch_target(target)
         if self._launch_target(target):
@@ -2774,7 +2812,61 @@ try {
 
         return False
 
+    def _mac_open(self, target: str, *, as_app: bool = False) -> bool:
+        """Open a file / folder / URL / app on macOS via the `open` command.
+
+        `open <path>`  -> opens a file in its default app, or a folder in Finder.
+        `open <url>`   -> opens a URL / mailto: in the default handler.
+        `open -a <name>` -> launches an app by name (LaunchServices fuzzy-matches,
+                            so 'chrome' -> Google Chrome, 'spotify' -> Spotify, ...).
+        Returns False (non-zero exit) when the target/app can't be found.
+        """
+        text = str(target or "").strip()
+        if not text:
+            return False
+        if not as_app and text.lower() == "explorer":
+            text = str(Path.home())  # Windows 'explorer' (home) -> Finder at home
+        cmd = ["open", "-a", text] if as_app else ["open", text]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=12)
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _build_mac_catalog(self) -> list[DesktopAppEntry]:
+        """Scan the standard macOS application directories for *.app bundles and
+        build the resolver catalog (used for spoken-name matching + hints)."""
+        roots = (
+            Path("/Applications"),
+            Path("/Applications/Utilities"),
+            Path.home() / "Applications",
+            Path("/System/Applications"),
+            Path("/System/Applications/Utilities"),
+        )
+        entries: dict[str, DesktopAppEntry] = {}
+        for root in roots:
+            try:
+                if not root.exists():
+                    continue
+                for app in root.glob("*.app"):
+                    name = app.stem
+                    norm = self._normalize_application_name(name)
+                    if not norm or norm in entries:
+                        continue
+                    entries[norm] = DesktopAppEntry(
+                        display_name=name,
+                        normalized_name=norm,
+                        target=str(app),
+                        source="mac",
+                        category="generic",
+                    )
+            except Exception:
+                continue
+        return sorted(entries.values(), key=lambda e: (e.normalized_name, e.display_name.lower()))
+
     def _launch_target(self, target: str) -> bool:
+        if self._mac:
+            return self._mac_open(target)
         lowered = str(target).lower()
         path_target = Path(target)
         try:
@@ -2817,7 +2909,7 @@ try {
 
 
     def minimize_active_window(self) -> bool:
-        if not self._available:
+        if not self._win:
             self._message = "window minimize unavailable on this platform"
             return False
         hwnd = self._foreground_window_handle()
@@ -2832,7 +2924,7 @@ try {
         return False
 
     def maximize_active_window(self) -> bool:
-        if not self._available:
+        if not self._win:
             self._message = "window maximize unavailable on this platform"
             return False
         hwnd = self._foreground_window_handle()
@@ -2847,7 +2939,7 @@ try {
         return False
 
     def restore_active_window(self) -> bool:
-        if not self._available:
+        if not self._win:
             self._message = "window restore unavailable on this platform"
             return False
         hwnd = self._foreground_window_handle()
@@ -2862,7 +2954,7 @@ try {
         return False
 
     def close_active_window(self) -> bool:
-        if not self._available:
+        if not self._win:
             self._message = "window close unavailable on this platform"
             return False
         hwnd = self._foreground_window_handle()
@@ -2877,7 +2969,7 @@ try {
         return False
 
     def close_named_window(self, app_name: str) -> bool:
-        if not self._available:
+        if not self._win:
             self._message = "window close unavailable on this platform"
             return False
         normalized_query = self._normalize_application_query(app_name) or self._normalize_application_name(app_name)

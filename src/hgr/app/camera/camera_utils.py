@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import platform
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,6 +11,34 @@ from typing import List, Optional, Tuple
 import cv2
 
 from .threaded_cv_capture import ThreadedCvCapture
+
+
+def _cam_log(msg: str) -> None:
+    """Lightweight stderr log for camera diagnostics (tees into the
+    Touchless debug log via main._StderrTee). Camera enumeration is
+    infrequent, and the macOS port needs this visibility to tell a
+    permission denial apart from a too-short open timeout."""
+    try:
+        sys.stderr.write(f"[camera] {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _macos_camera_auth_status() -> str:
+    """Best-effort AVFoundation camera authorization status string (macOS).
+
+    AVAuthorizationStatus: 0=notDetermined, 1=restricted, 2=denied,
+    3=authorized. (Note this is a DIFFERENT scale from TCC.db.auth_value,
+    where 2 means allowed.)"""
+    try:
+        from AVFoundation import AVCaptureDevice  # type: ignore
+
+        names = {0: "notDetermined", 1: "restricted", 2: "denied", 3: "authorized"}
+        s = int(AVCaptureDevice.authorizationStatusForMediaType_("vide"))
+        return f"AVFoundation auth={s} ({names.get(s, '?')})"
+    except Exception as exc:  # noqa: BLE001
+        return f"AVFoundation auth unavailable ({type(exc).__name__})"
 
 
 @dataclass(frozen=True)
@@ -128,15 +157,21 @@ def try_open_camera(
         cap = cv2.VideoCapture(index, backend)
         if not cap.isOpened():
             cap.release()
+            if platform.system() == "Darwin":
+                _cam_log(f"open idx={index} backend={backend_name(backend)} -> NOT opened")
             return None
 
-        for _ in range(read_attempts):
+        for attempt in range(read_attempts):
             ok, _ = cap.read()
             if ok:
+                if platform.system() == "Darwin":
+                    _cam_log(f"open idx={index} backend={backend_name(backend)} -> OK (frame after {attempt + 1} reads)")
                 return cap
             time.sleep(read_interval)
 
         cap.release()
+        if platform.system() == "Darwin":
+            _cam_log(f"open idx={index} backend={backend_name(backend)} -> opened but NO frame in {read_attempts} reads")
         return None
 
 
@@ -145,12 +180,19 @@ def request_camera_access_main_thread(max_index: int = 4) -> tuple[bool, str]:
     if system != "Darwin":
         return True, "Camera permission prompt is not required on this platform."
 
+    _cam_log(f"request_camera_access (main thread): {_macos_camera_auth_status()}")
+    # Patience matters on macOS: the built-in MacBook camera can take well over
+    # a second to deliver its first frame on a cold open (the green LED warm-up).
+    # 120 reads x 0.03s ~= 3.6s matches the engine-open cold-start budget so a
+    # working camera isn't misreported as "no camera detected".
     for backend in _backend_candidates():
-        cap = try_open_camera(0, backend, read_attempts=12)
+        cap = try_open_camera(0, backend, read_attempts=120)
         if cap is not None:
             cap.release()
+            _cam_log(f"request_camera_access -> OK via {backend_name(backend)}")
             return True, "Camera access confirmed on camera 0."
 
+    _cam_log("request_camera_access -> FAILED on all backends")
     return False, (
         "macOS camera access was not granted yet. Approve camera access when prompted, "
         "or enable it in System Settings > Privacy & Security > Camera for Terminal or your packaged app, then try again."
@@ -249,10 +291,15 @@ def list_available_cameras(max_index: int = 8) -> List[CameraInfo]:
     stop_after_misses = 2 if platform.system() == "Windows" else max_index
     qt_names = _qt_video_device_names()
 
+    # macOS: same cold-start patience as the access check (built-in camera is
+    # slow to first-frame); Windows keeps its short probe to stay snappy.
+    probe_read_attempts = 120 if platform.system() == "Darwin" else 10
+    if platform.system() == "Darwin":
+        _cam_log(f"list_available_cameras start: {_macos_camera_auth_status()}")
     for index in _candidate_indices(max_index):
         found_for_index = False
         for backend in _backend_candidates():
-            cap = try_open_camera(index, backend)
+            cap = try_open_camera(index, backend, read_attempts=probe_read_attempts)
             if cap is None:
                 continue
             cap.release()
@@ -282,6 +329,8 @@ def list_available_cameras(max_index: int = 8) -> List[CameraInfo]:
                 if discovered and consecutive_misses >= stop_after_misses:
                     break
 
+    if platform.system() == "Darwin":
+        _cam_log(f"list_available_cameras -> {len(discovered)} found ({[c.display_name for c in discovered]})")
     return discovered
 
 

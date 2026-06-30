@@ -1,15 +1,125 @@
 from __future__ import annotations
 
+import datetime as _dt
 import sys
+import time as _time
 from pathlib import Path
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
-from ..config.app_config import APP_NAME, load_config, save_config
+from ..config.app_config import APP_NAME, CONFIG_DIR, load_config, save_config
 from ..utils.runtime_paths import resource_path
 from .single_instance import acquire as acquire_single_instance
 from .ui.main_window import MainWindow
 from .ui.touchless_splash import TouchlessSplash
+
+
+class _StderrTee:
+    """Mirror every stderr write to a rolling debug log file in
+    addition to the original console / Qt-capture stream. Lets the
+    user paste a single file when reporting bugs instead of
+    scrolling through transient stderr buffers. Failures opening
+    or writing the file are swallowed — stderr capture must never
+    break the app even if the disk is full or read-only."""
+
+    def __init__(self, original, file_handle) -> None:
+        self._original = original
+        self._file = file_handle
+
+    def write(self, data) -> int:  # noqa: D401
+        try:
+            self._original.write(data)
+        except Exception:
+            pass
+        try:
+            self._file.write(data)
+            self._file.flush()
+        except Exception:
+            pass
+        try:
+            return len(data)
+        except Exception:
+            return 0
+
+    def flush(self) -> None:
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+        try:
+            self._file.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        try:
+            return bool(self._original.isatty())
+        except Exception:
+            return False
+
+    def fileno(self):
+        return self._original.fileno()
+
+
+def _install_debug_log_tee() -> Path | None:
+    """Open ~/.touchless/touchless_debug.log (rolling, max 4 MB) and
+    tee sys.stderr through it. Called once at startup before any
+    Qt construction so [clip-audio], [voice], [clip-anchor], etc.
+    all land in the file from the moment the app boots.
+
+    Returns the log file path on success, None on failure. The
+    file path is also written as the first line so the user knows
+    where to find it. Existing logs are renamed to .prev for one
+    generation of backup; the .prev file is overwritten on each
+    launch so disk doesn't grow unbounded."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = CONFIG_DIR / "touchless_debug.log"
+        # Roll over a single backup so we don't lose the prior
+        # session if the user just relaunched to reproduce a bug.
+        try:
+            if log_path.exists() and log_path.stat().st_size > 0:
+                backup = CONFIG_DIR / "touchless_debug.prev.log"
+                try:
+                    if backup.exists():
+                        backup.unlink()
+                except Exception:
+                    pass
+                log_path.replace(backup)
+        except Exception:
+            pass
+        handle = log_path.open("w", encoding="utf-8", buffering=1)
+        # Header so the file is self-describing when the user opens
+        # it standalone. Timestamps are wall-clock local time.
+        try:
+            ts = _dt.datetime.now().isoformat(timespec="seconds")
+        except Exception:
+            ts = "unknown"
+        try:
+            handle.write(
+                f"# Touchless debug log — session started {ts}\n"
+                f"# Tees every sys.stderr write for the lifetime of\n"
+                f"# this Touchless process. Safe to paste in bug\n"
+                f"# reports. Previous session's log was rotated to\n"
+                f"#   {(CONFIG_DIR / 'touchless_debug.prev.log')}\n"
+                f"# ----------------------------------------------\n"
+            )
+            handle.flush()
+        except Exception:
+            pass
+        sys.stderr = _StderrTee(sys.stderr, handle)
+        # Also surface the path to the original stderr so a console-
+        # attached user knows where the file lives without having
+        # to grep the source.
+        try:
+            (sys.stderr._original if hasattr(sys.stderr, "_original") else sys.__stderr__).write(
+                f"[touchless] debug log → {log_path}\n"
+            )
+        except Exception:
+            pass
+        return log_path
+    except Exception:
+        return None
 
 
 def _resolve_app_icon():
@@ -23,6 +133,14 @@ def _resolve_app_icon():
 
 
 def main() -> int:
+    # Install the stderr → debug-log tee BEFORE any other startup
+    # code so every [clip-audio], [clip-anchor], [voice] line from
+    # the moment the app boots lands in a single pasteable file.
+    # Placement note: must run BEFORE acquire_single_instance so
+    # even the "another instance was already running" branch leaves
+    # a trace in the file.
+    _install_debug_log_tee()
+
     # Bail before constructing the Qt app if another Touchless is
     # already running. When the bailing instance was launched via
     # a Jump-List task (Pause / Settings / Quit), `args` carries
@@ -48,6 +166,25 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationDisplayName(APP_NAME)
     app.setApplicationName(APP_NAME)
+
+    # --- macOS: keep cyclic GC on the main thread ---------------------------
+    # PySide6 QWidgets wrap NSWindows, and AppKit aborts hard (EXC_BREAKPOINT,
+    # "Must only be used from the main thread") if a window is torn down off the
+    # main thread. Python's cyclic GC can run on ANY thread that crosses the
+    # allocation threshold (e.g. the voice/worker threads); if a top-level
+    # QWidget sits in a reference cycle, GC destroys it there -> NSWindow close
+    # off-main-thread -> crash. Disable automatic GC and drive it from a
+    # main-thread QTimer so widget teardown always happens on the GUI thread.
+    # macOS-only; Windows keeps Python's default GC behavior.
+    if sys.platform == "darwin":
+        import gc as _gc
+        from PySide6.QtCore import QTimer as _QTimer
+
+        _gc.disable()
+        app._gc_timer = _QTimer(app)  # held on app so it isn't itself collected
+        app._gc_timer.setInterval(2000)
+        app._gc_timer.timeout.connect(lambda: _gc.collect())
+        app._gc_timer.start()
 
     # Install the taskbar Jump List. Only attempts in frozen builds
     # where sys.executable is Touchless.exe (each task re-launches

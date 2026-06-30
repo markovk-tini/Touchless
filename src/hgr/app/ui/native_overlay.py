@@ -235,6 +235,13 @@ def _apply_macos_overlay(widget) -> bool:
             ns_window.setLevel_(level)
 
         behavior = int(ns_window.collectionBehavior())
+        # CanJoinAllSpaces and MoveToActiveSpace are MUTUALLY EXCLUSIVE. Qt sets
+        # MoveToActiveSpace (1<<1) on Tool windows, so OR-ing in CanJoinAllSpaces
+        # made setCollectionBehavior_ raise NSInternalInconsistencyException and
+        # abort the entire overlay setup (the window then stayed a plain window —
+        # hiding on app switch and stealing focus). Clear it before requesting
+        # all-spaces.
+        behavior &= ~(1 << 1)  # NSWindowCollectionBehaviorMoveToActiveSpace
         if NSWindowCollectionBehaviorCanJoinAllSpaces is not None:
             behavior |= int(NSWindowCollectionBehaviorCanJoinAllSpaces)
         if NSWindowCollectionBehaviorStationary is not None:
@@ -268,7 +275,12 @@ def _apply_macos_overlay(widget) -> bool:
         except Exception:
             pass
         return True
-    except Exception:
+    except Exception as exc:
+        try:
+            import sys as _s
+            print(f"[overlay] macOS overlay FAILED: {type(exc).__name__}: {exc}", file=_s.stderr, flush=True)
+        except Exception:
+            pass
         return False
 
 

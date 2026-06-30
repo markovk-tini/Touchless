@@ -43,8 +43,15 @@ KNOWN_WEB_TARGETS = {
 
 class ChromeController:
     def __init__(self, *, executable_paths: tuple[Path, ...] | None = None) -> None:
-        self._available = platform.system() == "Windows"
-        self._message = "chrome idle"
+        system = platform.system()
+        self._win = system == "Windows"
+        self._mac = system == "Darwin"
+        # macOS: drive Chrome via `open -a "Google Chrome"` (launch / focus /
+        # open-URL through _launch_target). Window-focus + keyboard-shortcut
+        # methods (win32) are no-ops on macOS for now — the common URL/launch
+        # commands work; back/forward/new-tab via CGEvent come in a later pass.
+        self._available = self._win or (self._mac and self._mac_chrome_installed())
+        self._message = "chrome idle" if self._available else "chrome unavailable on this platform"
         self._executable_paths = executable_paths or self._default_executable_paths()
         self._handles_cache: list[int] = []
         self._handles_cache_until = 0.0
@@ -89,6 +96,15 @@ class ChromeController:
     def focus_or_open_window(self) -> bool:
         if not self._available:
             self._message = "chrome unavailable on this platform"
+            return False
+        if self._mac:
+            # `open -a "Google Chrome"` launches AND activates Chrome. Skip the
+            # win32 window-handle polling below — on macOS those handles never
+            # come, so _wait_for_window_handles would block the UI ~4s.
+            if self._launch_target():
+                self._message = "chrome focused"
+                return True
+            self._message = "chrome focus failed"
             return False
         if self.is_window_active():
             self._message = "chrome already focused"
@@ -411,6 +427,13 @@ class ChromeController:
 
         return " ".join(normalized.split()).strip()
 
+    @staticmethod
+    def _mac_chrome_installed() -> bool:
+        return (
+            Path("/Applications/Google Chrome.app").exists()
+            or (Path.home() / "Applications" / "Google Chrome.app").exists()
+        )
+
     def _default_executable_paths(self) -> tuple[Path, ...]:
         user_profile = Path.home()
         program_files = Path.home().anchor + "Program Files"
@@ -423,7 +446,7 @@ class ChromeController:
         )
 
     def _foreground_window_handle(self) -> int | None:
-        if not self._available:
+        if not self._win:
             return None
         try:
             foreground = ctypes.windll.user32.GetForegroundWindow()
@@ -432,7 +455,7 @@ class ChromeController:
         return int(foreground) if foreground else None
 
     def _chrome_window_handles(self) -> list[int]:
-        if not self._available:
+        if not self._win:
             return []
         now = time.monotonic()
         if now < self._handles_cache_until:
@@ -523,7 +546,7 @@ class ChromeController:
         return handles
 
     def _activate_window_handle(self, hwnd: int) -> bool:
-        if not self._available:
+        if not self._win:
             return False
         user32 = ctypes.windll.user32
         try:
@@ -535,7 +558,7 @@ class ChromeController:
             return False
 
     def _send_shortcut(self, *keys: int) -> bool:
-        if not self._available:
+        if not self._win:
             return False
         if not keys:
             return False
@@ -554,6 +577,19 @@ class ChromeController:
             return False
 
     def _launch_target(self, *args: str) -> bool:
+        if self._mac:
+            # `open -a "Google Chrome" [url]` launches/activates Chrome and opens
+            # the URL in it (no args = just launch/focus). Returns nonzero if
+            # Chrome isn't installed, which surfaces as "chrome open failed".
+            try:
+                result = subprocess.run(
+                    ["open", "-a", "Google Chrome", *args],
+                    capture_output=True,
+                    timeout=12,
+                )
+                return result.returncode == 0
+            except Exception:
+                return False
         for candidate in self._executable_paths:
             if not candidate.exists():
                 continue

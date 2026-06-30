@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
@@ -102,7 +103,9 @@ def default_save_directory(output_kind: str) -> Path:
     if normalized in {"drawings", "screenshots"}:
         return _fallback_user_dir("Pictures")
     if normalized in {"screen_recordings", "clips"}:
-        return _fallback_user_dir("Videos")
+        # macOS stores video in ~/Movies (there is no ~/Videos by default — writing
+        # there would silently create a stray folder). Windows/Linux use ~/Videos.
+        return _fallback_user_dir("Movies" if sys.platform == "darwin" else "Videos")
     return Path.home()
 
 

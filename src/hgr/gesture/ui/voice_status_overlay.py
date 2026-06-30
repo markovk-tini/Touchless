@@ -197,9 +197,15 @@ class VoiceStatusOverlay(QWidget):
         self.update()
 
     def _show_now(self) -> None:
+        import sys
         self._place_on_screen()
         self.show()
-        self.raise_()
+        if sys.platform != "darwin":
+            # raise_() activates the app on macOS, stealing focus from whatever
+            # the command just opened/controlled (e.g. Chrome after "open
+            # YouTube"). apply_overlay below orders this panel front
+            # non-activating instead.
+            self.raise_()
         self.repaint()
         apply_overlay(self)
 
