@@ -825,6 +825,16 @@ class GestureWorker(QObject):
         self._low_fps_above_since: float | None = None
         self._low_fps_auto_engaged = False
         self._low_fps_last_process = 0.0
+        # Track LAST APPLIED mode state separately from config. The UI
+        # updates config.lite_mode (etc.) BEFORE calling set_*_mode on
+        # the worker, so comparing was_enabled = bool(config.lite_mode)
+        # against the new value ALWAYS shows no-op — the no-op gate
+        # silently swallowed every mode toggle. Initialize to None so
+        # the first toggle always applies (even when matching the
+        # persisted config value at startup).
+        self._applied_lite_mode: bool | None = None
+        self._applied_gpu_mode: bool | None = None
+        self._applied_low_fps_mode: bool | None = None
         # Suggestion overlay bookkeeping (separate from auto-engage timing).
         self._low_fps_suggest_below_since: float | None = None
         self._low_fps_suggest_cooldown_until = 0.0
@@ -3753,11 +3763,20 @@ class GestureWorker(QObject):
         # Build the new engine first, then hand it to the runner; the
         # runner's set_engine call acquires the engine lock, blocking
         # briefly until any in-flight inference returns. ONLY THEN is
-        # it safe to close() the old engine â€” closing while the runner
-        # thread is mid-call would crash the MediaPipe / ONNX session.
-        # All mid-session engine rebuilds (Lite Mode toggle, GPU Mode
-        # toggle, auto-low-fps engage/disengage, set_low_fps_mode) go
-        # through here for that reason.
+        # it safe to close() the old engine.
+        try:
+            lite = bool(getattr(self.config, "lite_mode", False))
+            gpu = bool(getattr(self.config, "gpu_mode", False))
+            lowfps_cfg = bool(getattr(self.config, "low_fps_mode", False))
+            sys.stderr.write(
+                f"[perf-mode] _swap_engine_safely START "
+                f"lite={lite} gpu={gpu} low_fps_cfg={lowfps_cfg} "
+                f"auto_engaged={self._low_fps_auto_engaged} "
+                f"-> low_fps_active will be {lowfps_cfg or self._low_fps_auto_engaged}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         new_engine = self._build_engine_for_fps_mode()
         old_engine = self.engine
         self._engine_runner.set_engine(new_engine)
@@ -4011,6 +4030,23 @@ class GestureWorker(QObject):
         except Exception:
             pass
         if want_ffmpeg:
+            # DSHOW handle release is async on Windows. When we call
+            # OpenCV's release() above and immediately launch ffmpeg,
+            # the camera's DirectShow filter graph hasn't finished
+            # tearing down yet, so ffmpeg's `-i video=...` blocks on
+            # the driver and looks like a silent hang (proc_alive=True,
+            # stderr empty, no frames). The hang masks itself as
+            # "60 fps unsupported by camera" and we silently fall back
+            # to 30 fps. A short pause lets the driver actually release
+            # the handle so ffmpeg gets a clean open at the requested
+            # rate. 600 ms is empirically enough for Razer Kiyo Pro,
+            # Logitech BRIO, EOS Webcam Utility; cheaper webcams
+            # release in <200 ms but the extra latency is invisible
+            # next to the camera-open warmup that already happens.
+            try:
+                time.sleep(0.6)
+            except Exception:
+                pass
             from ..camera.ffmpeg_capture import (
                 FfmpegMjpegCapture,  # noqa: F401 - keep import for currently_ffmpeg check
                 resolve_dshow_device_for_index,
@@ -4075,10 +4111,27 @@ class GestureWorker(QObject):
             # + smaller inference frame, but keep Normal-mode
             # confidence thresholds + full stable-frame requirement
             # so gesture decisions still feel as solid as before.
+            #
+            # ALSO prefer_gpu=True even when the user hasn't toggled
+            # GPU mode explicitly. On a DirectML-capable system that
+            # routes inference through ONNX Runtime DirectML, which
+            # drops engine work from ~22 ms (MediaPipe XNNPACK CPU
+            # running the lite landmark model with a hand in frame)
+            # down to ~3-5 ms. Without this Lite mode "improves" on
+            # the no-hand path (palm-only, ~7 ms vs 27 ms normal)
+            # but REGRESSES on the with-hand path (22 ms lite-CPU vs
+            # 27 ms normal-CPU is barely a win, and the gesture loop
+            # feels laggier because tracking dwell on a present hand
+            # is where users actually notice frame rate). On systems
+            # without a DirectML-capable GPU, HandDetector falls back
+            # to MediaPipe CPU automatically — so this can't break
+            # anything; it just makes Lite mode actually live up to
+            # its name on the common case (modern Windows hardware
+            # with a usable GPU).
             detector = HandDetector(
                 model_complexity=0,
                 max_process_width=self._LITE_MODE_PROCESS_WIDTH,
-                prefer_gpu=prefer_gpu,
+                prefer_gpu=True,
             )
             stable_frames = max(2, self.config.stable_frames_required // 2)
         else:
@@ -4096,11 +4149,23 @@ class GestureWorker(QObject):
     def set_low_fps_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
         self.config.low_fps_mode = enabled
+        prev_applied = self._applied_low_fps_mode
+        try:
+            sys.stderr.write(
+                f"[perf-mode] set_low_fps_mode({enabled}) running={self._running} "
+                f"applied_was={prev_applied} -> applying={prev_applied != enabled}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         if not enabled:
             self._low_fps_auto_engaged = False
             self._low_fps_below_since = None
             self._low_fps_above_since = None
         self._low_fps_last_process = 0.0
+        if prev_applied == enabled:
+            return
+        self._applied_low_fps_mode = enabled
         if self._running:
             self._swap_engine_safely()
             self._fps = 0.0
@@ -4117,30 +4182,49 @@ class GestureWorker(QObject):
             self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
 
     def set_lite_mode(self, enabled: bool) -> None:
-        # Lite-model toggle. Rebuilds engine with lite landmark model +
-        # downsampled inference and, if no faster perf mode wins, swaps
-        # the camera capture to ffmpeg-MJPG via _apply_perf_camera_path.
-        self.config.lite_mode = bool(enabled)
+        # Lite-model toggle. Compares against LAST APPLIED state, not
+        # config — the UI updates config.lite_mode before calling this,
+        # so config-based comparison always shows no-op. See the
+        # _applied_*_mode docstring in __init__.
+        enabled = bool(enabled)
+        self.config.lite_mode = enabled
+        prev_applied = self._applied_lite_mode
+        try:
+            sys.stderr.write(
+                f"[perf-mode] set_lite_mode({enabled}) running={self._running} "
+                f"applied_was={prev_applied} -> applying={prev_applied != enabled}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         if not self._running:
             return
+        if prev_applied == enabled:
+            return
+        self._applied_lite_mode = enabled
         self._swap_engine_safely()
         self._fps = 0.0
-        # Reopen camera in fast path if ANY perf mode is active (lite,
-        # gpu, low_fps manual, or low_fps auto-engaged). Previously this
-        # function would early-return when _low_fps_active was already
-        # True, leaving dad's-PC-class hardware stuck on the OpenCV YUY2
-        # ceiling even after the toggle "succeeded."
         self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
 
     def set_gpu_mode(self, enabled: bool) -> None:
-        # GPU-acceleration toggle. Threads prefer_gpu through to the
-        # detector + reopens camera in fast path via
-        # _apply_perf_camera_path so the inference speedup actually
-        # translates to higher live FPS instead of being masked by
-        # the OpenCV YUY2 ceiling.
-        self.config.gpu_mode = bool(enabled)
+        # GPU-acceleration toggle. See set_lite_mode for the
+        # config-vs-applied rationale.
+        enabled = bool(enabled)
+        self.config.gpu_mode = enabled
+        prev_applied = self._applied_gpu_mode
+        try:
+            sys.stderr.write(
+                f"[perf-mode] set_gpu_mode({enabled}) running={self._running} "
+                f"applied_was={prev_applied} -> applying={prev_applied != enabled}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         if not self._running:
             return
+        if prev_applied == enabled:
+            return
+        self._applied_gpu_mode = enabled
         self._swap_engine_safely()
         self._fps = 0.0
         self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
@@ -5374,17 +5458,29 @@ class GestureWorker(QObject):
         # see massive perceived display lag (the 2-second-delayed
         # camera feeling). Always emit on hand appear/disappear or
         # action-fire so toasts and overlays stay punctual.
-        should_emit = True
-        if self._perf_optimisations_enabled() and not self._low_fps_active:
-            since_last = monotonic_now - self._last_emit_monotonic
-            significant = self._is_significant_state_change(result)
-            should_emit = significant or since_last >= self._emit_min_interval_seconds
-        if should_emit:
-            self._last_emit_monotonic = monotonic_now
-            try:
-                self.debug_frame_ready.emit(display_frame, payload)
-            except Exception:
-                pass
+        # REMOVED the 30 fps emit throttle that ran in perf modes. It
+        # was actively erasing the speedup that Lite/GPU Mode delivers:
+        # engine drops from 27ms (normal) to 3-7ms (Lite/GPU), but the
+        # emit-side throttle clamped visible fps at 30 either way, so
+        # the modes "did nothing" from the user's perspective. The
+        # throttle existed to avoid hammering the camera widget at
+        # >30 fps but modern displays handle 60-120+ fps fine, and the
+        # whole point of perf modes is to give the user MORE fps not
+        # less. Now every engine tick emits its display frame. The
+        # actual fps cap becomes whichever of:
+        #   - engine work time (Lite: ~7ms ceiling 140 fps; GPU: ~6ms
+        #     ceiling 160 fps; Normal: ~27ms ceiling 37 fps),
+        #   - camera capture rate (YUY2 ~30 fps; ffmpeg-MJPG ~60 fps),
+        #   - display refresh / Qt paint coalescing (usually 60 Hz).
+        # On a strong PC with Lite or GPU mode + ffmpeg-MJPG camera,
+        # actual fps should now reach 50-60. On dad's-PC-class hardware
+        # the engine work itself remains the cap; the throttle wasn't
+        # helping there either.
+        self._last_emit_monotonic = monotonic_now
+        try:
+            self.debug_frame_ready.emit(display_frame, payload)
+        except Exception:
+            pass
         if debug_timing:
             t_end = time.perf_counter()
             self._timing_samples.append(
@@ -5418,8 +5514,22 @@ class GestureWorker(QObject):
                 )
                 inferred_fps = 1000.0 / avg_total if avg_total > 0 else 0.0
                 try:
+                    # Surface mode state in every timing log so you can
+                    # see which mode is actually engaged when fps doesn't
+                    # match expectations. Useful for the "I toggled Lite
+                    # Mode but engine is still 27ms" diagnostic.
+                    _mode_lite = bool(getattr(self.config, "lite_mode", False))
+                    _mode_gpu = bool(getattr(self.config, "gpu_mode", False))
+                    _mode_lowfps = self._low_fps_active
+                    _mode_tag = (
+                        "LOW_FPS" if _mode_lowfps
+                        else ("LITE" if _mode_lite
+                              else ("GPU" if _mode_gpu else "NORMAL"))
+                    )
                     sys.stderr.write(
-                        f"[lite_mode/timing] read={avg_read:.1f} "
+                        f"[lite_mode/timing] mode={_mode_tag} "
+                        f"(lite={_mode_lite},gpu={_mode_gpu},lowfps={_mode_lowfps}) "
+                        f"read={avg_read:.1f} "
                         f"prep={avg_prep:.1f} engine={avg_engine:.1f} "
                         f"vol={avg_vol:.1f} app={avg_app:.1f} "
                         f"wheel={avg_wheel:.1f} overlay={avg_overlay:.1f} "

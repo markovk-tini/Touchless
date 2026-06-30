@@ -166,9 +166,31 @@ def open_ffmpeg_cap_with_fps_fallback(
     decompressed BGR frames without the per-frame uncompress cost
     YUY2 carries.
 
+    Single-retry budget for silent hangs:
+      * Real failure (fatal stderr pattern OR non-None returncode) →
+        next fps candidate immediately. Fast path.
+      * Silent hang (subprocess alive, no stderr, no first frame) →
+        retry the SAME fps once with extra warmup. Probably DSHOW
+        handle race from a prior cap teardown.
+      * The retry budget is SHARED across all fps candidates: only
+        one retry per call total. If the first silent-hang retry
+        also fails, something is genuinely holding the camera
+        (Razer Synapse, Windows Camera, a zombie ffmpeg from a
+        crashed test session, etc.) and retrying 30 fps with the
+        same warmup will also fail. Bail to OpenCV fallback right
+        away so the user isn't staring at a frozen splash for 15+
+        seconds while we cycle through doomed attempts.
+
+    Worst-case wall clock with default 2.5 s timeout:
+      * Silent hang once → retry succeeds: ~4 s. 60 fps engaged.
+      * Silent hang on first attempt, retry also hangs: ~6 s. Bail.
+      * Real format-rejection at 60, success at 30: ~3 s. 30 fps.
+      * Real failure on both: ~5 s. Caller falls to OpenCV.
+
     Returns the opened capture, or None if every candidate failed.
     The caller should fall through to the OpenCV path on None.
     """
+    retry_used = False
     for fps in fps_candidates:
         cap = FfmpegMjpegCapture(
             device_name,
@@ -186,10 +208,75 @@ def open_ffmpeg_cap_with_fps_fallback(
             except Exception:
                 pass
             return cap
+        silent_hang = cap._last_failure_was_silent_hang()
         try:
             cap.release()
         except Exception:
             pass
+        if silent_hang and not retry_used:
+            retry_used = True
+            try:
+                print(
+                    f"[ffmpeg_capture] {fps} fps open hung silently (likely DSHOW "
+                    f"handle race — one-shot retry with extra warmup)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
+            try:
+                time.sleep(1.0)
+            except Exception:
+                pass
+            cap = FfmpegMjpegCapture(
+                device_name,
+                width=width,
+                height=height,
+                fps=fps,
+            )
+            if cap.isOpened():
+                try:
+                    print(
+                        f"[ffmpeg_capture] engaged at {width}x{height} @ {fps} fps MJPG "
+                        f"(after silent-hang retry)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                return cap
+            try:
+                cap.release()
+            except Exception:
+                pass
+            # Retry also silent-hung — something is genuinely holding
+            # the camera. Bail to OpenCV fallback rather than burning
+            # another 5–8 s on the next fps candidate that will
+            # almost certainly fail the same way.
+            try:
+                print(
+                    f"[ffmpeg_capture] {fps} fps retry also silent-hung — "
+                    f"camera is being held by another process. Bailing to "
+                    f"OpenCV fallback instead of cycling more ffmpeg attempts. "
+                    f"Check Task Manager for zombie ffmpeg.exe, close Razer "
+                    f"Synapse / Windows Camera app, or unplug-replug the webcam.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return None
+        if silent_hang and retry_used:
+            try:
+                print(
+                    f"[ffmpeg_capture] {fps} fps silent-hung; retry budget "
+                    f"already spent — bailing to OpenCV fallback",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return None
         try:
             print(
                 f"[ffmpeg_capture] {fps} fps unsupported by camera — trying next candidate",
@@ -234,19 +321,15 @@ class FfmpegMjpegCapture:
         self._height = int(height)
         self._fps = int(fps)
         self._ffmpeg_path = ffmpeg_path or locate_ffmpeg()
-        # Lowered startup_timeout from 8s to 2.5s. The 8s value was
-        # there to forgive a DSHOW driver that hadn't yet released
-        # the device after an in-app camera-restart — but on the
-        # cold-start path (e.g. tutorial launched from Settings while
-        # the main app is closed) there's no lingering driver lock,
-        # so 8s just means an extra 16 s of dead time when ffmpeg
-        # genuinely can't open the device (failure × two fps
-        # candidates). 2.5 s is plenty for the legitimate cold-open
-        # case (typical first-frame latency is <500 ms when ffmpeg
-        # works at all). The rare DSHOW-still-busy-after-restart
-        # case now falls through to OpenCV faster — the user
-        # perceives "camera came up" instead of "camera frozen for
-        # 16 s then came up".
+        # Startup timeout: 2.5 s. Real failures (Could-not-set-video-
+        # options, Error-opening-input) still bail in <500 ms because
+        # _stderr_loop matches fatal patterns. The DSHOW-handle-race
+        # case (silent hang) is handled by a one-shot retry in
+        # open_ffmpeg_cap_with_fps_fallback — extending the timeout
+        # here did NOT help, because a hung DSHOW open stays hung
+        # until the other process releases the handle, however long
+        # we wait. Better to time out faster and lean on the retry's
+        # extra warmup window.
         self._startup_timeout = float(startup_timeout_seconds)
         # Known-fatal stderr substrings that mean ffmpeg has decided
         # it can't open this device: when any of these appear in the
@@ -293,6 +376,13 @@ class FfmpegMjpegCapture:
         self._fresh_frame_event = threading.Event()
         self._opened = False
         self._read_error = False
+        # Populated by _start() if startup fails so
+        # _last_failure_was_silent_hang() can classify the failure
+        # (DSHOW handle race vs genuine "this fps not supported")
+        # without re-inspecting the already-killed subprocess.
+        self._last_failure_proc_alive: bool | None = None
+        self._last_failure_returncode: int | None = None
+        self._last_failure_stderr_tail: str = ""
         # Fixed-prefix warmup discard. EOS Webcam Utility and some
         # other DSHOW filters emit a few placeholder frames immediately
         # after open (cached single-color frame, or auto-exposure
@@ -482,6 +572,13 @@ class FfmpegMjpegCapture:
             tail_pre = "".join(self._stderr_log[-12:]).strip()
         except Exception:
             tail_pre = ""
+        # Record the failure signature so
+        # _last_failure_was_silent_hang() can classify it for the
+        # fallback wrapper. Read these BEFORE _teardown_proc clears
+        # _proc and stderr below.
+        self._last_failure_proc_alive = proc_alive
+        self._last_failure_returncode = proc_returncode
+        self._last_failure_stderr_tail = tail_pre
         try:
             print(
                 f"[ffmpeg_capture] startup failed after {self._startup_timeout:.1f}s: "
@@ -623,6 +720,34 @@ class FfmpegMjpegCapture:
                 return None
             buf.extend(chunk)
         return bytes(buf)
+
+    def _last_failure_was_silent_hang(self) -> bool:
+        """Classify the most recent startup failure for the fallback
+        wrapper.
+
+        Returns True only when the signature matches "DSHOW handle
+        race" — meaning the ffmpeg subprocess was still alive when
+        the startup timeout fired, never produced a frame, and never
+        emitted a fatal error in stderr. That's the case where a
+        same-fps retry (after a longer warmup) usually succeeds,
+        because the driver finishes releasing the prior handle in
+        the meantime.
+
+        Returns False when ffmpeg either exited with a returncode
+        (real format-rejection failure) or printed a fatal pattern
+        like "Could not set video options" — those are genuine "this
+        fps isn't supported" cases where retrying just wastes time.
+        Caller should move to the next fps candidate immediately.
+        """
+        if self._last_failure_proc_alive is False:
+            return False
+        if self._last_failure_returncode is not None:
+            return False
+        tail_lower = (self._last_failure_stderr_tail or "").lower()
+        for pattern in self._fatal_stderr_patterns:
+            if pattern in tail_lower:
+                return False
+        return True
 
     def isOpened(self) -> bool:  # cv2.VideoCapture API parity
         if not self._opened:

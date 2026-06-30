@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import platform
+import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,6 +12,73 @@ from typing import List, Optional, Tuple
 import cv2
 
 from .threaded_cv_capture import ThreadedCvCapture
+
+
+def _cv2_open_with_timeout(
+    index: int,
+    backend: int,
+    timeout_seconds: float = 6.0,
+) -> Optional[cv2.VideoCapture]:
+    """Construct a `cv2.VideoCapture(index, backend)` in a background
+    daemon thread, abandoning the thread (NOT killing it — Python has
+    no portable way to interrupt a native call) if construction blocks
+    beyond `timeout_seconds`.
+
+    Why this exists:
+    On Windows, `cv2.VideoCapture(idx, CAP_DSHOW)` builds a full
+    DirectShow filter graph during construction. When another process
+    (Razer Synapse, Windows Camera app, a crashed Touchless test
+    session that didn't clean up, etc.) is holding the camera handle,
+    Windows' DSHOW infrastructure can block this constructor for
+    60-120 seconds before timing out. Without a wrapper, Touchless's
+    cold-start camera scan would freeze the splash for several
+    minutes — the user perceives this as "the app hung", quits with
+    Ctrl+C, and tries again, often making the device-state worse.
+
+    With this wrapper:
+      * Healthy cameras open in <1 s — well under the timeout.
+      * Locked cameras let the calling thread give up after 6 s and
+        try the next backend / fall through to the OpenCV-fallback
+        path or, eventually, "no camera" UI. The leaked background
+        thread is a daemon, so it dies when Python exits; while
+        Python is still alive it stays blocked on the OS call until
+        Windows times out internally and the thread cleanly returns.
+
+    Returns the cv2.VideoCapture on success, or None on timeout /
+    construction exception. Caller is responsible for the rest of
+    the open dance (cap.isOpened(), the read_attempts warmup loop).
+    """
+    result: list[Optional[cv2.VideoCapture]] = [None]
+
+    def _worker() -> None:
+        try:
+            result[0] = cv2.VideoCapture(index, backend)
+        except Exception:
+            result[0] = None
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"cv2-open-idx{index}-bk{backend}",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=float(timeout_seconds))
+    if thread.is_alive():
+        try:
+            sys.stderr.write(
+                f"[camera_utils] cv2.VideoCapture(index={index}, backend={backend}) "
+                f"blocked beyond {timeout_seconds:.1f}s timeout — likely the camera "
+                f"is held by another process (Razer Synapse, Windows Camera, OBS, "
+                f"a crashed Touchless test session, etc.). Skipping this backend; "
+                f"the leaked background thread will resolve when Windows DSHOW "
+                f"times out internally (no user impact, daemon thread dies with "
+                f"the process).\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return None
+    return result[0]
 
 
 @dataclass(frozen=True)
@@ -125,9 +194,22 @@ def try_open_camera(
     read_interval: float = 0.03,
 ) -> Optional[cv2.VideoCapture]:
     with _quiet_opencv_probe():
-        cap = cv2.VideoCapture(index, backend)
+        # Construct via timeout-wrapped helper. Healthy cameras open
+        # in <1 s; a locked DSHOW device would otherwise block this
+        # constructor for 60-120 s while Windows times out the
+        # contended handle, freezing the whole Touchless splash.
+        # 6 s is plenty for cold-start virtual cameras (EOS Webcam
+        # Utility, OBS Virtual Camera) — those deliver their first
+        # frame slowly inside the read_attempts loop below, not
+        # during the VideoCapture() constructor itself.
+        cap = _cv2_open_with_timeout(index, backend, timeout_seconds=6.0)
+        if cap is None:
+            return None
         if not cap.isOpened():
-            cap.release()
+            try:
+                cap.release()
+            except Exception:
+                pass
             return None
 
         for _ in range(read_attempts):
@@ -136,7 +218,10 @@ def try_open_camera(
                 return cap
             time.sleep(read_interval)
 
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
         return None
 
 
