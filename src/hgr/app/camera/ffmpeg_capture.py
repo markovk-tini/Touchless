@@ -660,9 +660,23 @@ class FfmpegMjpegCapture:
         # too fast (shouldn't happen but defensive).
         drain_limit_per_iter = 16
         last_read_done = 0.0
+        # C15 diagnostic: reader-side frame rate + per-frame breakdown.
+        # Logs the actual rate at which ffmpeg is delivering frames
+        # into the pipe (independent of what our main-thread consumer
+        # does). If _tick shows emit rate 25 fps but this shows the
+        # reader producing at 60 fps, then the consumer clear-on-read
+        # semantics are dropping frames; if the reader is also at
+        # 25 fps, the bottleneck is upstream (camera driver, USB
+        # bandwidth, auto-exposure framerate throttling).
+        stats_last_log = time.monotonic()
+        stats_frames = 0
+        stats_drained = 0
+        stats_read_wall_us: list[int] = []
+        stats_decode_wall_us: list[int] = []
         while not self._stop_event.is_set():
             drained = 0
             chunk: bytes | None = None
+            _read_start = time.monotonic()
             while True:
                 try:
                     raw = self._read_exact(self._proc.stdout, frame_bytes)
@@ -682,10 +696,12 @@ class FfmpegMjpegCapture:
                     # this frame and grab the next one.
                     last_read_done = now
                     drained += 1
+                    stats_drained += 1
                     continue
                 last_read_done = now
                 chunk = raw
                 break
+            _read_end = time.monotonic()
             try:
                 frame = np.frombuffer(chunk, dtype=np.uint8).reshape(
                     (self._height, self._width, 3)
@@ -707,6 +723,32 @@ class FfmpegMjpegCapture:
                 self._latest_frame_ts = decoded_at
             self._first_frame_event.set()
             self._fresh_frame_event.set()
+            # C15: reader-side rate + timing breakdown, logged every 2 s.
+            stats_frames += 1
+            stats_read_wall_us.append(int((_read_end - _read_start) * 1_000_000))
+            stats_decode_wall_us.append(int((decoded_at - _read_end) * 1_000_000))
+            if (decoded_at - stats_last_log) >= 2.0 and stats_frames >= 4:
+                elapsed = decoded_at - stats_last_log
+                fps = stats_frames / elapsed if elapsed > 0 else 0.0
+                read_avg_us = sum(stats_read_wall_us) // max(1, len(stats_read_wall_us))
+                read_max_us = max(stats_read_wall_us)
+                decode_avg_us = sum(stats_decode_wall_us) // max(1, len(stats_decode_wall_us))
+                try:
+                    sys.stderr.write(
+                        f"[ffmpeg_reader] delivered: {fps:.1f} fps "
+                        f"({stats_frames} frames / {elapsed:.2f} s, drained {stats_drained}) | "
+                        f"pipe read wall avg={read_avg_us/1000.0:.1f}ms max={read_max_us/1000.0:.1f}ms | "
+                        f"decode+copy avg={decode_avg_us/1000.0:.2f}ms | "
+                        f"target={self._fps}fps interval={camera_interval_s*1000.0:.1f}ms\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                stats_last_log = decoded_at
+                stats_frames = 0
+                stats_drained = 0
+                stats_read_wall_us.clear()
+                stats_decode_wall_us.clear()
 
     @staticmethod
     def _read_exact(stream, size: int) -> bytes | None:
