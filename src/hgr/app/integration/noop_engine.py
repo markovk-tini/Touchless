@@ -1332,6 +1332,17 @@ class GestureWorker(QObject):
         # skip-frame decision.
         self._async_result_pending: bool = False
 
+        # C14 diagnostic: raw_frame_ready emit rate + tick cadence.
+        # Logged every ~2 s so we can tell "the camera reader is
+        # only delivering 25 fps" apart from "the tick loop is only
+        # running 25 fps despite the reader delivering more." The
+        # per-tick timing block already shows engine=Xms; this fills
+        # in the tick-to-tick cadence view (paint→paint is a widget
+        # metric, this is an engine-side metric).
+        self._raw_emit_count: int = 0
+        self._raw_emit_last_log: float = 0.0
+        self._tick_call_count: int = 0
+
         # Per-frame timing samples used by the Lite Mode diagnostic
         # in _tick. Empty when Lite Mode is off; sampled at every
         # tick when on, summarised to stderr every 2s. Helps tell
@@ -5009,6 +5020,7 @@ class GestureWorker(QObject):
     def _tick(self) -> None:
         if not self._running or self._cap is None or self.engine is None:
             return
+        self._tick_call_count += 1
         # Dead-cap auto-recovery. The threaded reader marks the
         # capture dead (isOpened() → False) when it hits the
         # consecutive-failure ceiling — typically a USB hiccup or
@@ -5110,8 +5122,34 @@ class GestureWorker(QObject):
             if capture_ts <= 0.0:
                 capture_ts = time.monotonic()
             self.raw_frame_ready.emit(frame, capture_ts)
+            self._raw_emit_count += 1
         except Exception:
             pass
+        # C14 diagnostic: raw emit rate + tick fire rate. Camera
+        # reader delivers frames independently of engine work, so
+        # the emit rate tells us whether QTimer is firing at its
+        # 15 ms cadence (≈66 fps ceiling) or whether main-thread
+        # work is pushing tick fires apart.
+        if self._perf_optimisations_enabled():
+            _now_perf = time.monotonic()
+            if self._raw_emit_last_log <= 0.0:
+                self._raw_emit_last_log = _now_perf
+            elif (_now_perf - self._raw_emit_last_log) >= 2.0:
+                _elapsed = _now_perf - self._raw_emit_last_log
+                _emit_fps = self._raw_emit_count / _elapsed if _elapsed > 0 else 0.0
+                _tick_fps = self._tick_call_count / _elapsed if _elapsed > 0 else 0.0
+                try:
+                    sys.stderr.write(
+                        f"[raw_frame] emit rate: {_emit_fps:.1f} fps "
+                        f"(tick fires: {_tick_fps:.1f} fps, {self._tick_call_count} "
+                        f"calls / {_elapsed:.2f} s)\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                self._raw_emit_count = 0
+                self._tick_call_count = 0
+                self._raw_emit_last_log = _now_perf
         # Back-pressure: if the engine runner is still chewing on the
         # previous frame, drop the rest of this tick (no inference,
         # no debug payload). Display already went out above so the
