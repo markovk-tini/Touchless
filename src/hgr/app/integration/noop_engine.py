@@ -1286,6 +1286,22 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] runner init failed: {exc}")
             self._custom_gesture_runner = None
+        # v1.1.7 event-loop optimization (Step 3): rate-limit the
+        # slow-path custom-gesture inference. When the engine runtime
+        # produces landmarks the runner can reuse (mediapipe-cpu /
+        # tasks-gpu / onnx-directml with model_complexity=1), the fast
+        # path is nearly free. But Lite Mode uses model_complexity=0,
+        # forcing the slow path: a private MediaPipe pass on the raw
+        # frame, ~5-10 ms/frame on the MAIN THREAD every tick, purely
+        # to feed the custom-gesture classifier. Users hold static
+        # custom poses for a full second+ before firing, so sampling
+        # the slow path every OTHER frame is indistinguishable from
+        # per-frame at UX level while halving the main-thread cost.
+        # Skip counter cycles 0/1/2 — process_frame runs at cycle 0
+        # only. hand_lost() still fires every frame (it's a state
+        # update, not inference).
+        self._custom_runner_slow_path_skip_ratio = 2
+        self._custom_runner_slow_path_counter = 0
 
         # Dynamic custom-gesture runtime. Parallel to the static
         # runner above — same registry, same `fire_once` cooldown
@@ -5460,11 +5476,25 @@ class GestureWorker(QObject):
                     else:
                         self._custom_gesture_runner.hand_lost(runner_now)
                 else:
+                    # Slow path: private MediaPipe pass. Rate-limited
+                    # per Step 3 above so Lite Mode's ~5-10ms/frame
+                    # main-thread inference doesn't cap the tick rate.
+                    self._custom_runner_slow_path_counter = (
+                        (self._custom_runner_slow_path_counter + 1)
+                        % max(1, self._custom_runner_slow_path_skip_ratio)
+                    )
+                    should_run_slow_path = (self._custom_runner_slow_path_counter == 0)
                     frame_for_mp = getattr(result, "annotated_frame", None)
                     if frame_for_mp is not None:
-                        fired = self._custom_gesture_runner.process_frame(
-                            frame_for_mp, runner_now
-                        )
+                        if should_run_slow_path:
+                            fired = self._custom_gesture_runner.process_frame(
+                                frame_for_mp, runner_now
+                            )
+                        # else: skip this tick — the runner's internal
+                        # hold-and-fire cooldown expects gaps between
+                        # samples anyway, and static poses persist across
+                        # 2-3 frames. No hand_lost() on the skip — that
+                        # would confuse the hold detector.
                     else:
                         self._custom_gesture_runner.hand_lost(runner_now)
                 if fired:
