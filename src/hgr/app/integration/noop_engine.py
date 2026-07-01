@@ -4334,8 +4334,34 @@ class GestureWorker(QObject):
 
         camera_info, cap = self._open_camera()
         if cap is None or camera_info is None:
-            self._emit_status("no camera found")
-            self.error_occurred.emit("No available camera was found.")
+            # Detect known camera-holding apps so the error message
+            # names the specific culprit rather than a generic "no
+            # camera" line. Zero-setup principle: if the user has
+            # Razer Synapse / Discord / OBS / etc. running, they
+            # should learn about it from Touchless's error dialog
+            # rather than by hunting through Task Manager.
+            detected_holders: list = []
+            try:
+                from ..camera.camera_lock_detector import (
+                    detect_camera_holding_processes,
+                    summarize_processes_for_user,
+                )
+                detected_holders = detect_camera_holding_processes()
+            except Exception:
+                detected_holders = []
+            if detected_holders:
+                holder_summary = summarize_processes_for_user(detected_holders)
+                self._emit_status(f"camera held by: {holder_summary}")
+                self.error_occurred.emit(
+                    f"Touchless couldn't find a camera because another app "
+                    f"is currently holding yours: {holder_summary}. "
+                    "Close that app (right-click its tray icon → Quit) and "
+                    "restart Touchless. Auto-start Razer Synapse can be "
+                    "disabled in Task Manager → Startup."
+                )
+            else:
+                self._emit_status("no camera found")
+                self.error_occurred.emit("No available camera was found.")
             self.running_state_changed.emit(False)
             return
 
@@ -4567,27 +4593,64 @@ class GestureWorker(QObject):
         if now - self._camera_recovery_last_at < self._camera_recovery_cooldown_s:
             return
         self._camera_recovery_last_at = now
+        # Detect known camera-holding apps every recovery attempt so
+        # the user's status pill shows the specific culprit ("Razer
+        # Synapse 3 is holding your camera") instead of a generic
+        # "no camera" message. When the user closes that app, the
+        # next recovery cycle succeeds automatically — zero clicks
+        # inside Touchless. Detection is cheap (~150 ms one-shot to
+        # tasklist) and only runs when recovery is actually needed,
+        # so no impact on the happy path.
+        detected_holders: list = []
+        try:
+            from ..camera.camera_lock_detector import (
+                detect_camera_holding_processes,
+                summarize_processes_for_user,
+            )
+            detected_holders = detect_camera_holding_processes()
+        except Exception:
+            detected_holders = []
         if self._camera_recovery_attempts >= self._camera_recovery_max_attempts:
             # Give up — clean shutdown rather than spinning forever.
             if self._camera_recovery_attempts == self._camera_recovery_max_attempts:
                 # Increment once more so this branch only emits once.
                 self._camera_recovery_attempts += 1
                 try:
-                    self._emit_status("camera disconnected")
-                    self.error_occurred.emit(
-                        "Camera connection lost and could not be restored. "
-                        "Check the USB cable / make sure no other app is using the camera, "
-                        "then press Stop and Start to retry."
-                    )
+                    if detected_holders:
+                        holder_summary = summarize_processes_for_user(detected_holders)
+                        self._emit_status(f"camera held by: {holder_summary}")
+                        self.error_occurred.emit(
+                            "Touchless couldn't access your camera because "
+                            f"another app is holding it: {holder_summary}. "
+                            "Close that app (or right-click its tray icon → "
+                            "Quit) and Touchless will pick the camera back up "
+                            "automatically within a few seconds."
+                        )
+                    else:
+                        self._emit_status("camera disconnected")
+                        self.error_occurred.emit(
+                            "Camera connection lost and could not be restored. "
+                            "Check the USB cable / make sure no other app is using "
+                            "the camera, then press Stop and Start to retry."
+                        )
                 except Exception:
                     pass
             return
         self._camera_recovery_attempts += 1
         try:
-            self._emit_status(
-                f"reconnecting camera (attempt {self._camera_recovery_attempts}/"
-                f"{self._camera_recovery_max_attempts})…"
-            )
+            if detected_holders:
+                holder_summary = summarize_processes_for_user(detected_holders)
+                self._emit_status(
+                    f"camera held by {holder_summary} — close it and "
+                    f"Touchless auto-recovers (attempt "
+                    f"{self._camera_recovery_attempts}/"
+                    f"{self._camera_recovery_max_attempts})"
+                )
+            else:
+                self._emit_status(
+                    f"reconnecting camera (attempt {self._camera_recovery_attempts}/"
+                    f"{self._camera_recovery_max_attempts})…"
+                )
         except Exception:
             pass
         # Tear down the dead cap before opening a new one — some
