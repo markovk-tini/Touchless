@@ -37,17 +37,19 @@ def run_ffmpeg(args: list[str]) -> str:
 
 
 def list_video_devices(text: str) -> list[str]:
+    # ffmpeg 7.x dropped the "DirectShow video devices" section header
+    # and now tags each device line inline: [dshow @ 0x...] "Name" (video)
+    # or (audio). Match on the (video) tag directly and skip
+    # "Alternative name" rows (which repeat the same device under a
+    # PnP path we don't want as the friendly name).
     devices: list[str] = []
-    in_video_section = False
     for line in text.splitlines():
-        if "DirectShow video devices" in line:
-            in_video_section = True
+        if "Alternative name" in line:
             continue
-        if "DirectShow audio devices" in line:
-            in_video_section = False
+        if not line.rstrip().endswith("(video)"):
             continue
         match = re.search(r'"([^"]+)"', line)
-        if in_video_section and match and "Alternative name" not in line:
+        if match:
             devices.append(match.group(1))
     return devices
 
