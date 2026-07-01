@@ -5113,14 +5113,26 @@ class GestureWorker(QObject):
         except Exception:
             pass
         # Back-pressure: if the engine runner is still chewing on the
-        # previous frame, OR a runner result is queued waiting for the
-        # main thread to handle it, drop the rest of this tick (no
-        # inference, no debug payload). Display already went out
-        # above so the live view stays smooth. The next tick will
-        # pick up a fresh camera frame for inference once the runner
-        # is free. Skipping here keeps the request queue at depth=1
-        # so we never build an inference backlog.
-        if self._engine_runner.busy or self._async_result_pending:
+        # previous frame, drop the rest of this tick (no inference,
+        # no debug payload). Display already went out above so the
+        # live view stays smooth. The next tick will pick up a fresh
+        # camera frame for inference once the runner is free.
+        # Runner.submit() also self-checks _busy, so the request queue
+        # stays at depth=1 either way.
+        #
+        # Note: we deliberately no longer gate on
+        # _async_result_pending here. The runner clears its _busy
+        # flag the instant inference finishes (before it emits the
+        # queued result signal), so gating on _busy alone lets the
+        # next tick submit a fresh frame the moment the runner is
+        # idle, without waiting the extra ~5-15 ms it takes for Qt's
+        # queued-signal delivery to land _on_engine_result on the
+        # main thread. That single change lifts the tick cadence
+        # from ~25 fps to camera-limited (see release notes for
+        # measurements). _last_result_had_hand may be one cycle stale
+        # for the skip-inference optimization; that only affects when
+        # we can shortcut the neutral-frame case, never correctness.
+        if self._engine_runner.busy:
             return
         tick_now = time.time()
         if self._should_skip_forced_fps_tick(tick_now):
