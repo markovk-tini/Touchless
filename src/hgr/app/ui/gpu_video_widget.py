@@ -166,6 +166,24 @@ class GpuVideoWidget(QWidget):
         # with its fingertip cursor) is the top layer and the camera doesn't
         # visibly "read the hand". Set per-frame from the engine payload.
         self._hide_hand_overlay = False
+        # C8 (v1.1.7): explicit overlay-level tier for cheap paint-cost
+        # scaling per mode. Levels:
+        #   3 = full: skeleton + bbox + text banner (default; matches
+        #       Normal Mode behaviour)
+        #   2 = skeleton + bbox (banner text elided — saves per-hand
+        #       text metrics + drawText call chain per paint)
+        #   1 = skeleton only (matches the pre-C8 _lite_paint_mode
+        #       behaviour used during fullscreen games)
+        #   0 = no skeleton, no bbox, no banner (matches drawing-mode
+        #       behaviour when _hide_hand_overlay is True)
+        # Precedence at paint time is layered in _draw_landmarks:
+        #   drawing mode (_hide_hand_overlay=True) forces effective 0
+        #   fullscreen game (_lite_paint_mode=True) caps at 1
+        #   otherwise, this field controls what draws
+        # Set by the presentation-tier caller (see C9) — NOT plumbed
+        # through the engine payload to avoid a 1-frame lag race
+        # between the overlay-level change and the frame update.
+        self._overlay_level = 3
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(220, 140)
         # Disable Qt's automatic background fill — we paint the
@@ -183,6 +201,21 @@ class GpuVideoWidget(QWidget):
         self._lite_paint_mode = new_value
         # Force one paint so the change is visible immediately
         # (otherwise the next paint waits for the next frame).
+        self.update()
+
+    def set_overlay_level(self, level: int) -> None:
+        """Set the overlay-tier cap. See __init__ docstring for level
+        semantics. Called by the presentation-tier caller (live-view
+        receiver + engine mode-toggle handler); NOT plumbed through
+        the engine payload to avoid a 1-frame race between the level
+        change and the frame update. Clamped to [0, 3]. Idempotent."""
+        try:
+            new_level = max(0, min(3, int(level)))
+        except (TypeError, ValueError):
+            return
+        if new_level == self._overlay_level:
+            return
+        self._overlay_level = new_level
         self.update()
 
     # ----- public API used by the receivers ------------------
@@ -681,25 +714,43 @@ class GpuVideoWidget(QWidget):
         if not self._hands_info:
             return
 
-        # Per-hand bbox + banner. Drawn first so the skeleton +
-        # joints paint over them (avoids the bbox edge cutting
-        # through a fingertip).
-        # Heavy: per-hand text rendering (handedness + gesture
-        # label). Skipped in lite paint mode — the skeleton alone
-        # is enough to confirm tracking while gaming.
-        if not self._lite_paint_mode:
+        # C8 effective overlay level computed with layered precedence.
+        # See __init__ docstring for level semantics. Called after the
+        # mouse-overlay drawing above so mouse control-box overlay
+        # remains independent of the skeleton/bbox/banner level.
+        if self._lite_paint_mode:
+            # Fullscreen game: cap at 1 (skeleton only). Preserves the
+            # pre-C8 lite-paint behaviour (fullscreen games drop the
+            # bbox + banner cost).
+            effective_level = min(self._overlay_level, 1)
+        else:
+            effective_level = self._overlay_level
+
+        if effective_level == 0:
+            return
+
+        # Per-hand bbox + banner drawn at level 2 (bbox rects only,
+        # text banners elided) and level 3 (default: bbox + banner
+        # text). Drawn first so the skeleton + joints paint over
+        # them (avoids the bbox edge cutting through a fingertip).
+        if effective_level >= 2:
             painter.save()
             painter.setFont(self._banner_font)
             metrics = QFontMetrics(self._banner_font)
             banner_h = metrics.height()
-            self._draw_hand_banners(painter, tx, ty, tw, th, metrics, banner_h)
+            self._draw_hand_banners(
+                painter, tx, ty, tw, th, metrics, banner_h,
+                include_text=(effective_level >= 3),
+            )
             painter.restore()
 
-        # Skeleton + joints — cheap (2 batched paint ops total), drawn
-        # in BOTH normal and lite paint modes.
+        # Skeleton + joints — cheap (2 batched paint ops total),
+        # drawn at every level >= 1.
         self._draw_hand_skeleton(painter, tx, ty, tw, th)
 
-    def _draw_hand_banners(self, painter, tx, ty, tw, th, metrics, banner_h) -> None:
+    def _draw_hand_banners(
+        self, painter, tx, ty, tw, th, metrics, banner_h, include_text: bool = True,
+    ) -> None:
         for hand in self._hands_info:
             bbox = hand.get("bbox")
             if bbox is None:
@@ -714,6 +765,12 @@ class GpuVideoWidget(QWidget):
             painter.setPen(QPen(color, 2))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(rect)
+
+            # Text banner elided at overlay level 2 (bbox rect kept,
+            # text + text-background rect skipped). Saves the per-hand
+            # text-metrics + QPainter.drawText chain per paint.
+            if not include_text:
+                continue
 
             # Banner: "Right | gesture" when the hand has a
             # recognized gesture, "Right" when neutral. Empty
