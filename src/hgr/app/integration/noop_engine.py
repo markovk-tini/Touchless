@@ -854,6 +854,16 @@ class GestureWorker(QObject):
         # the engine back to the GPU path automatically. Transparent
         # to the user — no config toggle, no dialog.
         self._gpu_suppressed_for_fullscreen: bool = False
+        # C17 (v1.1.7): engine cache keyed by config signature. Mode
+        # switches (Lite ↔ GPU, GPU ↔ default, etc.) used to rebuild
+        # the HandDetector every time, which re-loaded the ONNX +
+        # DirectML session and blocked the main thread for ~2 seconds.
+        # On a GPU-capable box that runs both modes on the same ONNX
+        # model, the second build is pure re-init cost. Caching by
+        # signature makes repeat toggles instant (cache HIT) and keeps
+        # first-time builds at their existing cost. Bounded at ~4-6
+        # unique configs in practice; cleared in _shutdown_runtime.
+        self._engine_cache: "dict[tuple, GestureRecognitionEngine] | None" = None
         # Phone-camera-via-QR capture (owned by MainWindow / PhoneCameraServer).
         # None when no phone is connected; set by set_phone_camera_capture().
         self._phone_camera_capture = None
@@ -3856,6 +3866,19 @@ class GestureWorker(QObject):
         except Exception:
             pass
 
+    def _compute_engine_signature(self) -> tuple:
+        """Full tuple of every input `_build_engine_for_fps_mode` reads.
+        Two states with the same signature are guaranteed to produce
+        functionally identical engines — so the cache is safe to key on
+        this. Any config field that could change the built HandDetector
+        MUST be included here or a stale cache hit will occur."""
+        low_fps = bool(getattr(self.config, "low_fps_mode", False)) or self._low_fps_auto_engaged
+        lite = bool(getattr(self.config, "lite_mode", False))
+        gpu = bool(getattr(self.config, "gpu_mode", False))
+        fullscreen_suppress = bool(self._gpu_suppressed_for_fullscreen)
+        stable_frames_cfg = int(getattr(self.config, "stable_frames_required", 4))
+        return (low_fps, lite, gpu, fullscreen_suppress, stable_frames_cfg)
+
     def _swap_engine_safely(self) -> None:
         # Build the new engine first, then hand it to the runner; the
         # runner's set_engine call acquires the engine lock, blocking
@@ -3874,15 +3897,63 @@ class GestureWorker(QObject):
             sys.stderr.flush()
         except Exception:
             pass
-        new_engine = self._build_engine_for_fps_mode()
+        # C17: cache built engines by config signature so repeat mode
+        # toggles (Lite ↔ GPU) skip the ~1-2 s ONNX + DirectML session
+        # re-init that would otherwise freeze the main thread on every
+        # swap. Cache is bounded (~4-6 unique signatures over a session)
+        # and cleared in _shutdown_runtime so state doesn't leak between
+        # engine restarts.
+        swap_start_perf = time.perf_counter()
+        if self._engine_cache is None:
+            self._engine_cache = {}
+        signature = self._compute_engine_signature()
+        cached = self._engine_cache.get(signature)
         old_engine = self.engine
-        self._engine_runner.set_engine(new_engine)
-        self.engine = new_engine
-        if old_engine is not None:
+        cache_hit = False
+        if cached is not None and cached is not old_engine:
+            new_engine = cached
+            cache_hit = True
+            # C17 review fix #10: reset the cached engine's transient
+            # state BEFORE handing it to the runner so a mid-hold pose
+            # or partially-accumulated dynamic gesture from the last
+            # time this engine was active doesn't fire spuriously on
+            # the swap-back frame. detector.reset() clears the
+            # landmark smoother + last_primary_hand; engine.reset()
+            # additionally clears dynamic recognizer history + the
+            # stable-label counter.
             try:
-                old_engine.close()
+                new_engine.reset()
             except Exception:
                 pass
+        elif cached is old_engine and old_engine is not None:
+            # Signature matches the running engine — nothing to do.
+            try:
+                sys.stderr.write(f"[perf-mode] engine already matches sig={signature}, skipping swap\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        else:
+            new_engine = self._build_engine_for_fps_mode()
+            self._engine_cache[signature] = new_engine
+        self._engine_runner.set_engine(new_engine)
+        self.engine = new_engine
+        # C17 review add (c): wall-clock timing so we can VERIFY the
+        # cache actually shortcuts the swap. HIT should be a few ms;
+        # MISS is bounded by ONNX + DirectML session build (~1-2 s).
+        try:
+            elapsed_ms = (time.perf_counter() - swap_start_perf) * 1000.0
+            sys.stderr.write(
+                f"[perf-mode] engine cache {'HIT' if cache_hit else 'MISS'} "
+                f"sig={signature} elapsed={elapsed_ms:.1f}ms "
+                f"cache_size={len(self._engine_cache)}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        # DO NOT close old_engine — it stays in the cache for reuse on a
+        # future swap back to its signature. Closed for real in
+        # _shutdown_runtime which drains the cache.
 
     def _engage_auto_low_fps(self) -> None:
         # Log auto-engage so we can see in the debug log when slow
@@ -4360,6 +4431,12 @@ class GestureWorker(QObject):
             return
         self._shutdown_runtime(emit_signal=False)
         self.engine = self._build_engine_for_fps_mode()
+        # C17: seed the engine cache with the startup engine so a later
+        # toggle back to this signature hits the cache instead of paying
+        # another ONNX + DirectML session build.
+        if self._engine_cache is None:
+            self._engine_cache = {}
+        self._engine_cache[self._compute_engine_signature()] = self.engine
         # Spin up the background-thread engine runner. The lambda
         # bridge translates the runner-thread callback into a
         # cross-thread Qt signal emit, which auto-queues the result
@@ -4560,8 +4637,28 @@ class GestureWorker(QObject):
             if self._cap is not self._phone_camera_capture:
                 self._cap.release()
             self._cap = None
+        # C17: drain the engine cache before nulling self.engine — some
+        # of the entries may be the currently active engine, others are
+        # inactive cached siblings. Closing all of them here matches the
+        # pre-cache behavior where every mode swap closed its old engine
+        # immediately. Never leak an engine across engine-restarts.
+        if self._engine_cache is not None:
+            for cached_engine in self._engine_cache.values():
+                try:
+                    cached_engine.close()
+                except Exception:
+                    pass
+            self._engine_cache = None
         if self.engine is not None:
-            self.engine.close()
+            try:
+                # If self.engine was already closed via the cache drain
+                # above, close() is idempotent — the underlying MediaPipe
+                # / ONNX close() call short-circuits on already-closed
+                # state. Kept for the (rare) case where the engine was
+                # never added to the cache.
+                self.engine.close()
+            except Exception:
+                pass
             self.engine = None
         self._camera_info = None
         self._running = False
