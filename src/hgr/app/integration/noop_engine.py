@@ -5679,8 +5679,41 @@ class GestureWorker(QObject):
             self._update_volume_overlay()
             return
 
-        current_level = self.volume_controller.get_level()
-        current_muted = self._read_system_mute()
+        # v1.1.7 event-loop optimization (Step 1): only pay the
+        # Windows COM cost of reading system volume + mute when there's
+        # an actual chance we'll act on it this tick. Fresh state
+        # matters when:
+        #   - Volume overlay is already visible (user is controlling)
+        #   - Volume mode was already active last tick (in-progress)
+        #   - The trigger pose is being shown right now (about to enter)
+        # Otherwise, use the cached values from the engine's own
+        # bookkeeping (_volume_level / _volume_muted) — the volume
+        # tracker's update() will no-op with stale values because it's
+        # gated on the same pose the fresh-state check is gated on.
+        # When the tracker DOES activate on a subsequent tick, the
+        # entering_overlay branch below fires refresh_cache() which
+        # reads a fresh COM value before the first level adjustment.
+        # Savings: ~2-3 ms of main-thread work per idle tick × 25
+        # ticks/sec = 50-75 ms/sec of Qt event-loop budget freed up
+        # (the 25→35+ fps tick rate improvement the diagnostic release
+        # identified as the largest deferred win).
+        is_volume_pose_this_tick = (
+            hand_handedness == "Right"
+            and result.found
+            and result.prediction is not None
+            and getattr(result.prediction, "stable_label", "") == "volume_pose"
+        )
+        need_fresh_volume_state = (
+            self._volume_overlay_visible
+            or self._volume_mode_active
+            or is_volume_pose_this_tick
+        )
+        if need_fresh_volume_state:
+            current_level = self.volume_controller.get_level()
+            current_muted = self._read_system_mute()
+        else:
+            current_level = self._volume_level
+            current_muted = self._volume_muted
         if self.mouse_tracker.mode_enabled:
             self._volume_level = current_level
             self._volume_muted = current_muted
