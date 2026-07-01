@@ -20547,64 +20547,58 @@ Admin elevation
                 # any local webcam — only fail here when neither is
                 # available.
                 #
-                # v1.1.7: detect known camera-holding apps and name
-                # the specific culprit in the dialog + offer a Retry
-                # button. Users can close Razer Synapse / Discord /
-                # OBS / Teams / etc. in the background and click
-                # Retry — no need to restart Touchless. The recovery
-                # loop inside the engine handles the same case when
-                # the camera drops mid-session; this UI-side check
-                # covers the FIRST-run path where the engine hasn't
-                # been started yet.
-                while True:
-                    detected_holders: list = []
-                    try:
-                        from ..camera.camera_lock_detector import (
-                            detect_camera_holding_processes,
-                            summarize_processes_for_user,
-                        )
-                        detected_holders = detect_camera_holding_processes()
-                    except Exception:
-                        detected_holders = []
+                # v1.1.7 UX rewrite: silently retry the enumeration
+                # for a few seconds before surfacing anything. Windows
+                # sometimes needs a moment after driver install /
+                # boot / a briefly-held camera-open for DShow to
+                # publish the video device to QMediaDevices — a
+                # blocking "no camera, close your apps" dialog on
+                # this transient race is user-hostile and (per the
+                # Kiyo Pro fps investigation) we can't ask users to
+                # close the same driver software we just told them to
+                # install. Keep the camera-lock detector but only for
+                # stderr diagnostics; never blame it in user-facing
+                # copy or ask them to kill processes.
+                try:
+                    from ..camera.camera_lock_detector import (
+                        detect_camera_holding_processes,
+                        summarize_processes_for_user,
+                    )
+                    detected_holders = detect_camera_holding_processes()
                     if detected_holders:
                         holder_summary = summarize_processes_for_user(detected_holders)
-                        dialog_text = (
-                            f"Touchless couldn't find a camera because another "
-                            f"app is holding it:\n\n{holder_summary}\n\n"
-                            "Close that app (right-click its tray icon → Quit), "
-                            "then click Retry."
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f"[camera-diag] enumeration empty; running apps that "
+                            f"commonly share the camera: {holder_summary}. Retrying "
+                            f"silently — not surfacing to user.\n"
                         )
-                    else:
-                        dialog_text = (
-                            "No camera was detected.\n\n"
-                            "Make sure your webcam is plugged in and no other "
-                            "app is using it, then click Retry."
-                        )
-                    box = QMessageBox(self)
-                    box.setIcon(QMessageBox.Warning)
-                    box.setWindowTitle("Touchless")
-                    box.setText("Camera not available")
-                    box.setInformativeText(dialog_text)
-                    retry_btn = box.addButton("Retry", QMessageBox.AcceptRole)
-                    box.addButton("Cancel", QMessageBox.RejectRole)
-                    box.setDefaultButton(retry_btn)
-                    box.exec()
-                    clicked = box.clickedButton()
-                    if clicked is retry_btn:
-                        # Re-run inventory refresh + phone check and
-                        # loop. Fresh scan every time so if the user
-                        # closed the culprit AND replugged, both
-                        # discovery paths get another try.
-                        cameras = self.refresh_camera_inventory(update_status=True, notify=False)
-                        phone_qr_paired = (
-                            bool(getattr(self.config, "phone_camera_qr_active", False))
-                            and self._current_phone_camera_qr_server() is not None
-                        )
-                        if cameras or phone_qr_paired:
-                            break  # camera came back — proceed with normal start
-                        continue  # still no camera — re-show dialog with fresh detection
-                    # User clicked Cancel — abandon start.
-                    self.status_label.setText("Status: no camera found")
+                        _sys.stderr.flush()
+                except Exception:
+                    pass
+                self.status_label.setText("Status: looking for camera…")
+                import time as _time
+                deadline = _time.monotonic() + 8.0
+                while _time.monotonic() < deadline:
+                    QApplication.processEvents()
+                    _time.sleep(0.4)
+                    cameras = self.refresh_camera_inventory(update_status=False, notify=False)
+                    phone_qr_paired = (
+                        bool(getattr(self.config, "phone_camera_qr_active", False))
+                        and self._current_phone_camera_qr_server() is not None
+                    )
+                    if cameras or phone_qr_paired:
+                        break
+                if not cameras and not phone_qr_paired:
+                    # Genuinely gave up after silent retry window. Show
+                    # a neutral inline status (no modal dialog, no
+                    # process names) and let the user try Start again
+                    # whenever they're ready. The existing Stop/Start
+                    # button gives them the retry entry point without
+                    # blocking on a blame-y dialog.
+                    self.status_label.setText(
+                        "Status: no camera detected — plug in a webcam and press Start"
+                    )
                     return
 
             if cameras:
