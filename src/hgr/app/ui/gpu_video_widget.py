@@ -226,6 +226,22 @@ class GpuVideoWidget(QWidget):
         reader thread can safely overwrite its source buffer."""
         if bgr_frame is None or bgr_frame.size == 0:
             return
+        # v1.1.7 event-loop optimization (Step 4): skip the QImage
+        # construction + .copy() when the widget isn't currently
+        # visible. Camera frames arrive at ~30-60 fps regardless of
+        # whether the mini viewer is on screen — copying 2.76 MB of
+        # pixel data every frame for a widget the user can't see is
+        # pure waste. Qt's update() is a no-op on hidden widgets
+        # anyway, so nothing user-visible changes when we bail early.
+        # Restarts cleanly when the widget becomes visible again
+        # because the next raw_frame_ready emit runs this method
+        # with a fresh frame.
+        try:
+            visible = self.isVisible()
+        except Exception:
+            visible = True
+        if not visible:
+            return
         try:
             h, w = bgr_frame.shape[:2]
         except Exception:
