@@ -842,6 +842,18 @@ class GestureWorker(QObject):
         self._fullscreen_foreground_active = False
         self._fullscreen_foreground_process = ""
         self._fullscreen_check_last = 0.0
+        # v1.1.7 event-loop optimization (Step 2): when a fullscreen
+        # app (typically a game) has foreground and the user has GPU
+        # inference enabled (config.gpu_mode OR the implicit
+        # prefer_gpu=True baked into Lite Mode), auto-suppress the
+        # GPU path and fall back to CPU MediaPipe for the duration of
+        # the game session. DirectML inference and the game's GPU
+        # work were fighting for the same GPU, dragging both. When
+        # the game closes / minimizes, the transition-detection in
+        # _refresh_fullscreen_foreground clears this flag and swaps
+        # the engine back to the GPU path automatically. Transparent
+        # to the user — no config toggle, no dialog.
+        self._gpu_suppressed_for_fullscreen: bool = False
         # Phone-camera-via-QR capture (owned by MainWindow / PhoneCameraServer).
         # None when no phone is connected; set by set_phone_camera_capture().
         self._phone_camera_capture = None
@@ -3754,8 +3766,53 @@ class GestureWorker(QObject):
         # promptly. Restored to NORMAL when the game goes away.
         if active and not was_active:
             self._apply_process_priority(above_normal=True)
+            # Adaptive GPU (Step 2): fullscreen app just came up.
+            # If the user has GPU inference on (config.gpu_mode OR
+            # Lite Mode's implicit prefer_gpu=True), swap to CPU
+            # MediaPipe so we stop fighting the game for the GPU.
+            # Skipped if already suppressed (defensive; shouldn't
+            # happen since transitions are gated on was_active).
+            if not self._gpu_suppressed_for_fullscreen and self._running:
+                wants_gpu = (
+                    bool(getattr(self.config, "gpu_mode", False))
+                    or bool(getattr(self.config, "lite_mode", False))
+                )
+                if wants_gpu:
+                    self._gpu_suppressed_for_fullscreen = True
+                    try:
+                        sys.stderr.write(
+                            f"[perf-mode] fullscreen '{process or '?'}' detected — "
+                            "auto-suppressing GPU inference (swapping to CPU "
+                            "MediaPipe) so gesture tracking doesn't fight the "
+                            "foreground app for the GPU. Will restore GPU path "
+                            "when the fullscreen window closes.\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                    try:
+                        self._swap_engine_safely()
+                    except Exception:
+                        pass
         elif was_active and not active:
             self._apply_process_priority(above_normal=False)
+            # Adaptive GPU (Step 2): fullscreen app closed / minimized.
+            # Restore the GPU inference path if we suppressed it.
+            if self._gpu_suppressed_for_fullscreen and self._running:
+                self._gpu_suppressed_for_fullscreen = False
+                try:
+                    sys.stderr.write(
+                        "[perf-mode] fullscreen closed — restoring GPU "
+                        "inference path (was suppressed while a fullscreen "
+                        "foreground app was up).\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    self._swap_engine_safely()
+                except Exception:
+                    pass
 
     @staticmethod
     def _apply_process_priority(*, above_normal: bool) -> None:
@@ -4105,6 +4162,13 @@ class GestureWorker(QObject):
         # it on can never break gesture recognition â€” it just won't
         # speed anything up if the GPU path can't engage.
         prefer_gpu = bool(getattr(self.config, "gpu_mode", False))
+        # v1.1.7 Step 2 (adaptive GPU): if a fullscreen foreground app
+        # (game) is up and we auto-suppressed the GPU path, force
+        # prefer_gpu=False for this rebuild. When the game closes the
+        # transition-detector flips the flag back and swaps the engine
+        # again — no config change, fully automatic.
+        if self._gpu_suppressed_for_fullscreen:
+            prefer_gpu = False
         if self._low_fps_active:
             # Low-FPS already implies lite landmark model â€” keep its
             # tuned thresholds; lite_mode would be redundant here.
@@ -4144,7 +4208,11 @@ class GestureWorker(QObject):
             detector = HandDetector(
                 model_complexity=0,
                 max_process_width=self._LITE_MODE_PROCESS_WIDTH,
-                prefer_gpu=True,
+                # Lite Mode's implicit prefer_gpu=True (see comment
+                # above) also gets suppressed when a fullscreen game
+                # is up — Step 2's adaptive GPU applies to any path
+                # that would otherwise ask for GPU inference.
+                prefer_gpu=not self._gpu_suppressed_for_fullscreen,
             )
             stable_frames = max(2, self.config.stable_frames_required // 2)
         else:
