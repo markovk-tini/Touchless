@@ -537,6 +537,26 @@ class LiveViewWindow(QMainWindow):
                 self.video_label.set_lite_paint_mode(fullscreen)
             except Exception:
                 pass
+            # C9 (v1.1.7): thread the overlay-level tier from the
+            # perf-mode config down to the widget. Low-FPS Mode is
+            # the highest-priority hint (weakest hardware — reduce
+            # to skeleton only), then Lite Mode (skeleton + bbox
+            # only), then default full overlay. Kept in the same
+            # code path as set_lite_paint_mode so the raw-frame and
+            # overlay-level state stay frame-synchronised.
+            try:
+                cfg = getattr(worker, "config", None)
+                if cfg is None:
+                    overlay_level = 3
+                elif bool(getattr(cfg, "low_fps_mode", False)) or bool(getattr(worker, "_low_fps_auto_engaged", False)):
+                    overlay_level = 1
+                elif bool(getattr(cfg, "lite_mode", False)):
+                    overlay_level = 2
+                else:
+                    overlay_level = 3
+                self.video_label.set_overlay_level(overlay_level)
+            except Exception:
+                pass
         self._last_frame = frame
         self._render_frame()
         # Update the latency + display-rate readout. The label
