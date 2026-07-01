@@ -1325,6 +1325,19 @@ class GestureWorker(QObject):
         # re-sample to detect a new hand entering the frame.
         self._last_result_had_hand: bool = False
         self._inference_skipped_last: bool = False
+        # C13 (v1.1.7): track whether the last engine_landmarks_ready
+        # emit carried a non-empty hands list. When no hand is detected
+        # in the current cycle AND the previous emit also had no hands
+        # AND there's no mouse-mode overlay + no drawing-mode overlay
+        # override, the payload is byte-for-byte identical to the last
+        # one and just re-runs both live-view widgets' slot handlers
+        # for no visible change. Eliding the redundant emit lets the
+        # widgets skip an update_landmarks + paint cycle each. The
+        # hand-present-to-absent transition still fires exactly one
+        # final neutral emit so the widget clears its stashed skeleton
+        # — that's what prevents "hand leaves the frame but the
+        # skeleton stays" ghosting.
+        self._last_emit_had_hands: bool = False
 
         # Wall-clock-rate-limited debug-frame emit. The receivers
         # (mini viewer + live view) each do cv2.cvtColor + QImage +
@@ -5249,15 +5262,32 @@ class GestureWorker(QObject):
             hide_hand_overlay = bool(
                 self._drawing_mode_enabled and self._drawing_render_target == "camera"
             )
-            if mouse_overlay is not None or hide_hand_overlay:
-                payload = {
-                    "hands": hands_info,
-                    "mouse_overlay": mouse_overlay,
-                    "hide_hand_overlay": hide_hand_overlay,
-                }
-            else:
-                payload = hands_info
-            self.engine_landmarks_ready.emit(payload)
+            # C13: elide the emit when the payload would be a
+            # steady-state repeat (no hands, no mouse overlay, no
+            # drawing-mode override). The hand-present-to-absent
+            # transition still fires because _last_emit_had_hands is
+            # True on that specific cycle, forcing should_emit to True
+            # and letting the widget clear its stashed skeleton.
+            has_hands = bool(hands_info)
+            should_emit = True
+            if (
+                not has_hands
+                and mouse_overlay is None
+                and not hide_hand_overlay
+                and not self._last_emit_had_hands
+            ):
+                should_emit = False
+            if should_emit:
+                if mouse_overlay is not None or hide_hand_overlay:
+                    payload = {
+                        "hands": hands_info,
+                        "mouse_overlay": mouse_overlay,
+                        "hide_hand_overlay": hide_hand_overlay,
+                    }
+                else:
+                    payload = hands_info
+                self.engine_landmarks_ready.emit(payload)
+                self._last_emit_had_hands = has_hands
         except Exception:
             pass
 
