@@ -136,6 +136,21 @@ class GpuVideoWidget(QWidget):
         self._paint_delta_max_us = 0
         self._paint_delta_samples = 0
         self._paint_last_end_monotonic = 0.0
+        # C3 (v1.1.7 diagnostic): slot-to-paint latency. When
+        # update_frame is called from _on_worker_raw_frame in the
+        # receiver, we timestamp it. The next paintEvent computes
+        # the delta from that timestamp to paint completion — this
+        # measures how quickly Qt actually services the update()
+        # request. A large slot→paint delta with a small paint
+        # duration indicates event-loop coalescing (main thread
+        # busy handling other queued work between slot-fire and
+        # paint). Reset to 0 after the paintEvent consumes it so a
+        # subsequent paint triggered by something other than
+        # update_frame (resize, expose) doesn't record a stale delta.
+        self._last_slot_fire_perf = 0.0
+        self._slot_to_paint_total_us = 0
+        self._slot_to_paint_max_us = 0
+        self._slot_to_paint_samples = 0
         # Fullscreen-aware lite paint mode. When True, paintEvent
         # skips _draw_landmarks entirely -- the skeleton, bbox,
         # banner, and mouse-overlay strokes are the expensive part
@@ -194,6 +209,11 @@ class GpuVideoWidget(QWidget):
         self._image_w = w
         self._image_h = h
         self._idle_text = ""
+        # C3: stamp slot-fire time BEFORE update() so paintEvent's
+        # slot→paint delta measures from the moment this widget was
+        # asked for a new frame to the moment Qt got around to
+        # actually painting it.
+        self._last_slot_fire_perf = time.perf_counter()
         self.update()
 
     def update_landmarks(self, payload: Optional[object]) -> None:
@@ -369,6 +389,16 @@ class GpuVideoWidget(QWidget):
             if delta_us > self._paint_delta_max_us:
                 self._paint_delta_max_us = delta_us
         self._paint_last_end_monotonic = t_end
+        # C3: slot→paint delta from update_frame timestamp (if this
+        # paint was triggered by update_frame; resize / expose paints
+        # leave _last_slot_fire_perf==0 and are skipped).
+        if self._last_slot_fire_perf > 0.0:
+            slot_delta_us = int((t_end - self._last_slot_fire_perf) * 1_000_000)
+            self._slot_to_paint_total_us += slot_delta_us
+            self._slot_to_paint_samples += 1
+            if slot_delta_us > self._slot_to_paint_max_us:
+                self._slot_to_paint_max_us = slot_delta_us
+            self._last_slot_fire_perf = 0.0
         now = time.monotonic()
         if self._paint_log_at == 0.0:
             self._paint_log_at = now
@@ -390,6 +420,10 @@ class GpuVideoWidget(QWidget):
                 self._paint_delta_total_us // self._paint_delta_samples
                 if self._paint_delta_samples > 0 else 0
             )
+            avg_slot_us = (
+                self._slot_to_paint_total_us // self._slot_to_paint_samples
+                if self._slot_to_paint_samples > 0 else 0
+            )
             src_w = self._image_w if self._image is not None else 0
             src_h = self._image_h if self._image is not None else 0
             tgt_w = target.width() if self._image is not None else 0
@@ -404,6 +438,9 @@ class GpuVideoWidget(QWidget):
                     f"max={self._paint_timing_max_us / 1000:.2f}ms | "
                     f"paint→paint delta avg={avg_delta_us / 1000:.2f}ms "
                     f"max={self._paint_delta_max_us / 1000:.2f}ms | "
+                    f"slot→paint avg={avg_slot_us / 1000:.2f}ms "
+                    f"max={self._slot_to_paint_max_us / 1000:.2f}ms "
+                    f"(n={self._slot_to_paint_samples}) | "
                     f"src={src_w}x{src_h} target={tgt_w}x{tgt_h}\n"
                 )
                 sys.stderr.flush()
@@ -418,6 +455,9 @@ class GpuVideoWidget(QWidget):
             self._paint_delta_total_us = 0
             self._paint_delta_max_us = 0
             self._paint_delta_samples = 0
+            self._slot_to_paint_total_us = 0
+            self._slot_to_paint_max_us = 0
+            self._slot_to_paint_samples = 0
 
     def _aspect_target(self) -> QRect:
         if self._image_w <= 0 or self._image_h <= 0:
