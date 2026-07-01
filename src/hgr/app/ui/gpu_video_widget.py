@@ -120,6 +120,22 @@ class GpuVideoWidget(QWidget):
         # diverge, paint events are coalescing somewhere.
         self._paint_count = 0
         self._paint_log_at = 0.0
+        # C1 (v1.1.7 diagnostic): per-section paintEvent timing +
+        # paint-to-paint wall-clock delta. Every paint measures
+        # drawImage cost + overlay cost + total wall time; the
+        # 2 s summary log emits averages so we can distinguish
+        # "paint is genuinely expensive" (delta ≈ paint duration)
+        # from "paint is cheap but events coalesce" (delta ≫ paint
+        # duration). Reset every log emission so the 2 s window is
+        # independent — no cross-window contamination.
+        self._paint_timing_total_us = 0
+        self._paint_timing_drawimage_us = 0
+        self._paint_timing_overlay_us = 0
+        self._paint_timing_max_us = 0
+        self._paint_delta_total_us = 0
+        self._paint_delta_max_us = 0
+        self._paint_delta_samples = 0
+        self._paint_last_end_monotonic = 0.0
         # Fullscreen-aware lite paint mode. When True, paintEvent
         # skips _draw_landmarks entirely -- the skeleton, bbox,
         # banner, and mouse-overlay strokes are the expensive part
@@ -286,12 +302,22 @@ class GpuVideoWidget(QWidget):
         # already GPU-accelerated. drawImage with Format_BGR888
         # uploads to a texture and samples on the GPU; no CPU
         # colour conversion needed.
+        # C1 (v1.1.7 diagnostic): time each section so the 2 s log
+        # emission below can distinguish drawImage cost from overlay
+        # cost from total, and can compare paint duration vs paint-
+        # to-paint wall delta.
+        t_start = time.perf_counter()
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.fillRect(self.rect(), self._background)
         target = self._aspect_target()
+        drawimage_us = 0
+        overlay_us = 0
         if self._image is not None and not self._image.isNull():
+            t_before_drawimage = time.perf_counter()
             painter.drawImage(target, self._image)
+            t_after_drawimage = time.perf_counter()
+            drawimage_us = int((t_after_drawimage - t_before_drawimage) * 1_000_000)
             # In lite paint mode (a fullscreen game is foreground)
             # we keep the cheap parts of the overlay — the hand
             # skeleton + joint dots, which are 2 batched draw calls
@@ -308,7 +334,9 @@ class GpuVideoWidget(QWidget):
             # (baked into the frame, with its fingertip cursor) show — the
             # drawing is the top layer and the hand-reading graphics vanish.
             if not self._hide_hand_overlay:
+                t_before_overlay = time.perf_counter()
                 self._draw_landmarks(painter, target)
+                overlay_us = int((time.perf_counter() - t_before_overlay) * 1_000_000)
         elif self._idle_text:
             painter.setPen(QPen(self._idle_color, 1))
             painter.setFont(self._idle_font)
@@ -318,25 +346,78 @@ class GpuVideoWidget(QWidget):
                 self._idle_text,
             )
         painter.end()
+        t_end = time.perf_counter()
+        total_us = int((t_end - t_start) * 1_000_000)
         # Paint-rate diagnostic. Prints actual on-screen update
         # rate every 2 s so we can confirm whether the display is
         # tracking the worker's emit rate or coalescing.
         self._paint_count += 1
+        # C1 accumulation for the 2 s summary. Paint-to-paint wall
+        # delta uses the interval between successive paintEvent
+        # completions — if that delta is close to `total_us` the cap
+        # is truly paint cost; if delta is much larger, event
+        # coalescing is happening between paints.
+        self._paint_timing_total_us += total_us
+        self._paint_timing_drawimage_us += drawimage_us
+        self._paint_timing_overlay_us += overlay_us
+        if total_us > self._paint_timing_max_us:
+            self._paint_timing_max_us = total_us
+        if self._paint_last_end_monotonic > 0.0:
+            delta_us = int((t_end - self._paint_last_end_monotonic) * 1_000_000)
+            self._paint_delta_total_us += delta_us
+            self._paint_delta_samples += 1
+            if delta_us > self._paint_delta_max_us:
+                self._paint_delta_max_us = delta_us
+        self._paint_last_end_monotonic = t_end
         now = time.monotonic()
         if self._paint_log_at == 0.0:
             self._paint_log_at = now
         elif now - self._paint_log_at >= 2.0:
             rate = self._paint_count / (now - self._paint_log_at)
+            avg_total_us = (
+                self._paint_timing_total_us // self._paint_count
+                if self._paint_count > 0 else 0
+            )
+            avg_drawimage_us = (
+                self._paint_timing_drawimage_us // self._paint_count
+                if self._paint_count > 0 else 0
+            )
+            avg_overlay_us = (
+                self._paint_timing_overlay_us // self._paint_count
+                if self._paint_count > 0 else 0
+            )
+            avg_delta_us = (
+                self._paint_delta_total_us // self._paint_delta_samples
+                if self._paint_delta_samples > 0 else 0
+            )
+            src_w = self._image_w if self._image is not None else 0
+            src_h = self._image_h if self._image is not None else 0
+            tgt_w = target.width() if self._image is not None else 0
+            tgt_h = target.height() if self._image is not None else 0
             try:
                 sys.stderr.write(
                     f"[gpu_video] paint rate: {rate:.1f} fps "
-                    f"(widget={self.objectName() or type(self).__name__})\n"
+                    f"(widget={self.objectName() or type(self).__name__}) | "
+                    f"avg paint={avg_total_us / 1000:.2f}ms "
+                    f"(drawImage={avg_drawimage_us / 1000:.2f}ms, "
+                    f"overlay={avg_overlay_us / 1000:.2f}ms) "
+                    f"max={self._paint_timing_max_us / 1000:.2f}ms | "
+                    f"paint→paint delta avg={avg_delta_us / 1000:.2f}ms "
+                    f"max={self._paint_delta_max_us / 1000:.2f}ms | "
+                    f"src={src_w}x{src_h} target={tgt_w}x{tgt_h}\n"
                 )
                 sys.stderr.flush()
             except Exception:
                 pass
             self._paint_count = 0
             self._paint_log_at = now
+            self._paint_timing_total_us = 0
+            self._paint_timing_drawimage_us = 0
+            self._paint_timing_overlay_us = 0
+            self._paint_timing_max_us = 0
+            self._paint_delta_total_us = 0
+            self._paint_delta_max_us = 0
+            self._paint_delta_samples = 0
 
     def _aspect_target(self) -> QRect:
         if self._image_w <= 0 or self._image_h <= 0:
