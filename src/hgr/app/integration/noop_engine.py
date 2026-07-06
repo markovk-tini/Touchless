@@ -3866,6 +3866,117 @@ class GestureWorker(QObject):
         except Exception:
             pass
 
+    def _build_engine_guarded(self, timeout_seconds: float = 8.0):
+        """Build the engine on a helper thread with a hard wall-clock
+        timeout, so a DirectML EP init hang (D3D12 adapter enumeration
+        blocked by Razer Cortex / Synapse / a laptop's dGPU-iGPU probe)
+        cannot freeze the Qt main thread indefinitely.
+
+        v1.1.7 C20: user reported that when gpu_mode was auto-loaded
+        from config on startup, the app AND the PC briefly froze during
+        engine build. Root cause: HandDetector.__init__ →
+        load_hand_runtime → ort.InferenceSession(providers=[DmlEP,...])
+        runs on the Qt main thread with no timeout. If DirectML EP init
+        blocks (adapter contention), Qt event loop halts.
+
+        Failure recovery: on timeout, force config.gpu_mode=False for
+        THIS session (persisted state is left alone so a future launch
+        may retry once the contention clears), rebuild on CPU, and emit
+        a neutral status message so the user knows GPU didn't engage.
+        """
+        import concurrent.futures as _cf
+        # Log pre-build so a hang shows up as "pre without post" in the
+        # log — this is the decisive line the adversarial verifier
+        # asked for. Includes the requested engine signature so we can
+        # tell whether the hang is in the GPU path specifically.
+        try:
+            sig = self._compute_engine_signature()
+            sys.stderr.write(f"[perf-mode] pre-engine-build sig={sig}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        _t0 = time.perf_counter()
+        # Try the primary build in a background thread with a hard wait.
+        # Pump Qt events during the wait so the UI (splash / status
+        # label / mode toggles that are also on the main thread) stays
+        # responsive. Poll on a short interval so the response feels
+        # snappy on the fast-build success case.
+        try:
+            from PySide6.QtWidgets import QApplication as _QApp
+            _qapp = _QApp.instance()
+        except Exception:
+            _qapp = None
+        exec_ = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-build")
+        try:
+            fut = exec_.submit(self._build_engine_for_fps_mode)
+            engine_new = None
+            timed_out = False
+            deadline = time.monotonic() + max(0.5, float(timeout_seconds))
+            while True:
+                try:
+                    engine_new = fut.result(timeout=0.05)
+                    break
+                except _cf.TimeoutError:
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
+                    if _qapp is not None:
+                        try:
+                            _qapp.processEvents()
+                        except Exception:
+                            pass
+                except Exception:
+                    traceback.print_exc()
+                    engine_new = None
+                    break
+        finally:
+            exec_.shutdown(wait=False)
+        elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+        if timed_out:
+            try:
+                sys.stderr.write(
+                    f"[perf-mode] engine build TIMEOUT after {elapsed_ms:.0f}ms "
+                    f"— disabling gpu_mode for this session and falling back to CPU\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            # In-memory disable only. Do NOT persist to disk — user
+            # may just be in a transient bad state (Razer Cortex
+            # briefly holding the GPU adapter, driver update in
+            # progress, etc.). Next launch retries; if it hangs again
+            # they see the timeout again and can flip gpu_mode off in
+            # Settings.
+            try:
+                self.config.gpu_mode = False
+                self._applied_gpu_mode = False
+            except Exception:
+                pass
+            try:
+                self._emit_status(
+                    "GPU acceleration didn't start — running on CPU. "
+                    "You can retry GPU Mode in Settings."
+                )
+            except Exception:
+                pass
+            # Second build attempt on the main thread — GPU is now
+            # off in config so this takes the CPU path and is safe
+            # to block briefly.
+            try:
+                engine_new = self._build_engine_for_fps_mode()
+            except Exception:
+                traceback.print_exc()
+                engine_new = None
+        try:
+            sys.stderr.write(
+                f"[perf-mode] post-engine-build elapsed={elapsed_ms:.0f}ms "
+                f"timeout={timed_out} ok={engine_new is not None}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return engine_new
+
     def _compute_engine_signature(self) -> tuple:
         """Full tuple of every input `_build_engine_for_fps_mode` reads.
         Two states with the same signature are guaranteed to produce
@@ -3934,8 +4045,30 @@ class GestureWorker(QObject):
                 pass
             return
         else:
-            new_engine = self._build_engine_for_fps_mode()
-            self._engine_cache[signature] = new_engine
+            # C20: guarded build. On DirectML timeout the helper
+            # forces gpu_mode=False and rebuilds on CPU, so
+            # new_engine is a valid CPU engine (not None) in the
+            # timeout path — cache under the CPU signature not the
+            # requested GPU one.
+            new_engine = self._build_engine_guarded()
+            if new_engine is not None:
+                # If the guarded build fell back to CPU, the
+                # signature computed inside the helper's post-log is
+                # the current one (CPU). Recompute after in case
+                # config.gpu_mode was flipped by the fallback.
+                self._engine_cache[self._compute_engine_signature()] = new_engine
+            else:
+                # Build failed with no fallback — keep the current
+                # engine to avoid a null-engine session. Skip the
+                # runner swap below.
+                try:
+                    sys.stderr.write(
+                        "[perf-mode] engine build returned None — keeping current engine\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                return
         self._engine_runner.set_engine(new_engine)
         self.engine = new_engine
         # C17 review add (c): wall-clock timing so we can VERIFY the
@@ -4430,13 +4563,18 @@ class GestureWorker(QObject):
         if self._running:
             return
         self._shutdown_runtime(emit_signal=False)
-        self.engine = self._build_engine_for_fps_mode()
+        # C20: guard the initial build with a wall-clock timeout so a
+        # persisted-from-config gpu_mode=True that hangs on DirectML
+        # init cannot freeze the Qt main thread at startup. Falls back
+        # to CPU on timeout with a neutral status message.
+        self.engine = self._build_engine_guarded()
         # C17: seed the engine cache with the startup engine so a later
         # toggle back to this signature hits the cache instead of paying
         # another ONNX + DirectML session build.
         if self._engine_cache is None:
             self._engine_cache = {}
-        self._engine_cache[self._compute_engine_signature()] = self.engine
+        if self.engine is not None:
+            self._engine_cache[self._compute_engine_signature()] = self.engine
         # Spin up the background-thread engine runner. The lambda
         # bridge translates the runner-thread callback into a
         # cross-thread Qt signal emit, which auto-queues the result
@@ -4763,6 +4901,10 @@ class GestureWorker(QObject):
         else:
             result = open_preferred_or_first_available(self.config.preferred_camera_index, max_index=self.config.camera_scan_limit)
         self._apply_low_fps_capture_tuning(result)
+        # C20: default-mode tuning — nudge the OpenCV cap to 30 fps +
+        # MJPG. No-op for Low FPS (already tuned above) and for Lite /
+        # GPU (they upgrade to ffmpeg-MJPG right after this).
+        self._apply_default_capture_tuning(result)
         result = self._upgrade_to_ffmpeg_capture_if_lite(result)
         return result
 
@@ -5067,6 +5209,68 @@ class GestureWorker(QObject):
         try:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        except Exception:
+            pass
+
+    def _apply_default_capture_tuning(self, open_result) -> None:
+        """Push a 30 fps + MJPG FOURCC hint into the OpenCV cap on
+        initial open when we're in default mode (no perf toggle).
+
+        Motivation (v1.1.7 C20): the user reports steady 20 fps in
+        default mode on a Kiyo Pro that the DShow probe confirms can
+        do 60 fps at every 640×480 / 720p / 1080p mode. cv2.VideoCapture
+        never sends the DShow driver an explicit framerate request on
+        open — it takes whatever the driver defaults to. The default
+        for many UVC drivers under YUY2 is 15-20 fps because that's
+        the exposure-time-safe rate under Windows auto-exposure. An
+        explicit CAP_PROP_FPS=30 request lifts that cap on drivers
+        that honour it (including the Kiyo Pro's).
+
+        MJPG FOURCC hint is best-effort: OpenCV's Windows path often
+        silently ignores it, but when it works the driver switches
+        to MJPG which lifts the YUY2 bandwidth cap. Zero cost when
+        ignored.
+
+        Skipped when perf modes are active because those have their
+        own tuning path (_apply_low_fps_capture_tuning for Low FPS,
+        ffmpeg-MJPG for Lite / GPU).
+        """
+        if self._any_perf_mode_active() or self._low_fps_active:
+            return
+        cap = None
+        if isinstance(open_result, tuple) and len(open_result) >= 2:
+            cap = open_result[1]
+        elif open_result is not None and hasattr(open_result, "set"):
+            cap = open_result
+        if cap is None:
+            return
+        # Skip if the cap is our ffmpeg wrapper (already 60 fps MJPG).
+        try:
+            if "FfmpegMjpegCapture" in type(cap).__name__:
+                return
+        except Exception:
+            pass
+        # MJPG FOURCC hint. Best-effort — many Windows OpenCV builds
+        # silently keep YUY2. When it lands, the driver can hit higher
+        # fps at the same resolution than YUY2 bandwidth would allow.
+        try:
+            if hasattr(cv2, "CAP_PROP_FOURCC"):
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
+        # Explicit fps request. UVC drivers honour this when the
+        # requested rate is within their advertised range for the
+        # current (fmt, resolution) combo.
+        try:
+            if hasattr(cv2, "CAP_PROP_FPS"):
+                cap.set(cv2.CAP_PROP_FPS, 30.0)
+        except Exception:
+            pass
+        # Small buffer size so a brief stall doesn't accumulate
+        # latency in the driver's queue.
+        try:
+            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
 
