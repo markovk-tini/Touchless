@@ -367,6 +367,34 @@ def list_available_cameras(max_index: int = 8) -> List[CameraInfo]:
                 if discovered and consecutive_misses >= stop_after_misses:
                     break
 
+    # v1.1.7 Windows ffmpeg-DShow enumeration fallback. On some
+    # driver/OS combos (post Razer Synapse install, WMF-hidden UVC
+    # devices, or a camera briefly held by a background app while
+    # we probed), QMediaDevices returns empty AND every OpenCV
+    # backend fails to open — so the user sees "no camera" even
+    # though ffmpeg's DShow enumeration can see the device fine.
+    # If ffmpeg's list is non-empty when our probe found nothing,
+    # synthesize CameraInfo entries so the app can still open via
+    # the ffmpeg-subprocess path (open_camera_by_index has the
+    # matching fallback). Zero cost when the OpenCV probe already
+    # found the camera — this branch only runs when discovered is
+    # empty AND we're on Windows.
+    if not discovered and platform.system() == "Windows":
+        try:
+            from .ffmpeg_capture import list_dshow_video_devices
+            dshow_devices = list_dshow_video_devices()
+        except Exception:
+            dshow_devices = []
+        for idx, name in enumerate(dshow_devices):
+            discovered.append(
+                CameraInfo(
+                    index=idx,
+                    backend=-1,
+                    backend_name="ffmpeg-dshow",
+                    display_name=f"{name} (Camera {idx})",
+                )
+            )
+
     return discovered
 
 
@@ -493,6 +521,39 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
                     # ffmpeg_cap is already async-buffered internally
                     # (ffmpeg pipes raw BGR24 into our reader thread),
                     # so no ThreadedCvCapture wrapper needed here.
+                    return info, ffmpeg_cap
+    # v1.1.7 general Windows ffmpeg-DShow open fallback. Every
+    # cv2.VideoCapture backend failed above — usually because Qt/
+    # OpenCV rely on Windows Media Foundation which sometimes
+    # doesn't see UVC devices that DirectShow does (post Synapse
+    # install for Kiyo Pro, some Razer/Discord/Teams driver states
+    # that briefly park the camera). ffmpeg's DShow enumeration
+    # runs in a child process and typically succeeds where the
+    # in-process cv2.VideoCapture doesn't. Same shape ffmpeg cap
+    # the perf-mode path already uses, so downstream code is
+    # transparent to which path we came from.
+    if platform.system() == "Windows":
+        try:
+            from .ffmpeg_capture import list_dshow_video_devices, open_ffmpeg_cap_with_fps_fallback
+            dshow_devices = list_dshow_video_devices()
+        except Exception:
+            dshow_devices = []
+        if 0 <= index < len(dshow_devices):
+            device_name = str(dshow_devices[index] or "").strip()
+            if device_name:
+                try:
+                    ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
+                        device_name, width=1280, height=720
+                    )
+                except Exception:
+                    ffmpeg_cap = None
+                if ffmpeg_cap is not None and ffmpeg_cap.isOpened():
+                    info = CameraInfo(
+                        index=index,
+                        backend=-1,
+                        backend_name="ffmpeg-dshow",
+                        display_name=f"{device_name} (Camera {index}, ffmpeg)",
+                    )
                     return info, ffmpeg_cap
     return None, None
 
