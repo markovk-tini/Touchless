@@ -20576,28 +20576,73 @@ Admin elevation
                         _sys.stderr.flush()
                 except Exception:
                     pass
-                self.status_label.setText("Status: looking for camera…")
+                # v1.1.7 C21 rewrite: the previous 8-second retry loop
+                # re-ran the full OpenCV probe on every iteration, which
+                # itself can take 8+ seconds for a locked camera (each
+                # index tries DSHOW then MSMF, each open blocks up to
+                # 6 s). Net result was 1-2 attempts inside the window —
+                # not enough time for a briefly-held camera (Discord
+                # video call ending, Synapse preview closing) to be
+                # picked up. Rewrite: query ONLY the fast ffmpeg
+                # -list_devices probe (~100 ms), poll every 1 s, and
+                # extend the wait to 30 s so an active video call
+                # ending is more likely to be caught. When ffmpeg-DShow
+                # reports the camera back, we run the full inventory
+                # refresh once to populate it and break.
+                self.status_label.setText(
+                    "Status: waiting for camera — another app may be using it…"
+                )
                 import time as _time
-                deadline = _time.monotonic() + 8.0
+                from ..camera.ffmpeg_capture import list_dshow_video_devices
+                deadline = _time.monotonic() + 30.0
+                last_status_at = 0.0
                 while _time.monotonic() < deadline:
                     QApplication.processEvents()
-                    _time.sleep(0.4)
-                    cameras = self.refresh_camera_inventory(update_status=False, notify=False)
-                    phone_qr_paired = (
-                        bool(getattr(self.config, "phone_camera_qr_active", False))
-                        and self._current_phone_camera_qr_server() is not None
-                    )
-                    if cameras or phone_qr_paired:
-                        break
+                    _time.sleep(1.0)
+                    try:
+                        ffmpeg_devices = list_dshow_video_devices()
+                    except Exception:
+                        ffmpeg_devices = []
+                    if ffmpeg_devices:
+                        # Camera came back at the DirectShow layer.
+                        # Now trigger the full inventory refresh so the
+                        # camera picker + camera_utils.list_available_cameras
+                        # populate CameraInfo entries the engine can open.
+                        cameras = self.refresh_camera_inventory(update_status=False, notify=False)
+                        phone_qr_paired = (
+                            bool(getattr(self.config, "phone_camera_qr_active", False))
+                            and self._current_phone_camera_qr_server() is not None
+                        )
+                        if cameras or phone_qr_paired:
+                            break
+                    else:
+                        phone_qr_paired = (
+                            bool(getattr(self.config, "phone_camera_qr_active", False))
+                            and self._current_phone_camera_qr_server() is not None
+                        )
+                        if phone_qr_paired:
+                            break
+                    # Refresh status every ~5 s with a countdown so the
+                    # user knows the app is still trying.
+                    now = _time.monotonic()
+                    if now - last_status_at >= 5.0:
+                        last_status_at = now
+                        remaining = int(deadline - now)
+                        self.status_label.setText(
+                            f"Status: waiting for camera — retrying for {remaining}s more…"
+                        )
                 if not cameras and not phone_qr_paired:
-                    # Genuinely gave up after silent retry window. Show
-                    # a neutral inline status (no modal dialog, no
-                    # process names) and let the user try Start again
-                    # whenever they're ready. The existing Stop/Start
-                    # button gives them the retry entry point without
-                    # blocking on a blame-y dialog.
+                    # Genuinely gave up after 30 s. Camera is being held
+                    # exclusively at the OS level (Razer Axon
+                    # broadcasting, Synapse live preview, an active
+                    # Discord / Teams video call, etc.) — there's
+                    # nothing more the app can do to open it. Neutral
+                    # status message (no app names, no blame) so the
+                    # user knows to check.
                     self.status_label.setText(
-                        "Status: no camera detected — plug in a webcam and press Start"
+                        "Status: camera unavailable — close any app "
+                        "actively using the camera (video call, streaming "
+                        "software, camera preview) then press Start"
                     )
                     return
 

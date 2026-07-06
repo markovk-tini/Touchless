@@ -380,11 +380,34 @@ def list_available_cameras(max_index: int = 8) -> List[CameraInfo]:
     # found the camera — this branch only runs when discovered is
     # empty AND we're on Windows.
     if not discovered and platform.system() == "Windows":
+        import sys as _sys
+        try:
+            _sys.stderr.write(
+                "[camera-enum] OpenCV probe returned 0 cameras; trying ffmpeg-DShow fallback\n"
+            )
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        dshow_devices: list[str] = []
         try:
             from .ffmpeg_capture import list_dshow_video_devices
             dshow_devices = list_dshow_video_devices()
-        except Exception:
+        except Exception as _exc:
+            try:
+                _sys.stderr.write(
+                    f"[camera-enum] list_dshow_video_devices raised: {_exc!r}\n"
+                )
+                _sys.stderr.flush()
+            except Exception:
+                pass
             dshow_devices = []
+        try:
+            _sys.stderr.write(
+                f"[camera-enum] ffmpeg-DShow fallback returned {len(dshow_devices)} device(s): {dshow_devices!r}\n"
+            )
+            _sys.stderr.flush()
+        except Exception:
+            pass
         for idx, name in enumerate(dshow_devices):
             discovered.append(
                 CameraInfo(
