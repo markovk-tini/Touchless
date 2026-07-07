@@ -4811,6 +4811,38 @@ class GestureWorker(QObject):
         t0 = time.perf_counter() if debug_timing else 0.0
         ok, frame = self._cap.read()
         t_read = time.perf_counter() if debug_timing else 0.0
+        # PERF DIAG (HGR_PERF_LOG=1): disambiguate the fps cap. Logs how often
+        # _tick actually fires vs how often a genuinely NEW camera frame
+        # arrives. tick~60/newframe~15 => camera is delivering ~15 fps (auto-
+        # exposure/lighting); tick~15 => event-loop/timer throttled; tick~60 &
+        # newframe~60 but low self._fps => runner back-pressure.
+        if self._perf_log_enabled:
+            self._tickdiag_ticks = getattr(self, "_tickdiag_ticks", 0) + 1
+            _cap_ts = float(
+                getattr(self._cap, "_latest_frame_ts", 0.0)
+                or getattr(self._cap, "_last_consumed_ts", 0.0)
+                or 0.0
+            )
+            if _cap_ts != getattr(self, "_tickdiag_last_ts", -1.0):
+                self._tickdiag_newframes = getattr(self, "_tickdiag_newframes", 0) + 1
+                self._tickdiag_last_ts = _cap_ts
+            _dnow = time.monotonic()
+            if not hasattr(self, "_tickdiag_at"):
+                self._tickdiag_at = _dnow
+            elif _dnow - self._tickdiag_at >= 2.0:
+                _dt = _dnow - self._tickdiag_at
+                try:
+                    sys.stderr.write(
+                        f"[tickdiag] tick={self._tickdiag_ticks / _dt:.1f}/s "
+                        f"newframe={getattr(self, '_tickdiag_newframes', 0) / _dt:.1f}/s "
+                        f"busy={self._engine_runner.busy} pending={self._async_result_pending}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                self._tickdiag_ticks = 0
+                self._tickdiag_newframes = 0
+                self._tickdiag_at = _dnow
         if not ok:
             # Camera stalled briefly (ffmpeg pipe between frames,
             # No fresh frame this poll â€” let the periodic 15 ms
