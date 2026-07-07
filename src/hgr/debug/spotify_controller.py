@@ -1332,6 +1332,15 @@ class SpotifyController:
         fallback_ports = [port, 5001, 5002, 5003, 5004]
         explicit_redirect = bool(self._redirect_uri)
         redirect_uri = self._redirect_uri or f"http://127.0.0.1:{port}/callback"
+        if self._mac:
+            # macOS reserves port 5000 for the AirPlay Receiver (ControlCenter),
+            # so an explicit :5000 redirect can NEVER bind. Force the fallback
+            # walk (ports 5000-5004 are all registered redirect URIs for this
+            # app) and let the bound-port rebuild below point Spotify at
+            # whichever one actually binds — otherwise connect always fails
+            # with 'Address already in use' on port 5000.
+            explicit_redirect = False
+            redirect_uri = f"http://127.0.0.1:{port}/callback"
         state = secrets.token_urlsafe(16)
         # PKCE: generate a high-entropy code_verifier (43-128 chars,
         # URL-safe) and derive the challenge as base64url(SHA256(verifier)).
