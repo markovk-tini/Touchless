@@ -224,6 +224,29 @@ def main() -> int:
             except Exception:
                 pass
 
+        # --- macOS: raise main-thread QoS to USER_INTERACTIVE ---------------
+        # A python process launched from a TERMINAL (not a .app bundle) is
+        # given a low/utility QoS class by macOS, which throttles its run-loop
+        # timers — the gesture QTimer that should fire at 66 Hz only fires
+        # ~17 Hz even though the CPU is idle and each frame's work is <25 ms.
+        # (This is separate from App Nap.) Promote the main thread so timers
+        # fire at full rate. In a packaged .app the process QoS is already
+        # user-interactive, but setting it is harmless there.
+        try:
+            import ctypes as _ctypes
+            _libsystem = _ctypes.CDLL("/usr/lib/libSystem.dylib")
+            # pthread_set_qos_class_self_np(qos_class_t, relative_priority)
+            # QOS_CLASS_USER_INTERACTIVE = 0x21
+            _rc = _libsystem.pthread_set_qos_class_self_np(0x21, 0)
+            sys.stderr.write(f"[macos] main-thread QoS -> USER_INTERACTIVE (rc={_rc})\n")
+            sys.stderr.flush()
+        except Exception as _qos_exc:
+            try:
+                sys.stderr.write(f"[macos] QoS bump failed: {type(_qos_exc).__name__}: {_qos_exc}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+
     # Install the taskbar Jump List. Only attempts in frozen builds
     # where sys.executable is Touchless.exe (each task re-launches
     # the exe with a flag). Source runs use python.exe whose path
