@@ -81,10 +81,15 @@ class SpotifyWheelOverlay(QWidget):
         self._apply_circle_mask()
 
     def show_overlay(self) -> None:
+        import sys
         self._place_on_screen()
         self._apply_circle_mask()
         self.show()
-        self.raise_()
+        if sys.platform != "darwin":
+            # raise_() activates the whole app on macOS, stealing focus from
+            # the app you're controlling (Chrome, etc.). apply_overlay orders
+            # the wheel front NON-activating via the nonactivating NSPanel path.
+            self.raise_()
         self.repaint()
         apply_overlay(self)
 

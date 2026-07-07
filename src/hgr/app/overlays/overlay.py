@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 import time
 from datetime import datetime
 from itertools import cycle
@@ -12,6 +13,21 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QGuiApplication, QImage, 
 from PySide6.QtWidgets import QApplication, QColorDialog, QDialog, QFrame, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget
 
 from ..ui.native_overlay import apply_overlay
+
+
+def _front_overlay(widget) -> None:
+    """Order a HUD overlay to the front WITHOUT stealing focus.
+
+    On macOS, raise_() activates the whole app, pulling focus off whatever the
+    user is actually controlling (Chrome, etc.); the nonactivating-NSPanel path
+    in apply_overlay() orders the window front without activating. On Windows a
+    Qt.Tool + WA_ShowWithoutActivating window's raise_() is a plain Z-order
+    raise that does NOT steal focus, so keep the existing behavior there.
+    """
+    if sys.platform == "darwin":
+        apply_overlay(widget)
+    else:
+        widget.raise_()
 
 
 class HelloOverlay(QWidget):
@@ -50,7 +66,7 @@ class HelloOverlay(QWidget):
         self.current_color = QColor(next(self._color_cycle))
         self._resize_to_primary_screen()
         self.show()
-        self.raise_()
+        _front_overlay(self)
         self.update()
 
     def hide_message(self) -> None:
@@ -303,7 +319,7 @@ class ScreenDrawOverlay(QWidget):
     def show_overlay(self) -> None:
         self._resize_to_screen()
         self.show()
-        self.raise_()
+        _front_overlay(self)
         self.update()
 
     def hide_overlay(self) -> None:
@@ -1030,7 +1046,7 @@ class CountdownOverlay(QWidget):
         self._value = str(value)
         self._resize_to_primary_screen()
         self.show()
-        self.raise_()
+        _front_overlay(self)
         self.update()
 
     def hide_countdown(self) -> None:
@@ -1087,7 +1103,7 @@ class RecordingIndicatorOverlay(QWidget):
         self._resize_to_primary_screen()
         self._pulse_on = True
         self.show()
-        self.raise_()
+        _front_overlay(self)
         self._timer.start()
         self.update()
 
@@ -1372,7 +1388,7 @@ class ProcessingOverlay(QWidget):
         self._last_tick_time = time.monotonic()
         self._place_on_screen()
         self.show()
-        self.raise_()
+        _front_overlay(self)
         # Force a synchronous paint + event flush BEFORE returning.
         # show_processing("Starting Touchless") is called immediately
         # before start_engine blocks the UI thread with worker spin-
@@ -1580,7 +1596,7 @@ class SavedLocationOverlay(QWidget):
         self.move(self._slide_x, self._slide_start_y)
         self.setWindowOpacity(1.0)
         self.show()
-        self.raise_()
+        _front_overlay(self)
         self.repaint()
         try:
             QApplication.processEvents()
@@ -1811,7 +1827,7 @@ class TrackingQualityPill(QWidget):
         self._fit_size_for_state()
         self._place_on_screen()
         self.show()
-        self.raise_()
+        _front_overlay(self)
         self.repaint()
         try:
             apply_overlay(self)
