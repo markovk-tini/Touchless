@@ -85,12 +85,19 @@ class ChromeController:
         return False
 
     def is_window_active(self) -> bool:
+        if self._mac:
+            # No win32 handles on macOS; "Chrome is running" is the best proxy
+            # (checking frontmost would need Accessibility). This is what the
+            # Chrome-mode router uses to allow mode to turn on.
+            return self.is_running()
         handles = self._chrome_window_handles()
         if not handles:
             return False
         return self._foreground_window_handle() in handles
 
     def is_window_open(self) -> bool:
+        if self._mac:
+            return self.is_running()
         return bool(self._chrome_window_handles())
 
     def focus_or_open_window(self) -> bool:
