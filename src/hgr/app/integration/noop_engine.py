@@ -4192,7 +4192,7 @@ class GestureWorker(QObject):
         if self._cap is not None and not self._low_fps_active:
             self._restore_normal_capture_tuning(self._cap)
         # Restore OpenCV cap unless another perf mode is still active.
-        self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
+        self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
 
     def _maybe_auto_toggle_low_fps(self, now: float) -> None:
         if getattr(self.config, "low_fps_mode", False):
@@ -4339,14 +4339,38 @@ class GestureWorker(QObject):
 
     def _any_perf_mode_active(self) -> bool:
         """True if ANY of lite, gpu, low_fps (manual or auto) is on.
-        Used by the camera reopen helper below to decide whether
-        ffmpeg-MJPG should be the active capture path."""
+        Used by skip-inference / debug-frame throttle / other engine-
+        side gates that care about "is any perf mode on."
+
+        NOTE: NO LONGER used to decide the camera-path swap. Use
+        _wants_ffmpeg_cap() for that."""
         return (
             bool(getattr(self.config, "lite_mode", False))
             or bool(getattr(self.config, "gpu_mode", False))
             or bool(getattr(self.config, "low_fps_mode", False))
             or self._low_fps_auto_engaged
         )
+
+    def _wants_ffmpeg_cap(self) -> bool:
+        """v1.1.7 C24: only GPU Mode uses the ffmpeg-MJPG camera path.
+        Lite Mode and Low FPS Mode stay on the default OpenCV cap so
+        toggling them doesn't fire a ~2 s camera-swap dance (release
+        old cap + time.sleep(0.6) DShow-release + ffmpeg subprocess
+        boot + 6-frame warmup discard). Their per-mode benefits — lite
+        MediaPipe / smaller inference frame / reduced overlay work /
+        skip-inference / lite_paint_mode — don't need ffmpeg's higher-
+        fps source to deliver value.
+
+        User's design intent matches: "Lite is a universal CPU boost
+        that works without a strong GPU. GPU is the heaviest boost."
+        Only the heaviest path warrants the camera swap.
+
+        Ffmpeg reopen still fires exactly ONCE per session per
+        Lite/Low-FPS enable/disable cycle — namely when the user
+        toggles GPU. First swap into GPU is the last one that pays
+        the ~2 s cost; every subsequent Default/Lite/Low-FPS toggle
+        is engine-only (~5-10 ms via the C17 cache HIT branch)."""
+        return bool(getattr(self.config, "gpu_mode", False))
 
     def _apply_perf_camera_path(self, *, want_ffmpeg: bool) -> None:
         """Idempotent: reopen the camera in the requested codec path.
@@ -4552,7 +4576,7 @@ class GestureWorker(QObject):
             # the existing OpenCV cap, which means a user enabling
             # Low FPS Mode on slow hardware stayed on the YUY2 8-10
             # fps ceiling and the mode produced no noticeable effect.
-            self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
+            self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
 
     def set_lite_mode(self, enabled: bool) -> None:
         # Lite-model toggle. Compares against LAST APPLIED state, not
@@ -4577,7 +4601,7 @@ class GestureWorker(QObject):
         self._applied_lite_mode = enabled
         self._swap_engine_safely()
         self._fps = 0.0
-        self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
+        self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
 
     def set_gpu_mode(self, enabled: bool) -> None:
         # GPU-acceleration toggle. See set_lite_mode for the
@@ -4600,7 +4624,7 @@ class GestureWorker(QObject):
         self._applied_gpu_mode = enabled
         self._swap_engine_safely()
         self._fps = 0.0
-        self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
+        self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
 
     def set_force_ten_fps_test_mode(self, enabled: bool) -> None:
         self.config.force_ten_fps_test_mode = bool(enabled)
