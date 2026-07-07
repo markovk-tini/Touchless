@@ -186,6 +186,44 @@ def main() -> int:
         app._gc_timer.timeout.connect(lambda: _gc.collect())
         app._gc_timer.start()
 
+        # --- macOS: prevent App Nap -----------------------------------------
+        # Touchless runs a real-time camera + gesture pipeline while the user is
+        # focused on ANOTHER app (Chrome, Spotify, …), so Touchless is almost
+        # always a BACKGROUND app. macOS App Nap then throttles a background
+        # app's timers + run loop to conserve power, which capped the whole
+        # pipeline at ~15 fps even though per-frame work is <20 ms (the extra
+        # ~40 ms/frame was pure run-loop throttling, not compute — which is why
+        # Lite/GPU/paint changes did nothing). Register a long-lived
+        # user-initiated + latency-critical activity so macOS keeps us running
+        # at full rate in the background. The returned token is held on `app`;
+        # releasing it would end the activity.
+        try:
+            from Foundation import NSProcessInfo
+            try:
+                from Foundation import (
+                    NSActivityUserInitiated,
+                    NSActivityLatencyCritical,
+                )
+                _nap_opts = int(NSActivityUserInitiated) | int(NSActivityLatencyCritical)
+            except Exception:
+                # Raw flag values if pyobjc doesn't export the constants.
+                _nap_opts = 0x00FFFFFF | 0xFF00000000
+            app._nap_activity = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
+                _nap_opts, "Touchless real-time camera + gesture pipeline"
+            )
+            try:
+                sys.stderr.write("[macos] App Nap disabled (beginActivity) for full background fps\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+        except Exception as _nap_exc:
+            app._nap_activity = None
+            try:
+                sys.stderr.write(f"[macos] App Nap disable failed: {type(_nap_exc).__name__}: {_nap_exc}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+
     # Install the taskbar Jump List. Only attempts in frozen builds
     # where sys.executable is Touchless.exe (each task re-launches
     # the exe with a flag). Source runs use python.exe whose path
