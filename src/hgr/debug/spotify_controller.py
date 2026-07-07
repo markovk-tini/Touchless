@@ -108,6 +108,11 @@ class SpotifyController:
         # Windows keeps the Web-API path. Everything else stays unavailable.
         self._mac = _system == "Darwin"
         self._available = self._detect_mac_spotify_installed() if self._mac else (_system == "Windows")
+        # Short-TTL cache for is_running() so per-frame mac gates don't scan the
+        # full process table every frame (busted on launch — see launch paths).
+        self._mac_running_cache: bool | None = None
+        self._mac_running_cache_until: float = 0.0
+        self._mac_running_cache_ttl: float = 1.5
         self._message = "spotify idle"
         self._client_id: str | None = None
         self._client_secret: str | None = None
@@ -224,6 +229,7 @@ class SpotifyController:
             for _ in range(20):  # ~2s for Spotify to accept Apple Events
                 ok, out, _ = self._mac_osascript('application "Spotify" is running')
                 if ok and out == "true":
+                    self._mac_running_cache = None  # force gates to re-check
                     break
                 time.sleep(0.1)
         script = (
@@ -317,7 +323,8 @@ class SpotifyController:
                 except Exception:
                     pass
                 for _ in range(20):
-                    if self.is_running():
+                    if self._is_running_uncached():
+                        self._mac_running_cache = None  # force gates to re-check
                         return True
                     time.sleep(0.1)
             self._message = "spotify not running"
@@ -366,7 +373,8 @@ class SpotifyController:
                 self._message = "spotify launch failed"
                 return False
             for _ in range(20):
-                if self.is_running():
+                if self._is_running_uncached():
+                    self._mac_running_cache = None  # force gates to re-check
                     self._message = "launching spotify"
                     return True
                 time.sleep(0.1)
@@ -480,7 +488,7 @@ class SpotifyController:
             return False
         return False
 
-    def is_running(self) -> bool:
+    def _is_running_uncached(self) -> bool:
         try:
             for proc in psutil.process_iter(["name"]):
                 name = (proc.info.get("name") or "").lower()
@@ -489,6 +497,22 @@ class SpotifyController:
         except Exception:
             return False
         return False
+
+    def is_running(self) -> bool:
+        # macOS gates (is_window_open / is_active_device_available) call this
+        # per gesture frame. psutil.process_iter over every process is ~10-30 ms
+        # — enough to visibly drop fps — so cache it briefly on mac. Windows
+        # keeps the uncached scan (its window/device gates have their own
+        # caches). Cache is busted on launch so 'two'/open sees the app quickly.
+        if not self._mac:
+            return self._is_running_uncached()
+        now = time.monotonic()
+        if self._mac_running_cache is not None and now < self._mac_running_cache_until:
+            return self._mac_running_cache
+        value = self._is_running_uncached()
+        self._mac_running_cache = value
+        self._mac_running_cache_until = now + self._mac_running_cache_ttl
+        return value
 
     def is_window_open(self) -> bool:
         """Stricter than is_running(): True only when Spotify has at
@@ -748,9 +772,16 @@ class SpotifyController:
 
     def focus_or_open_window(self) -> bool:
         if self._mac:
-            # `activate` both launches (if needed) and raises Spotify.
-            ok, _out, err = self._mac_osascript('tell application "Spotify" to activate')
-            self._message = "spotify focused" if ok else self._mac_error_message("spotify focus failed", err)
+            # `open -a` launches Spotify if needed AND brings it to the front,
+            # WITHOUT sending an Apple Event — so it works even before the
+            # Automation grant (unlike `activate`, which needs the TCC prompt).
+            try:
+                proc = subprocess.run(["open", "-a", "Spotify"], capture_output=True, text=True, timeout=8.0, check=False)
+                ok = proc.returncode == 0
+            except Exception:
+                ok = False
+            self._mac_running_cache = None  # re-check running state after focus/launch
+            self._message = "spotify focused" if ok else "spotify focus failed"
             return ok
         if not self._available:
             self._message = "spotify unavailable on this platform"
@@ -1035,6 +1066,13 @@ class SpotifyController:
         return True
 
     def is_active_for_wheel(self) -> bool:
+        if self._mac:
+            # Per-frame wheel gate: use the cached run check; never fall through
+            # to the ~150 ms get_player_state osascript below.
+            if self.is_running():
+                return True
+            self._message = "spotify not running"
+            return False
         # Wheel only engages when Spotify is genuinely available for
         # control: either it has a visible window the user can
         # interact with, or the Spotify Web API confirms an active
