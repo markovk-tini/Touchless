@@ -30107,6 +30107,20 @@ Admin elevation
             pass
     def _start_screen_recording_ffmpeg(self, region: QRect) -> bool:
         if not self._ffmpeg_ready():
+            if sys.platform == "darwin":
+                # macOS: no ffmpeg yet → fall back silently to the Qt-grab
+                # recorder (no modal; the Windows "corrupted install" copy
+                # doesn't apply). Audio needs ffmpeg (avfoundation) — tracked
+                # in docs/MACOS_PORT.md.
+                try:
+                    sys.stderr.write(
+                        "[screen-record] ffmpeg not found on macOS; using Qt-grab "
+                        "fallback (no audio). Install ffmpeg for audio capture.\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                return False
             try:
                 QMessageBox.warning(
                     self, "Screen recording — ffmpeg unavailable",

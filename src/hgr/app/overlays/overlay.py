@@ -1040,7 +1040,10 @@ class CountdownOverlay(QWidget):
         if screen is None:
             self.setGeometry(0, 0, 1280, 720)
             return
-        self.setGeometry(screen.geometry())
+        # macOS: availableGeometry excludes the menu bar / Dock so top-anchored
+        # HUD content isn't clipped behind the menu bar (screen.geometry()
+        # starts at y=0 under it).
+        self.setGeometry(screen.availableGeometry() if sys.platform == "darwin" else screen.geometry())
 
     def show_countdown(self, value: int | str) -> None:
         self._value = str(value)
@@ -1092,7 +1095,10 @@ class RecordingIndicatorOverlay(QWidget):
         if screen is None:
             self.setGeometry(0, 0, 1280, 720)
             return
-        self.setGeometry(screen.geometry())
+        # macOS: availableGeometry so the top-anchored "Recording" pill clears
+        # the menu bar (screen.geometry() put its top behind the menu bar and
+        # clipped it — user report).
+        self.setGeometry(screen.availableGeometry() if sys.platform == "darwin" else screen.geometry())
 
     def _toggle_pulse(self) -> None:
         self._pulse_on = not self._pulse_on
