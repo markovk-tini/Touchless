@@ -1353,6 +1353,30 @@ class GestureWorker(QObject):
         self._raw_emit_last_log: float = 0.0
         self._tick_call_count: int = 0
 
+        # C22 diagnostic: system-level CPU / GPU / RAM every ~5 s so
+        # the user can correlate mode toggles with real resource usage
+        # from the app log alone (instead of having Task Manager open
+        # side by side). NVIDIA GPU stats via nvidia-smi if it's on
+        # PATH; skipped silently on non-NVIDIA or when the CLI is
+        # missing. psutil-based process CPU + RSS is always emitted.
+        # State kept minimal: just the last-log timestamp; everything
+        # else is queried on demand.
+        self._perf_monitor_last_log: float = 0.0
+        try:
+            import psutil as _psutil_mod
+            self._perf_monitor_psutil = _psutil_mod
+            self._perf_monitor_proc = _psutil_mod.Process()
+            # Prime cpu_percent() so the first real call returns a
+            # meaningful delta rather than 0. Same trick psutil docs
+            # recommend for per-process cpu_percent.
+            try:
+                self._perf_monitor_proc.cpu_percent(interval=None)
+            except Exception:
+                pass
+        except Exception:
+            self._perf_monitor_psutil = None
+            self._perf_monitor_proc = None
+
         # Per-frame timing samples used by the Lite Mode diagnostic
         # in _tick. Empty when Lite Mode is off; sampled at every
         # tick when on, summarised to stderr every 2s. Helps tell
@@ -4545,6 +4569,123 @@ class GestureWorker(QObject):
         self.config.force_ten_fps_test_mode = bool(enabled)
         self._low_fps_last_process = 0.0
 
+    def _maybe_log_perf_monitor(self) -> None:
+        """C22: log a system-resource snapshot every 5 s so the user
+        can see CPU / GPU / RAM change as they toggle modes from the
+        log alone. Non-blocking: nvidia-smi is queried on a background
+        thread and the result cached across ticks, so a slow query
+        never blocks the main-thread tick loop.
+
+        Emits ONE stderr line every ~5 s in the shape:
+
+            [perf-monitor] proc: cpu=X.X% rss=NNMB | sys: cpu=X.X% |
+                gpu: NN% mem=NN%/NNNMB (RTX 4070) | tick_fps=NN
+                emit_fps=NN
+
+        Any component that can't be measured is elided from the line
+        (e.g. non-NVIDIA systems drop the gpu block entirely).
+        """
+        try:
+            _now = time.monotonic()
+            if self._perf_monitor_last_log <= 0.0:
+                self._perf_monitor_last_log = _now
+                # Kick off the first background GPU query so the log
+                # has data by the time we hit the 5-second window.
+                self._perf_monitor_kickoff_gpu_query()
+                return
+            if (_now - self._perf_monitor_last_log) < 5.0:
+                return
+            self._perf_monitor_last_log = _now
+            parts: list[str] = []
+            # ---- Process CPU + RAM via psutil ----
+            if self._perf_monitor_proc is not None:
+                try:
+                    p_cpu = self._perf_monitor_proc.cpu_percent(interval=None)
+                    p_rss_mb = self._perf_monitor_proc.memory_info().rss / (1024 * 1024)
+                    parts.append(f"proc: cpu={p_cpu:.1f}% rss={p_rss_mb:.0f}MB")
+                except Exception:
+                    pass
+            # ---- System-wide CPU ----
+            if self._perf_monitor_psutil is not None:
+                try:
+                    sys_cpu = self._perf_monitor_psutil.cpu_percent(interval=None)
+                    parts.append(f"sys: cpu={sys_cpu:.1f}%")
+                except Exception:
+                    pass
+            # ---- GPU: consume the background-thread result if ready,
+            # then kick off the next query. This keeps the main tick
+            # off nvidia-smi's ~50-100 ms subprocess spawn.
+            gpu_row = self._perf_monitor_consume_gpu_result()
+            if gpu_row is not None:
+                util_pct, mem_used_mb, mem_total_mb, gpu_name = gpu_row
+                mem_pct = (100.0 * mem_used_mb / mem_total_mb) if mem_total_mb > 0 else 0.0
+                parts.append(
+                    f"gpu: {util_pct:.0f}% mem={mem_pct:.0f}%/{mem_used_mb:.0f}MB "
+                    f"({gpu_name})"
+                )
+            self._perf_monitor_kickoff_gpu_query()
+            # ---- fps context ----
+            try:
+                parts.append(f"self._fps={self._fps:.1f}")
+            except Exception:
+                pass
+            try:
+                sys.stderr.write("[perf-monitor] " + " | ".join(parts) + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+        except Exception:
+            # Never let the diagnostic take down the tick loop.
+            pass
+
+    def _perf_monitor_kickoff_gpu_query(self) -> None:
+        """Spawn nvidia-smi in a helper thread. Result is stashed on
+        `_perf_monitor_gpu_result` for the next tick that reaches the
+        5-second window. If nvidia-smi is missing or the machine has no
+        NVIDIA GPU, the result stays None forever (silent no-op)."""
+        if getattr(self, "_perf_monitor_gpu_query_in_flight", False):
+            return
+        self._perf_monitor_gpu_query_in_flight = True
+        def _worker() -> None:
+            try:
+                import subprocess as _sp
+                out = _sp.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used,memory.total,name",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    stderr=_sp.DEVNULL,
+                    timeout=1.5,
+                    creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+                )
+                text = out.decode("utf-8", errors="replace").strip().splitlines()
+                if not text:
+                    return
+                first_row = text[0]
+                fields = [f.strip() for f in first_row.split(",")]
+                if len(fields) < 4:
+                    return
+                util_pct = float(fields[0])
+                mem_used_mb = float(fields[1])
+                mem_total_mb = float(fields[2])
+                gpu_name = fields[3]
+                self._perf_monitor_gpu_result = (util_pct, mem_used_mb, mem_total_mb, gpu_name)
+            except Exception:
+                # nvidia-smi missing, timeout, non-NVIDIA GPU, etc.
+                pass
+            finally:
+                self._perf_monitor_gpu_query_in_flight = False
+        try:
+            threading.Thread(target=_worker, name="perf-monitor-gpu", daemon=True).start()
+        except Exception:
+            self._perf_monitor_gpu_query_in_flight = False
+
+    def _perf_monitor_consume_gpu_result(self):
+        """Return the most-recent nvidia-smi row (util, used, total,
+        name) or None if we haven't gotten one yet."""
+        return getattr(self, "_perf_monitor_gpu_result", None)
+
     def _should_skip_forced_fps_tick(self, now: float) -> bool:
         if not bool(getattr(self.config, "force_ten_fps_test_mode", False)):
             self._low_fps_last_process = 0.0
@@ -5438,6 +5579,14 @@ class GestureWorker(QObject):
                 self._raw_emit_count = 0
                 self._tick_call_count = 0
                 self._raw_emit_last_log = _now_perf
+        # C22 diagnostic: system resource snapshot every ~5 s. Runs
+        # regardless of perf-mode so the user can watch CPU / GPU
+        # move as they toggle modes without needing Task Manager open
+        # side-by-side. Cheap: psutil calls are microseconds; the
+        # nvidia-smi shell out is bounded at 500 ms per query and
+        # cached to a background thread so the main tick doesn't
+        # jitter when the subprocess is slow.
+        self._maybe_log_perf_monitor()
         # Back-pressure: if the engine runner is still chewing on the
         # previous frame, drop the rest of this tick (no inference,
         # no debug payload). Display already went out above so the
