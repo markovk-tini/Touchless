@@ -557,7 +557,35 @@ class ChromeController:
         except Exception:
             return False
 
+    def _mac_send_shortcut(self, keys) -> bool:
+        """Translate the Windows VK combos the navigation methods send into the
+        correct macOS Chrome shortcuts. macOS is Cmd-based, and several combos
+        differ from a naive Ctrl->Cmd swap (back=Cmd+[, history=Cmd+Y,
+        downloads=Cmd+Shift+J)."""
+        from ..platform_compat import mac_input
+
+        mac_map = {
+            (VK_MENU, VK_LEFT): ("[", {"cmd": True}),                       # back
+            (VK_MENU, VK_RIGHT): ("]", {"cmd": True}),                      # forward
+            (VK_CONTROL, VK_R): ("r", {"cmd": True}),                       # refresh
+            (VK_CONTROL, VK_T): ("t", {"cmd": True}),                       # new tab
+            (VK_CONTROL, VK_SHIFT, VK_N): ("n", {"cmd": True, "shift": True}),  # incognito
+            (VK_CONTROL, VK_D): ("d", {"cmd": True}),                       # bookmark
+            (VK_CONTROL, VK_H): ("y", {"cmd": True}),                       # history
+            (VK_CONTROL, VK_J): ("j", {"cmd": True, "shift": True}),        # downloads
+            (VK_CONTROL, VK_P): ("p", {"cmd": True}),                       # print
+            (VK_CONTROL, VK_SHIFT, VK_T): ("t", {"cmd": True, "shift": True}),  # reopen tab
+        }
+        mapped = mac_map.get(tuple(keys))
+        if mapped is None:
+            self._message = "chrome shortcut not available on macOS"
+            return False
+        key, mods = mapped
+        return mac_input.tap(key, **mods)
+
     def _send_shortcut(self, *keys: int) -> bool:
+        if self._mac:
+            return self._mac_send_shortcut(keys)
         if not self._win:
             return False
         if not keys:

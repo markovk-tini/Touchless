@@ -191,6 +191,10 @@ def _unicode_press(ch: str) -> List[_INPUT]:
 
 def execute_keystroke(key: str) -> bool:
     """Press and release a single named key (e.g., 'enter', 'f5', 'a')."""
+    if platform.system() == "Darwin":
+        from ..platform_compat import mac_input
+
+        return mac_input.tap(str(key or "").strip().lower())
     vk = _resolve_vk(key)
     return _send_inputs(_vk_press(vk))
 
@@ -198,6 +202,27 @@ def execute_keystroke(key: str) -> bool:
 def execute_hotkey(keys: Iterable[str]) -> bool:
     """Press a combo like Ctrl+Shift+T. Holds all modifiers while the final
     key fires, then releases in reverse order — standard chord semantics."""
+    keys = list(keys)
+    if platform.system() == "Darwin":
+        from ..platform_compat import mac_input
+
+        # Map Ctrl/Cmd/Win -> Cmd (the common cross-platform intent, e.g. a
+        # user-bound "Ctrl+C" means Cmd+C on macOS). Shift/Alt map directly.
+        mods = {"cmd": False, "shift": False, "option": False, "control": False}
+        main_key = None
+        for raw in keys:
+            token = str(raw or "").strip().lower()
+            if token in ("ctrl", "control", "cmd", "command", "win", "meta", "super"):
+                mods["cmd"] = True
+            elif token == "shift":
+                mods["shift"] = True
+            elif token in ("alt", "option", "opt"):
+                mods["option"] = True
+            elif token:
+                main_key = token
+        if main_key is None:
+            return False
+        return mac_input.tap(main_key, **mods)
     vks = [_resolve_vk(k) for k in keys]
     if not vks:
         return False
@@ -218,6 +243,10 @@ def execute_hotkey(keys: Iterable[str]) -> bool:
 def execute_text(text: str) -> bool:
     """Type a literal string via Unicode key events. Slower than clipboard
     paste but avoids clobbering the clipboard and works in more targets."""
+    if platform.system() == "Darwin":
+        from ..platform_compat import mac_input
+
+        return mac_input.type_text(str(text or ""))
     events: List[_INPUT] = []
     for ch in text:
         events.extend(_unicode_press(ch))
