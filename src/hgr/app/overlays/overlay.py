@@ -1120,9 +1120,16 @@ class RecordingIndicatorOverlay(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        box_width = 196
         box_height = 56
-        rect = QRect(0, 0, box_width, box_height)
+        label = 'Recording'
+        font = QFont('Arial', 18, QFont.Bold)
+        # Fit the pill to its content (dot + label) instead of a fixed 196 px,
+        # so there's no dead space to the right of "Recording".
+        text_left = 44   # left edge -> text start (clears the dot)
+        right_pad = 16
+        text_w = QFontMetrics(font).horizontalAdvance(label)
+        box_width = text_left + text_w + right_pad
+        rect = QRect(0, 0, int(box_width), box_height)
         rect.moveCenter(QPoint(self.rect().center().x(), self.rect().top() + 42))
         painter.setPen(QPen(QColor(255, 255, 255, 68), 1.2))
         painter.setBrush(QColor(10, 18, 26, 148))
@@ -1132,9 +1139,8 @@ class RecordingIndicatorOverlay(QWidget):
         painter.setBrush(dot_color)
         painter.drawEllipse(QPoint(rect.left() + 28, rect.center().y()), 8, 8)
         painter.setPen(QColor('#F4FAFF'))
-        font = QFont('Arial', 18, QFont.Bold)
         painter.setFont(font)
-        painter.drawText(rect.adjusted(44, 0, -8, 0), Qt.AlignVCenter | Qt.AlignLeft, 'Recording')
+        painter.drawText(rect.adjusted(text_left, 0, -right_pad, 0), Qt.AlignVCenter | Qt.AlignLeft, label)
 
 
 class ProcessingOverlay(QWidget):
