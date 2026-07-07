@@ -4,6 +4,7 @@ import ctypes
 import csv
 import math
 import shutil
+import contextlib
 import subprocess
 import sys
 import tempfile
@@ -5887,6 +5888,131 @@ class _WheelScrollGuard(QObject):
             return False
 
 
+def _import_quartz():
+    try:
+        import Quartz  # type: ignore
+        return Quartz
+    except Exception:
+        return None
+
+
+def _cgimage_to_bgr(img, q):
+    """CGImageRef -> contiguous (H, W, 3) uint8 BGR ndarray for cv2.
+
+    CoreGraphics screen images are 32-bit BGRA, so channels 0..2 are already
+    B, G, R (no colour conversion needed). Rows are padded to a hardware stride
+    (CGImageGetBytesPerRow >= width*4), so we reshape by the TRUE stride then
+    crop to width — otherwise the frame skews / tears diagonally."""
+    if img is None:
+        return None
+    try:
+        width = int(q.CGImageGetWidth(img))
+        height = int(q.CGImageGetHeight(img))
+        if width <= 0 or height <= 0:
+            return None
+        bytes_per_row = int(q.CGImageGetBytesPerRow(img))
+        provider = q.CGImageGetDataProvider(img)
+        if provider is None:
+            return None
+        data = q.CGDataProviderCopyData(provider)
+        if data is None:
+            return None
+        try:
+            raw = np.frombuffer(data, dtype=np.uint8)
+        except Exception:
+            raw = np.frombuffer(bytes(data), dtype=np.uint8)
+        needed = bytes_per_row * height
+        if raw.size < needed:
+            return None
+        rows = raw[:needed].reshape((height, bytes_per_row // 4, 4))  # BGRA, padded
+        bgr = rows[:, :width, :3]  # crop stride padding + drop alpha -> BGR view
+        return np.ascontiguousarray(bgr)
+    except Exception:
+        return None
+
+
+class MacScreenClipCapturer:
+    """macOS off-GUI-thread rolling screen capture for the instant-clip buffer.
+
+    Runs entirely on a daemon thread using Quartz CGDisplayCreateImage (a
+    synchronous C call that needs no run loop, unlike QScreen.grabWindow which
+    must run on the GUI thread). Feeds the window's EXISTING cv2 MJPG segment
+    pipeline via the _mac_capture_* bridge methods (which hold the clip-cache
+    lock). The Qt GUI thread is never touched, so gesture fps is unaffected.
+    Requires the Screen Recording TCC grant (checked before start())."""
+
+    def __init__(self, window, fps: float = 20.0):
+        self._window = window
+        self._fps = max(1.0, float(fps))
+        self._interval = 1.0 / self._fps
+        self._q = None
+        self._thread = None
+        self._stop = threading.Event()
+        self.degraded = False
+
+    def start(self) -> bool:
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        self._q = _import_quartz()
+        if self._q is None:
+            return False
+        self._stop.clear()
+        self.degraded = False
+        self._thread = threading.Thread(target=self._run, name="mac-clip-capture", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        t = self._thread
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=2.0)
+        self._thread = None
+
+    def _run(self) -> None:
+        q = self._q
+        try:
+            main_display = q.CGMainDisplayID()
+        except Exception:
+            return
+        if not self._window._mac_capture_open_segment():
+            return
+        consecutive_none = 0
+        next_tick = time.monotonic()
+        try:
+            while not self._stop.is_set():
+                img = None
+                try:
+                    img = q.CGDisplayCreateImage(main_display)
+                except Exception:
+                    img = None
+                frame = _cgimage_to_bgr(img, q) if img is not None else None
+                if frame is None:
+                    consecutive_none += 1
+                    if consecutive_none >= 40:  # ~2s of nothing -> permission lost / display asleep
+                        self.degraded = True
+                        try:
+                            self._window._clip_cache_health_warning = (
+                                "Screen Recording was revoked or the display slept - re-enable "
+                                "it in System Settings > Privacy & Security > Screen Recording, "
+                                "then restart Touchless."
+                            )
+                        except Exception:
+                            pass
+                        break
+                else:
+                    consecutive_none = 0
+                    self._window._mac_capture_write_frame(frame)
+                next_tick += self._interval
+                sleep_for = next_tick - time.monotonic()
+                if sleep_for > 0:
+                    self._stop.wait(sleep_for)  # exits promptly on stop()
+                else:
+                    next_tick = time.monotonic()  # fell behind: reset, don't spiral
+        finally:
+            self._window._mac_capture_close_segment()
+
+
 class MainWindow(QMainWindow):
     # Cross-thread bridge for the off-thread clip export. The
     # worker thread emits this signal after stashing its result on
@@ -6182,6 +6308,18 @@ class MainWindow(QMainWindow):
         # 30-fps overhead during background capture.
         self._clip_cache_fps = 20.0
         self._clip_cache_segment_seconds = 10.0
+        # Health/degrade message shown in the "clip not ready" popup (e.g. the
+        # macOS Screen-Recording grant instruction). Initialised here because
+        # the macOS capture path + the not-ready gate read it; previously only
+        # the ffmpeg watchdog set it.
+        self._clip_cache_health_warning = None
+        # macOS off-GUI-thread clip capturer (Quartz CGDisplayCreateImage on a
+        # daemon thread) + the lock that serialises the shared segment state
+        # between that capture thread and the clip-export worker thread. On
+        # Windows the lock is a no-op (capture + export already interleave on
+        # the GUI QTimer / worker as before — byte-for-byte unchanged).
+        self._mac_clip_capturer = None
+        self._clip_cache_lock = threading.Lock() if sys.platform == "darwin" else contextlib.nullcontext()
         # Buffer length — derived from config when available so the
         # user's preset clip length (or any voice-requested duration
         # up to 5 min) actually has the footage to back it. Default
@@ -24509,30 +24647,84 @@ Admin elevation
             if frame.shape[1] != expected_w or frame.shape[0] != expected_h:
                 frame = cv2.resize(frame, (expected_w, expected_h), interpolation=cv2.INTER_AREA)
         self._screen_record_writer.write(frame)
-    def _start_clip_cache(self) -> bool:
-        if self._ffmpeg_ready() and self._start_clip_cache_ffmpeg():
+    def _start_clip_cache_macos(self) -> bool:
+        """Start the macOS off-GUI-thread rolling clip buffer (Quartz capture on
+        a daemon thread). Returns False (cache stays off, gestures stay fast) if
+        Screen Recording isn't granted — the not-ready gate then surfaces the
+        grant instruction via _clip_cache_health_warning."""
+        capturer = getattr(self, "_mac_clip_capturer", None)
+        if capturer is not None and getattr(capturer, "_thread", None) is not None and capturer._thread.is_alive():
             return True
-        if sys.platform == "darwin":
-            # macOS: the OpenCV fallback below records the screen every 50 ms via
-            # QScreen.grabWindow() on the MAIN THREAD (~19 ms/grab) + a synchronous
-            # cv2.VideoWriter.write. Because the clip cache is a CONTINUOUS rolling
-            # buffer (started automatically at engine start), that saturated the GUI
-            # thread and throttled the whole gesture loop to ~15 fps (profiled:
-            # grabWindow 10.5 s + VideoWriter 3.3 s of a 107 s session). Windows uses
-            # native GDI BitBlt off the hot path; macOS has no cheap main-thread grab.
-            # Gesture control is the priority, so skip the main-thread capture here.
-            # Instant-clip / screen-recording on macOS needs an OFF-thread capture
-            # (ffmpeg -f avfoundation screen input, or ScreenCaptureKit) — tracked
-            # as a follow-up; see docs/MACOS_PORT.md.
+        from ...platform_compat.capabilities import is_screen_recording_trusted
+        if not is_screen_recording_trusted(prompt=True):
+            self._clip_cache_health_warning = (
+                "Enable Screen Recording for Touchless in System Settings > "
+                "Privacy & Security > Screen Recording, then restart the app to "
+                "record clips."
+            )
             try:
                 sys.stderr.write(
-                    "[clip-cache] disabled on macOS (main-thread grabWindow capture "
-                    "would throttle the gesture loop; needs off-thread screen capture)\n"
+                    "[clip-cache] macOS Screen Recording not granted; clip buffer off "
+                    "(gestures unaffected)\n"
                 )
                 sys.stderr.flush()
             except Exception:
                 pass
             return False
+        self._clip_cache_health_warning = None
+        self._clip_cache_backend = "opencv"
+        self._mac_clip_capturer = MacScreenClipCapturer(self, fps=self._clip_cache_fps)
+        ok = self._mac_clip_capturer.start()
+        if not ok:
+            self._mac_clip_capturer = None
+        return ok
+
+    def _mac_capture_open_segment(self) -> bool:
+        """Capture-thread: open the first segment writer (reuses existing method)."""
+        with self._clip_cache_lock:
+            self._clip_cache_backend = "opencv"
+            return self._start_new_clip_cache_segment()
+
+    def _mac_capture_write_frame(self, frame) -> None:
+        """Capture-thread: write one frame + rotate the segment on interval."""
+        with self._clip_cache_lock:
+            writer = self._clip_cache_segment_writer
+            region = self._clip_cache_region
+            if writer is None or region is None:
+                return
+            w, h = int(region.width()), int(region.height())
+            # CGDisplayCreateImage returns NATIVE (Retina 2x) pixels; downscale
+            # to the region's point size (same resize the old grab path did) —
+            # fixes scale AND shrinks the MJPG encode.
+            if frame.shape[1] != w or frame.shape[0] != h:
+                try:
+                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+                except Exception:
+                    return
+            try:
+                writer.write(frame)
+                self._clip_cache_segment_frame_count += 1
+            except Exception:
+                return
+            if (time.time() - self._clip_cache_segment_started_at) >= float(self._clip_cache_segment_seconds):
+                self._rotate_clip_cache_segment()
+
+    def _mac_capture_close_segment(self) -> None:
+        """Capture-thread exit: finalize the in-progress segment (existing method)."""
+        with self._clip_cache_lock:
+            self._finalize_clip_cache_segment()
+
+    def _start_clip_cache(self) -> bool:
+        if self._ffmpeg_ready() and self._start_clip_cache_ffmpeg():
+            return True
+        if sys.platform == "darwin":
+            # macOS: record the rolling buffer on an OFF-GUI-THREAD Quartz
+            # capturer (CGDisplayCreateImage) instead of the main-thread
+            # QScreen.grabWindow path — the latter saturated the GUI thread and
+            # throttled the gesture loop to ~15 fps. Keeps backend == "opencv"
+            # so _buffered_clip_seconds + the OpenCV export reader work
+            # unchanged. Requires the Screen Recording TCC grant.
+            return self._start_clip_cache_macos()
         if self._clip_cache_segment_writer is not None and self._clip_cache_timer.isActive():
             return True
         region = self._normalized_record_region(self._screens_union_geometry())
@@ -24628,6 +24820,17 @@ Admin elevation
         if self._clip_cache_backend == "ffmpeg":
             self._stop_clip_cache_ffmpeg(delete_files=True)
             return
+        # macOS off-thread capturer: stop + join FIRST. Its finally block
+        # finalizes the in-progress .avi under the lock, so the subsequent
+        # _finalize below is a safe no-op (writer already None). On Windows the
+        # attr is None -> skipped, path unchanged.
+        capturer = getattr(self, "_mac_clip_capturer", None)
+        if capturer is not None:
+            try:
+                capturer.stop()
+            except Exception:
+                pass
+            self._mac_clip_capturer = None
         self._clip_cache_timer.stop()
         self._finalize_clip_cache_segment()
         for meta in self._clip_cache_segments:
@@ -28881,19 +29084,26 @@ Admin elevation
         end_ts are dropped entirely; the boundary segment that
         STRADDLES end_ts is frame-trimmed at the tail in proportion
         to how much of its span is past end_ts."""
-        if self._clip_cache_segment_writer is not None:
-            # Caller path may have an in-progress writer; rotate
-            # to flush it. _rotate_clip_cache_segment is invoked
-            # by the cv2-based capture timer normally; calling it
-            # from a worker thread is OK because it's just file
-            # I/O + a writer release.
-            self._rotate_clip_cache_segment()
-        segments = [
-            meta
-            for meta in self._clip_cache_segments
-            if Path(meta.get("path")).exists()
-            and int(meta.get("frame_count", 0) or 0) > 0
-        ]
+        # Serialize the flush + segment snapshot against the macOS off-thread
+        # capturer (which writes/rotates the same writer + segments list). On
+        # Windows _clip_cache_lock is contextlib.nullcontext() -> no-op, so the
+        # existing GUI-timer/worker interleaving is byte-for-byte unchanged.
+        # Held only around the flush + snapshot; released before the heavy
+        # cv2.VideoCapture reads (finalized segment files are immutable).
+        with self._clip_cache_lock:
+            if self._clip_cache_segment_writer is not None:
+                # Caller path may have an in-progress writer; rotate
+                # to flush it. _rotate_clip_cache_segment is invoked
+                # by the cv2-based capture timer normally; calling it
+                # from a worker thread is OK because it's just file
+                # I/O + a writer release.
+                self._rotate_clip_cache_segment()
+            segments = [
+                meta
+                for meta in self._clip_cache_segments
+                if Path(meta.get("path")).exists()
+                and int(meta.get("frame_count", 0) or 0) > 0
+            ]
         if not segments:
             return (False, None, 0.0)
         # When end_ts is provided, filter out segments fully past it

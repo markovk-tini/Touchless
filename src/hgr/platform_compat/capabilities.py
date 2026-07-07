@@ -98,3 +98,29 @@ def is_accessibility_trusted(prompt: bool = False) -> bool:
             return bool(AXIsProcessTrusted())
         except Exception:
             return False
+
+
+def is_screen_recording_trusted(prompt: bool = False) -> bool:
+    """macOS: is this process trusted for the Screen Recording permission?
+
+    Screen Recording is a DISTINCT TCC permission (separate from Camera /
+    Accessibility / Automation). It gates CGDisplayCreateImage / ScreenCaptureKit
+    (used for the instant-clip rolling buffer, OCR/vision, foreign-window
+    titles). ``CGPreflightScreenCaptureAccess`` returns the grant status WITHOUT
+    prompting; ``CGRequestScreenCaptureAccess`` (prompt=True) shows the OS prompt
+    once and registers the app under System Settings > Privacy & Security >
+    Screen Recording. A fresh grant needs an app RESTART to take effect for the
+    capture APIs, and (for ad-hoc-signed builds) resets on rebuild. Always True
+    off macOS; True on pre-10.15 where the preflight symbol is absent."""
+    if not IS_MACOS:
+        return True
+    try:
+        import Quartz  # type: ignore
+
+        if prompt and hasattr(Quartz, "CGRequestScreenCaptureAccess"):
+            return bool(Quartz.CGRequestScreenCaptureAccess())
+        if hasattr(Quartz, "CGPreflightScreenCaptureAccess"):
+            return bool(Quartz.CGPreflightScreenCaptureAccess())
+    except Exception:
+        pass
+    return True
