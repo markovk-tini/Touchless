@@ -33,6 +33,18 @@ import time
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+# macOS-only: QWidget paint uses the CPU software raster engine (no D3D
+# acceleration like Windows), so scaling a full 720p frame in paintEvent is
+# expensive. We pre-downscale to the on-screen size with cv2 there.
+if sys.platform == "darwin":
+    try:
+        import cv2 as _cv2
+    except Exception:
+        _cv2 = None
+else:
+    _cv2 = None
+
 from PySide6.QtCore import QLineF, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QGuiApplication, QImage, QPainter, QPaintEvent, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
@@ -168,6 +180,25 @@ class GpuVideoWidget(QWidget):
             return
         if h <= 0 or w <= 0:
             return
+        # macOS: paint is CPU raster, so scaling a 720p frame in paintEvent
+        # costs ~60 ms (a hard ~15 fps cap). Pre-downscale to the widget's
+        # on-screen (physical, Retina-aware) size with cv2 INTER_AREA — fast
+        # (~0.5 ms) and good quality — so paintEvent draws ~1:1. Only ever
+        # downscales; if the widget is bigger than the frame we leave it.
+        if _cv2 is not None:
+            try:
+                dpr = float(self.devicePixelRatioF() or 1.0)
+                aw = max(1, self.width())
+                ah = max(1, self.height())
+                fit = min(aw / float(w), ah / float(h))
+                if fit > 0:
+                    tw = max(1, int(round(w * fit * dpr)))
+                    th = max(1, int(round(h * fit * dpr)))
+                    if tw < w:
+                        bgr_frame = _cv2.resize(bgr_frame, (tw, th), interpolation=_cv2.INTER_AREA)
+                        h, w = th, tw
+            except Exception:
+                pass
         # Format_BGR888 stores 3 bytes/pixel B,G,R in that order
         # — same as the cv2 numpy buffer. Qt's GL paint engine
         # handles the BGR-vs-RGB sampler swizzle on the GPU, so
@@ -287,7 +318,10 @@ class GpuVideoWidget(QWidget):
         # uploads to a texture and samples on the GPU; no CPU
         # colour conversion needed.
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        # macOS: the frame is pre-scaled to ~1:1 in update_frame, so smooth
+        # transform buys nothing and the CPU raster engine makes it costly —
+        # disable it there. Windows keeps smooth (D3D-accelerated, free).
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, sys.platform != "darwin")
         painter.fillRect(self.rect(), self._background)
         target = self._aspect_target()
         if self._image is not None and not self._image.isNull():
