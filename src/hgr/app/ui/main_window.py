@@ -6133,6 +6133,13 @@ class MainWindow(QMainWindow):
         self._spotify_decline_pill_fade_effect: QGraphicsOpacityEffect | None = None
         self._spotify_decline_pill_fade_anim: QPropertyAnimation | None = None
         self._spotify_decline_pill_hide_timer: QTimer | None = None
+        # "Connect Spotify" pill — shown when the user opens Spotify by
+        # gesture/voice without having connected the Web API (has a Connect
+        # button that runs the same OAuth flow as the Settings one).
+        self._spotify_connect_pill: QFrame | None = None
+        self._spotify_connect_pill_fade_effect: QGraphicsOpacityEffect | None = None
+        self._spotify_connect_pill_fade_anim: QPropertyAnimation | None = None
+        self._spotify_connect_pill_hide_timer: QTimer | None = None
         # Game-detection state. The detector polls psutil every 2 s
         # while any gaming-mode toggle is on, and updates the cached
         # bool used by `_should_show_camera_view` /
@@ -20450,6 +20457,152 @@ Admin elevation
         if effect.opacity() <= 0.001:
             pill.setVisible(False)
 
+    # ----- Spotify connect pill (bottom-center, has a Connect button) ------
+
+    def _ensure_spotify_connect_pill(self) -> "QFrame":
+        """Lazy-create the pill shown when the user opens Spotify by gesture or
+        voice without having connected the Web API. Message + a Connect button
+        (runs the same OAuth flow as Settings) + a hint pointing at the setup
+        wizard. Parented to the main window; matches the Touchless theme."""
+        pill = self._spotify_connect_pill
+        if pill is not None:
+            return pill
+        pill = QFrame(self)
+        pill.setObjectName("spotifyConnectPill")
+        pill.setAttribute(Qt.WA_StyledBackground, True)
+        pill.setStyleSheet(
+            "QFrame#spotifyConnectPill {"
+            "  background: rgba(15, 23, 42, 0.97);"
+            "  border: 1px solid rgba(29, 233, 182, 0.55);"
+            "  border-radius: 14px;"
+            "}"
+            "QLabel { color: #E5F6FF; background: transparent; }"
+            "QLabel#spotifyConnectHint { color: rgba(229, 246, 255, 0.62); font-size: 11px; }"
+            "QPushButton#spotifyConnectPillBtn {"
+            "  background: #1DB954; color: #06210F; font-weight: 600;"
+            "  border: none; border-radius: 9px; padding: 7px 20px;"
+            "}"
+            "QPushButton#spotifyConnectPillBtn:hover { background: #22D861; }"
+        )
+        col = QVBoxLayout(pill)
+        col.setContentsMargins(18, 12, 18, 12)
+        col.setSpacing(8)
+        title = QLabel("If you want to connect your Spotify, click Connect below.")
+        title.setWordWrap(True)
+        title.setMaximumWidth(420)
+        title.setStyleSheet("font-size: 13px;")
+        col.addWidget(title)
+        connect_btn = QPushButton("Connect Spotify")
+        connect_btn.setObjectName("spotifyConnectPillBtn")
+        connect_btn.setCursor(Qt.PointingHandCursor)
+        connect_btn.clicked.connect(self._on_spotify_connect_pill_clicked)
+        # Left-align the button under the text.
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.addWidget(connect_btn)
+        btn_row.addStretch(1)
+        col.addLayout(btn_row)
+        hint = QLabel("You can also set this up in Settings → General → Spotify Set Up.")
+        hint.setObjectName("spotifyConnectHint")
+        hint.setWordWrap(True)
+        hint.setMaximumWidth(420)
+        col.addWidget(hint)
+        pill.setVisible(False)
+        self._spotify_connect_pill = pill
+        return pill
+
+    def _ensure_spotify_connect_pill_fade(self) -> tuple:
+        pill = self._ensure_spotify_connect_pill()
+        effect = self._spotify_connect_pill_fade_effect
+        anim = self._spotify_connect_pill_fade_anim
+        if effect is None:
+            effect = QGraphicsOpacityEffect(pill)
+            effect.setOpacity(1.0)
+            pill.setGraphicsEffect(effect)
+            self._spotify_connect_pill_fade_effect = effect
+        if anim is None:
+            anim = QPropertyAnimation(effect, b"opacity", self)
+            anim.setDuration(900)
+            anim.setStartValue(1.0)
+            anim.setEndValue(0.0)
+            anim.setEasingCurve(QEasingCurve.InOutQuad)
+            anim.finished.connect(self._on_spotify_connect_pill_fade_done)
+            self._spotify_connect_pill_fade_anim = anim
+        return effect, anim
+
+    def _show_spotify_connect_pill(self) -> None:
+        # Don't nag users who have already connected (defensive — the worker
+        # only emits when unauthorized, but the state may have changed).
+        try:
+            worker = getattr(self, "_worker", None)
+            controller = getattr(worker, "spotify_controller", None) if worker is not None else None
+            if controller is not None and bool(getattr(controller, "has_authorization", False)):
+                return
+        except Exception:
+            pass
+        pill = self._ensure_spotify_connect_pill()
+        effect, anim = self._ensure_spotify_connect_pill_fade()
+        if anim is not None and anim.state() == QPropertyAnimation.Running:
+            anim.stop()
+        if effect is not None:
+            effect.setOpacity(1.0)
+        pill.adjustSize()
+        self._position_spotify_connect_pill()
+        pill.setVisible(True)
+        pill.raise_()
+        timer = self._spotify_connect_pill_hide_timer
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._fade_spotify_connect_pill)
+            self._spotify_connect_pill_hide_timer = timer
+        # Longer than the decline pill (12 s) so the user has time to reach the
+        # Connect button before it fades.
+        timer.start(12000)
+
+    def _on_spotify_connect_pill_clicked(self) -> None:
+        # Same OAuth flow as the Settings button; hide the pill immediately.
+        pill = self._spotify_connect_pill
+        if pill is not None:
+            pill.setVisible(False)
+        timer = self._spotify_connect_pill_hide_timer
+        if timer is not None:
+            timer.stop()
+        try:
+            self._on_connect_spotify_clicked()
+        except Exception:
+            pass
+
+    def _position_spotify_connect_pill(self) -> None:
+        pill = self._spotify_connect_pill
+        if pill is None:
+            return
+        pill.adjustSize()
+        margin_bottom = 32
+        x = max(8, (self.width() - pill.width()) // 2)
+        y = max(8, self.height() - pill.height() - margin_bottom)
+        pill.move(x, y)
+
+    def _fade_spotify_connect_pill(self) -> None:
+        pill = self._spotify_connect_pill
+        if pill is None or not pill.isVisible():
+            return
+        effect, anim = self._ensure_spotify_connect_pill_fade()
+        if anim is None:
+            pill.setVisible(False)
+            return
+        if anim.state() == QPropertyAnimation.Running:
+            anim.stop()
+        anim.start()
+
+    def _on_spotify_connect_pill_fade_done(self) -> None:
+        pill = self._spotify_connect_pill
+        effect = self._spotify_connect_pill_fade_effect
+        if pill is None or effect is None:
+            return
+        if effect.opacity() <= 0.001:
+            pill.setVisible(False)
+
     def start_engine(self, checked: bool = False, skip_tutorial_prompt: bool = False) -> None:
             # Diagnostic trace — written to stderr (same stream as
             # MediaPipe's TFLite/INFO lines) so it lines up with the
@@ -20726,6 +20879,11 @@ Admin elevation
             self._worker.debug_frame_ready.connect(self._on_worker_debug_frame)
             self._worker.save_prompt_completed.connect(self._on_save_prompt_completed)
             self._worker.action_history_changed.connect(self._on_action_history_changed)
+            if hasattr(self._worker, "spotify_connect_prompt_requested"):
+                try:
+                    self._worker.spotify_connect_prompt_requested.connect(self._show_spotify_connect_pill)
+                except Exception:
+                    pass
             if hasattr(self._worker, "mouse_mode_activated"):
                 try:
                     self._worker.mouse_mode_activated.connect(self._on_mouse_mode_activated)
@@ -31095,6 +31253,8 @@ Admin elevation
         self._update_home_status_card_width()
         if getattr(self, "_spotify_decline_pill", None) is not None and self._spotify_decline_pill.isVisible():
             self._position_spotify_decline_pill()
+        if getattr(self, "_spotify_connect_pill", None) is not None and self._spotify_connect_pill.isVisible():
+            self._position_spotify_connect_pill()
         toast = getattr(self, "_update_toast_pill", None)
         if toast is not None and toast.isVisible():
             self._position_update_toast()

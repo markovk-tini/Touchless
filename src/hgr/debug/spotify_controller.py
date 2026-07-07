@@ -113,6 +113,9 @@ class SpotifyController:
         self._mac_running_cache: bool | None = None
         self._mac_running_cache_until: float = 0.0
         self._mac_running_cache_ttl: float = 1.5
+        # Fired after a user action opens/focuses Spotify while NOT connected to
+        # the Web API — drives the "connect Spotify" pill. See _notify_opened.
+        self._on_opened_listener = None
         self._message = "spotify idle"
         self._client_id: str | None = None
         self._client_secret: str | None = None
@@ -180,6 +183,23 @@ class SpotifyController:
         prompt to skip the Allow/Don't Allow modal when the user has
         already authorised in a previous run."""
         return bool(self._refresh_token) or bool(self._access_token)
+
+    def set_opened_listener(self, callback) -> None:
+        """Register a callback fired right after a user action opens/focuses
+        Spotify while the Web API is NOT connected. Used to surface the
+        'connect Spotify' pill. The listener throttles itself."""
+        self._on_opened_listener = callback
+
+    def _notify_opened(self) -> None:
+        """Invoke the opened-listener, but only when the user has NOT connected
+        Spotify (an authorized user needs no prompt)."""
+        cb = self._on_opened_listener
+        if cb is None or self.has_authorization:
+            return
+        try:
+            cb()
+        except Exception:
+            pass
 
     # ---- macOS: control the Spotify desktop app via AppleScript ----------
     # The macOS Spotify app is natively scriptable, so no OAuth/Web API is
@@ -380,9 +400,11 @@ class SpotifyController:
                 if self._is_running_uncached():
                     self._mac_running_cache = None  # force gates to re-check
                     self._message = "launching spotify"
+                    self._notify_opened()
                     return True
                 time.sleep(0.1)
             self._message = "launching spotify"
+            self._notify_opened()
             return True
         # The launcher used to be a single-line subprocess.Popen on
         # whichever Spotify.exe path existed first — including the
@@ -786,6 +808,8 @@ class SpotifyController:
                 ok = False
             self._mac_running_cache = None  # re-check running state after focus/launch
             self._message = "spotify focused" if ok else "spotify focus failed"
+            if ok:
+                self._notify_opened()
             return ok
         if not self._available:
             self._message = "spotify unavailable on this platform"

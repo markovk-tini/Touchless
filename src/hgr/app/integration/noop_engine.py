@@ -617,6 +617,10 @@ class GestureWorker(QObject):
     # GpuVideoWidget.update_landmarks for GPU-side overlay rendering;
     # we no longer draw landmarks on the BGR frame on the CPU.
     engine_landmarks_ready = Signal(object)
+    # Fired when the user opens/focuses Spotify by gesture or voice while NOT
+    # connected to the Spotify Web API — the main window shows a "connect
+    # Spotify" pill in response. Throttled by the worker.
+    spotify_connect_prompt_requested = Signal()
     # Internal: runner-thread â†’ main-thread bridge for engine results.
     # Emitted from the _EngineRunner thread when inference completes;
     # the Auto/Queued connection delivers the slot call on the
@@ -973,6 +977,10 @@ class GestureWorker(QObject):
 
         _pump_events()
         self.spotify_controller = SpotifyController()
+        # Surface the "connect Spotify" pill when the user opens Spotify by
+        # gesture/voice without having connected the Web API (throttled).
+        self._spotify_connect_prompt_cooldown_until = 0.0
+        self.spotify_controller.set_opened_listener(self._request_spotify_connect_prompt)
         self.spotify_router = SpotifyGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.5)
         self._spotify_control_text = self.spotify_controller.message
 
@@ -7023,6 +7031,21 @@ class GestureWorker(QObject):
             if snapshot.last_action != "-":
                 self.command_detected.emit(snapshot.control_text)
                 self._record_action(snapshot.last_action, snapshot.control_text)
+
+    def _request_spotify_connect_prompt(self) -> None:
+        """Throttled bridge: the SpotifyController opened-listener fires this
+        when Spotify is opened by gesture/voice while the Web API is NOT
+        connected. Emit the UI signal at most once per cooldown so a burst of
+        opens (or the repeating 'two' focus) doesn't stack pills. May be called
+        from the voice worker thread — the Qt signal marshals to the GUI thread."""
+        try:
+            now = time.monotonic()
+            if now < self._spotify_connect_prompt_cooldown_until:
+                return
+            self._spotify_connect_prompt_cooldown_until = now + 30.0
+            self.spotify_connect_prompt_requested.emit()
+        except Exception:
+            pass
 
     def _handle_tutorial_controls(self, prediction, hand_reading, hand_handedness: str | None, now: float) -> None:
         step_key = self._tutorial_step_key or ""
