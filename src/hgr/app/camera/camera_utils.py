@@ -529,8 +529,11 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
             if device_name:
                 try:
                     from .ffmpeg_capture import open_ffmpeg_cap_with_fps_fallback
+                    # C27: 640x480 to match Default's OpenCV cap res.
+                    # Higher res introduced a persistent 1-2 s live-
+                    # viewer lag through the frame-copy pipeline.
                     ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                        device_name, width=1280, height=720
+                        device_name, width=640, height=480
                     )
                 except Exception:
                     ffmpeg_cap = None
@@ -565,8 +568,11 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
             device_name = str(dshow_devices[index] or "").strip()
             if device_name:
                 try:
+                    # C27: 640x480 to match Default's OpenCV cap res.
+                    # Higher res introduced a persistent 1-2 s live-
+                    # viewer lag through the frame-copy pipeline.
                     ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                        device_name, width=1280, height=720
+                        device_name, width=640, height=480
                     )
                 except Exception:
                     ffmpeg_cap = None

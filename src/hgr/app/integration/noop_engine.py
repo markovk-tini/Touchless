@@ -4453,8 +4453,21 @@ class GestureWorker(QObject):
                 if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
                     self._cap = recovered[1]
                 return
+            # C27: open the ffmpeg-MJPG cap at 640x480, not 1280x720.
+            # The higher resolution ~3× the bytes per frame through
+            # every pipeline stage (ffmpeg pipe read, reader thread
+            # decode, QImage.copy in the widget). On the user's Kiyo
+            # Pro, that resolution difference produced a persistent
+            # 1-2 second visual lag in GPU Mode that wasn't present
+            # in Default (which uses 640x480 OpenCV). User said
+            # utilization and fps are fine — priority is latency —
+            # so match Default's resolution. ONNX inference still
+            # runs at max_process_width=960 (from _NORMAL_PROCESS_WIDTH)
+            # which is now a no-op resize on 640×480 input; hand
+            # tracking accuracy is essentially the same on a
+            # face-and-hand-in-frame use case at either resolution.
             ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                device_name, width=1280, height=720
+                device_name, width=640, height=480
             )
             if ffmpeg_cap is not None and ffmpeg_cap.isOpened():
                 self._cap = ffmpeg_cap
@@ -5341,8 +5354,12 @@ class GestureWorker(QObject):
             cap.release()
         except Exception:
             pass
+        # C27: match _apply_perf_camera_path — 640x480 not 1280x720.
+        # Same rationale: kill the persistent 1-2 s visual lag the
+        # user reports on GPU Mode by keeping frame size at parity
+        # with Default's OpenCV cap.
         ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-            device_name, width=1280, height=720
+            device_name, width=640, height=480
         )
         if ffmpeg_cap is not None and ffmpeg_cap.isOpened():
             _log("ffmpeg cap engaged")
