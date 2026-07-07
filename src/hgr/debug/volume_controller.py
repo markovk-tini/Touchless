@@ -131,6 +131,34 @@ class VolumeController:
             muted = m2.group(1) == "true"
         return level, muted
 
+    def _mac_spotify_active_volume(self) -> tuple[float | None, bool]:
+        """(level_scalar_0_1, is_playing). One guarded osascript: reports the
+        Spotify app's own volume only when it is actively playing. Used to
+        light up the dual Spotify+system volume bar on macOS."""
+        script = (
+            'if application "Spotify" is not running then\n'
+            '\treturn "no"\n'
+            'end if\n'
+            'tell application "Spotify"\n'
+            '\tif player state is playing then\n'
+            '\t\treturn ("yes" & (character id 31) & (sound volume as text))\n'
+            '\telse\n'
+            '\t\treturn "no"\n'
+            '\tend if\n'
+            'end tell'
+        )
+        out = self._mac_osascript(script)
+        if not out or out == "no":
+            return None, False
+        parts = out.split("\x1f")
+        if len(parts) < 2 or parts[0] != "yes":
+            return None, False
+        try:
+            vol = int(parts[1])
+        except (ValueError, TypeError):
+            return None, False
+        return max(0.0, min(1.0, vol / 100.0)), True
+
     def _mac_start_worker(self) -> None:
         if not self._mac:
             return
@@ -398,6 +426,16 @@ class VolumeController:
         the peak enumeration is safe for the Razer/Genshin driver stability
         concern that forced us to remove the YouTube auto-mode probe.
         """
+        if self._mac:
+            # macOS has no per-app audio-session API; only the Spotify app is
+            # queryable (AppleScript). Report it as the active app when it's
+            # actually playing, so the dual Spotify+system volume bar appears
+            # just like on Windows. Chrome/other apps aren't detectable here.
+            if any("spotify" in str(name).lower() for name in process_names):
+                level, playing = self._mac_spotify_active_volume()
+                if playing:
+                    return "spotify", level
+            return None, None
         if platform.system() != "Windows":
             return None, None
         try:
