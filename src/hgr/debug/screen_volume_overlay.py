@@ -67,9 +67,13 @@ class ScreenVolumeOverlay(QWidget):
         self.update()
 
     def show_overlay(self) -> None:
+        import sys
         self._place_on_screen()
         self.show()
-        self.raise_()
+        if sys.platform != "darwin":
+            # raise_() activates the app on macOS (steals focus from whatever
+            # you're controlling); apply_overlay orders it front non-activating.
+            self.raise_()
         self.repaint()
         apply_overlay(self)
 
