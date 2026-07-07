@@ -20490,35 +20490,50 @@ Admin elevation
         card.setAttribute(Qt.WA_StyledBackground, True)
         # Wide + short: the message + button share one row, hint below.
         card.setFixedWidth(560)
+        # EXACT ProcessingOverlay palette: translucent medium-blue body, teal
+        # border, light text (see overlay.py ProcessingOverlay.paintEvent) so
+        # this reads as the same pill family.
         card.setStyleSheet(
             "QFrame#spotifyConnectPill {"
-            "  background: rgba(15, 23, 42, 0.96);"
-            "  border: 1px solid rgba(29, 233, 182, 0.5);"
-            "  border-radius: 16px;"
+            "  background: rgba(25, 73, 143, 0.64);"
+            "  border: 1px solid rgba(29, 233, 182, 0.82);"
+            "  border-radius: 18px;"
             "}"
-            "QLabel { color: #E5F6FF; background: transparent; }"
-            "QLabel#spotifyConnectHint { color: rgba(229, 246, 255, 0.62); font-size: 11px; }"
+            "QLabel { color: #E8F6FF; background: transparent; }"
+            "QLabel#spotifyConnectHint { color: rgba(232, 246, 255, 0.66); font-size: 11px; }"
             "QPushButton#spotifyConnectPillBtn {"
             "  background: #1DB954; color: #06210F; font-weight: 600;"
             "  border: none; border-radius: 9px; padding: 7px 18px;"
             "}"
             "QPushButton#spotifyConnectPillBtn:hover { background: #22D861; }"
+            "QPushButton#spotifyConnectCloseBtn {"
+            "  background: transparent; color: rgba(232, 246, 255, 0.7);"
+            "  border: none; font-size: 17px; font-weight: 700; padding: 0px;"
+            "}"
+            "QPushButton#spotifyConnectCloseBtn:hover { color: #FFFFFF; }"
         )
         col = QVBoxLayout(card)
-        col.setContentsMargins(20, 12, 20, 12)
+        col.setContentsMargins(20, 10, 16, 12)
         col.setSpacing(7)
         top_row = QHBoxLayout()
         top_row.setContentsMargins(0, 0, 0, 0)
-        top_row.setSpacing(16)
+        top_row.setSpacing(14)
         title = QLabel("If you want to connect your Spotify, click Connect.")
         title.setWordWrap(True)
         title.setStyleSheet("font-size: 13px;")
-        top_row.addWidget(title, 1)
+        top_row.addWidget(title, 1, Qt.AlignVCenter)
         connect_btn = QPushButton("Connect Spotify")
         connect_btn.setObjectName("spotifyConnectPillBtn")
         connect_btn.setCursor(Qt.PointingHandCursor)
         connect_btn.clicked.connect(self._on_spotify_connect_pill_clicked)
         top_row.addWidget(connect_btn, 0, Qt.AlignVCenter)
+        close_btn = QPushButton("×")  # ×
+        close_btn.setObjectName("spotifyConnectCloseBtn")
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setFixedSize(22, 22)
+        close_btn.setToolTip("Close")
+        close_btn.clicked.connect(self._dismiss_spotify_connect_pill)
+        top_row.addWidget(close_btn, 0, Qt.AlignTop)
         col.addLayout(top_row)
         hint = QLabel("You can also set this up in Settings → General → Spotify Set Up.")
         hint.setObjectName("spotifyConnectHint")
@@ -20578,22 +20593,28 @@ Admin elevation
             timer.setSingleShot(True)
             timer.timeout.connect(self._fade_spotify_connect_pill)
             self._spotify_connect_pill_hide_timer = timer
-        # Longer than the decline pill (12 s) so the user has time to reach the
-        # Connect button before it fades.
-        timer.start(12000)
+        # Fade after 5 s if the user doesn't interact.
+        timer.start(5000)
 
     def _on_spotify_connect_pill_clicked(self) -> None:
         # Same OAuth flow as the Settings button; hide the pill immediately.
-        pill = self._spotify_connect_pill
-        if pill is not None:
-            pill.setVisible(False)
-        timer = self._spotify_connect_pill_hide_timer
-        if timer is not None:
-            timer.stop()
+        self._dismiss_spotify_connect_pill()
         try:
             self._on_connect_spotify_clicked()
         except Exception:
             pass
+
+    def _dismiss_spotify_connect_pill(self) -> None:
+        """Immediately close the connect pill (the × button, or after connect)."""
+        pill = self._spotify_connect_pill
+        if pill is not None:
+            pill.hide()
+        timer = self._spotify_connect_pill_hide_timer
+        if timer is not None:
+            timer.stop()
+        anim = self._spotify_connect_pill_fade_anim
+        if anim is not None and anim.state() == QPropertyAnimation.Running:
+            anim.stop()
 
     def _position_spotify_connect_pill(self) -> None:
         pill = self._spotify_connect_pill
