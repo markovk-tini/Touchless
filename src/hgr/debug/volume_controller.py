@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import platform
+import re
+import threading
 import time
 from dataclasses import dataclass
 
@@ -33,8 +35,26 @@ class VolumeController:
             # macOS: system output volume + mute via osascript (CoreAudio).
             # Per-app volume has no public macOS API and stays unavailable
             # (see docs/MACOS_PORT.md).
+            #
+            # CRITICAL PERF: each osascript call spawns a subprocess (~100 ms).
+            # get_level()/get_mute() are called EVERY frame by the gesture
+            # loop, so doing them inline capped the whole app at ~5 fps on Mac
+            # (the Windows pycaw path is in-process and free). Instead, a
+            # background daemon thread polls the system every _mac_poll_interval
+            # and writes are queued (optimistic + latest-wins), so the GUI
+            # thread NEVER blocks on a subprocess. get/set just touch the cache.
             self._available = True
             self._message = "Volume control ready."
+            self._mac_lock = threading.Lock()
+            self._mac_pending_level: float | None = None
+            self._mac_pending_mute: bool | None = None
+            self._mac_suppress_reads_until = 0.0
+            self._mac_poll_interval = 0.5
+            self._mac_last_poll = 0.0
+            self._mac_wake = threading.Event()
+            self._mac_stop = threading.Event()
+            self._mac_thread: threading.Thread | None = None
+            self._mac_start_worker()
             return
         if platform.system() != "Windows":
             self._message = "Volume control is only supported on Windows."
@@ -91,12 +111,93 @@ class VolumeController:
             f"set volume output muted {'true' if muted else 'false'}"
         ) is not None
 
+    def _mac_read_settings(self) -> tuple[float | None, bool | None]:
+        """One osascript call returns BOTH output volume and mute state
+        ('output volume:50, input volume:100, alert volume:100,
+        output muted:false'), halving subprocess spawns vs two calls."""
+        out = self._mac_osascript("get volume settings")
+        if not out:
+            return None, None
+        level: float | None = None
+        muted: bool | None = None
+        m = re.search(r"output volume:(\d+)", out)
+        if m:
+            try:
+                level = max(0.0, min(1.0, float(m.group(1)) / 100.0))
+            except Exception:
+                level = None
+        m2 = re.search(r"output muted:(true|false)", out)
+        if m2:
+            muted = m2.group(1) == "true"
+        return level, muted
+
+    def _mac_start_worker(self) -> None:
+        if not self._mac:
+            return
+        if self._mac_thread is not None and self._mac_thread.is_alive():
+            return
+        self._mac_thread = threading.Thread(
+            target=self._mac_worker_loop, name="MacVolumePoller", daemon=True
+        )
+        self._mac_thread.start()
+
+    def _mac_seed_cache(self) -> None:
+        """Synchronous one-shot read to populate the cache before the poller
+        has produced its first sample. Called from get/refresh only when the
+        cache is still empty, so it costs one subprocess at most once."""
+        level, muted = self._mac_read_settings()
+        if level is not None:
+            self._last_known_level = level
+        if muted is not None:
+            self._last_known_muted = muted
+
+    def _mac_worker_loop(self) -> None:
+        while not self._mac_stop.is_set():
+            # Apply queued writes first (latest-wins) so an active volume
+            # drag reaches CoreAudio without blocking the GUI thread.
+            with self._mac_lock:
+                pending_level = self._mac_pending_level
+                pending_mute = self._mac_pending_mute
+                self._mac_pending_level = None
+                self._mac_pending_mute = None
+            wrote = False
+            if pending_level is not None:
+                self._mac_set_scalar(pending_level)
+                wrote = True
+            if pending_mute is not None:
+                self._mac_set_muted(pending_mute)
+                wrote = True
+            now = time.monotonic()
+            if wrote:
+                # Let CoreAudio settle before the next read so a poll can't
+                # clobber the optimistic cache with a stale value (mirrors
+                # the Windows _level_write_until sync window).
+                self._mac_suppress_reads_until = now + 0.4
+            elif now >= self._mac_suppress_reads_until and (now - self._mac_last_poll) >= self._mac_poll_interval:
+                self._mac_last_poll = now
+                level, muted = self._mac_read_settings()
+                if level is not None:
+                    self._last_known_level = level
+                if muted is not None:
+                    self._last_known_muted = muted
+            # Wake immediately when a write is queued; otherwise idle at a
+            # cadence tight enough for a responsive drag.
+            self._mac_wake.wait(timeout=0.05)
+            self._mac_wake.clear()
+
+    def stop(self) -> None:
+        """Stop the macOS poller thread (no-op elsewhere)."""
+        if self._mac:
+            self._mac_stop.set()
+            self._mac_wake.set()
+
     def get_level(self, *, prefer_cached: bool = True) -> float | None:
         if self._mac:
-            level = self._mac_get_scalar()
-            if level is not None:
-                self._last_known_level = level
-            return level if level is not None else self._last_known_level
+            # Cache-only: the background poller keeps _last_known_level fresh.
+            # Never spawn osascript here — this is called every frame.
+            if self._last_known_level is None:
+                self._mac_seed_cache()
+            return self._last_known_level
         self._refresh_default_endpoint_if_changed()
         for attempt in range(2):
             if not self.available:
@@ -122,9 +223,9 @@ class VolumeController:
         if direction == 0:
             return False
         if self._mac:
-            current = self._mac_get_scalar()
+            current = self.get_level()  # cache-backed, seeds if empty
             if current is None:
-                current = self._last_known_level if self._last_known_level is not None else 0.5
+                current = 0.5
             step = 0.0625  # ~one macOS volume-key notch (1/16)
             return self.set_level(current + (step if direction > 0 else -step))
         if platform.system() != "Windows" or direction == 0:
@@ -144,11 +245,16 @@ class VolumeController:
 
     def set_level(self, scalar: float) -> bool:
         if self._mac:
+            # Optimistic + queued: update the cache now (so the overlay and
+            # per-frame reads see it immediately) and hand the actual
+            # osascript write to the background thread. Never blocks the GUI.
             scalar = max(0.0, min(1.0, float(scalar)))
-            ok = self._mac_set_scalar(scalar)
-            if ok:
-                self._last_known_level = scalar
-            return ok
+            self._last_known_level = scalar
+            with self._mac_lock:
+                self._mac_pending_level = scalar
+            self._mac_suppress_reads_until = time.monotonic() + 0.4
+            self._mac_wake.set()
+            return True
         self._refresh_default_endpoint_if_changed()
         scalar = max(0.0, min(1.0, float(scalar)))
         min_write_step = float(getattr(self, "_min_write_step", 0.003))
@@ -185,10 +291,10 @@ class VolumeController:
 
     def get_mute(self, *, prefer_cached: bool = True) -> bool | None:
         if self._mac:
-            muted = self._mac_get_muted()
-            if muted is not None:
-                self._last_known_muted = muted
-            return muted if muted is not None else self._last_known_muted
+            # Cache-only (poller keeps it fresh); never osascript per frame.
+            if self._last_known_muted is None:
+                self._mac_seed_cache()
+            return self._last_known_muted
         self._refresh_default_endpoint_if_changed()
         for attempt in range(2):
             if not self.available:
@@ -212,10 +318,14 @@ class VolumeController:
 
     def set_mute(self, muted: bool) -> bool:
         if self._mac:
-            ok = self._mac_set_muted(bool(muted))
-            if ok:
-                self._last_known_muted = bool(muted)
-            return ok
+            # Optimistic + queued (see set_level). Never blocks the GUI.
+            muted = bool(muted)
+            self._last_known_muted = muted
+            with self._mac_lock:
+                self._mac_pending_mute = muted
+            self._mac_suppress_reads_until = time.monotonic() + 0.4
+            self._mac_wake.set()
+            return True
         self._refresh_default_endpoint_if_changed()
         for attempt in range(2):
             if not self.available:
@@ -393,6 +503,17 @@ class VolumeController:
         )
 
     def refresh_cache(self) -> VolumeStatus:
+        if self._mac:
+            # Return the poller-maintained cache (≤ _mac_poll_interval stale),
+            # seeding synchronously only if it has never been populated. Called
+            # on volume-overlay entry, not per frame, so no hot-path subprocess.
+            if self._last_known_level is None or self._last_known_muted is None:
+                self._mac_seed_cache()
+            return VolumeStatus(
+                available=True,
+                message=self._message,
+                level_scalar=self._last_known_level,
+            )
         self._refresh_default_endpoint_if_changed()
         if not self.available:
             return VolumeStatus(
@@ -422,6 +543,16 @@ class VolumeController:
             pass
 
     def sync_live_state(self) -> VolumeStatus:
+        if self._mac:
+            # Cache-backed (poller-fresh). Never osascript inline — this can be
+            # hit repeatedly during an active volume adjustment.
+            if self._last_known_level is None or self._last_known_muted is None:
+                self._mac_seed_cache()
+            return VolumeStatus(
+                available=True,
+                message=self._message,
+                level_scalar=self._last_known_level,
+            )
         if not self.available:
             return VolumeStatus(
                 available=False,
