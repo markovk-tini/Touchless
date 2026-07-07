@@ -4577,6 +4577,13 @@ class GestureWorker(QObject):
             # Low FPS Mode on slow hardware stayed on the YUY2 8-10
             # fps ceiling and the mode produced no noticeable effect.
             self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
+            # C25: also refresh the OpenCV cap fps request so a Low
+            # FPS → Lite transition picks up Lite's 60 fps target
+            # (the _restore_normal_capture_tuning above uses 30 fps).
+            try:
+                self._apply_default_capture_tuning((None, self._cap))
+            except Exception:
+                pass
 
     def set_lite_mode(self, enabled: bool) -> None:
         # Lite-model toggle. Compares against LAST APPLIED state, not
@@ -4602,6 +4609,17 @@ class GestureWorker(QObject):
         self._swap_engine_safely()
         self._fps = 0.0
         self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
+        # C25: re-apply OpenCV capture tuning when a mode toggle
+        # changes the target fps request. Noop when the current cap
+        # is our FfmpegMjpegCapture wrapper. Handles the case where
+        # user toggles Lite ON while the camera path is a noop
+        # (Default ↔ Lite share the OpenCV cap under C24), so
+        # without this the driver stays on the pre-toggle fps
+        # request and Lite doesn't get its 60-fps bump.
+        try:
+            self._apply_default_capture_tuning((None, self._cap))
+        except Exception:
+            pass
 
     def set_gpu_mode(self, enabled: bool) -> None:
         # GPU-acceleration toggle. See set_lite_mode for the
@@ -4625,6 +4643,17 @@ class GestureWorker(QObject):
         self._swap_engine_safely()
         self._fps = 0.0
         self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
+        # C25: re-apply OpenCV capture tuning when a mode toggle
+        # changes the target fps request. Noop when the current cap
+        # is our FfmpegMjpegCapture wrapper. Handles the case where
+        # user toggles Lite ON while the camera path is a noop
+        # (Default ↔ Lite share the OpenCV cap under C24), so
+        # without this the driver stays on the pre-toggle fps
+        # request and Lite doesn't get its 60-fps bump.
+        try:
+            self._apply_default_capture_tuning((None, self._cap))
+        except Exception:
+            pass
 
     def set_force_ten_fps_test_mode(self, enabled: bool) -> None:
         self.config.force_ten_fps_test_mode = bool(enabled)
@@ -5433,11 +5462,20 @@ class GestureWorker(QObject):
         to MJPG which lifts the YUY2 bandwidth cap. Zero cost when
         ignored.
 
-        Skipped when perf modes are active because those have their
-        own tuning path (_apply_low_fps_capture_tuning for Low FPS,
-        ffmpeg-MJPG for Lite / GPU).
+        v1.1.7 C25: also applies to Lite Mode (which now shares the
+        default OpenCV cap since C24) with an fps request bumped to
+        60 fps instead of 30. On drivers that honour it (Kiyo Pro
+        does), Lite delivers noticeably higher fps than Default at
+        the cost of higher camera-decode CPU per second — matches
+        the user's "Lite is a universal CPU-cost fps boost" intent.
+        On drivers that ignore CAP_PROP_FPS (Lite is no worse than
+        Default in that case), it's a silent no-op.
+
+        Skipped when GPU Mode is on (ffmpeg-MJPG handles fps itself)
+        or Low FPS is active (its own tuning path targets 30 fps to
+        keep CPU low on weak hardware).
         """
-        if self._any_perf_mode_active() or self._low_fps_active:
+        if self._wants_ffmpeg_cap() or self._low_fps_active:
             return
         cap = None
         if isinstance(open_result, tuple) and len(open_result) >= 2:
@@ -5462,10 +5500,14 @@ class GestureWorker(QObject):
             pass
         # Explicit fps request. UVC drivers honour this when the
         # requested rate is within their advertised range for the
-        # current (fmt, resolution) combo.
+        # current (fmt, resolution) combo. C25: Lite gets 60 fps
+        # request (matches the mode's "fps boost" intent); Default
+        # keeps 30 fps.
         try:
             if hasattr(cv2, "CAP_PROP_FPS"):
-                cap.set(cv2.CAP_PROP_FPS, 30.0)
+                lite_active = bool(getattr(self.config, "lite_mode", False))
+                fps_target = 60.0 if lite_active else 30.0
+                cap.set(cv2.CAP_PROP_FPS, fps_target)
         except Exception:
             pass
         # Small buffer size so a brief stall doesn't accumulate

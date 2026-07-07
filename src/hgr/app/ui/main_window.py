@@ -14148,10 +14148,40 @@ class MainWindow(QMainWindow):
         worker = getattr(self, "_worker", None)
         if worker is None or not hasattr(worker, "set_gpu_mode"):
             return
+        # C25 UX: GPU Mode is the ONLY mode that swaps the camera
+        # capture path (OpenCV ↔ ffmpeg-MJPG), which takes ~2 s of
+        # blocked main thread on Windows (old-cap release + DShow
+        # settle + ffmpeg subprocess boot + first-frame wait). Prior
+        # to this the user saw a frozen video for 2 s AND then a
+        # ~2 s catch-up as stale frames drained from the pipeline.
+        # Cover the live view with the existing processing-overlay
+        # for the duration of the swap so the transition is a clean
+        # "Loading GPU Mode…" splash → fresh live video instead of
+        # a frozen frame → catching-up video.
+        try:
+            self.processing_overlay.show_processing(
+                "Loading GPU Mode" if self.config.gpu_mode else "Loading Default Mode"
+            )
+            # Force an immediate paint so the overlay is visible
+            # before we start the blocking set_gpu_mode call.
+            QApplication.processEvents()
+        except Exception:
+            pass
         try:
             worker.set_gpu_mode(self.config.gpu_mode)
         except Exception:
             pass
+        # Hide the overlay. A short delay after the swap lets the
+        # widget's first fresh frame arrive so the transition from
+        # overlay → live is instant instead of showing one final
+        # stale frame first.
+        try:
+            QTimer.singleShot(150, self.processing_overlay.hide_processing)
+        except Exception:
+            try:
+                self.processing_overlay.hide_processing()
+            except Exception:
+                pass
 
 
     def _build_microphone_panel(self) -> QWidget:
