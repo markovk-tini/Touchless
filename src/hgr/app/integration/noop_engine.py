@@ -4530,7 +4530,26 @@ class GestureWorker(QObject):
                 max_process_width=self._LITE_MODE_PROCESS_WIDTH,
                 prefer_gpu=False,
             )
-            stable_frames = max(2, self.config.stable_frames_required // 2)
+            # C26: user reported that Lite Mode felt identical to
+            # Default on their strong hardware (camera Synapse-capped
+            # at 35 fps, so no fps or CPU delta was perceivable). The
+            # workflow diagnosed that Lite's real per-frame benefits
+            # are below sample noise when the camera is the bottleneck.
+            # Give Lite ONE lever the user WILL feel on every camera:
+            # gesture-snap. stable_frames=1 fires a static gesture on
+            # the first consistent frame instead of waiting for the
+            # default half-of-stable_frames_required (typically 2-3
+            # frames = ~60-90 ms). Matches the Low FPS branch's
+            # precedent above.
+            #
+            # Tradeoff: rapid pose transitions (e.g. moving fist →
+            # open_palm passes through four/three) can now fire a
+            # phantom intermediate gesture. The user opted into Lite
+            # explicitly, so this is acceptable — and the whole
+            # point of the mode is to be a "snappier response"
+            # tradeoff. If false-positives become a support issue,
+            # gate this behind a per-user config knob.
+            stable_frames = 1
         else:
             detector = HandDetector(
                 max_process_width=self._NORMAL_PROCESS_WIDTH,
