@@ -6780,6 +6780,35 @@ class MainWindow(QMainWindow):
         camera_row_layout.addStretch(1)
         info_layout.addWidget(camera_row)
 
+        # 4.1.1 first-run "no camera detected" hint. Hidden by default;
+        # _rebuild_camera_combo flips visible when zero local cameras
+        # AND no paired phone. Without this a new user with camera
+        # permission denied (or no webcam) sees only a terse
+        # "No camera detected" combo entry and assumes the app is
+        # broken. Refresh button re-runs full cv2 enumeration.
+        self.no_camera_hint_row = QWidget()
+        self.no_camera_hint_row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        no_camera_layout = QHBoxLayout(self.no_camera_hint_row)
+        no_camera_layout.setContentsMargins(0, 4, 0, 0)
+        no_camera_layout.setSpacing(10)
+        self.no_camera_hint_label = QLabel(
+            "Open Windows Settings → Privacy & security → Camera and "
+            "allow Touchless, or plug in a webcam, then click Refresh."
+        )
+        self.no_camera_hint_label.setObjectName("homeNoCameraHint")
+        self.no_camera_hint_label.setWordWrap(True)
+        self.no_camera_hint_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        no_camera_layout.addWidget(self.no_camera_hint_label, 1, Qt.AlignVCenter)
+        self.no_camera_refresh_button = QPushButton("Refresh")
+        self.no_camera_refresh_button.setObjectName("homeNoCameraRefreshButton")
+        self.no_camera_refresh_button.setCursor(Qt.PointingHandCursor)
+        self.no_camera_refresh_button.clicked.connect(
+            lambda: self.refresh_camera_inventory(update_status=True, notify=True)
+        )
+        no_camera_layout.addWidget(self.no_camera_refresh_button, 0, Qt.AlignVCenter)
+        self.no_camera_hint_row.setVisible(False)
+        info_layout.addWidget(self.no_camera_hint_row)
+
         self.home_microphone_combo = _DisplayOverrideCombo()
         self.home_microphone_combo.setObjectName("homeRuntimeDeviceCombo")
         self.home_microphone_combo.activated.connect(self._save_microphone_preference_from_home)
@@ -18837,6 +18866,12 @@ Admin elevation
         # so they have a path forward without leaving the start
         # screen.
         no_cameras = (not self._discovered_cameras) and (not phone_paired)
+        # 4.1.1: surface the first-run hint row on the home card when
+        # zero cameras + no phone paired. Hidden the moment either
+        # appears so it doesn't linger after Refresh finds one.
+        hint_row = getattr(self, "no_camera_hint_row", None)
+        if hint_row is not None:
+            hint_row.setVisible(no_cameras)
         for combo in combos:
             is_home = combo is home_combo
             combo.blockSignals(True)

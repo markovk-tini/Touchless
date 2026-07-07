@@ -5553,6 +5553,28 @@ class GestureWorker(QObject):
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
             pass
+        # Manual exposure — force a short shutter so dim rooms don't get
+        # motion blur, and, as a side benefit, prevent UVC drivers from
+        # dropping fps (many throttle to 15-25 fps when auto-exposure
+        # extends the shutter to gather more light in dim conditions).
+        # DirectShow semantics: CAP_PROP_AUTO_EXPOSURE = 0.25 → auto,
+        # 0.75 → manual (on some builds it's 1/3 instead — we set to
+        # 1.0 as a widely-honoured "manual" hint; drivers that don't
+        # recognise the value silently ignore it). CAP_PROP_EXPOSURE
+        # uses a log2 scale on DShow so -6 means 2^-6 s ≈ 15.6 ms —
+        # short enough to eliminate typical hand-motion blur.
+        # Tradeoff: dim rooms get a darker image. If users complain,
+        # per OPEN_ISSUES.md 2.2 the follow-up is a Settings slider.
+        try:
+            if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
+        except Exception:
+            pass
+        try:
+            if hasattr(cv2, "CAP_PROP_EXPOSURE"):
+                cap.set(cv2.CAP_PROP_EXPOSURE, -6.0)
+        except Exception:
+            pass
 
     def _restore_normal_capture_tuning(self, open_result) -> None:
         cap = None
