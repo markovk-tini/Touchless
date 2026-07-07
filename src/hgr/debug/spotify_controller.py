@@ -314,7 +314,11 @@ class SpotifyController:
         return player
 
     def ensure_ready(self, *, open_if_needed: bool = False) -> bool:
-        if self._mac:
+        if self._mac and not self.has_authorization:
+            # AppleScript-only mode (no Web API auth): just ensure the app is up.
+            # When the user HAS connected Spotify (has_authorization), fall
+            # through to the full Web-API device setup so search-and-play can
+            # target the desktop app as an active device.
             if self.is_running():
                 return True
             if open_if_needed:
@@ -1040,8 +1044,11 @@ class SpotifyController:
         return self.play_search_request(request.query, preferred_types=request.preferred_types)
 
     def play_search_request(self, query: str, *, preferred_types: tuple[str, ...] | None = None) -> bool:
-        if self._mac:
-            self._message = "search-and-play isn't available for the macOS Spotify app"
+        if self._mac and not self.has_authorization:
+            # Search needs the Web API (no AppleScript equivalent). Prompt the
+            # user to connect Spotify; once authorized this falls through to the
+            # real Web-API search+play below.
+            self._message = "connect Spotify (Settings > General) to enable search-and-play on macOS"
             return False
         normalized = re.sub(r"\s+", " ", str(query or "")).strip(" .!?")
         if len(normalized) < 2:
