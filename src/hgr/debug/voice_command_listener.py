@@ -790,14 +790,16 @@ class VoiceCommandListener:
                     audio_seconds=float(max_seconds or 0.0),
                     transcript_mode=transcript_mode)
         except Exception:
+            # v1.1.7: SAPI PowerShell fallback removed (Windows
+            # Defender flagged its `-EncodedCommand` shell-out as a
+            # malware-dropper pattern). Whisper failing here is now a
+            # terminal condition — the user sees "voice transcription
+            # failed" and the audio is preserved for debug. Whisper
+            # ships with three backend variants (CUDA/Vulkan/CPU) so
+            # a total transcription-engine failure only happens on a
+            # broken install; a rare miss is preferable to shipping a
+            # binary that gets quarantined by every scanner.
             transcription_failed = True
-            fallback = self._fallback_system_speech(max_seconds=max_seconds, transcript_mode=transcript_mode)
-            if fallback.success:
-                try:
-                    audio_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                return fallback
             self._message = "voice transcription failed"
             self._preserve_debug_audio(audio_path, transcript_mode=transcript_mode, text="<transcription_failed>")
             return VoiceCommandResult(heard_text="", success=False, message=self._message)
@@ -812,9 +814,9 @@ class VoiceCommandListener:
                     self._preserve_debug_audio(audio_path, transcript_mode=transcript_mode, text="empty")
 
         if not text:
-            fallback = self._fallback_system_speech(max_seconds=max_seconds, transcript_mode=transcript_mode)
-            if fallback.success:
-                return fallback
+            # v1.1.7: SAPI PowerShell fallback removed. See the earlier
+            # except-branch comment for rationale. When Whisper produces
+            # an empty transcript, surface that directly.
             self._message = "dictation not understood" if transcript_mode == "dictation" else "voice command not understood"
             return VoiceCommandResult(heard_text="", success=False, message=self._message)
 
@@ -2043,143 +2045,5 @@ class VoiceCommandListener:
         for source, target in replacements:
             value = value.replace(source, target)
         return value
-
-    def _fallback_system_speech(self, *, max_seconds: float, transcript_mode: str = "command") -> VoiceCommandResult:
-        import base64
-        import subprocess
-
-        command = [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            self._encoded_system_speech_script(max_seconds=max_seconds),
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=max_seconds + 4.0,
-                check=False,
-                **hidden_subprocess_kwargs(),
-            )
-        except Exception:
-            return VoiceCommandResult(heard_text="", success=False, message="voice command not heard")
-
-        payload = self._parse_payload(completed.stdout)
-        if not payload or payload.get("error"):
-            return VoiceCommandResult(heard_text="", success=False, message="voice command not heard")
-        heard_text = self._select_phrase(payload.get("phrases") or [], transcript_mode=transcript_mode)
-        if not heard_text:
-            return VoiceCommandResult(heard_text="", success=False, message="voice command not heard")
-        return VoiceCommandResult(heard_text=heard_text, success=True, message=f"heard: {heard_text}")
-
-    def _parse_payload(self, stdout_text: str) -> dict | None:
-        lines = [line.strip() for line in (stdout_text or "").splitlines() if line.strip()]
-        for line in reversed(lines):
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                return value
-        return None
-
-    def _select_phrase(self, phrases: list[dict], *, transcript_mode: str = "command") -> str:
-        best_text = ""
-        best_score = -1.0
-        structural_phrases = (
-            "file",
-            "folder",
-            "documents",
-            "downloads",
-            "desktop",
-            "outlook",
-            "sent items",
-            "inbox",
-            "settings",
-        )
-        for item in phrases:
-            if not isinstance(item, dict):
-                continue
-            text = self._normalize_text(str(item.get("text", "")), transcript_mode=transcript_mode)
-            if not text:
-                continue
-            confidence = float(item.get("confidence", 0.0) or 0.0)
-            word_count = len(text.split())
-            hint_bonus = min(0.16, sum(0.04 for hint in self._app_hints[:20] if hint and hint in text))
-            structure_bonus = min(0.12, sum(0.03 for phrase in structural_phrases if phrase in text))
-            chain_bonus = 0.05 if len(re.findall(r"\b(?:in|inside|under|within)\b", text)) >= 2 else 0.0
-            score = (
-                confidence
-                + min(word_count, 16) * 0.075
-                + min(len(text), 120) * 0.0015
-                + hint_bonus
-                + structure_bonus
-                + chain_bonus
-            )
-            if score > best_score:
-                best_score = score
-                best_text = text
-        return best_text
-
-    def _encoded_system_speech_script(self, *, max_seconds: float) -> str:
-        import base64
-
-        seconds = max(6.0, float(max_seconds))
-        script = f"""
-$ErrorActionPreference = 'Stop'
-try {{
-    Add-Type -AssemblyName System.Speech
-    $culture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
-    $recognizer = New-Object System.Speech.Recognition.SpeechRecognitionEngine($culture)
-    $grammar = New-Object System.Speech.Recognition.DictationGrammar
-    $recognizer.LoadGrammar($grammar)
-    $recognizer.SetInputToDefaultAudioDevice()
-    $recognizer.InitialSilenceTimeout = [TimeSpan]::FromSeconds(3.0)
-    $recognizer.BabbleTimeout = [TimeSpan]::FromSeconds(3.0)
-    $recognizer.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.20)
-    $recognizer.EndSilenceTimeoutAmbiguous = [TimeSpan]::FromSeconds(1.55)
-    $deadline = [DateTime]::UtcNow.AddSeconds({seconds})
-    $phrases = New-Object System.Collections.Generic.List[object]
-    while ([DateTime]::UtcNow -lt $deadline) {{
-        $remaining = $deadline - [DateTime]::UtcNow
-        if ($remaining.TotalSeconds -lt 1) {{ break }}
-        try {{
-            $result = $recognizer.Recognize([TimeSpan]::FromSeconds([Math]::Min(4.5, $remaining.TotalSeconds)))
-        }} catch {{
-            $result = $null
-        }}
-        if ($null -ne $result -and -not [string]::IsNullOrWhiteSpace($result.Text)) {{
-            $phrases.Add([PSCustomObject]@{{
-                text = $result.Text
-                confidence = [double]$result.Confidence
-            }})
-            $wordCount = $result.Text.Trim().Split().Count
-            $confidence = [double]$result.Confidence
-            if (
-                ($wordCount -ge 8 -and $confidence -ge 0.45) -or
-                ($wordCount -ge 6 -and $confidence -ge 0.62)
-            ) {{
-                break
-            }}
-        }}
-    }}
-    $recognizer.Dispose()
-    [PSCustomObject]@{{
-        phrases = $phrases
-        error = $null
-    }} | ConvertTo-Json -Compress -Depth 4
-}} catch {{
-    [PSCustomObject]@{{
-        phrases = @()
-        error = $_.Exception.Message
-    }} | ConvertTo-Json -Compress -Depth 4
-}}
-"""
-        return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
 # Author: Konstantin Markov

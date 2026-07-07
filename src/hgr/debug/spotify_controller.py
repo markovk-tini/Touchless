@@ -171,7 +171,23 @@ class SpotifyController:
         already authorised in a previous run."""
         return bool(self._refresh_token) or bool(self._access_token)
 
-    def ensure_ready(self, *, open_if_needed: bool = False) -> bool:
+    def ensure_ready(self, *, open_if_needed: bool = False,
+                     visible_launch: bool = False) -> bool:
+        """Verify Spotify is reachable as a Spotify Connect device.
+
+        Args:
+          open_if_needed: launch Spotify if no device is found.
+            Default False so background callers (gesture polling
+            for is-active-for-wheel, queue add, etc.) never trigger
+            launches.
+          visible_launch: when launching, show Spotify's window
+            (hidden=False). Default False — only EXPLICIT
+            user-initiated play (the spotify_play connector) opts
+            in. Gesture / background paths keep silent launches
+            to preserve focus on the user's active window. Hidden
+            launches still register as Connect devices on classic
+            Spotify; Store Spotify ignores the hint either way.
+        """
         if not self._available:
             self._message = "spotify unavailable on this platform"
             return False
@@ -180,11 +196,14 @@ class SpotifyController:
 
         devices = self._get_devices()
         if not devices and open_if_needed:
-            launched = self.launch_spotify(hidden=True)
+            launched = self.launch_spotify(
+                hidden=not visible_launch)
             if launched:
                 devices = self._wait_for_devices()
         if not devices:
-            self._message = "spotify device not available"
+            self._message = (
+                "Spotify isn't available — make sure Spotify is "
+                "installed and logged in, then try again.")
             return False
 
         active_device = next((device for device in devices if device.get("is_active")), None)
@@ -203,30 +222,53 @@ class SpotifyController:
         return True
 
     def launch_spotify(self, *, hidden: bool) -> bool:
-        # The launcher used to be a single-line subprocess.Popen on
-        # whichever Spotify.exe path existed first — including the
-        # 0-byte App Execution Alias stub at
-        # %LOCALAPPDATA%\Microsoft\WindowsApps\<package>\Spotify.exe.
-        # That worked: Windows resolves the alias on CreateProcess
-        # and the real Store Spotify boots. A later attempt to skip
-        # the stub by file size was wrong — Popen on the stub does
-        # work, and removing it broke launching for users who only
-        # have the Store install. Now we Popen every candidate that
-        # exists, regardless of size, and verify each launch by
-        # polling for a real Spotify process before declaring it
-        # the winner.
+        # ORDER MATTERS. The 'spotify:' protocol handler via
+        # os.startfile (ShellExecute) is the FIRST attempt because:
+        #   1. It works for BOTH Classic and Store installs (Store
+        #      uses an App Execution Alias that needs ShellExecute,
+        #      not CreateProcess — raw Popen on the 0-byte stub
+        #      returns a PID that exits in <100ms without booting
+        #      the real client).
+        #   2. When Spotify is already running in the tray (window
+        #      closed, process alive), this surfaces the window AND
+        #      forces Spotify to re-register as a Connect device
+        #      with the Web API. Popen on the stub does neither —
+        #      it sees Spotify is "running" via _has_real_spotify_
+        #      process and returns success without actually waking
+        #      the tray instance.
+        #   3. ShellExecute respects the user's app association,
+        #      so a portable / custom install path works too.
+        # Popen fallbacks come second for users who have Classic
+        # Spotify but no protocol handler registered.
         def _attempt(fire: Callable[[], None]) -> bool:
             try:
                 fire()
             except Exception:
                 return False
-            return self._wait_for_spotify_process(timeout_seconds=4.0)
+            # Bumped 4s → 8s so first-time cold launch of Store
+            # Spotify has time to show its window.
+            return self._wait_for_spotify_process(timeout_seconds=8.0)
 
+        # 1) Protocol-handler launch (canonical "wake Spotify" path).
+        if _attempt(lambda: os.startfile("spotify:")):
+            self._message = "launching spotify"
+            return True
+        if _attempt(lambda: os.startfile("spotify")):
+            self._message = "launching spotify"
+            return True
+
+        # 2) Direct .exe fallbacks for unusual installs (portable,
+        #    custom path). hidden is honored only when launching
+        #    Classic Spotify directly; Store stub launches always
+        #    surface a window because ShellExecute ignores hide hints.
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
         for candidate in self._executable_paths:
             try:
                 if not candidate.exists():
+                    continue
+                # Skip the 0-byte Store stub here — it needs
+                # ShellExecute, which we already tried above.
+                if candidate.stat().st_size < 1024:
                     continue
             except Exception:
                 continue
@@ -246,30 +288,12 @@ class SpotifyController:
                 self._message = "launching spotify"
                 return True
 
-        # ShellExecute fallbacks — only reached when no candidate
-        # path was launchable. os.startfile self-inits the COM
-        # apartment so it works from background threads where raw
-        # ShellExecuteW silently drops the request. PowerShell is a
-        # last resort because it spawns a new process and reads
-        # like a dropper to behavioural AV.
-        if _attempt(lambda: os.startfile("spotify")):
-            self._message = "launching spotify"
-            return True
-        if _attempt(lambda: os.startfile("spotify:")):
-            self._message = "launching spotify"
-            return True
-        if _attempt(
-            lambda: subprocess.Popen(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    "Start-Process spotify:",
-                ],
-                creationflags=creationflags,
-            )
-        ):
+        # 3) ShellExecuteW fallback (same "spotify:" URI, no shell-out).
+        # Was `powershell.exe -Command Start-Process spotify:` — a hidden
+        # powershell.exe launch is the exact byte pattern Defender ASR
+        # rules quarantine. os.startfile above already used ShellExecute,
+        # so this is genuine paranoia in case that raised.
+        if _attempt(lambda: launch_external("spotify:")):
             self._message = "launching spotify"
             return True
 
@@ -749,12 +773,24 @@ class SpotifyController:
             return False
         return self.play_search_request(request.query, preferred_types=request.preferred_types)
 
-    def play_search_request(self, query: str, *, preferred_types: tuple[str, ...] | None = None) -> bool:
+    def play_search_request(self, query: str, *,
+                            preferred_types: tuple[str, ...] | None = None,
+                            visible_launch: bool = True) -> bool:
+        """Search Spotify + play the best result.
+
+        `visible_launch` defaults to True because callers of this
+        method are user-initiated play commands ("play poker face"
+        from voice / typed input / Iris planner) — the user expects
+        Spotify to open visibly. Background callers (gesture next /
+        previous / shuffle, queue add) use the simpler play() / etc.
+        methods which never launch Spotify.
+        """
         normalized = re.sub(r"\s+", " ", str(query or "")).strip(" .!?")
         if len(normalized) < 2:
             self._message = "spotify play query missing"
             return False
-        if not self.ensure_ready(open_if_needed=True):
+        if not self.ensure_ready(open_if_needed=True,
+                                 visible_launch=visible_launch):
             return False
 
         search_types = preferred_types or ("track", "playlist", "album", "artist")
@@ -764,8 +800,17 @@ class SpotifyController:
             return False
 
         payload = selection["payload"]
-        status, _ = self._request_json("PUT", "/me/player/play", payload=payload)
-        if status not in {202, 204}:
+        # CRITICAL: include device_id in params, mirroring play() /
+        # pause() / next_track() / previous_track(). Without this,
+        # the API can route the play command to a different device
+        # (or no device) — observed symptom: requested track gets
+        # accepted (202) but plays nothing or plays on wrong
+        # device. See _device_params docstring for details.
+        status, _ = self._request_json(
+            "PUT", "/me/player/play",
+            payload=payload,
+            params=self._device_params())
+        if status not in {200, 202, 204}:
             self._message = "spotify play request failed"
             return False
 
@@ -1624,7 +1669,13 @@ class SpotifyController:
         return [device for device in devices if not device.get("is_restricted")]
 
     def _wait_for_devices(self) -> list[dict[str, Any]]:
-        deadline = time.monotonic() + 7.0
+        # 20s budget: Microsoft Store Spotify cold-launch can take
+        # 5-15s (login screen + Connect handshake), and the Web API
+        # needs 1-3s after that to discover the new device. 20s is
+        # comfortably above worst-case observed cold-start so we
+        # don't surface "device not available" while Spotify is
+        # still booting.
+        deadline = time.monotonic() + 20.0
         devices: list[dict[str, Any]] = []
         while time.monotonic() < deadline:
             devices = self._get_devices()

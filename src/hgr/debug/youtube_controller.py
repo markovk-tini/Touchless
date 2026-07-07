@@ -927,177 +927,177 @@ class YouTubeController:
     def _find_first_search_result_rect(
         self, hwnd: int, keywords: list[str]
     ) -> tuple[int, int, int, int] | None:
-        """Run a PowerShell UIA script that walks the YouTube search-
-        results page tree and returns the bounding rectangle of the
-        first `Hyperlink` whose name overlaps with the query
-        keywords (filtered against an extensive nav-chrome blocklist).
+        """Walk the YouTube search-results page's UIA tree and return
+        the bounding rectangle of the first `Hyperlink` (or, if none
+        match, any control) whose name overlaps with the query
+        keywords, filtered against an extensive nav-chrome blocklist.
 
         Returns (left, top, right, bottom) in screen coords or None.
 
-        The previous version called `InvokePattern.Invoke()` directly
-        from PowerShell. UIA accepted the call but YouTube's SPA
-        components didn't trigger their JS handlers, so the page
-        never navigated — the user reported "it searched correctly
-        but didn't play a video". Returning the rect and letting the
-        Python side click it via SetCursorPos+mouse_event triggers
-        the real mouse-event pipeline, which YouTube's handlers DO
-        respond to."""
+        We deliberately return the rect and let the Python caller
+        click it via SetCursorPos+mouse_event rather than invoking
+        the UIA InvokePattern here. UIA accepts InvokePattern calls
+        but YouTube's SPA components don't trigger their JS handlers
+        from them — the user reported "it searched correctly but
+        didn't play a video" in the previous InvokePattern version.
+        A synthesized real mouse event goes through YouTube's actual
+        click pipeline."""
+        # v1.1.7 PowerShell-removal: the previous version invoked a
+        # ~50-line UIA script via `powershell.exe -Command`. Same
+        # logic here, but through the native `uiautomation` pip
+        # package. Preserves the two important quirks of the original:
+        #   1. Chrome activation warm-up: the first FindAll against
+        #      an un-activated Chrome window returns 0 elements even
+        #      when the page is fully loaded. Walking the tree (which
+        #      is what a screen reader does) triggers Chrome to
+        #      populate its accessibility tree. We do that walk in
+        #      Python and it's the "no shell-out" replacement of the
+        #      original TreeWalker warm-up loop.
+        #   2. Hyperlink-then-any-control fallback: YouTube's video
+        #      card outer wrapper is sometimes Hyperlink, sometimes
+        #      Group/Image/Button, depending on Chrome + page state.
         if hwnd <= 0 or not keywords:
             return None
         try:
-            payload = json.dumps([str(k).lower() for k in keywords])
+            import uiautomation as auto  # type: ignore[import-untyped]
         except Exception:
+            self._log_autoplay("UIA exec failed", "uiautomation package missing")
             return None
-        script = f"""
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-$hwnd = [IntPtr]({int(hwnd)})
-$keywords = ConvertFrom-Json @'
-{payload}
-'@
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-if ($null -eq $root) {{
-    [Console]::Out.Write('NOT_FOUND_ROOT')
-    exit 0
-}}
-
-# CHROME ACCESSIBILITY ACTIVATION
-# Chrome enables its accessibility tree lazily — the first FindAll
-# against an un-activated Chrome window returns 0 elements even
-# when the page is fully loaded. Walking the tree with TreeWalker
-# and reading per-node properties is what screen readers do and is
-# what reliably triggers Chrome to populate. Up to 400 nodes in
-# BFS order to keep this bounded if the tree is huge.
-$walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
-$queue = New-Object System.Collections.Generic.Queue[object]
-$queue.Enqueue($root)
-$processed = 0
-while ($queue.Count -gt 0 -and $processed -lt 400) {{
-    $current = $queue.Dequeue()
-    $processed++
-    try {{
-        $null = $current.Current.Name
-        $null = $current.Current.ControlType
-    }} catch {{}}
-    try {{
-        $child = $walker.GetFirstChild($current)
-    }} catch {{
-        $child = $null
-    }}
-    while ($child -ne $null -and $queue.Count -lt 600) {{
-        $queue.Enqueue($child)
-        try {{
-            $child = $walker.GetNextSibling($child)
-        }} catch {{
-            $child = $null
-        }}
-    }}
-}}
-Start-Sleep -Milliseconds 350
-
-$linkType = [System.Windows.Automation.ControlType]::Hyperlink
-$cond = New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-    $linkType
-)
-$links = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
-if ($links.Count -eq 0) {{
-    # Last-resort: try ANY element type. YouTube's video card
-    # outer wrapper sometimes registers as Group / Image / Button
-    # rather than Hyperlink, depending on Chrome version + page
-    # state. Filter by name only.
-    $links = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
-}}
-if ($links.Count -eq 0) {{
-    [Console]::Out.Write('NO_LINKS')
-    exit 0
-}}
-for ($i = 0; $i -lt $links.Count; $i++) {{
-    $link = $links.Item($i)
-    try {{
-        $name = [string]$link.Current.Name
-    }} catch {{
-        $name = ''
-    }}
-    if ([string]::IsNullOrWhiteSpace($name)) {{ continue }}
-    $nameLower = $name.ToLowerInvariant()
-    # Reject nav/chrome links present on every YouTube page.
-    if ($nameLower -match '^(home|shorts|subscriptions|library|history|trending|gaming|music|news|sports|learning|fashion|sign in|premium|youtube studio|your channel|search|skip navigation|skip to main content|guide|settings|create|notifications|filters|help|send feedback|about|press|copyright|contact us|creators|advertise|developers|terms|privacy|policy & safety|how youtube works|test new features|youtube)$') {{
-        continue
-    }}
-    if ($nameLower.Length -lt 8) {{ continue }}
-    $matched = $false
-    foreach ($kw in $keywords) {{
-        if (-not [string]::IsNullOrWhiteSpace([string]$kw) -and $nameLower.Contains(([string]$kw).ToLowerInvariant())) {{
-            $matched = $true
-            break
-        }}
-    }}
-    if (-not $matched) {{ continue }}
-    try {{
-        $rect = $link.Current.BoundingRectangle
-    }} catch {{
-        continue
-    }}
-    # Min size 100x60 = real video card. The TrueCondition fallback
-    # otherwise matches small tooltip / hidden overlay elements
-    # whose names happen to share keywords with the query.
-    if ($rect.Width -lt 100 -or $rect.Height -lt 60) {{ continue }}
-    # Visible-on-screen check: element must have a non-degenerate rect.
-    if ($rect.Width -le 0 -or $rect.Height -le 0) {{ continue }}
-    [Console]::Out.Write(('RECT ' + [int]$rect.Left + ' ' + [int]$rect.Top + ' ' + [int]$rect.Right + ' ' + [int]$rect.Bottom + ' ' + $name))
-    exit 0
-}}
-[Console]::Out.Write(('NOT_FOUND_LINKS=' + $links.Count))
-"""
         try:
-            completed = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    script,
-                ],
-                capture_output=True,
-                text=True,
-                # TreeWalker activation walk + per-node property
-                # reads is slower than a bare FindAll; 12 s cap so
-                # a slow Chrome accessibility activation doesn't
-                # time out. Worker is on a daemon thread so the
-                # voice pipeline isn't blocked.
-                timeout=12.0,
-                check=False,
-            )
+            root = auto.ControlFromHandle(int(hwnd))
         except Exception as exc:
             self._log_autoplay("UIA exec failed", type(exc).__name__)
             return None
-        if completed.returncode != 0:
-            stderr_tail = (completed.stderr or "").strip().splitlines()[-1:] if completed.stderr else []
-            self._log_autoplay(
-                "UIA returncode",
-                f"rc={completed.returncode} stderr={stderr_tail!r}",
-            )
+        if root is None:
+            self._log_autoplay("UIA returned", "NOT_FOUND_ROOT")
             return None
-        outcome = str(completed.stdout or "").strip()
-        if not outcome.startswith("RECT "):
-            short = outcome.split()[0] if outcome else "EMPTY_OUTPUT"
-            self._log_autoplay("UIA returned", short)
-            return None
+        keywords_lower = [str(k).lower() for k in keywords if str(k).strip()]
+
+        # Chrome accessibility activation walk. Read Name +
+        # ControlType on the first ~400 nodes in BFS to warm the tree
+        # up, then let it settle.
         try:
-            parts = outcome.split(maxsplit=5)
-            left = int(parts[1])
-            top = int(parts[2])
-            right = int(parts[3])
-            bottom = int(parts[4])
-            link_name = parts[5] if len(parts) > 5 else ""
-        except (IndexError, ValueError):
-            self._log_autoplay("bad UIA output", outcome[:120])
+            queue: list = [root]
+            processed = 0
+            _WARMUP_CAP = 400
+            _FANOUT_CAP = 600
+            while queue and processed < _WARMUP_CAP:
+                current = queue.pop(0)
+                processed += 1
+                try:
+                    _ = current.Name
+                except Exception:
+                    pass
+                try:
+                    _ = current.ControlTypeName
+                except Exception:
+                    pass
+                if len(queue) >= _FANOUT_CAP:
+                    continue
+                try:
+                    children = current.GetChildren() or []
+                except Exception:
+                    children = []
+                for child in children:
+                    if len(queue) < _FANOUT_CAP:
+                        queue.append(child)
+                    else:
+                        break
+            time.sleep(0.35)
+        except Exception:
+            pass  # warm-up best-effort; downstream FindAll can still succeed
+
+        _NAV_CHROME = {
+            "home", "shorts", "subscriptions", "library", "history", "trending",
+            "gaming", "music", "news", "sports", "learning", "fashion",
+            "sign in", "premium", "youtube studio", "your channel", "search",
+            "skip navigation", "skip to main content", "guide", "settings",
+            "create", "notifications", "filters", "help", "send feedback",
+            "about", "press", "copyright", "contact us", "creators",
+            "advertise", "developers", "terms", "privacy", "policy & safety",
+            "how youtube works", "test new features", "youtube",
+        }
+
+        def _iterate_all_descendants(root_element):
+            """BFS over the full UIA descendant tree with a bounded
+            node cap. Yields (name, rect) tuples where rect is
+            (left, top, right, bottom) — same shape the caller
+            expects."""
+            stack: list = [root_element]
+            seen_nodes = 0
+            _NODE_CAP = 8000  # matches the practical fanout of FindAll on Chrome
+            while stack and seen_nodes < _NODE_CAP:
+                element = stack.pop(0)
+                seen_nodes += 1
+                try:
+                    name_val = element.Name
+                except Exception:
+                    name_val = ""
+                try:
+                    rect_obj = element.BoundingRectangle
+                    left = int(rect_obj.left)
+                    top = int(rect_obj.top)
+                    right = int(rect_obj.right)
+                    bottom = int(rect_obj.bottom)
+                except Exception:
+                    left = top = right = bottom = 0
+                try:
+                    ctype_name = element.ControlTypeName or ""
+                except Exception:
+                    ctype_name = ""
+                yield (name_val or "", ctype_name, (left, top, right, bottom))
+                try:
+                    children = element.GetChildren() or []
+                except Exception:
+                    children = []
+                stack.extend(children)
+
+        def _pick_match(descendants, hyperlink_only: bool):
+            """Filter the descendant iterator by name + rect quality.
+            Returns (rect, name) on match or None."""
+            for name, ctype_name, rect in descendants:
+                if not name or not name.strip():
+                    continue
+                name_lower = name.lower()
+                if name_lower in _NAV_CHROME:
+                    continue
+                if len(name_lower) < 8:
+                    continue
+                if hyperlink_only and "hyperlink" not in ctype_name.lower():
+                    continue
+                if not any(kw and kw in name_lower for kw in keywords_lower):
+                    continue
+                left, top, right, bottom = rect
+                width = right - left
+                height = bottom - top
+                if width <= 0 or height <= 0:
+                    continue
+                if width < 100 or height < 60:
+                    continue
+                return ((left, top, right, bottom), name)
             return None
+
+        try:
+            # Materialise the descendant list once, then run the two
+            # passes (Hyperlink-only, then any control) over the same
+            # snapshot. Matches the PowerShell version's "FindAll
+            # Hyperlink, else FindAll TrueCondition" fallback.
+            snapshot = list(_iterate_all_descendants(root))
+        except Exception as exc:
+            self._log_autoplay("UIA exec failed", type(exc).__name__)
+            return None
+        if not snapshot:
+            self._log_autoplay("UIA returned", "NO_LINKS")
+            return None
+        result = _pick_match(iter(snapshot), hyperlink_only=True)
+        if result is None:
+            result = _pick_match(iter(snapshot), hyperlink_only=False)
+        if result is None:
+            self._log_autoplay("UIA returned", f"NOT_FOUND_LINKS={len(snapshot)}")
+            return None
+        rect, link_name = result
         self._log_autoplay("UIA matched link", f"name={link_name!r}")
-        return (left, top, right, bottom)
+        return rect
 
     def _invoke_named_control_action(self, name_patterns: tuple[str, ...], *, success_message: str) -> bool:
         hwnd = self._activate_youtube_tab()
@@ -1111,6 +1111,17 @@ for ($i = 0; $i -lt $links.Count; $i++) {{
         return False
 
     def _invoke_uia_named_control(self, hwnd: int, name_patterns: tuple[str, ...]) -> bool:
+        """Walk the UIA tree under `hwnd`, find the first descendant
+        whose Name contains any of the given case-insensitive
+        `name_patterns` substrings, and try to activate it via
+        Invoke / Toggle / SelectionItem / LegacyIAccessible in that
+        order. Returns True if any activation reported success.
+
+        v1.1.7 PowerShell-removal: uses the `uiautomation` pip
+        package (thin COM wrapper over UIAutomationClient) instead of
+        shelling out to `powershell.exe -Command <script>` — same
+        UIA API surface, no shell-out fingerprint.
+        """
         if not self._is_windows or hwnd <= 0:
             return False
         needles = [str(pattern or "").strip().lower() for pattern in name_patterns if str(pattern or "").strip()]
@@ -1119,103 +1130,73 @@ for ($i = 0; $i -lt $links.Count; $i++) {{
         if not self._focus_window_handle(hwnd, restore_if_minimized=True):
             return False
         try:
-            payload = json.dumps(needles)
+            import uiautomation as auto  # type: ignore[import-untyped]
         except Exception:
             return False
-        script = f"""
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-$hwnd = [IntPtr]({int(hwnd)})
-$needles = ConvertFrom-Json @'
-{payload}
-'@
-$root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
-if ($null -eq $root) {{
-    [Console]::Out.Write('NOT_FOUND')
-    exit 0
-}}
-$elements = $root.FindAll(
-    [System.Windows.Automation.TreeScope]::Descendants,
-    [System.Windows.Automation.Condition]::TrueCondition
-)
-for ($i = 0; $i -lt $elements.Count; $i++) {{
-    $element = $elements.Item($i)
-    try {{
-        $name = [string]$element.Current.Name
-    }} catch {{
-        $name = ''
-    }}
-    if ([string]::IsNullOrWhiteSpace($name)) {{
-        continue
-    }}
-    $nameLower = $name.ToLowerInvariant()
-    $matched = $false
-    foreach ($needle in $needles) {{
-        if (-not [string]::IsNullOrWhiteSpace([string]$needle) -and $nameLower.Contains(([string]$needle).ToLowerInvariant())) {{
-            $matched = $true
-            break
-        }}
-    }}
-    if (-not $matched) {{
-        continue
-    }}
-    try {{
-        $invokePattern = $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
-        if ($invokePattern -is [System.Windows.Automation.InvokePattern]) {{
-            $invokePattern.Invoke()
-            [Console]::Out.Write('INVOKED')
-            exit 0
-        }}
-    }} catch {{}}
-    try {{
-        $togglePattern = $element.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
-        if ($togglePattern -is [System.Windows.Automation.TogglePattern]) {{
-            $togglePattern.Toggle()
-            [Console]::Out.Write('TOGGLED')
-            exit 0
-        }}
-    }} catch {{}}
-    try {{
-        $selectionPattern = $element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-        if ($selectionPattern -is [System.Windows.Automation.SelectionItemPattern]) {{
-            $selectionPattern.Select()
-            [Console]::Out.Write('SELECTED')
-            exit 0
-        }}
-    }} catch {{}}
-    try {{
-        $legacyPattern = $element.GetCurrentPattern([System.Windows.Automation.LegacyIAccessiblePattern]::Pattern)
-        if ($legacyPattern -is [System.Windows.Automation.LegacyIAccessiblePattern]) {{
-            $legacyPattern.DoDefaultAction()
-            [Console]::Out.Write('DEFAULT')
-            exit 0
-        }}
-    }} catch {{}}
-}}
-[Console]::Out.Write('NOT_FOUND')
-"""
         try:
-            completed = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    script,
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_UIA_ACTION_TIMEOUT_SECONDS,
-                check=False,
-            )
+            root = auto.ControlFromHandle(int(hwnd))
         except Exception:
             return False
-        if completed.returncode != 0:
+        if root is None:
             return False
-        outcome = str(completed.stdout or "").strip().upper()
-        return outcome in {"INVOKED", "TOGGLED", "SELECTED", "DEFAULT"}
+        deadline = time.monotonic() + max(1.0, float(_UIA_ACTION_TIMEOUT_SECONDS) - 0.5)
+        # Breadth-first walk with a depth cap. Matches the PowerShell
+        # `FindAll(Descendants, TrueCondition)` semantics — enumerate
+        # every descendant and check names — but avoids materialising
+        # the whole element array at once, which lets us bail early
+        # on the first match instead of loading thousands of nodes.
+        stack: list = [root]
+        visited = 0
+        _MAX_NODES = 4000  # ~= FindAll's practical fanout on Chrome
+        while stack and visited < _MAX_NODES and time.monotonic() < deadline:
+            element = stack.pop(0)
+            visited += 1
+            try:
+                name_raw = element.Name  # property access can raise
+                name = str(name_raw or "")
+            except Exception:
+                name = ""
+            if name:
+                name_lower = name.lower()
+                if any(needle in name_lower for needle in needles):
+                    # Try activation patterns in the same order as the
+                    # PowerShell version: Invoke → Toggle → Select →
+                    # LegacyIAccessible.DoDefaultAction.
+                    for pattern_getter, action_name in (
+                        (lambda e: e.GetInvokePattern(), "invoke"),
+                        (lambda e: e.GetTogglePattern(), "toggle"),
+                        (lambda e: e.GetSelectionItemPattern(), "select"),
+                        (lambda e: e.GetLegacyIAccessiblePattern(), "legacy"),
+                    ):
+                        try:
+                            pattern = pattern_getter(element)
+                        except Exception:
+                            pattern = None
+                        if pattern is None:
+                            continue
+                        try:
+                            if action_name == "invoke":
+                                pattern.Invoke()
+                            elif action_name == "toggle":
+                                pattern.Toggle()
+                            elif action_name == "select":
+                                pattern.Select()
+                            elif action_name == "legacy":
+                                pattern.DoDefaultAction()
+                            return True
+                        except Exception:
+                            continue
+                    # Named match found but no activation pattern
+                    # succeeded — keep walking in case a sibling has
+                    # a working pattern.
+            try:
+                children = element.GetChildren() or []
+            except Exception:
+                children = []
+            # BFS order preserves the original PowerShell walk's
+            # "shallowest match wins" semantics.
+            stack.extend(children)
+        return False
 
     def _execute_youtube_script_action(self, hwnd: int, script: str) -> str | None:
         if not self._is_windows or hwnd <= 0 or self._text_input is None:
@@ -1389,65 +1370,71 @@ for ($i = 0; $i -lt $elements.Count; $i++) {{
                     pass
 
     def _ocr_image_path(self, image_path: Path) -> str:
+        """OCR a PNG file via the Windows Media OCR engine.
+
+        v1.1.7 (PowerShell-removal pass): replaced the previous
+        `powershell.exe -Command <WinRT wrapper script>` shell-out
+        with a native `winsdk` Python projection of the same WinRT
+        API. Same OCR quality, no PowerShell fingerprint for
+        Defender / ASR to trip on.
+
+        Returns the recognised text (may be empty). Returns "" on any
+        error — winsdk missing, engine unavailable on this Windows
+        edition, decode failure, or the file not existing.
+        """
         if not self._is_windows:
             return ""
-        script = r"""
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
-$null = [Windows.Storage.FileAccessMode, Windows.Storage, ContentType = WindowsRuntime]
-$null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
-$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
-$null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
-$null = [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime]
-function Await($asyncOp, $resultType) {
-    $method = [System.WindowsRuntimeSystemExtensions].GetMethods() |
-        Where-Object { $_.Name -eq 'AsTask' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 } |
-        Select-Object -First 1
-    if ($null -eq $method) {
-        return $null
-    }
-    $task = $method.MakeGenericMethod($resultType).Invoke($null, @($asyncOp))
-    $task.Wait(-1)
-    return $task.Result
-}
-$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($args[0])) ([Windows.Storage.StorageFile])
-if ($null -eq $file) { return }
-$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
-if ($null -eq $stream) { return }
-$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-if ($null -eq $decoder) { return }
-$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
-if ($null -eq $bitmap) { return }
-$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
-if ($null -eq $engine) { return }
-$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
-if ($null -ne $result -and $null -ne $result.Text) {
-    [Console]::Out.Write($result.Text)
-}
-"""
         try:
-            completed = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    script,
-                    str(image_path),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=_CAPTIONS_OCR_TIMEOUT_SECONDS,
-                check=False,
-            )
+            import asyncio
+            from winsdk.windows.media.ocr import OcrEngine
+            from winsdk.windows.graphics.imaging import BitmapDecoder
+            from winsdk.windows.storage import StorageFile, FileAccessMode
         except Exception:
             return ""
-        if completed.returncode != 0:
+
+        async def _run() -> str:
+            try:
+                file = await StorageFile.get_file_from_path_async(str(image_path))
+                if file is None:
+                    return ""
+                stream = await file.open_async(FileAccessMode.READ)
+                if stream is None:
+                    return ""
+                try:
+                    decoder = await BitmapDecoder.create_async(stream)
+                    if decoder is None:
+                        return ""
+                    bitmap = await decoder.get_software_bitmap_async()
+                    if bitmap is None:
+                        return ""
+                    engine = OcrEngine.try_create_from_user_profile_languages()
+                    if engine is None:
+                        return ""
+                    result = await engine.recognize_async(bitmap)
+                    if result is None or result.text is None:
+                        return ""
+                    return str(result.text).strip()
+                finally:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+            except Exception:
+                return ""
+
+        # Run the WinRT async ops on a fresh event loop scoped to this
+        # call; can't reuse an outer loop because this is called from
+        # arbitrary threads (voice + YouTube auto-skip workers).
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    asyncio.wait_for(_run(), timeout=float(_CAPTIONS_OCR_TIMEOUT_SECONDS))
+                )
+            finally:
+                loop.close()
+        except Exception:
             return ""
-        return str(completed.stdout or "").strip()
 
     def _load_skip_templates(self) -> list:
         try:
