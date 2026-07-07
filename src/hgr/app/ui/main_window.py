@@ -20467,14 +20467,24 @@ Admin elevation
         pill = self._spotify_connect_pill
         if pill is not None:
             return pill
-        pill = QFrame(self)
+        pill = QFrame(None)
         pill.setObjectName("spotifyConnectPill")
+        # Top-level (parent=None) so it floats at the bottom-center of the
+        # SCREEN like the other Touchless pills, not clamped to the app window.
+        pill.setWindowFlags(
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.NoDropShadowWindowHint
+        )
+        pill.setAttribute(Qt.WA_TranslucentBackground, True)
+        pill.setAttribute(Qt.WA_ShowWithoutActivating, True)
         pill.setAttribute(Qt.WA_StyledBackground, True)
         pill.setStyleSheet(
             "QFrame#spotifyConnectPill {"
-            "  background: rgba(15, 23, 42, 0.97);"
-            "  border: 1px solid rgba(29, 233, 182, 0.55);"
-            "  border-radius: 14px;"
+            "  background: rgba(15, 23, 42, 0.92);"
+            "  border: 1px solid rgba(29, 233, 182, 0.45);"
+            "  border-radius: 16px;"
             "}"
             "QLabel { color: #E5F6FF; background: transparent; }"
             "QLabel#spotifyConnectHint { color: rgba(229, 246, 255, 0.62); font-size: 11px; }"
@@ -20511,24 +20521,20 @@ Admin elevation
         self._spotify_connect_pill = pill
         return pill
 
-    def _ensure_spotify_connect_pill_fade(self) -> tuple:
+    def _ensure_spotify_connect_pill_fade(self) -> "QPropertyAnimation":
         pill = self._ensure_spotify_connect_pill()
-        effect = self._spotify_connect_pill_fade_effect
         anim = self._spotify_connect_pill_fade_anim
-        if effect is None:
-            effect = QGraphicsOpacityEffect(pill)
-            effect.setOpacity(1.0)
-            pill.setGraphicsEffect(effect)
-            self._spotify_connect_pill_fade_effect = effect
         if anim is None:
-            anim = QPropertyAnimation(effect, b"opacity", self)
-            anim.setDuration(900)
+            # Top-level translucent window → fade via windowOpacity (a
+            # QGraphicsOpacityEffect fights WA_TranslucentBackground).
+            anim = QPropertyAnimation(pill, b"windowOpacity", self)
+            anim.setDuration(700)
             anim.setStartValue(1.0)
             anim.setEndValue(0.0)
             anim.setEasingCurve(QEasingCurve.InOutQuad)
             anim.finished.connect(self._on_spotify_connect_pill_fade_done)
             self._spotify_connect_pill_fade_anim = anim
-        return effect, anim
+        return anim
 
     def _show_spotify_connect_pill(self) -> None:
         # Don't nag users who have already connected (defensive — the worker
@@ -20541,15 +20547,23 @@ Admin elevation
         except Exception:
             pass
         pill = self._ensure_spotify_connect_pill()
-        effect, anim = self._ensure_spotify_connect_pill_fade()
+        anim = self._ensure_spotify_connect_pill_fade()
         if anim is not None and anim.state() == QPropertyAnimation.Running:
             anim.stop()
-        if effect is not None:
-            effect.setOpacity(1.0)
+        pill.setWindowOpacity(1.0)
         pill.adjustSize()
         self._position_spotify_connect_pill()
-        pill.setVisible(True)
-        pill.raise_()
+        pill.show()
+        import sys as _sys
+        if _sys.platform != "darwin":
+            # raise_() activates the app on macOS (steals focus from Spotify);
+            # apply_overlay orders it front non-activating and keeps it clickable.
+            pill.raise_()
+        try:
+            from .native_overlay import apply_overlay
+            apply_overlay(pill)
+        except Exception:
+            pass
         timer = self._spotify_connect_pill_hide_timer
         if timer is None:
             timer = QTimer(self)
@@ -20578,18 +20592,24 @@ Admin elevation
         if pill is None:
             return
         pill.adjustSize()
-        margin_bottom = 32
-        x = max(8, (self.width() - pill.width()) // 2)
-        y = max(8, self.height() - pill.height() - margin_bottom)
+        try:
+            from PySide6.QtGui import QGuiApplication
+            geo = QGuiApplication.primaryScreen().availableGeometry()
+        except Exception:
+            return
+        # Bottom-center of the SCREEN (availableGeometry already excludes the
+        # menu bar / Dock), with a small gap above the Dock.
+        x = geo.center().x() - pill.width() // 2
+        y = geo.bottom() - pill.height() - 48
         pill.move(x, y)
 
     def _fade_spotify_connect_pill(self) -> None:
         pill = self._spotify_connect_pill
         if pill is None or not pill.isVisible():
             return
-        effect, anim = self._ensure_spotify_connect_pill_fade()
+        anim = self._ensure_spotify_connect_pill_fade()
         if anim is None:
-            pill.setVisible(False)
+            pill.hide()
             return
         if anim.state() == QPropertyAnimation.Running:
             anim.stop()
@@ -20597,11 +20617,10 @@ Admin elevation
 
     def _on_spotify_connect_pill_fade_done(self) -> None:
         pill = self._spotify_connect_pill
-        effect = self._spotify_connect_pill_fade_effect
-        if pill is None or effect is None:
+        if pill is None:
             return
-        if effect.opacity() <= 0.001:
-            pill.setVisible(False)
+        if pill.windowOpacity() <= 0.01:
+            pill.hide()
 
     def start_engine(self, checked: bool = False, skip_tutorial_prompt: bool = False) -> None:
             # Diagnostic trace — written to stderr (same stream as
