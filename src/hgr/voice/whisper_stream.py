@@ -34,6 +34,14 @@ _MIN_SPEECH_MS = 500
 _RMS_SILENCE_THRESHOLD = 0.003
 _MODEL_ID = "deepdml/faster-whisper-large-v3-turbo-ct2"
 
+# Kill switch for live dictation hypotheses (interim results). Consumed by
+# app.integration.noop_engine (imported as _DICTATION_HYP_ENABLED). Set
+# HGR_DICTATION_HYPOTHESES=0 to disable. Defined here so the module stays
+# self-consistent with its importers — the committed code (both main and this
+# branch) imports this name but the full dictation-streaming revamp that also
+# defines it currently lives only in the Windows working tree.
+_HYP_ENABLED = os.getenv("HGR_DICTATION_HYPOTHESES", "1").strip() != "0"
+
 # Hotwords bias the decoder toward listed terms. A tech-heavy
 # default list used to live here, but it was net-negative for
 # natural prose dictation: when the user said something acoustically
