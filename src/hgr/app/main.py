@@ -283,6 +283,31 @@ def main() -> int:
         return w
 
     TouchlessSplash.run_with(_build_window, config.accent_color, app)
+
+    # HGR_PROFILE=1: profile the MAIN THREAD for the whole session and dump the
+    # hottest functions on quit. This attributes the per-frame event-loop time
+    # (timer _tick, queued signal receivers, paints) that the [lite_mode/timing]
+    # stages don't cover — used to find the macOS fps cap. Zero cost when off.
+    import os as _os
+    if _os.environ.get("HGR_PROFILE") == "1":
+        import cProfile
+        import io as _io
+        import pstats
+        _pr = cProfile.Profile()
+        _pr.enable()
+        try:
+            _rc = app.exec()
+        finally:
+            _pr.disable()
+            try:
+                _buf = _io.StringIO()
+                pstats.Stats(_pr, stream=_buf).sort_stats("tottime").print_stats(35)
+                sys.stderr.write("\n===== HGR_PROFILE: main-thread, top 35 by tottime =====\n")
+                sys.stderr.write(_buf.getvalue())
+                sys.stderr.flush()
+            except Exception:
+                pass
+        return _rc
     return app.exec()
 
 # Author: Konstantin Markov
