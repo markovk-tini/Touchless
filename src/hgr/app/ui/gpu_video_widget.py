@@ -317,6 +317,7 @@ class GpuVideoWidget(QWidget):
         # already GPU-accelerated. drawImage with Format_BGR888
         # uploads to a texture and samples on the GPU; no CPU
         # colour conversion needed.
+        _pt0 = time.perf_counter()
         painter = QPainter(self)
         # macOS: the frame is pre-scaled to ~1:1 in update_frame, so smooth
         # transform buys nothing and the CPU raster engine makes it costly —
@@ -354,22 +355,33 @@ class GpuVideoWidget(QWidget):
         painter.end()
         # Paint-rate diagnostic. Prints actual on-screen update
         # rate every 2 s so we can confirm whether the display is
-        # tracking the worker's emit rate or coalescing.
+        # tracking the worker's emit rate or coalescing. Also reports
+        # avg paintEvent cost + widget/backing size + dpr so a slow
+        # macOS paint can be attributed to destination size.
         self._paint_count += 1
+        self._paint_ms_accum = getattr(self, "_paint_ms_accum", 0.0) + (time.perf_counter() - _pt0) * 1000.0
         now = time.monotonic()
         if self._paint_log_at == 0.0:
             self._paint_log_at = now
         elif now - self._paint_log_at >= 2.0:
             rate = self._paint_count / (now - self._paint_log_at)
+            avg_ms = self._paint_ms_accum / max(1, self._paint_count)
+            try:
+                dpr = float(self.devicePixelRatioF() or 1.0)
+            except Exception:
+                dpr = 1.0
+            img_dims = f"{self._image_w}x{self._image_h}" if self._image is not None else "none"
             try:
                 sys.stderr.write(
-                    f"[gpu_video] paint rate: {rate:.1f} fps "
-                    f"(widget={self.objectName() or type(self).__name__})\n"
+                    f"[gpu_video] paint rate: {rate:.1f} fps avg={avg_ms:.1f}ms "
+                    f"widget={self.width()}x{self.height()} dpr={dpr:.1f} img={img_dims} "
+                    f"(name={self.objectName() or type(self).__name__})\n"
                 )
                 sys.stderr.flush()
             except Exception:
                 pass
             self._paint_count = 0
+            self._paint_ms_accum = 0.0
             self._paint_log_at = now
 
     def _aspect_target(self) -> QRect:
