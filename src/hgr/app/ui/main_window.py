@@ -46,7 +46,6 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleOptionComboBox,
     QStylePainter,
-    QProgressDialog,
     QVBoxLayout,
     QWidget,
     QSizePolicy,
@@ -14149,69 +14148,48 @@ class MainWindow(QMainWindow):
         worker = getattr(self, "_worker", None)
         if worker is None or not hasattr(worker, "set_gpu_mode"):
             return
-        # C26 UX: GPU Mode toggle triggers a ~2 s camera-path swap
-        # (OpenCV ↔ ffmpeg-MJPG on Windows: old-cap release + DShow
-        # settle + ffmpeg subprocess boot + first-frame wait). During
-        # that window the video widget's raw_frame_ready pipeline is
-        # paused, so the widget keeps repainting its last cached
-        # frame — the user sees a frozen video.
+        # C28 UX: use the Touchless-branded ProcessingOverlay pill
+        # (bottom-center, blue translucent, teal border) with its
+        # built-in loading bar for the GPU Mode swap. Same visual
+        # family as VoiceStatusOverlay and the "Starting Touchless"
+        # splash, so the user reads them all as one system.
         #
-        # C25's original attempt (processing_overlay pill) failed
-        # because ProcessingOverlay is a 220x88 Qt.Tool window
-        # anchored to the bottom-center of the screen — it never
-        # actually covered the live-view widget. Frozen frame was
-        # still visible behind and around the pill.
+        # ProcessingOverlay handles progress-bar animation internally:
+        # an idle-creep pushes the bar forward at ~5%/s (capped at
+        # 92%) during the swap, then complete_and_hide() smoothly
+        # fills to 100% and dismisses.
         #
-        # C26 fix: use a QProgressDialog with an indeterminate
-        # progress bar. Qt manages placement (centered on the main
-        # window), Cancel button suppressed, WindowModal so the user
-        # can't stack rapid mode toggles mid-swap. The dialog covers
-        # the mode-toggle button area and gives clear "something is
-        # happening" feedback without pretending to hide the video —
-        # which the workflow adversarial-review noted is a footgun on
-        # PySide6 due to Qt.Tool → child reparent silently dropping
-        # window flags.
-        dialog = None
+        # The pill lives at bottom-center of the screen, not over the
+        # video widget, so the video keeps painting its last frame
+        # during the swap. The C27 resolution drop (1280×720 → 640×480)
+        # already killed the persistent lag, so covering the video
+        # isn't necessary — the pill just tells the user "GPU Mode
+        # is loading" and dismisses when the pipeline is fresh.
+        label = "Loading GPU Mode" if self.config.gpu_mode else "Restoring Default Mode"
         try:
-            label = "Loading GPU Mode…" if self.config.gpu_mode else "Restoring Default Mode…"
-            dialog = QProgressDialog(label, "", 0, 0, self)
-            dialog.setWindowTitle("Touchless")
-            dialog.setWindowModality(Qt.WindowModal)
-            dialog.setCancelButton(None)
-            # Kill the auto-close-after-1s progress dialog default.
-            dialog.setAutoClose(False)
-            dialog.setAutoReset(False)
-            # Show and force a paint before the blocking call.
-            dialog.setMinimumDuration(0)
-            dialog.show()
-            QApplication.processEvents()
+            self.processing_overlay.show_processing(label)
         except Exception:
-            dialog = None
-        # Run the actual mode swap. This blocks the main thread for
-        # up to ~2 s while ffmpeg subprocess boots + first frame
-        # lands. QProgressDialog's own indeterminate spinner keeps
-        # animating because it's driven by its own internal timer.
+            pass
         try:
             worker.set_gpu_mode(self.config.gpu_mode)
         except Exception:
             pass
-        # Extended close delay: covers the post-swap ffmpeg-reader
-        # backlog drain (the reader has been reading buffered frames
-        # from ffmpeg's rtbuf during startup, so the first few reads
-        # deliver frames that were captured DURING the swap — old
-        # data). 800 ms lets the pipeline reach fresh content before
-        # the dialog dismisses, matching the adversarial verifier's
-        # 600-1200 ms recommendation from the C26 workflow.
-        def _close():
+        # Delay the "complete" call so the bar's fill animation and
+        # the post-swap ffmpeg-reader drain window both finish before
+        # the pill hides. 700 ms lets the fresh frame land in the
+        # widget first, matching C26's tuning.
+        def _finish():
             try:
-                if dialog is not None:
-                    dialog.close()
+                self.processing_overlay.complete_and_hide()
             except Exception:
-                pass
+                try:
+                    self.processing_overlay.hide_processing()
+                except Exception:
+                    pass
         try:
-            QTimer.singleShot(800, _close)
+            QTimer.singleShot(700, _finish)
         except Exception:
-            _close()
+            _finish()
 
 
     def _build_microphone_panel(self) -> QWidget:
