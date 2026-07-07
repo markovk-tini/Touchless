@@ -5486,6 +5486,22 @@ class GestureWorker(QObject):
         # for paint events to be processed. The 15 ms periodic
         # timer naturally interleaves paint dispatch and worker
         # execution, which is what keeps the live view smooth.
+        #
+        # macOS EXCEPTION: re-enable the tight self-schedule here. The
+        # original paint-starve came from expensive 720p paints; on macOS
+        # paint is now ~0.4 ms (pre-downscaled) AND the main thread is no
+        # longer hogged by the clip-cache screen grab, so firing the next
+        # tick immediately (instead of waiting up to 15 ms for the timer)
+        # shaves that wait off input latency. It doesn't busy-spin: the next
+        # frame's ~16-27 ms inference round-trip runs on the runner thread,
+        # leaving the event loop idle for paint/input between ticks. The
+        # runner's own back-pressure (busy/pending) drops duplicate submits,
+        # so no wasted inference. Windows keeps the periodic-timer pacing.
+        if sys.platform == "darwin" and self._running:
+            try:
+                QTimer.singleShot(0, self._tick)
+            except Exception:
+                pass
 
     def _handle_volume_control(self, result, now: float, *, hand_handedness: str | None) -> None:
         # Tutorial isolation: volume + mute go through the
