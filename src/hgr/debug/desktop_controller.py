@@ -2841,6 +2841,62 @@ try {
         except Exception:
             return False
 
+    def _mac_osascript(self, script: str) -> tuple[bool, str]:
+        """Run an AppleScript snippet. Returns (ok, output). ok is False when
+        osascript exits non-zero (e.g. Accessibility permission not granted) or
+        the script caught an error and returned an 'ERR:' sentinel."""
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=4,
+            )
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        out = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        if result.returncode != 0:
+            return False, err or out or "osascript failed"
+        if out.startswith("ERR:"):
+            return False, out
+        return True, out
+
+    def _mac_window_action(self, body: str) -> tuple[bool, str]:
+        """Wrap an Accessibility statement in a System Events 'front app' tell
+        block. `frontApp` binds to the frontmost application process — which,
+        because Touchless overlays are non-activating, is the app the user is
+        controlling. Errors (missing Accessibility grant, no window) are caught
+        and surfaced as an 'ERR:<num>:<msg>' sentinel."""
+        script = (
+            'tell application "System Events"\n'
+            '  set frontApp to first application process whose frontmost is true\n'
+            '  try\n'
+            f'    {body}\n'
+            '  on error errMsg number errNum\n'
+            '    return "ERR:" & errNum & ":" & errMsg\n'
+            '  end try\n'
+            'end tell\n'
+            'return "OK"'
+        )
+        return self._mac_osascript(script)
+
+    def _mac_visible_frame(self) -> tuple[int, int, int, int] | None:
+        """Main screen's visible frame (excludes menu bar + Dock) in AppleScript
+        top-left coordinates. Single-display assumption (laptop); multi-monitor
+        maximize targeting is deferred."""
+        try:
+            from AppKit import NSScreen
+            screen = NSScreen.mainScreen()
+            if screen is None:
+                return None
+            vis = screen.visibleFrame()
+            full = screen.frame()
+            x = int(vis.origin.x)
+            # NSScreen uses a bottom-left origin; AppleScript uses top-left.
+            y = int(full.size.height - (vis.origin.y + vis.size.height))
+            return x, y, int(vis.size.width), int(vis.size.height)
+        except Exception:
+            return None
+
     def _build_mac_catalog(self) -> list[DesktopAppEntry]:
         """Scan the standard macOS application directories for *.app bundles and
         build the resolver catalog (used for spoken-name matching + hints)."""
@@ -2917,6 +2973,12 @@ try {
 
 
     def minimize_active_window(self) -> bool:
+        if self._mac:
+            ok, out = self._mac_window_action(
+                'set value of attribute "AXMinimized" of front window of frontApp to true'
+            )
+            self._message = "minimized active window" if ok else f"could not minimize window ({out})"
+            return ok
         if not self._win:
             self._message = "window minimize unavailable on this platform"
             return False
@@ -2932,6 +2994,28 @@ try {
         return False
 
     def maximize_active_window(self) -> bool:
+        if self._mac:
+            # macOS has no "maximize" state — fill the screen's visible frame
+            # (matches the Windows fill behavior, avoids the zoom-vs-fullscreen
+            # ambiguity of pressing the green button). Falls back to the native
+            # AXZoomButton if the screen frame can't be resolved.
+            frame = self._mac_visible_frame()
+            if frame is not None:
+                x, y, w, h = frame
+                body = (
+                    'tell (front window of frontApp)\n'
+                    f'      set position to {{{x}, {y}}}\n'
+                    f'      set size to {{{w}, {h}}}\n'
+                    '    end tell'
+                )
+            else:
+                body = (
+                    'perform action "AXPress" of '
+                    '(first button of front window of frontApp whose subrole is "AXZoomButton")'
+                )
+            ok, out = self._mac_window_action(body)
+            self._message = "maximized active window" if ok else f"could not maximize window ({out})"
+            return ok
         if not self._win:
             self._message = "window maximize unavailable on this platform"
             return False
@@ -2947,6 +3031,14 @@ try {
         return False
 
     def restore_active_window(self) -> bool:
+        if self._mac:
+            # Un-minimize the front window (macOS has no maximized state to
+            # restore from). Harmless no-op if the window isn't minimized.
+            ok, out = self._mac_window_action(
+                'set value of attribute "AXMinimized" of front window of frontApp to false'
+            )
+            self._message = "restored active window" if ok else f"could not restore window ({out})"
+            return ok
         if not self._win:
             self._message = "window restore unavailable on this platform"
             return False
@@ -2962,6 +3054,16 @@ try {
         return False
 
     def close_active_window(self) -> bool:
+        if self._mac:
+            # Press the window's red close button (AXCloseButton) — the direct
+            # analog of Windows' WM_CLOSE (closes the window, doesn't force-quit
+            # the app).
+            ok, out = self._mac_window_action(
+                'perform action "AXPress" of '
+                '(first button of front window of frontApp whose subrole is "AXCloseButton")'
+            )
+            self._message = "closed active window" if ok else f"could not close window ({out})"
+            return ok
         if not self._win:
             self._message = "window close unavailable on this platform"
             return False
@@ -2977,6 +3079,21 @@ try {
         return False
 
     def close_named_window(self, app_name: str) -> bool:
+        if self._mac:
+            spoken = " ".join((app_name or "").split()).strip()
+            if not spoken:
+                return self.close_active_window()
+            # Resolve the spoken query to the real .app display name (so
+            # 'chrome' -> 'Google Chrome'), then quit it — closing all its
+            # windows. Falls back to the raw spoken name if unresolved.
+            resolved = self._resolve_application(spoken)
+            target_name = resolved.display_name if resolved is not None else spoken
+            ok, out = self._mac_osascript(f'tell application "{target_name}" to quit')
+            if ok:
+                self._message = f"closed app: {target_name}"
+                return True
+            self._message = f"could not close app: {target_name} ({out})"
+            return False
         if not self._win:
             self._message = "window close unavailable on this platform"
             return False
