@@ -14115,10 +14115,41 @@ class MainWindow(QMainWindow):
         worker = getattr(self, "_worker", None)
         if worker is None or not hasattr(worker, "set_lite_mode"):
             return
+        # C29: same Touchless-pill loading UX as GPU Mode (C28). Lite
+        # mode's swap is much faster than GPU's — C24 keeps Lite on
+        # the same OpenCV camera path as Default so there's no
+        # camera-swap wall time, and the engine build is ~5 ms via
+        # the C17 cache HIT or ~500 ms on the first miss. Even
+        # though the operation is quick, showing the pill briefly
+        # gives the user consistent visual feedback ("something
+        # is happening") across all mode toggles — same visual
+        # language as GPU Mode's swap, just a shorter total
+        # lifetime.
+        label = "Loading Lite Mode" if self.config.lite_mode else "Restoring Default Mode"
+        try:
+            self.processing_overlay.show_processing(label)
+        except Exception:
+            pass
         try:
             worker.set_lite_mode(self.config.lite_mode)
         except Exception:
             pass
+        # Shorter delay than GPU (C28 uses 700 ms) since there's no
+        # ffmpeg pipeline drain to wait through. 300 ms lets the
+        # first engine result land + gives the bar's fill animation
+        # a chance to visibly progress before dismissing.
+        def _finish():
+            try:
+                self.processing_overlay.complete_and_hide()
+            except Exception:
+                try:
+                    self.processing_overlay.hide_processing()
+                except Exception:
+                    pass
+        try:
+            QTimer.singleShot(300, _finish)
+        except Exception:
+            _finish()
 
     def _refresh_gpu_mode_button_label(self) -> None:
         if not hasattr(self, "gpu_mode_button"):
