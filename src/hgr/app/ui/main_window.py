@@ -24512,6 +24512,27 @@ Admin elevation
     def _start_clip_cache(self) -> bool:
         if self._ffmpeg_ready() and self._start_clip_cache_ffmpeg():
             return True
+        if sys.platform == "darwin":
+            # macOS: the OpenCV fallback below records the screen every 50 ms via
+            # QScreen.grabWindow() on the MAIN THREAD (~19 ms/grab) + a synchronous
+            # cv2.VideoWriter.write. Because the clip cache is a CONTINUOUS rolling
+            # buffer (started automatically at engine start), that saturated the GUI
+            # thread and throttled the whole gesture loop to ~15 fps (profiled:
+            # grabWindow 10.5 s + VideoWriter 3.3 s of a 107 s session). Windows uses
+            # native GDI BitBlt off the hot path; macOS has no cheap main-thread grab.
+            # Gesture control is the priority, so skip the main-thread capture here.
+            # Instant-clip / screen-recording on macOS needs an OFF-thread capture
+            # (ffmpeg -f avfoundation screen input, or ScreenCaptureKit) — tracked
+            # as a follow-up; see docs/MACOS_PORT.md.
+            try:
+                sys.stderr.write(
+                    "[clip-cache] disabled on macOS (main-thread grabWindow capture "
+                    "would throttle the gesture loop; needs off-thread screen capture)\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return False
         if self._clip_cache_segment_writer is not None and self._clip_cache_timer.isActive():
             return True
         region = self._normalized_record_region(self._screens_union_geometry())
