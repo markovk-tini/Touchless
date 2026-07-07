@@ -5871,13 +5871,16 @@ class GestureWorker(QObject):
             elif action_id == "play_pause":
                 try:
                     if sys.platform == "darwin":
-                        # macOS: the Spotify Web-API controller is Windows-only,
-                        # so play/pause goes through the OS media key — it
-                        # controls whatever owns Now Playing (Apple Music, the
-                        # Spotify app, a browser video), matching the "pause or
-                        # play whatever's playing" intent of the fist gesture.
-                        from ...platform_compat import mac_input
-                        fired = mac_input.media_play_pause()
+                        # macOS: control the Spotify app directly via AppleScript
+                        # when it's running (reliable, and matches the Windows
+                        # fist, which is Spotify-specific). Fall back to the OS
+                        # media key for other players when Spotify isn't running.
+                        if self.spotify_controller.is_running():
+                            self.spotify_controller.dispatch_async(self.spotify_controller.toggle_playback)
+                            fired = True
+                        else:
+                            from ...platform_compat import mac_input
+                            fired = mac_input.media_play_pause()
                     else:
                         self.spotify_controller.dispatch_async(self.spotify_controller.toggle_playback)
                         fired = True

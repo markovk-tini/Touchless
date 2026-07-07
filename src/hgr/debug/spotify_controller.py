@@ -102,7 +102,12 @@ class SpotifyController:
         request_timeout_seconds: float = 5.0,
     ) -> None:
         self._request_timeout_seconds = float(request_timeout_seconds)
-        self._available = platform.system() == "Windows"
+        _system = platform.system()
+        # macOS controls the Spotify DESKTOP APP directly via AppleScript
+        # (no OAuth/Web API) — available whenever Spotify.app is installed.
+        # Windows keeps the Web-API path. Everything else stays unavailable.
+        self._mac = _system == "Darwin"
+        self._available = self._detect_mac_spotify_installed() if self._mac else (_system == "Windows")
         self._message = "spotify idle"
         self._client_id: str | None = None
         self._client_secret: str | None = None
@@ -171,7 +176,152 @@ class SpotifyController:
         already authorised in a previous run."""
         return bool(self._refresh_token) or bool(self._access_token)
 
+    # ---- macOS: control the Spotify desktop app via AppleScript ----------
+    # The macOS Spotify app is natively scriptable, so no OAuth/Web API is
+    # needed. Every property read/tell auto-LAUNCHES Spotify, so each script
+    # guards with `if application "Spotify" is running` first; only that query
+    # and `open -a` are launch-safe. Fields are joined with ASCII unit
+    # separator (0x1F) — it never appears in track metadata.
+    _MAC_SEP = "\x1f"
+
+    def _mac_osascript(self, script: str, timeout: float = 4.0) -> tuple[bool, str, str]:
+        """Run one AppleScript. Returns (ok, stdout_stripped, stderr_stripped)."""
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        except Exception as exc:
+            return False, "", f"{type(exc).__name__}: {exc}"
+        return (proc.returncode == 0), (proc.stdout or "").strip(), (proc.stderr or "").strip()
+
+    def _detect_mac_spotify_installed(self) -> bool:
+        """True iff the Spotify app is installed. Filesystem-first (no side
+        effects); LaunchServices id lookup as a fallback (does NOT launch)."""
+        for candidate in (Path("/Applications/Spotify.app"), Path.home() / "Applications" / "Spotify.app"):
+            try:
+                if candidate.exists():
+                    return True
+            except Exception:
+                pass
+        ok, out, _ = self._mac_osascript('id of application "Spotify"')
+        return ok and out == "com.spotify.client"
+
+    def _mac_error_message(self, prefix: str, detail: str) -> str:
+        """Map the TCC Automation denial (-1743) to a one-time friendly hint."""
+        if "-1743" in detail or "Not authorized" in detail or "not allowed assistive" in detail:
+            return f"{prefix}: allow Touchless to control Spotify in System Settings > Privacy & Security > Automation"
+        return prefix
+
+    def _mac_transport(self, command: str, *, launch: bool = False) -> bool:
+        """Send a transport verb (playpause/play/pause/next track/previous
+        track). launch=True opens+focuses Spotify first (for explicit play)."""
+        if launch and not self.is_running():
+            try:
+                subprocess.run(["open", "-a", "Spotify"], capture_output=True, text=True, timeout=8.0, check=False)
+            except Exception:
+                pass
+            for _ in range(20):  # ~2s for Spotify to accept Apple Events
+                ok, out, _ = self._mac_osascript('application "Spotify" is running')
+                if ok and out == "true":
+                    break
+                time.sleep(0.1)
+        script = (
+            'if application "Spotify" is running then\n'
+            f'\ttell application "Spotify" to {command}\n'
+            'end if'
+        )
+        ok, _out, err = self._mac_osascript(script)
+        if not ok:
+            self._message = self._mac_error_message("spotify control failed", err)
+        return ok
+
+    def _mac_player_state(self) -> dict[str, Any] | None:
+        """Synthesize the Web-API-shaped /me/player dict from one guarded
+        AppleScript call, so get_playback_state/get_current_track_details/
+        get_volume all work unchanged. None when Spotify isn't running."""
+        sep = self._MAC_SEP
+        script = (
+            'if application "Spotify" is not running then\n'
+            '\treturn "not-running"\n'
+            'end if\n'
+            'tell application "Spotify"\n'
+            f'\tset d to (character id 31)\n'
+            '\tif player state is playing then\n'
+            '\t\tset st to "playing"\n'
+            '\telse if player state is paused then\n'
+            '\t\tset st to "paused"\n'
+            '\telse\n'
+            '\t\tset st to "stopped"\n'
+            '\tend if\n'
+            '\tset shuf to (shuffling as text)\n'
+            '\tset rep to (repeating as text)\n'
+            '\tset vol to (sound volume as text)\n'
+            '\tif player state is stopped then\n'
+            '\t\treturn st & d & "" & d & "" & d & "" & d & "" & d & "" & d & shuf & d & rep & d & "0" & d & vol\n'
+            '\tend if\n'
+            '\tset t to current track\n'
+            '\treturn st & d & (name of t) & d & (artist of t) & d & (album of t) & d & ((duration of t) as text) & d & (spotify url of t) & d & shuf & d & rep & d & ((player position) as text) & d & vol\n'
+            'end tell'
+        )
+        ok, out, err = self._mac_osascript(script)
+        if not ok:
+            self._message = self._mac_error_message("spotify not reachable", err)
+            return None
+        if out == "not-running":
+            self._message = "spotify not running"
+            return None
+        parts = out.split(sep)
+        if len(parts) < 10:
+            return None
+        state, name, artist, album, dur, uri, shuf, rep, pos, vol = parts[:10]
+
+        def _to_int(text: str):
+            try:
+                return int(float(text))
+            except (ValueError, TypeError):
+                return None
+
+        volume_percent = _to_int(vol)
+        player: dict[str, Any] = {
+            "is_playing": state == "playing",
+            "shuffle_state": (shuf == "true"),
+            # AppleScript `repeating` is a plain bool; map to the Web-API vocab
+            # (no track-vs-context distinction available on the desktop app).
+            "repeat_state": ("context" if rep == "true" else "off"),
+            "device": {"name": "This Mac", "type": "Computer", "volume_percent": volume_percent},
+            "context": {},
+            "progress_ms": (int(float(pos) * 1000) if pos not in ("", "0") and _to_int(pos) is not None else (0 if pos == "0" else None)),
+            "item": (
+                {
+                    "name": name,
+                    "artists": [{"name": artist}] if artist else [],
+                    "album": {"name": album},
+                    "duration_ms": _to_int(dur),
+                    "uri": uri,
+                }
+                if name
+                else {}
+            ),
+        }
+        self._message = "spotify track info"
+        return player
+
     def ensure_ready(self, *, open_if_needed: bool = False) -> bool:
+        if self._mac:
+            if self.is_running():
+                return True
+            if open_if_needed:
+                try:
+                    subprocess.run(["open", "-a", "Spotify"], capture_output=True, text=True, timeout=8.0, check=False)
+                except Exception:
+                    pass
+                for _ in range(20):
+                    if self.is_running():
+                        return True
+                    time.sleep(0.1)
+            self._message = "spotify not running"
+            return False
         if not self._available:
             self._message = "spotify unavailable on this platform"
             return False
@@ -203,6 +353,25 @@ class SpotifyController:
         return True
 
     def launch_spotify(self, *, hidden: bool) -> bool:
+        if self._mac:
+            # `open -g -a` launches in the background (no focus steal) for the
+            # tutorial hidden path; `open -a` foregrounds it otherwise.
+            args = ["open", "-g", "-a", "Spotify"] if hidden else ["open", "-a", "Spotify"]
+            try:
+                proc = subprocess.run(args, capture_output=True, text=True, timeout=8.0, check=False)
+            except Exception:
+                self._message = "spotify launch failed"
+                return False
+            if proc.returncode != 0:
+                self._message = "spotify launch failed"
+                return False
+            for _ in range(20):
+                if self.is_running():
+                    self._message = "launching spotify"
+                    return True
+                time.sleep(0.1)
+            self._message = "launching spotify"
+            return True
         # The launcher used to be a single-line subprocess.Popen on
         # whichever Spotify.exe path existed first — including the
         # 0-byte App Execution Alias stub at
@@ -330,6 +499,10 @@ class SpotifyController:
         window counts. is_running() is kept as-is for places that
         care about ANY spotify process (e.g. avoiding redundant
         launches in focus_or_open_window)."""
+        if self._mac:
+            # No cheap "has a visible window" check without Accessibility;
+            # a running Spotify app is the usable-for-control signal on mac.
+            return self.is_running()
         return bool(self._spotify_window_handles())
 
     def get_playback_state(self) -> bool | None:
@@ -339,6 +512,8 @@ class SpotifyController:
         return bool(player.get("is_playing"))
 
     def get_player_state(self) -> dict[str, Any] | None:
+        if self._mac:
+            return self._mac_player_state()
         if not self._ensure_authenticated():
             return None
         status, payload = self._request_json("GET", "/me/player")
@@ -353,6 +528,12 @@ class SpotifyController:
         return payload
 
     def toggle_playback(self) -> bool:
+        if self._mac:
+            # Atomic — no need to read state first.
+            if self._mac_transport("playpause"):
+                self._message = "spotify play/pause"
+                return True
+            return False
         playback_state = self.get_playback_state()
         if playback_state is True:
             return self.pause()
@@ -372,6 +553,11 @@ class SpotifyController:
         return {"device_id": self._device_id}
 
     def play(self) -> bool:
+        if self._mac:
+            if self._mac_transport("play", launch=True):
+                self._message = "spotify play"
+                return True
+            return False
         if not self.ensure_ready(open_if_needed=True):
             self._message = "spotify play failed (not ready)"
             return False
@@ -396,6 +582,11 @@ class SpotifyController:
         return False
 
     def pause(self) -> bool:
+        if self._mac:
+            if self._mac_transport("pause"):
+                self._message = "spotify pause"
+                return True
+            return False
         if not self.ensure_ready(open_if_needed=False):
             self._message = "spotify pause failed (not ready)"
             return False
@@ -413,6 +604,11 @@ class SpotifyController:
         return False
 
     def next_track(self) -> bool:
+        if self._mac:
+            if self._mac_transport("next track"):
+                self._message = "spotify next track"
+                return True
+            return False
         if not self.ensure_ready(open_if_needed=True):
             return False
         status, _ = self._request_json("POST", "/me/player/next", params=self._device_params())
@@ -423,6 +619,11 @@ class SpotifyController:
         return False
 
     def previous_track(self) -> bool:
+        if self._mac:
+            if self._mac_transport("previous track"):
+                self._message = "spotify previous track"
+                return True
+            return False
         if not self.ensure_ready(open_if_needed=True):
             return False
         status, _ = self._request_json("POST", "/me/player/previous", params=self._device_params())
@@ -433,6 +634,23 @@ class SpotifyController:
         return False
 
     def toggle_repeat_track(self) -> bool:
+        if self._mac:
+            # Desktop app has only on/off repeat (no track-vs-context).
+            script = (
+                'if application "Spotify" is not running then\n'
+                '\treturn "not-running"\n'
+                'end if\n'
+                'tell application "Spotify"\n'
+                '\tset repeating to (not repeating)\n'
+                '\treturn (repeating as text)\n'
+                'end tell'
+            )
+            ok, out, err = self._mac_osascript(script)
+            if not ok or out == "not-running":
+                self._message = self._mac_error_message("spotify not running", err) if not ok else "spotify not running"
+                return False
+            self._message = f"spotify repeat {'on' if out == 'true' else 'off'}"
+            return True
         player = self.get_player_state()
         current_mode = (player or {}).get("repeat_state")
         target_mode = "off" if current_mode == "track" else "track"
@@ -452,6 +670,22 @@ class SpotifyController:
         return False
 
     def toggle_shuffle(self) -> bool:
+        if self._mac:
+            script = (
+                'if application "Spotify" is not running then\n'
+                '\treturn "not-running"\n'
+                'end if\n'
+                'tell application "Spotify"\n'
+                '\tset shuffling to (not shuffling)\n'
+                '\treturn (shuffling as text)\n'
+                'end tell'
+            )
+            ok, out, err = self._mac_osascript(script)
+            if not ok or out == "not-running":
+                self._message = self._mac_error_message("spotify not running", err) if not ok else "spotify not running"
+                return False
+            self._message = f"spotify shuffle {'on' if out == 'true' else 'off'}"
+            return True
         player = self.get_player_state()
         if player is None and not self.ensure_ready(open_if_needed=True):
             return False
@@ -477,6 +711,18 @@ class SpotifyController:
 
     def set_volume(self, volume_percent: int) -> bool:
         volume_percent = max(0, min(100, int(volume_percent)))
+        if self._mac:
+            script = (
+                'if application "Spotify" is running then\n'
+                f'\ttell application "Spotify" to set sound volume to {volume_percent}\n'
+                'end if'
+            )
+            ok, _out, err = self._mac_osascript(script)
+            self._message = (
+                f"spotify volume {volume_percent}%" if ok
+                else self._mac_error_message("spotify volume set failed", err)
+            )
+            return ok
         if not self._ensure_authenticated():
             return False
         status, _ = self._request_json(
@@ -491,12 +737,21 @@ class SpotifyController:
         return False
 
     def is_window_active(self) -> bool:
+        if self._mac:
+            # Frontmost detection would need Accessibility and isn't required:
+            # every mac control verb is focus-independent.
+            return False
         handles = self._spotify_window_handles()
         if not handles:
             return False
         return self._foreground_window_handle() in handles
 
     def focus_or_open_window(self) -> bool:
+        if self._mac:
+            # `activate` both launches (if needed) and raises Spotify.
+            ok, _out, err = self._mac_osascript('tell application "Spotify" to activate')
+            self._message = "spotify focused" if ok else self._mac_error_message("spotify focus failed", err)
+            return ok
         if not self._available:
             self._message = "spotify unavailable on this platform"
             return False
@@ -597,6 +852,10 @@ class SpotifyController:
                 self._launch_in_flight = False
 
     def is_active_device_available(self) -> bool:
+        if self._mac:
+            # A running Spotify app IS the controllable device on mac. (Bypass
+            # the has_authorization/Web-API device probe entirely.)
+            return self.is_running()
         now = time.monotonic()
         if self._active_device_cache is not None and now < self._active_device_cache_until:
             return self._active_device_cache
@@ -750,6 +1009,9 @@ class SpotifyController:
         return self.play_search_request(request.query, preferred_types=request.preferred_types)
 
     def play_search_request(self, query: str, *, preferred_types: tuple[str, ...] | None = None) -> bool:
+        if self._mac:
+            self._message = "search-and-play isn't available for the macOS Spotify app"
+            return False
         normalized = re.sub(r"\s+", " ", str(query or "")).strip(" .!?")
         if len(normalized) < 2:
             self._message = "spotify play query missing"
@@ -789,6 +1051,9 @@ class SpotifyController:
         return False
 
     def add_current_track_to_queue(self) -> bool:
+        if self._mac:
+            self._message = "add-to-queue isn't available for the macOS Spotify app"
+            return False
         uri = self._current_track_uri()
         if not uri:
             self._message = "spotify track unavailable"
@@ -807,6 +1072,9 @@ class SpotifyController:
         return False
 
     def save_current_track(self) -> bool:
+        if self._mac:
+            self._message = "liking songs isn't available for the macOS Spotify app"
+            return False
         track_id = self._current_track_id()
         if not track_id:
             self._message = "spotify track unavailable"
@@ -819,6 +1087,9 @@ class SpotifyController:
         return False
 
     def remove_current_track_from_liked(self) -> bool:
+        if self._mac:
+            self._message = "unliking songs isn't available for the macOS Spotify app"
+            return False
         track_id = self._current_track_id()
         if not track_id:
             self._message = "spotify track unavailable"
@@ -831,6 +1102,9 @@ class SpotifyController:
         return False
 
     def add_current_track_to_playlist(self, playlist_name: str) -> bool:
+        if self._mac:
+            self._message = "playlist editing isn't available for the macOS Spotify app"
+            return False
         target = self._resolve_playlist_target(playlist_name)
         track_uri = self._current_track_uri()
         if target is None or not track_uri:
@@ -855,6 +1129,9 @@ class SpotifyController:
         return False
 
     def remove_current_track_from_current_playlist(self) -> bool:
+        if self._mac:
+            self._message = "playlist editing isn't available for the macOS Spotify app"
+            return False
         player = self.get_player_state()
         track_uri = self._current_track_uri()
         if not player or not track_uri:
@@ -883,6 +1160,9 @@ class SpotifyController:
         return False
 
     def remove_current_track_from_playlist(self, playlist_name: str) -> bool:
+        if self._mac:
+            self._message = "playlist editing isn't available for the macOS Spotify app"
+            return False
         target = self._resolve_playlist_target(playlist_name)
         track_uri = self._current_track_uri()
         if target is None or not track_uri:
@@ -905,6 +1185,9 @@ class SpotifyController:
         return False
 
     def create_playlist(self, name: str, *, public: bool = False) -> bool:
+        if self._mac:
+            self._message = "creating playlists isn't available for the macOS Spotify app"
+            return False
         clean = (name or "").strip()
         if not clean:
             self._message = "spotify playlist name missing"
@@ -1838,7 +2121,7 @@ class SpotifyController:
         return None
 
     def _foreground_window_handle(self) -> int | None:
-        if not self._available:
+        if not self._available or self._mac:
             return None
         try:
             foreground = ctypes.windll.user32.GetForegroundWindow()
@@ -1847,7 +2130,7 @@ class SpotifyController:
         return int(foreground) if foreground else None
 
     def _spotify_window_handles(self) -> list[int]:
-        if not self._available:
+        if not self._available or self._mac:
             return []
         now = time.monotonic()
         if now < self._handles_cache_until:
@@ -1943,7 +2226,7 @@ class SpotifyController:
         return handles
 
     def _activate_window_handle(self, hwnd: int) -> bool:
-        if not self._available:
+        if not self._available or self._mac:
             return False
         user32 = ctypes.windll.user32
         try:
