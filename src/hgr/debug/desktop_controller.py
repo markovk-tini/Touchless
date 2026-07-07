@@ -1862,6 +1862,14 @@ try {
         for name in FILE_SEARCH_ROOT_NAMES:
             path = home / name
             add_root(path)
+        if self._mac:
+            # macOS: video saves live in ~/Movies (FILE_SEARCH_ROOT_NAMES uses
+            # the Windows "Videos", which doesn't exist here), and Touchless
+            # historically saved clips directly in the home dir. Include both so
+            # the fast search finds ALL clips, plus /Applications for app files.
+            add_root(home / "Movies")
+            add_root(home)
+            add_root(Path("/Applications"))
         # Also include fixed-drive roots (C:\, D:\, ...) so top-level
         # folders outside the home tree (e.g. C:\HGR App v1.0.0) are
         # findable. These are scanned shallowly + system-dir-pruned in
