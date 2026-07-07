@@ -136,3 +136,65 @@ def backspace(count: int = 1) -> bool:
     for _ in range(max(0, int(count))):
         ok = tap("delete") and ok
     return ok
+
+
+# NX_KEYTYPE aux-control-button codes for system media control.
+NX_KEYTYPE_PLAY = 16
+NX_KEYTYPE_NEXT = 17
+NX_KEYTYPE_PREVIOUS = 18
+NX_KEYTYPE_FAST = 19
+NX_KEYTYPE_REWIND = 20
+
+
+def media_key(key_code: int) -> bool:
+    """Post a system media key (play/pause, next, previous, …) via the
+    NSSystemDefined aux-control-button event — the SAME event the physical
+    media keys emit, so it controls whatever app currently owns Now Playing
+    (Apple Music, the Spotify app, a browser video, …) rather than any one app.
+
+    `key_code` is one of the NX_KEYTYPE_* constants. Requires Accessibility
+    (like every CGEventPost here). Returns False if Quartz/AppKit is
+    unavailable or posting fails."""
+    if _q is None:
+        return False
+    try:
+        from AppKit import NSEvent  # type: ignore
+
+        ns_system_defined = 14  # NSEventType.systemDefined
+        aux_subtype = 8         # NX_SUBTYPE_AUX_CONTROL_BUTTONS
+        for down in (True, False):
+            # data1 encodes the key + its up/down state (0xA down, 0xB up);
+            # modifierFlags mirrors it in its high byte.
+            data1 = (int(key_code) << 16) | ((0xA if down else 0xB) << 8)
+            event = NSEvent.otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2_(
+                ns_system_defined,
+                (0.0, 0.0),
+                0xA00 if down else 0xB00,
+                0,
+                0,
+                None,
+                aux_subtype,
+                data1,
+                -1,
+            )
+            if event is None:
+                return False
+            cg_event = event.CGEvent()
+            if cg_event is None:
+                return False
+            _q.CGEventPost(_q.kCGHIDEventTap, cg_event)
+        return True
+    except Exception:
+        return False
+
+
+def media_play_pause() -> bool:
+    return media_key(NX_KEYTYPE_PLAY)
+
+
+def media_next() -> bool:
+    return media_key(NX_KEYTYPE_NEXT)
+
+
+def media_previous() -> bool:
+    return media_key(NX_KEYTYPE_PREVIOUS)
