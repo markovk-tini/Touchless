@@ -20459,18 +20459,21 @@ Admin elevation
 
     # ----- Spotify connect pill (bottom-center, has a Connect button) ------
 
-    def _ensure_spotify_connect_pill(self) -> "QFrame":
-        """Lazy-create the pill shown when the user opens Spotify by gesture or
-        voice without having connected the Web API. Message + a Connect button
-        (runs the same OAuth flow as Settings) + a hint pointing at the setup
-        wizard. Parented to the main window; matches the Touchless theme."""
+    def _ensure_spotify_connect_pill(self) -> "QWidget":
+        """Lazy-create the screen-bottom pill shown when the user opens Spotify
+        by gesture/voice without having connected the Web API. Message + a
+        Connect button (same OAuth flow as Settings) + a setup-wizard hint.
+        Top-level so it floats at the screen bottom-center like the other
+        Touchless pills."""
         pill = self._spotify_connect_pill
         if pill is not None:
             return pill
-        pill = QFrame(None)
-        pill.setObjectName("spotifyConnectPill")
-        # Top-level (parent=None) so it floats at the bottom-center of the
-        # SCREEN like the other Touchless pills, not clamped to the app window.
+        # A transparent top-level HOST wraps an opaque rounded CARD. Child
+        # frames paint their stylesheet fill reliably, whereas a translucent
+        # top-level QFrame renders see-through on macOS. Matches the other
+        # Touchless pop-up pills (solid navy + teal border).
+        pill = QWidget(None)
+        pill.setObjectName("spotifyConnectPillHost")
         pill.setWindowFlags(
             Qt.Tool
             | Qt.FramelessWindowHint
@@ -20479,44 +20482,49 @@ Admin elevation
         )
         pill.setAttribute(Qt.WA_TranslucentBackground, True)
         pill.setAttribute(Qt.WA_ShowWithoutActivating, True)
-        pill.setAttribute(Qt.WA_StyledBackground, True)
-        pill.setStyleSheet(
+        host = QVBoxLayout(pill)
+        host.setContentsMargins(0, 0, 0, 0)
+
+        card = QFrame(pill)
+        card.setObjectName("spotifyConnectPill")
+        card.setAttribute(Qt.WA_StyledBackground, True)
+        # Wide + short: the message + button share one row, hint below.
+        card.setFixedWidth(560)
+        card.setStyleSheet(
             "QFrame#spotifyConnectPill {"
-            "  background: rgba(15, 23, 42, 0.92);"
-            "  border: 1px solid rgba(29, 233, 182, 0.45);"
+            "  background: rgba(15, 23, 42, 0.96);"
+            "  border: 1px solid rgba(29, 233, 182, 0.5);"
             "  border-radius: 16px;"
             "}"
             "QLabel { color: #E5F6FF; background: transparent; }"
             "QLabel#spotifyConnectHint { color: rgba(229, 246, 255, 0.62); font-size: 11px; }"
             "QPushButton#spotifyConnectPillBtn {"
             "  background: #1DB954; color: #06210F; font-weight: 600;"
-            "  border: none; border-radius: 9px; padding: 7px 20px;"
+            "  border: none; border-radius: 9px; padding: 7px 18px;"
             "}"
             "QPushButton#spotifyConnectPillBtn:hover { background: #22D861; }"
         )
-        col = QVBoxLayout(pill)
-        col.setContentsMargins(18, 12, 18, 12)
-        col.setSpacing(8)
-        title = QLabel("If you want to connect your Spotify, click Connect below.")
+        col = QVBoxLayout(card)
+        col.setContentsMargins(20, 12, 20, 12)
+        col.setSpacing(7)
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(16)
+        title = QLabel("If you want to connect your Spotify, click Connect.")
         title.setWordWrap(True)
-        title.setMaximumWidth(420)
         title.setStyleSheet("font-size: 13px;")
-        col.addWidget(title)
+        top_row.addWidget(title, 1)
         connect_btn = QPushButton("Connect Spotify")
         connect_btn.setObjectName("spotifyConnectPillBtn")
         connect_btn.setCursor(Qt.PointingHandCursor)
         connect_btn.clicked.connect(self._on_spotify_connect_pill_clicked)
-        # Left-align the button under the text.
-        btn_row = QHBoxLayout()
-        btn_row.setContentsMargins(0, 0, 0, 0)
-        btn_row.addWidget(connect_btn)
-        btn_row.addStretch(1)
-        col.addLayout(btn_row)
+        top_row.addWidget(connect_btn, 0, Qt.AlignVCenter)
+        col.addLayout(top_row)
         hint = QLabel("You can also set this up in Settings → General → Spotify Set Up.")
         hint.setObjectName("spotifyConnectHint")
         hint.setWordWrap(True)
-        hint.setMaximumWidth(420)
         col.addWidget(hint)
+        host.addWidget(card)
         pill.setVisible(False)
         self._spotify_connect_pill = pill
         return pill
