@@ -4015,6 +4015,49 @@ class GestureWorker(QObject):
         return (low_fps, lite, gpu, fullscreen_suppress, stable_frames_cfg)
 
     def _swap_engine_safely(self) -> None:
+        # C23: reentrancy guard. _build_engine_guarded pumps Qt events
+        # during its future.wait() so the UI stays responsive when
+        # DirectML EP init takes 500-1000 ms. That pump also lets OTHER
+        # queued Qt signals dispatch — including the second half of a
+        # "mode preset" toggle (e.g. clicking a GPU-Mode button
+        # actually fires set_lite_mode(False) THEN set_gpu_mode(True),
+        # and the second one lands DURING the first swap's build wait).
+        # Without this guard, two _swap_engine_safely calls run in
+        # parallel, each spawning its own ThreadPoolExecutor + its own
+        # ort.InferenceSession(DirectML). The two DirectML session
+        # inits contend for the GPU adapter, roughly DOUBLING the total
+        # wall time and stalling the paint loop for ~1.5 s at the mode
+        # switch (which the user perceives as a 1-2 s delay every time
+        # they toggle GPU on). Coalesce: if a swap is already in flight
+        # when a new one is requested, record that a re-run is needed
+        # and return. When the in-flight swap finishes it re-invokes
+        # itself once with the (possibly updated) current config, and
+        # the C17 cache HIT branch collapses that second call to a
+        # constant-time no-op when the signature didn't change.
+        if getattr(self, "_swap_in_progress", False):
+            self._swap_pending_re_run = True
+            try:
+                sys.stderr.write(
+                    "[perf-mode] _swap_engine_safely coalesced (another swap "
+                    "in flight — will re-check config when it finishes)\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        self._swap_in_progress = True
+        try:
+            self._swap_engine_safely_impl()
+        finally:
+            self._swap_in_progress = False
+            if getattr(self, "_swap_pending_re_run", False):
+                self._swap_pending_re_run = False
+                # Recurse once. If config hasn't changed the C17 cache
+                # HIT / "already matches" branch returns immediately
+                # (single dict lookup + one signature compute).
+                self._swap_engine_safely()
+
+    def _swap_engine_safely_impl(self) -> None:
         # Build the new engine first, then hand it to the runner; the
         # runner's set_engine call acquires the engine lock, blocking
         # briefly until any in-flight inference returns. ONLY THEN is
@@ -4439,35 +4482,29 @@ class GestureWorker(QObject):
             )
             stable_frames = 1
         elif lite_active:
-            # Lite Mode: lite landmark model (~2.5x faster on CPU)
-            # + smaller inference frame, but keep Normal-mode
-            # confidence thresholds + full stable-frame requirement
-            # so gesture decisions still feel as solid as before.
-            #
-            # ALSO prefer_gpu=True even when the user hasn't toggled
-            # GPU mode explicitly. On a DirectML-capable system that
-            # routes inference through ONNX Runtime DirectML, which
-            # drops engine work from ~22 ms (MediaPipe XNNPACK CPU
-            # running the lite landmark model with a hand in frame)
-            # down to ~3-5 ms. Without this Lite mode "improves" on
-            # the no-hand path (palm-only, ~7 ms vs 27 ms normal)
-            # but REGRESSES on the with-hand path (22 ms lite-CPU vs
-            # 27 ms normal-CPU is barely a win, and the gesture loop
-            # feels laggier because tracking dwell on a present hand
-            # is where users actually notice frame rate). On systems
-            # without a DirectML-capable GPU, HandDetector falls back
-            # to MediaPipe CPU automatically — so this can't break
-            # anything; it just makes Lite mode actually live up to
-            # its name on the common case (modern Windows hardware
-            # with a usable GPU).
+            # Lite Mode (v1.1.7 C23): CPU-only. The previous version
+            # silently set prefer_gpu=True so Lite would use ONNX +
+            # DirectML on GPU-capable hardware — but that made two
+            # things worse:
+            #   1. Lite and GPU Mode became functionally identical on
+            #      the common case (both landed on DirectML with only
+            #      the inference-input width differing), so users saw
+            #      no meaningful difference when toggling between them.
+            #   2. Every switch INTO Lite paid the 500-1000 ms
+            #      ort.InferenceSession(DirectML) init on the Qt main
+            #      thread. The user perceived that as a 1-2 second
+            #      lag every time they toggled Lite. Confirmed via the
+            #      [perf-mode] engine-build elapsed=795ms log line.
+            # Now Lite = lite landmark model + narrower inference frame
+            # + CPU MediaPipe. Engine build is ~5 ms (MediaPipe init is
+            # cheap). Users who want the GPU acceleration should use
+            # GPU Mode explicitly. Matches user's stated intent for the
+            # mode topology: "Lite is a universal CPU-cost boost that
+            # works without a strong GPU."
             detector = HandDetector(
                 model_complexity=0,
                 max_process_width=self._LITE_MODE_PROCESS_WIDTH,
-                # Lite Mode's implicit prefer_gpu=True (see comment
-                # above) also gets suppressed when a fullscreen game
-                # is up — Step 2's adaptive GPU applies to any path
-                # that would otherwise ask for GPU inference.
-                prefer_gpu=not self._gpu_suppressed_for_fullscreen,
+                prefer_gpu=False,
             )
             stable_frames = max(2, self.config.stable_frames_required // 2)
         else:
