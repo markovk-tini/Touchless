@@ -27,7 +27,15 @@ class VolumeController:
         self._min_write_step = 0.003
         self._endpoint_id: str | None = None
         self._last_endpoint_check_time = 0.0
+        self._mac = platform.system() == "Darwin"
 
+        if self._mac:
+            # macOS: system output volume + mute via osascript (CoreAudio).
+            # Per-app volume has no public macOS API and stays unavailable
+            # (see docs/MACOS_PORT.md).
+            self._available = True
+            self._message = "Volume control ready."
+            return
         if platform.system() != "Windows":
             self._message = "Volume control is only supported on Windows."
             return
@@ -41,13 +49,54 @@ class VolumeController:
 
     @property
     def available(self) -> bool:
+        if self._mac:
+            return True
         return self._available and self._volume is not None
 
     @property
     def message(self) -> str:
         return self._message
 
+    # --- macOS system-volume helpers (osascript / CoreAudio) ----------------
+    def _mac_osascript(self, script: str) -> str | None:
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["osascript", "-e", script], capture_output=True, text=True, timeout=3
+            )
+            if result.returncode != 0:
+                return None
+            return (result.stdout or "").strip()
+        except Exception:
+            return None
+
+    def _mac_get_scalar(self) -> float | None:
+        out = self._mac_osascript("output volume of (get volume settings)")
+        try:
+            return max(0.0, min(1.0, float(out) / 100.0)) if out is not None else None
+        except Exception:
+            return None
+
+    def _mac_set_scalar(self, scalar: float) -> bool:
+        vol = int(round(max(0.0, min(1.0, float(scalar))) * 100))
+        return self._mac_osascript(f"set volume output volume {vol}") is not None
+
+    def _mac_get_muted(self) -> bool | None:
+        out = self._mac_osascript("output muted of (get volume settings)")
+        return out.strip().lower() == "true" if out is not None else None
+
+    def _mac_set_muted(self, muted: bool) -> bool:
+        return self._mac_osascript(
+            f"set volume output muted {'true' if muted else 'false'}"
+        ) is not None
+
     def get_level(self, *, prefer_cached: bool = True) -> float | None:
+        if self._mac:
+            level = self._mac_get_scalar()
+            if level is not None:
+                self._last_known_level = level
+            return level if level is not None else self._last_known_level
         self._refresh_default_endpoint_if_changed()
         for attempt in range(2):
             if not self.available:
@@ -70,6 +119,14 @@ class VolumeController:
         return self._last_known_level
 
     def nudge_system_volume_key(self, direction: int) -> bool:
+        if direction == 0:
+            return False
+        if self._mac:
+            current = self._mac_get_scalar()
+            if current is None:
+                current = self._last_known_level if self._last_known_level is not None else 0.5
+            step = 0.0625  # ~one macOS volume-key notch (1/16)
+            return self.set_level(current + (step if direction > 0 else -step))
         if platform.system() != "Windows" or direction == 0:
             return False
         try:
@@ -86,6 +143,12 @@ class VolumeController:
             return False
 
     def set_level(self, scalar: float) -> bool:
+        if self._mac:
+            scalar = max(0.0, min(1.0, float(scalar)))
+            ok = self._mac_set_scalar(scalar)
+            if ok:
+                self._last_known_level = scalar
+            return ok
         self._refresh_default_endpoint_if_changed()
         scalar = max(0.0, min(1.0, float(scalar)))
         min_write_step = float(getattr(self, "_min_write_step", 0.003))
@@ -121,6 +184,11 @@ class VolumeController:
         return False
 
     def get_mute(self, *, prefer_cached: bool = True) -> bool | None:
+        if self._mac:
+            muted = self._mac_get_muted()
+            if muted is not None:
+                self._last_known_muted = muted
+            return muted if muted is not None else self._last_known_muted
         self._refresh_default_endpoint_if_changed()
         for attempt in range(2):
             if not self.available:
@@ -143,6 +211,11 @@ class VolumeController:
         return self._last_known_muted
 
     def set_mute(self, muted: bool) -> bool:
+        if self._mac:
+            ok = self._mac_set_muted(bool(muted))
+            if ok:
+                self._last_known_muted = bool(muted)
+            return ok
         self._refresh_default_endpoint_if_changed()
         for attempt in range(2):
             if not self.available:
