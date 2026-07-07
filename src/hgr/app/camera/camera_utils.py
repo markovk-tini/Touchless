@@ -161,6 +161,22 @@ def try_open_camera(
                 _cam_log(f"open idx={index} backend={backend_name(backend)} -> NOT opened")
             return None
 
+        # macOS: cap the AVFoundation capture resolution BEFORE the first read.
+        # OpenCV's AVFoundation backend delivers the built-in camera's NATIVE
+        # resolution (1080p+) at only ~3 fps, which ceilings the entire gesture
+        # pipeline. Requesting 1280x720@30 up front negotiates a fast mode (the
+        # tracker downsamples anyway). macOS-only — Windows DSHOW/MSMF paths and
+        # their tuning are byte-for-byte unchanged.
+        if platform.system() == "Darwin":
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                if hasattr(cv2, "CAP_PROP_FPS"):
+                    cap.set(cv2.CAP_PROP_FPS, 30)
+                _cam_log(f"open idx={index}: requested 1280x720@30 (AVFoundation perf cap)")
+            except Exception:
+                pass
+
         for attempt in range(read_attempts):
             ok, _ = cap.read()
             if ok:

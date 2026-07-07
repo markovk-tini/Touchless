@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import queue
 import re
 import sys
@@ -806,6 +807,12 @@ class GestureWorker(QObject):
         self._last_chrome_action = "-"
         self._last_time = time.time()
         self._fps = 0.0
+        # macOS perf diagnostic: when HGR_PERF_LOG=1 the per-frame timing
+        # attribution ([lite_mode/timing] read/prep/engine/vol/app/wheel/
+        # overlay/emit ms) is emitted in ALL modes, not just Lite/GPU, so a
+        # 3-fps report on Mac can be attributed to capture vs paint vs
+        # inference without toggling a perf mode. Off by default → zero cost.
+        self._perf_log_enabled = os.getenv("HGR_PERF_LOG", "").strip() == "1"
         self._dynamic_hold_label = "neutral"
         self._dynamic_hold_until = 0.0
         # Last static / dynamic labels we emitted a `gesture_detected`
@@ -4792,7 +4799,7 @@ class GestureWorker(QObject):
         # so we can attribute fps drops to camera vs MediaPipe vs
         # downstream work. Lazy so non-debug callers pay no
         # clock-syscall cost.
-        debug_timing = self._perf_optimisations_enabled()
+        debug_timing = self._perf_optimisations_enabled() or self._perf_log_enabled
         t0 = time.perf_counter() if debug_timing else 0.0
         ok, frame = self._cap.read()
         t_read = time.perf_counter() if debug_timing else 0.0
