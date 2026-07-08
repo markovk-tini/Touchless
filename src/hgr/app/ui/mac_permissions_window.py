@@ -221,7 +221,11 @@ class MacPermissionsWizard(QDialog):
         # prompt. Once-per-process so reopening from Settings doesn't wipe grants
         # made this session. Never runs in a frozen/shipped build.
         global _reverted_this_process
-        if not getattr(sys, "frozen", False) and not _reverted_this_process:
+        if (
+            not getattr(sys, "frozen", False)
+            and not _reverted_this_process
+            and not os.environ.get("HGR_MAC_PERMS_NO_RESET")
+        ):
             revert_test_permissions()
             _reverted_this_process = True
 
@@ -530,26 +534,37 @@ class MacPermissionsWizard(QDialog):
                 pass
 
     def _restart_app(self) -> None:
-        """Relaunch the app so restart-gated grants activate. Detach a tiny
-        shell that waits for our PID to exit then reopens the bundle; then
-        quit. From source (no bundle) we can only quit — the dev relaunches."""
+        """Relaunch the app so restart-gated grants activate. Works for BOTH
+        the frozen .app (`open <bundle>`) and a source run (re-exec the
+        interpreter + argv — the mac dev launcher runs `python run_app.py`, so
+        sys.argv reconstructs it). A tiny detached shell waits for our PID to
+        exit, then relaunches; args are passed positionally so paths with
+        spaces need no quoting.
+
+        The child gets HGR_MAC_PERMS_NO_RESET=1 so it does NOT re-run the dev
+        TCC reset — otherwise the relaunch would wipe the very grant it's meant
+        to activate."""
         bundle = _app_bundle_path()
-        if bundle:
-            try:
-                pid = os.getpid()
-                script = (
-                    f'while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; '
-                    f'sleep 0.5; open "{bundle}"'
-                )
-                subprocess.Popen(
-                    ["/bin/bash", "-c", script],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except Exception:
-                pass
+        relaunch = ["open", bundle] if bundle else [sys.executable, *sys.argv]
+        try:
+            env = os.environ.copy()
+            env["HGR_MAC_PERMS_NO_RESET"] = "1"
+            waiter = (
+                'pid="$1"; shift; '
+                'while kill -0 "$pid" 2>/dev/null; do sleep 0.3; done; '
+                'sleep 0.5; exec "$@"'
+            )
+            subprocess.Popen(
+                ["/bin/bash", "-c", waiter, "_", str(os.getpid()), *relaunch],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                cwd=os.getcwd(),
+                env=env,
+            )
+        except Exception:
+            pass
         try:
             from PySide6.QtWidgets import QApplication
 
