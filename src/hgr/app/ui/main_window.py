@@ -9026,6 +9026,9 @@ class MainWindow(QMainWindow):
         inner_layout.addWidget(self._build_general_spotify_section())
         inner_layout.addWidget(self._build_general_discord_section())
         inner_layout.addWidget(self._build_general_startup_section())
+        # macOS only: TCC permission manager. No such concept on Windows.
+        if sys.platform == "darwin":
+            inner_layout.addWidget(self._build_general_permissions_section())
         inner_layout.addWidget(self._build_general_updates_section())
         inner_layout.addWidget(self._build_general_diagnostics_section())
 
@@ -10276,6 +10279,37 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         body.addLayout(row)
         self._general_controls["auto_start_on_login"] = checkbox
+        return card
+
+    def _build_general_permissions_section(self) -> "QFrame":
+        """Settings → General → Permissions (macOS only). A single button that
+        reopens the first-run permission onboarding wizard so the user can
+        review / re-request Camera, Microphone, Accessibility, Screen
+        Recording, and Automation grants at any time."""
+        card, body = self._make_general_section(
+            "Permissions",
+            "Manage the macOS permissions Touchless needs.",
+            details=(
+                "macOS requires you to grant Camera, Microphone, "
+                "Accessibility, Screen Recording, and Automation access "
+                "before the matching features work. This opens a panel that "
+                "shows each permission's status and links straight to the "
+                "right System Settings pane. Accessibility and Screen "
+                "Recording take effect after you reopen Touchless."
+            ),
+        )
+        manage_btn = QPushButton("Manage macOS Permissions")
+        manage_btn.setObjectName("macPermissionsButton")
+        manage_btn.setCursor(Qt.PointingHandCursor)
+        manage_btn.setStyleSheet(self._settings_panel_button_stylesheet())
+        manage_btn.clicked.connect(self._open_mac_permissions_wizard)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        row.addStretch(1)
+        row.addWidget(manage_btn)
+        row.addStretch(1)
+        body.addLayout(row)
         return card
 
     def _build_general_updates_section(self) -> "QFrame":
@@ -20048,6 +20082,57 @@ Admin elevation
                     toggle.blockSignals(blocker)
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    def _maybe_show_mac_permissions_wizard(self) -> None:
+        """macOS first-run: show the permission onboarding wizard once.
+
+        Latches on config.mac_permissions_wizard_shown so it never nags on
+        later launches — afterwards it's reachable from Settings ▸ General ▸
+        Permissions. Skips entirely (and latches) when everything the app can
+        verify is already granted, so a returning user with all grants in
+        place never sees it. In dev (source run) it always shows so the flow
+        is easy to iterate on, mirroring _maybe_show_privacy_prompt.
+        """
+        if sys.platform != "darwin":
+            return
+        is_frozen = bool(getattr(sys, "frozen", False))
+        if is_frozen and bool(getattr(self.config, "mac_permissions_wizard_shown", False)):
+            return
+        try:
+            from .mac_permissions_window import (
+                MacPermissionsWizard,
+                has_all_critical_permissions,
+            )
+            if is_frozen and has_all_critical_permissions():
+                # Nothing to ask for — latch so we don't re-check every launch.
+                self.config.mac_permissions_wizard_shown = True
+                try:
+                    save_config(self.config)
+                except Exception:
+                    pass
+                return
+            dialog = MacPermissionsWizard(self)
+            dialog.exec()
+            self.config.mac_permissions_wizard_shown = True
+            try:
+                save_config(self.config)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _open_mac_permissions_wizard(self) -> None:
+        """Re-open the macOS permission wizard from Settings ▸ General ▸
+        Permissions. Same modal as first run; no latch side effect."""
+        if sys.platform != "darwin":
+            return
+        try:
+            from .mac_permissions_window import MacPermissionsWizard
+
+            dialog = MacPermissionsWizard(self)
+            dialog.exec()
         except Exception:
             pass
 
@@ -31598,6 +31683,10 @@ Admin elevation
             # engine first. Deferred until after the privacy modal
             # has had a chance to land + dismiss.
             QTimer.singleShot(2200, self._check_spotify_at_startup)
+            # macOS only: first-run permission onboarding. Deferred past
+            # the privacy modal so the two don't stack. No-op on Windows.
+            if sys.platform == "darwin":
+                QTimer.singleShot(2600, self._maybe_show_mac_permissions_wizard)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         try:

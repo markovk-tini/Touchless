@@ -516,6 +516,11 @@ class AppConfig:
     #     in via the first-run dialog or Settings → About toggle.
     privacy_disclosure_shown: bool = False
     analytics_enabled: bool = False
+    # macOS only: latched True after the first-run permission onboarding
+    # wizard (Camera / Mic / Accessibility / Screen Recording / Automation)
+    # has been shown once, so it doesn't nag on every launch. Reachable
+    # afterwards from Settings ▸ General ▸ Permissions. Inert on Windows.
+    mac_permissions_wizard_shown: bool = False
     # The Touchless version that was running the last time this
     # install opened the main window. Used by the "Updated to
     # vX.Y.Z" success toast: when the launching __version__

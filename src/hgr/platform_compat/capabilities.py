@@ -124,3 +124,80 @@ def is_screen_recording_trusted(prompt: bool = False) -> bool:
     except Exception:
         pass
     return True
+
+
+# --- Camera / Microphone (AVFoundation) TCC status + prompt -------------------
+# Camera and Microphone are their own TCC permissions, distinct from
+# Accessibility / Screen Recording / Automation. Unlike those, macOS shows the
+# grant prompt *in-process* the first time the app touches the device (or when
+# we call AVCaptureDevice.requestAccessForMediaType_), and a fresh grant takes
+# effect IMMEDIATELY — no app restart required. That's why the onboarding wizard
+# can request these live and reflect the result on its next status poll.
+
+# AVMediaType four-char codes (AVMediaTypeVideo / AVMediaTypeAudio).
+_AV_VIDEO = "vide"
+_AV_AUDIO = "soun"
+# AVAuthorizationStatus: 0 notDetermined, 1 restricted, 2 denied, 3 authorized.
+_AV_STATE_NAMES = {0: "notDetermined", 1: "restricted", 2: "denied", 3: "authorized"}
+
+
+def _av_media_state(media_type: str) -> str:
+    """AVFoundation authorization state for a media type as a string:
+    'authorized' | 'denied' | 'notDetermined' | 'restricted' | 'unknown'.
+    'unknown' off macOS or if AVFoundation can't be reached."""
+    if not IS_MACOS:
+        return "unknown"
+    try:
+        from AVFoundation import AVCaptureDevice  # type: ignore
+
+        s = int(AVCaptureDevice.authorizationStatusForMediaType_(media_type))
+        return _AV_STATE_NAMES.get(s, "unknown")
+    except Exception:
+        return "unknown"
+
+
+def camera_permission_state() -> str:
+    return _av_media_state(_AV_VIDEO)
+
+
+def microphone_permission_state() -> str:
+    return _av_media_state(_AV_AUDIO)
+
+
+def is_camera_authorized() -> bool:
+    """True when the camera is usable. Off macOS there is no TCC gate, so we
+    treat it as authorized (Windows just opens the device)."""
+    return True if not IS_MACOS else camera_permission_state() == "authorized"
+
+
+def is_microphone_authorized() -> bool:
+    """True when the microphone is usable. True off macOS (no TCC gate)."""
+    return True if not IS_MACOS else microphone_permission_state() == "authorized"
+
+
+def _request_av_media_access(media_type: str) -> None:
+    """Fire the OS grant prompt for a media type (async, fire-and-forget).
+    Only prompts while the status is notDetermined — once the user has decided,
+    macOS won't re-prompt and they must use System Settings. No-op off macOS."""
+    if not IS_MACOS:
+        return
+    try:
+        from AVFoundation import AVCaptureDevice  # type: ignore
+
+        # completionHandler is required by the API; a no-op block is fine — the
+        # caller polls authorizationStatusForMediaType_ separately rather than
+        # reacting inside the handler (which runs on an arbitrary GCD queue,
+        # not the Qt/main thread).
+        AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+            media_type, lambda granted: None
+        )
+    except Exception:
+        pass
+
+
+def request_camera_access() -> None:
+    _request_av_media_access(_AV_VIDEO)
+
+
+def request_microphone_access() -> None:
+    _request_av_media_access(_AV_AUDIO)
