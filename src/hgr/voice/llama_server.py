@@ -139,7 +139,12 @@ def _detect_vulkan() -> bool:
 def _resolve_backend_executable() -> Optional[tuple[str, Path]]:
     override = os.getenv("HGR_LLAMA_BACKEND", "").strip().lower()
     backend_order: list[str]
-    if override in {"cuda", "vulkan", "cpu"}:
+    is_mac = sys.platform == "darwin"
+    if is_mac:
+        # macOS: llama.cpp Metal build (Apple GPU), extensionless Mach-O in
+        # build_metal/. No CUDA/Vulkan on mac; CPU is the fallback.
+        backend_order = [override] if override in {"metal", "cpu"} else ["metal", "cpu"]
+    elif override in {"cuda", "vulkan", "cpu"}:
         backend_order = [override]
     else:
         backend_order = []
@@ -153,12 +158,18 @@ def _resolve_backend_executable() -> Optional[tuple[str, Path]]:
         "cuda": "build_cuda",
         "vulkan": "build_vulkan",
         "cpu": "build_cpu",
+        "metal": "build_metal",
     }
+    exe_names = (
+        ("bin/llama-server", "llama-server")
+        if is_mac
+        else ("bin/Release/llama-server.exe", "bin/llama-server.exe")
+    )
 
     for backend in backend_order:
         build_dir = build_dirs[backend]
         for root in _candidate_llama_roots():
-            for rel in ("bin/Release/llama-server.exe", "bin/llama-server.exe"):
+            for rel in exe_names:
                 candidate = root / build_dir / rel
                 if candidate.exists():
                     return backend, candidate

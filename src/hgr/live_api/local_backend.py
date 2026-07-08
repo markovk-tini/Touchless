@@ -137,7 +137,11 @@ def _detect_nvidia_gpu() -> bool:
 
 def _resolve_llama_server_executable() -> Optional[Tuple[str, Path]]:
     override = os.getenv("HGR_LLAMA_BACKEND", "").strip().lower()
-    if override in {"cuda", "vulkan", "cpu"}:
+    is_mac = sys.platform == "darwin"
+    if is_mac:
+        # macOS: llama.cpp Metal build (Apple GPU), extensionless Mach-O.
+        backend_order = [override] if override in {"metal", "cpu"} else ["metal", "cpu"]
+    elif override in {"cuda", "vulkan", "cpu"}:
         backend_order = [override]
     else:
         backend_order = []
@@ -145,10 +149,11 @@ def _resolve_llama_server_executable() -> Optional[Tuple[str, Path]]:
             backend_order.append("cuda")
         backend_order.extend(["vulkan", "cpu"])
 
-    build_dirs = {"cuda": "build_cuda", "vulkan": "build_vulkan", "cpu": "build_cpu"}
+    build_dirs = {"cuda": "build_cuda", "vulkan": "build_vulkan", "cpu": "build_cpu", "metal": "build_metal"}
+    rels = ("bin/llama-server", "llama-server") if is_mac else ("bin/Release/llama-server.exe", "bin/llama-server.exe")
     for backend in backend_order:
         for root in _candidate_llama_roots():
-            for rel in ("bin/Release/llama-server.exe", "bin/llama-server.exe"):
+            for rel in rels:
                 candidate = root / build_dirs[backend] / rel
                 if candidate.exists():
                     return backend, candidate
@@ -185,10 +190,18 @@ def _resolve_whisper_command() -> Optional[Tuple[str, ...]]:
     home = Path.home() / "Documents" / "whisper.cpp"
     if home not in roots:
         roots.append(home)
+    is_mac = sys.platform == "darwin"
+    # macOS: whisper.cpp Metal build (build_metal) -> extensionless Mach-O.
+    build_dirs = ("build_metal", "build", "build_stream") if is_mac else ("build", "build_cuda", "build_vulkan", "build_stream")
     for root in roots:
-        for build_dir in ("build", "build_cuda", "build_vulkan", "build_stream"):
+        for build_dir in build_dirs:
             bin_dir = root / build_dir / "bin"
-            for candidate in (bin_dir / "Release" / "whisper-cli.exe", bin_dir / "whisper-cli.exe"):
+            candidates = (
+                (bin_dir / "whisper-cli", bin_dir / "Release" / "whisper-cli")
+                if is_mac
+                else (bin_dir / "Release" / "whisper-cli.exe", bin_dir / "whisper-cli.exe")
+            )
+            for candidate in candidates:
                 if candidate.exists():
                     return (str(candidate),)
     return None

@@ -31,7 +31,7 @@ class RefinementResult:
     duration_seconds: float
 
 
-_CLI_NAME = "whisper-cli.exe"
+_CLI_NAME = "whisper-cli" + (".exe" if sys.platform == "win32" else "")  # extensionless Mach-O on macOS
 _TIMESTAMP_PREFIX_RE = re.compile(r"^\[[^\]]+\]\s*")
 
 
@@ -58,8 +58,8 @@ def _resolve_cli_executable() -> Optional[tuple[str, Path]]:
     candidate = stream_exe.parent / _CLI_NAME
     if candidate.exists():
         return backend, candidate
-    # fall back: scan build dirs
-    build_dirs = ("build_cuda", "build_vulkan", "build_stream")
+    # fall back: scan build dirs (build_metal = macOS Apple-GPU build)
+    build_dirs = ("build_metal", "build_cuda", "build_vulkan", "build_stream")
     for root in _candidate_whisper_roots():
         for build in build_dirs:
             for sub in ("bin/Release", "bin"):

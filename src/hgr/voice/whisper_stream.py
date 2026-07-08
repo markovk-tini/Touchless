@@ -491,7 +491,12 @@ def _resolve_backend_executable(
 ) -> Optional[tuple[str, Path]]:
     override = os.getenv("HGR_WHISPER_BACKEND", "").strip().lower()
     backend_order: list[str]
-    if override in {"cuda", "vulkan", "cpu"}:
+    if sys.platform == "darwin":
+        # macOS: the whisper.cpp Metal build (Apple GPU) is an extensionless
+        # Mach-O in build_metal/. No CUDA/Vulkan on mac; CPU is the fallback.
+        exe_name = exe_name[:-4] if exe_name.endswith(".exe") else exe_name
+        backend_order = [override] if override in {"metal", "cpu"} else ["metal", "cpu"]
+    elif override in {"cuda", "vulkan", "cpu"}:
         backend_order = [override]
     else:
         backend_order = []
@@ -505,6 +510,7 @@ def _resolve_backend_executable(
         "cuda": ("build_cuda",),
         "vulkan": ("build_vulkan",),
         "cpu": ("build_stream", "build_cpu"),
+        "metal": ("build_metal",),
     }
 
     for backend in backend_order:
