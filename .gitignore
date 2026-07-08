@@ -104,5 +104,8 @@ tools/onnx_conversion/
 # Large vendored pipelines
 mp_modules/
 
+# macOS: vendored static ffmpeg/ffprobe (fetched by builder/macos/_fetch_ffmpeg.sh)
+builder/macos/vendor/
+
 # Test output
 tests/output/

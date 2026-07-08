@@ -124,14 +124,32 @@ _channel_marker.parent.mkdir(parents=True, exist_ok=True)
 _channel_marker.write_text("website", encoding="utf-8")
 datas.append((str(_channel_marker), "."))
 
-# --- Optional: bundle ffmpeg (arm64) if present (do NOT hard-fail) ----------
-_ffmpeg_src = shutil.which("ffmpeg")
-if _ffmpeg_src and Path(_ffmpeg_src).exists():
-    binaries.append((_ffmpeg_src, "."))
-else:
-    print("[mac spec] NOTE: ffmpeg not on PATH — bundling without it. The plain "
-          "AVFoundation capture path works; the EOS-style subprocess fallback "
-          "is Windows-specific anyway.")
+# --- Bundle a STATIC arm64 ffmpeg + ffprobe so recording / clip audio works on
+#     ANY user's Mac with ZERO setup (the shipping contract) --------------------
+# A Homebrew ffmpeg is dynamically linked against /opt/homebrew dylibs the end
+# user won't have, so shipping it produces a binary that crashes on launch. We
+# therefore prefer a self-contained STATIC build vendored under
+# builder/macos/vendor/ (populate it with builder/macos/_fetch_ffmpeg.sh). The
+# PATH fallback is DEV-ONLY and warned loudly because it will likely break on
+# end-user machines. The runtime finds these in Contents/Frameworks via
+# main_window._locate_ffmpeg_executable.
+_VENDOR = ROOT / "builder" / "macos" / "vendor"
+for _tool in ("ffmpeg", "ffprobe"):
+    _vendored = _VENDOR / _tool
+    if _vendored.exists():
+        binaries.append((str(_vendored), "."))
+        print(f"[mac spec] bundling vendored static {_tool}: {_vendored}")
+        continue
+    _path_tool = shutil.which(_tool)
+    if _path_tool and Path(_path_tool).exists():
+        binaries.append((_path_tool, "."))
+        print(f"[mac spec] WARNING: bundling {_tool} from PATH ({_path_tool}). If this "
+              f"is a Homebrew build it is DYNAMICALLY linked and WILL FAIL on end-user "
+              f"Macs. Vendor a static build: builder/macos/_fetch_ffmpeg.sh")
+    else:
+        print(f"[mac spec] NOTE: no {_tool} vendored or on PATH — recording / clip "
+              f"audio will be unavailable in this build. Run "
+              f"builder/macos/_fetch_ffmpeg.sh to vendor a static build.")
 
 
 def _collect_metal_runtime(roots, subdir_prefix, keep_ext):

@@ -76,6 +76,15 @@ if [[ "$DO_METAL" == "1" ]]; then
   bash "$ROOT/builder/macos/_build_llama_metal.sh"   || echo "[build_mac] llama Metal build failed (continuing)"
 fi
 
+# ---- 2b. vendor a STATIC ffmpeg/ffprobe so recording/clip audio ships with
+#         zero user setup. Non-fatal: without it the app records video-only.
+if [[ ! -x "$ROOT/builder/macos/vendor/ffmpeg" ]]; then
+  echo "[build_mac] fetching static ffmpeg/ffprobe (recording audio) ..."
+  bash "$ROOT/builder/macos/_fetch_ffmpeg.sh" || \
+    echo "[build_mac] ffmpeg fetch failed (continuing; recordings will be video-only). "\
+"Vendor manually into builder/macos/vendor/ to enable audio."
+fi
+
 # ---- 3. .icns icon (generated from the 1024 PNG) ---------------------------
 ICNS="$ROOT/assets/icons/touchless_icon.icns"
 PNG="$ROOT/assets/icons/touchless_icon.png"

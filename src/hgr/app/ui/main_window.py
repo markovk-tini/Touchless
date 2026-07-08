@@ -23330,10 +23330,21 @@ Admin elevation
             candidates.append(Path.cwd() / exe_name)
         except Exception:
             pass
-        # macOS: a GUI-launched .app has a minimal PATH (no Homebrew), so
-        # shutil.which misses a brew-installed ffmpeg. Check the standard
-        # Homebrew prefixes explicitly (Apple Silicon + Intel).
+        # macOS: check the .app bundle's own dirs FIRST (a vendored static
+        # ffmpeg ships there so recording/clip audio works with zero user
+        # setup), then Homebrew. A GUI-launched .app has a minimal PATH, so
+        # shutil.which alone would miss both.
         if sys.platform == "darwin":
+            try:
+                exe_path = Path(sys.executable).resolve()
+                contents = exe_path.parent.parent  # <App>.app/Contents
+                # PyInstaller .app stows bundled binaries in Contents/Frameworks;
+                # Contents/Resources is the data dir. Contents/MacOS is covered
+                # by the with_name() candidate above.
+                candidates.append(contents / "Frameworks" / exe_name)
+                candidates.append(contents / "Resources" / exe_name)
+            except Exception:
+                pass
             for brew_dir in ("/opt/homebrew/bin", "/usr/local/bin"):
                 candidates.append(Path(brew_dir) / exe_name)
         for candidate in candidates:
