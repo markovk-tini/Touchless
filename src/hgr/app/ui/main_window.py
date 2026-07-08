@@ -30819,22 +30819,45 @@ Admin elevation
         output_path = self._record_output_specs()[0][0]
 
         def build(with_audio: bool) -> list[str]:
+            # avfoundation device spec is "<video>:<audio>". Video-only is the
+            # BARE index — ":none" is not valid avfoundation syntax and makes
+            # ffmpeg try to open an audio device literally named "none".
             spec = (f"{screen_idx}:{mic_idx}"
-                    if (with_audio and mic_idx is not None) else f"{screen_idx}:none")
+                    if (with_audio and mic_idx is not None) else f"{screen_idx}")
             cmd = [
-                self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+                self._ffmpeg_path, "-hide_banner", "-loglevel", "warning", "-y",
                 "-f", "avfoundation",
                 "-capture_cursor", "1",
                 "-framerate", f"{fps:.3f}",
+                # Timestamp each frame with the wall clock instead of trusting
+                # the requested framerate. avfoundation screen capture delivers
+                # frames at the display's refresh rate (often 60), so tagging
+                # them at the requested 24 fps compressed the timeline and made
+                # playback ~2x too fast. Wall-clock PTS = real-time duration.
+                "-use_wallclock_as_timestamps", "1",
                 "-i", spec,
                 "-c:v", vcodec, "-pix_fmt", "yuv420p",
             ]
             cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
                     else ["-preset", "veryfast", "-crf", "23"])
-            cmd += (["-c:a", acodec, "-b:a", "128k"]
-                    if (with_audio and mic_idx is not None) else ["-an"])
+            # Resample to a constant output rate at real speed.
+            cmd += ["-r", f"{fps:.3f}"]
+            if with_audio and mic_idx is not None:
+                cmd += ["-c:a", acodec, "-b:a", "128k"]
+            else:
+                cmd += ["-an"]
             cmd += [str(output_path)]
             return cmd
+
+        try:
+            sys.stderr.write(
+                f"[screen-record] mac avfoundation: screen_idx={screen_idx} "
+                f"mic_idx={mic_idx} vcodec={vcodec}\n"
+                f"[screen-record] cmd: {' '.join(build(with_audio=True))}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
 
         self._last_ffmpeg_startup_error = None
         process = self._start_ffmpeg_process(build(with_audio=True))
@@ -30843,7 +30866,8 @@ Admin elevation
             # than nothing.
             try:
                 sys.stderr.write(
-                    "[screen-record] mac audio input failed; retrying video-only\n"
+                    "[screen-record] mac audio input failed "
+                    f"({self._last_ffmpeg_startup_error}); retrying video-only\n"
                 )
                 sys.stderr.flush()
             except Exception:
@@ -30851,6 +30875,13 @@ Admin elevation
             process = self._start_ffmpeg_process(build(with_audio=False))
         if process is None:
             return False
+        # Drain ffmpeg's stderr to the log so avfoundation device/audio errors
+        # that fire AFTER the startup window are visible (mic silently dropped,
+        # sample-rate negotiation, etc.).
+        try:
+            self._spawn_ffmpeg_stderr_drain(process, "screen-record-mac")
+        except Exception:
+            pass
         self._screen_record_process = process
         self._screen_record_backend = "ffmpeg"
         self._screen_record_region = None
