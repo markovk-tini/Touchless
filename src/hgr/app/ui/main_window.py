@@ -30841,17 +30841,24 @@ Admin elevation
             cmd = [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "info", "-stats", "-y",
             ]
-            # Input 0: screen video.
+            # Input 0: screen video. A big thread queue keeps the reader from
+            # stalling while the heavy video encode runs.
             cmd += [
                 "-f", "avfoundation", "-capture_cursor", "1",
-                "-framerate", f"{fps:.3f}", "-i", f"{screen_idx}",
+                "-framerate", f"{fps:.3f}", "-thread_queue_size", "1024",
+                "-i", f"{screen_idx}",
             ]
             if with_audio and mic_idx is not None:
                 # Input 1: mic as a SEPARATE avfoundation input so it keeps its
-                # own clean clock. A combined "screen:mic" session dragged BOTH
-                # streams to ~2x speed + static; splitting them + aresample
-                # async=1 (absorbs A/V drift) is the robust fix.
-                cmd += ["-f", "avfoundation", "-i", f":{mic_idx}",
+                # own clean clock (a combined "screen:mic" session dragged BOTH
+                # to ~2x). A GENEROUS thread_queue_size is the key to clean
+                # audio: without it the mic packet queue overflows while ffmpeg
+                # is busy encoding the big video frame, dropping samples ->
+                # the choppy/"bad reception" static. NO aresample=async (that
+                # continuously stretches/drops samples to chase avfoundation's
+                # jittery PTS, which itself sounds glitchy).
+                cmd += ["-f", "avfoundation", "-thread_queue_size", "1024",
+                        "-i", f":{mic_idx}",
                         "-map", "0:v", "-map", "1:a"]
             cmd += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
             cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
@@ -30863,10 +30870,10 @@ Admin elevation
             # the audio track (which IS captured/muxed — the log shows 532KiB of
             # aac). Forcing output -r + constant-rate + a 30000 timescale yields
             # a clean, universally-playable file with working audio.
-            cmd += ["-r", f"{fps:.3f}", "-vsync", "cfr",
+            cmd += ["-r", f"{fps:.3f}", "-fps_mode", "cfr",
                     "-video_track_timescale", "30000"]
             if with_audio and mic_idx is not None:
-                cmd += ["-c:a", acodec, "-b:a", "128k", "-af", "aresample=async=1"]
+                cmd += ["-c:a", acodec, "-b:a", "128k"]
             else:
                 cmd += ["-an"]
             cmd += [str(output_path)]
