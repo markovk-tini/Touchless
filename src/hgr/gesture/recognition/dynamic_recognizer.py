@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque
@@ -31,6 +32,36 @@ class DynamicGestureRecognizer:
         self.history.clear()
         self._blocked_horizontal_label = None
         self._blocked_horizontal_until = 0.0
+
+    def _effective_low_fps(self) -> bool:
+        """True when swipes should use the relaxed (low-fps) gates — either the
+        engine forced low_fps_mode, OR the actual capture cadence is slow
+        (median inter-sample dt > ~0.055 s, i.e. under ~18 fps).
+
+        The swipe gates use a fixed-SAMPLE window, so at low fps that window
+        spans too much wall-clock time and the duration/step gates silently
+        zero the score. macOS commonly runs in the ~13-17 fps 'dead zone' where
+        the engine's own low_fps auto-toggle (fps<12) hasn't engaged yet, so
+        swipes stop firing. Deriving this per-frame from the timestamps already
+        on the samples fixes that without waiting on the engine. At normal
+        ~30 fps (dt ~0.033 s) this returns False, so Windows behavior is
+        unchanged."""
+        if self.low_fps_mode:
+            return True
+        # macOS-only: the dt-based auto-relax trades some precision (slow
+        # motion can read as a swipe) for recall at the mac's low fps. Windows
+        # keeps its exact tuned behavior (and its tests) — it engages the
+        # relaxed gates only via the explicit engine low_fps_mode there.
+        if sys.platform != "darwin":
+            return False
+        recent = list(self.history)[-8:]
+        dts = [b.timestamp - a.timestamp for a, b in zip(recent, recent[1:])
+               if b.timestamp > a.timestamp]
+        if len(dts) < 2:
+            return False
+        dts.sort()
+        median_dt = dts[len(dts) // 2]
+        return median_dt > 0.055
 
     def _fold_gate(self, finger) -> float:
         if finger.state == "closed":
@@ -68,7 +99,8 @@ class DynamicGestureRecognizer:
                 one_pose_gate=one_pose_gate,
             )
         )
-        min_samples = 3 if self.low_fps_mode else 4
+        effective_low_fps = self._effective_low_fps()
+        min_samples = 3 if effective_low_fps else 4
         if len(self.history) < min_samples:
             return "neutral", tuple(), {}
 
@@ -76,7 +108,7 @@ class DynamicGestureRecognizer:
             self._blocked_horizontal_label = None
             self._blocked_horizontal_until = 0.0
 
-        window_size = 6 if self.low_fps_mode else 9
+        window_size = 6 if effective_low_fps else 9
         window = list(self.history)[-window_size:]
         first = window[0]
         last = window[-1]
@@ -93,7 +125,7 @@ class DynamicGestureRecognizer:
         depth_noise = 0.0
         positive_x_steps = 0
         negative_x_steps = 0
-        step_threshold = 0.007 if self.low_fps_mode else 0.02
+        step_threshold = 0.007 if effective_low_fps else 0.02
         for prev, current in zip(window, window[1:]):
             step = (current.center - prev.center) / max(current.scale, 1e-6)
             step_duration = max(current.timestamp - prev.timestamp, 1e-6)
@@ -109,7 +141,7 @@ class DynamicGestureRecognizer:
         pose_strength = sum(sample.pose_gate for sample in window) / len(window)
         straightness = clamp01(abs(horizontal) / max(path, 1e-6))
         horizontal_axis_gate = clamp01(((abs(horizontal) / max(vertical + 0.62 * depth, 1e-6)) - 1.35) / 0.90)
-        if self.low_fps_mode:
+        if effective_low_fps:
             horizontal_min_duration_gate = clamp01((duration - 0.04) / 0.05)
             horizontal_max_duration_gate = clamp01((1.25 - duration) / 0.50)
             positive_x_gate = clamp01((positive_x_steps - negative_x_steps - 0.4) / 1.2)
@@ -123,7 +155,7 @@ class DynamicGestureRecognizer:
             horizontal_commit_gate = 1.0
         horizontal_duration_gate = horizontal_min_duration_gate * horizontal_max_duration_gate
 
-        if self.low_fps_mode:
+        if effective_low_fps:
             right_h_floor = 0.28
             left_h_floor = 0.27
             speed_floor_r = 0.44
@@ -236,7 +268,7 @@ class DynamicGestureRecognizer:
             )
         )
         best = ranked[0] if ranked else GestureCandidate("neutral", 0.0, "dynamic")
-        score_floor = 0.34 if self.low_fps_mode else 0.59
+        score_floor = 0.34 if effective_low_fps else 0.59
         if best.score < score_floor:
             return "neutral", ranked, scores
 
