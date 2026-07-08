@@ -213,6 +213,19 @@ def _apply_macos_overlay(widget) -> bool:
         if ns_window is None:
             return False
 
+        # A HUD overlay that is click-through in Qt (WA_TransparentForMouseEvents)
+        # must ALSO be click-through at the NSWindow level — the Qt attribute
+        # does NOT propagate to NSWindow, so a fullscreen overlay (e.g. the
+        # recording indicator, shown for the whole recording) otherwise swallows
+        # every mouse click on macOS. ignoresMouseEvents does not suppress
+        # painting (unlike Qt.WindowTransparentForInput, which we drop on mac).
+        try:
+            from PySide6.QtCore import Qt as _Qt
+            if widget.testAttribute(_Qt.WA_TransparentForMouseEvents):
+                ns_window.setIgnoresMouseEvents_(True)
+        except Exception:
+            pass
+
         if NSWindowStyleMaskNonactivatingPanel is not None:
             try:
                 ns_window.setStyleMask_(int(ns_window.styleMask()) | int(NSWindowStyleMaskNonactivatingPanel))
