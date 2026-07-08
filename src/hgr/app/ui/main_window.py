@@ -290,7 +290,10 @@ class WindowControlButton(QAbstractButton):
         self.title_bar = title_bar
         self._hovered = False
         self._pressed = False
-        self.setFixedSize(22, 28)
+        # macOS: render as a traffic-light circle (smaller footprint) instead
+        # of the Windows glyph button.
+        self._mac = sys.platform == "darwin"
+        self.setFixedSize(14 if self._mac else 22, 28)
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_Hover, True)
@@ -330,7 +333,51 @@ class WindowControlButton(QAbstractButton):
             return _with_alpha(base.lighter(134), 235)
         return _with_alpha(base.lighter(124), 210)
 
+    def _paint_mac_traffic_light(self) -> None:
+        """macOS red/yellow/green circle. Solid colour at rest; the ×/−/+ glyph
+        appears on hover (macOS shows glyphs when the controls are hovered)."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        colors = {
+            "close": QColor("#FF5F57"),
+            "min": QColor("#FEBC2E"),
+            "max": QColor("#28C840"),
+        }
+        fill = colors.get(self.kind, QColor("#8A8A8A"))
+        if not self.isEnabled():
+            fill = QColor("#6E6E6E")
+        d = 12
+        rect = self.rect()
+        cx = rect.center().x()
+        cy = rect.center().y()
+        circle = QRect(int(cx - d / 2), int(cy - d / 2), d, d)
+        painter.setPen(QPen(fill.darker(125), 0.5))
+        painter.setBrush(fill.darker(112) if self._pressed else fill)
+        painter.drawEllipse(circle)
+        show_glyph = (
+            self._hovered
+            or self._pressed
+            or getattr(self.title_bar, "_mac_controls_hovered", False)
+        )
+        if show_glyph and self.isEnabled():
+            gp = QPen(fill.darker(200))
+            gp.setWidthF(1.3)
+            gp.setCapStyle(Qt.RoundCap)
+            painter.setPen(gp)
+            g = 3
+            if self.kind == "close":
+                painter.drawLine(cx - g, cy - g, cx + g, cy + g)
+                painter.drawLine(cx + g, cy - g, cx - g, cy + g)
+            elif self.kind == "min":
+                painter.drawLine(cx - g, cy, cx + g, cy)
+            elif self.kind == "max":
+                painter.drawLine(cx - g, cy, cx + g, cy)
+                painter.drawLine(cx, cy - g, cx, cy + g)
+
     def paintEvent(self, event) -> None:  # noqa: N802
+        if self._mac:
+            self._paint_mac_traffic_light()
+            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -395,6 +442,7 @@ class TitleBar(QFrame):
         # MainWindow if the version ever changes mid-session
         # (which it doesn't today, but the hook is here).
         from ... import __version__ as _APP_VERSION
+        is_mac = sys.platform == "darwin"
         self.version_label = QLabel(f"v{_APP_VERSION}", self)
         self.version_label.setObjectName("titleBarVersion")
         self.version_label.setStyleSheet(
@@ -408,8 +456,6 @@ class TitleBar(QFrame):
             "}"
         )
         self.version_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        layout.addWidget(self.version_label, 0, Qt.AlignLeft | Qt.AlignVCenter)
-        layout.addStretch(1)
 
         # "Tutorial" indicator label, centred horizontally between the
         # version tag and the window controls. Visible only while the
@@ -432,8 +478,6 @@ class TitleBar(QFrame):
         )
         self.tutorial_indicator_label.setAlignment(Qt.AlignCenter)
         self.tutorial_indicator_label.setVisible(False)
-        layout.addWidget(self.tutorial_indicator_label, 0, Qt.AlignCenter)
-        layout.addStretch(1)
 
         controls = QWidget(self)
         self.controls = controls
@@ -442,7 +486,8 @@ class TitleBar(QFrame):
         controls.setAttribute(Qt.WA_Hover, True)
         control_layout = QHBoxLayout(controls)
         control_layout.setContentsMargins(0, 0, 0, 0)
-        control_layout.setSpacing(2)
+        # macOS traffic lights sit ~8 px apart; the Windows glyph buttons abut.
+        control_layout.setSpacing(8 if is_mac else 2)
 
         self.min_button = WindowControlButton("min", self)
         self.max_button = WindowControlButton("max", self)
@@ -455,10 +500,28 @@ class TitleBar(QFrame):
         for widget in (self, self.controls, self.min_button, self.max_button, self.close_button):
             widget.installEventFilter(self)
 
-        control_layout.addWidget(self.min_button)
-        control_layout.addWidget(self.max_button)
-        control_layout.addWidget(self.close_button)
-        layout.addWidget(controls, 0, Qt.AlignRight)
+        if is_mac:
+            # macOS convention: traffic lights top-LEFT, ordered close(red) /
+            # min(yellow) / max(green); version tag moves to the right.
+            control_layout.addWidget(self.close_button)
+            control_layout.addWidget(self.min_button)
+            control_layout.addWidget(self.max_button)
+            layout.addWidget(controls, 0, Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addSpacing(8)
+            layout.addStretch(1)
+            layout.addWidget(self.tutorial_indicator_label, 0, Qt.AlignCenter)
+            layout.addStretch(1)
+            layout.addWidget(self.version_label, 0, Qt.AlignRight | Qt.AlignVCenter)
+        else:
+            # Windows: version tag left, min/max/close glyph buttons right.
+            layout.addWidget(self.version_label, 0, Qt.AlignLeft | Qt.AlignVCenter)
+            layout.addStretch(1)
+            layout.addWidget(self.tutorial_indicator_label, 0, Qt.AlignCenter)
+            layout.addStretch(1)
+            control_layout.addWidget(self.min_button)
+            control_layout.addWidget(self.max_button)
+            control_layout.addWidget(self.close_button)
+            layout.addWidget(controls, 0, Qt.AlignRight)
 
     def refresh(self) -> None:
         self.update()
