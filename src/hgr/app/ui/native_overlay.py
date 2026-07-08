@@ -284,6 +284,38 @@ def _apply_macos_overlay(widget) -> bool:
         return False
 
 
+def apply_macos_rounded_corners(widget, radius: float = 10.0) -> bool:
+    """Round a window's corners natively (CoreAnimation layer mask) so it looks
+    like other macOS apps, WITHOUT losing the window shadow. The content view's
+    layer is corner-radiused + clipped, and the NSWindow is made non-opaque with
+    a clear background so the corner triangles show through as transparent.
+    Safe/no-op off macOS or if the native window isn't available yet (call after
+    the window is first shown so winId() resolves)."""
+    if not _HAS_MAC or objc is None or ctypes is None:
+        return False
+    try:
+        from AppKit import NSColor
+
+        widget.winId()
+        ns_view = objc.objc_object(c_void_p=ctypes.c_void_p(int(widget.winId())))
+        ns_window = ns_view.window()
+        if ns_window is None:
+            return False
+        try:
+            ns_window.setOpaque_(False)
+            ns_window.setBackgroundColor_(NSColor.clearColor())
+        except Exception:
+            pass
+        ns_view.setWantsLayer_(True)
+        layer = ns_view.layer()
+        if layer is not None:
+            layer.setCornerRadius_(float(radius))
+            layer.setMasksToBounds_(True)
+        return True
+    except Exception:
+        return False
+
+
 def _apply_windows_overlay(widget) -> bool:
     if not _HAS_WIN or _user32 is None:
         return False

@@ -32157,6 +32157,15 @@ Admin elevation
             # the privacy modal so the two don't stack. No-op on Windows.
             if sys.platform == "darwin":
                 QTimer.singleShot(2600, self._maybe_show_mac_permissions_wizard)
+                # Round the window corners natively (like other mac apps).
+                # Deferred so the native NSWindow exists; keeps the shadow.
+                def _round_corners():
+                    try:
+                        from .native_overlay import apply_macos_rounded_corners
+                        apply_macos_rounded_corners(self, 10.0)
+                    except Exception:
+                        pass
+                QTimer.singleShot(0, _round_corners)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         try:
