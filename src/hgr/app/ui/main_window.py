@@ -30835,14 +30835,13 @@ Admin elevation
             # ffmpeg try to open an audio device literally named "none".
             spec = (f"{screen_idx}:{mic_idx}"
                     if (with_audio and mic_idx is not None) else f"{screen_idx}")
+            # Clean baseline avfoundation command. Earlier attempts
+            # (-use_wallclock_as_timestamps, -r/-vsync juggling) made the audio
+            # static and didn't fix the 2x, so we go back to the standard form
+            # and diagnose the 2x from the log (Stream fps + final time=) rather
+            # than guessing more flags.
             cmd = [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "info", "-stats", "-y",
-                # Stamp EVERY incoming packet (video AND audio) with the wall
-                # clock. avfoundation's own timestamps were compressing the
-                # whole timeline to ~half real-time, so both streams played ~2x
-                # fast. Wall-clock PTS = real elapsed time -> correct speed.
-                # (Input option: must precede -i.)
-                "-use_wallclock_as_timestamps", "1",
                 "-f", "avfoundation",
                 "-capture_cursor", "1",
                 "-framerate", f"{fps:.3f}",
@@ -30851,12 +30850,10 @@ Admin elevation
             ]
             cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
                     else ["-preset", "veryfast", "-crf", "23"])
-            # Variable frame rate: keep the real wall-clock PTS rather than
-            # resampling to a forced constant rate (which reintroduced the
-            # speed skew). -vsync 2 == vfr.
-            cmd += ["-vsync", "2"]
             if with_audio and mic_idx is not None:
-                cmd += ["-c:a", acodec, "-b:a", "128k"]
+                # Let aac negotiate the mic's native rate; explicit -ar/-ac
+                # avoids garbled/static audio from a format mismatch.
+                cmd += ["-c:a", acodec, "-b:a", "128k", "-ar", "48000", "-ac", "1"]
             else:
                 cmd += ["-an"]
             cmd += [str(output_path)]
@@ -32264,15 +32261,21 @@ Admin elevation
             # the privacy modal so the two don't stack. No-op on Windows.
             if sys.platform == "darwin":
                 QTimer.singleShot(2600, self._maybe_show_mac_permissions_wizard)
-                # Round the window corners natively (like other mac apps).
-                # Deferred so the native NSWindow exists; keeps the shadow.
-                def _round_corners():
-                    try:
-                        from .native_overlay import apply_macos_rounded_corners
-                        apply_macos_rounded_corners(self, 10.0)
-                    except Exception:
-                        pass
-                QTimer.singleShot(0, _round_corners)
+                # Rounded corners require a NON-OPAQUE window (clear bg + layer
+                # mask), which makes the compositor blend the whole window every
+                # frame — with the live camera view that measurably lowered fps
+                # and degraded gesture detection. FPS + gestures win over the
+                # cosmetic curve, so this is OFF by default; opt in for testing
+                # with HGR_MAC_ROUNDED_CORNERS=1. (Revisit with a cheaper
+                # technique later.)
+                if os.environ.get("HGR_MAC_ROUNDED_CORNERS"):
+                    def _round_corners():
+                        try:
+                            from .native_overlay import apply_macos_rounded_corners
+                            apply_macos_rounded_corners(self, 10.0)
+                        except Exception:
+                            pass
+                    QTimer.singleShot(0, _round_corners)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         try:
