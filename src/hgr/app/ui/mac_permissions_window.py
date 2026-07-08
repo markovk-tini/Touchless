@@ -445,18 +445,116 @@ class MacPermissionsWizard(QDialog):
             return
         if state == "restricted":
             return
-        if state == "granted" and not _DEV_SIMULATE:
+        if _DEV_SIMULATE:
+            # Dev/source: the real permission is already granted to Terminal,
+            # so macOS won't show its prompt. Show a faithful MOCK of the
+            # system prompt so the enable flow is visible + drivable; clicking
+            # an already-on row just flips it back off (re-test loop).
+            if state == "granted":
+                _DEV_STATE[key] = "denied"
+            elif self._show_simulated_prompt(key):
+                _DEV_STATE[key] = "granted"
+            self._refresh(force=True)
+            return
+        if state == "granted":
             # Already on; there's nothing to prompt. Reviewing / turning it
             # off is a System Settings task, so open that specific pane.
             self._open_pane(key)
             return
-        # Fire the real request. Dev-sim forces the 'pending' path so the
-        # prompt/registration always fires, then flips the simulated badge so
-        # the enabled/disabled loop stays exercisable in a source build.
-        self._enable(key, "pending" if _DEV_SIMULATE else state)
-        if _DEV_SIMULATE:
-            _DEV_STATE[key] = "denied" if state == "granted" else "granted"
+        # Frozen build: fire the real request (native prompt + registration).
+        self._enable(key, state)
         self._refresh(force=True)
+
+    def _show_simulated_prompt(self, key: str) -> bool:
+        """DEV-ONLY faithful mock of the macOS TCC permission prompt. Returns
+        True on Allow. Never runs in a frozen build — there the real system
+        prompt fires from _enable(). Exists because a source run's permissions
+        are already granted to Terminal, so macOS won't re-prompt and the
+        enable flow would otherwise be invisible."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+
+        titles = {
+            "camera": '“Touchless” would like to access the camera.',
+            "microphone": '“Touchless” would like to access the microphone.',
+            "accessibility": '“Touchless” would like to control this '
+                             'computer using accessibility features.',
+            "screen_recording": '“Touchless” would like to record this '
+                                 'computer’s screen.',
+        }
+        bodies = {
+            "camera": "Touchless uses the camera to recognize your hand gestures.",
+            "microphone": "Touchless uses the microphone for voice commands and dictation.",
+            "accessibility": "Grant this in System Settings, then reopen Touchless.",
+            "screen_recording": "Grant this in System Settings, then reopen Touchless.",
+        }
+        deny_txt, allow_txt = ("Don’t Allow", "Allow")
+        if key in ("accessibility", "screen_recording"):
+            deny_txt, allow_txt = ("Deny", "Open System Settings")
+
+        dlg = QDialog(self)
+        dlg.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
+        dlg.setModal(True)
+        dlg.setFixedWidth(300)
+        # Styled to resemble the SYSTEM prompt (light panel, not app-themed) —
+        # the real macOS prompt isn't drawn by the app either.
+        dlg.setStyleSheet(
+            "QDialog { background: #ECECEC; border-radius: 14px; }"
+            "QLabel#t { color: #111; font-size: 13px; font-weight: 700; }"
+            "QLabel#b { color: #444; font-size: 12px; }"
+            "QPushButton { background: #FBFBFB; color: #111;"
+            "  border: 1px solid #C4C4C4; border-radius: 7px; padding: 7px 10px;"
+            "  font-weight: 600; min-width: 110px; }"
+            "QPushButton:hover { background: #F0F0F0; }"
+            "QPushButton#allow { background: #DCEBFF; border-color: #A9CBFF; }"
+            "QPushButton#allow:hover { background: #CFE3FF; }"
+        )
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(22, 20, 22, 16)
+        lay.setSpacing(10)
+
+        icon = QLabel()
+        icon.setAlignment(Qt.AlignCenter)
+        try:
+            pm = self.windowIcon().pixmap(52, 52)
+            if not pm.isNull():
+                icon.setPixmap(pm)
+        except Exception:
+            pass
+        lay.addWidget(icon)
+
+        t = QLabel(titles.get(key, '“Touchless” would like access.'))
+        t.setObjectName("t")
+        t.setWordWrap(True)
+        t.setAlignment(Qt.AlignCenter)
+        lay.addWidget(t)
+
+        b = QLabel(bodies.get(key, ""))
+        b.setObjectName("b")
+        b.setWordWrap(True)
+        b.setAlignment(Qt.AlignCenter)
+        lay.addWidget(b)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        deny = QPushButton(deny_txt)
+        deny.setCursor(Qt.PointingHandCursor)
+        deny.clicked.connect(dlg.reject)
+        allow = QPushButton(allow_txt)
+        allow.setObjectName("allow")
+        allow.setCursor(Qt.PointingHandCursor)
+        allow.clicked.connect(dlg.accept)
+        row.addWidget(deny)
+        row.addWidget(allow)
+        lay.addLayout(row)
+
+        dlg.adjustSize()
+        try:
+            if self.isVisible():
+                c = self.geometry().center()
+                dlg.move(c.x() - dlg.width() // 2, c.y() - dlg.height() // 2)
+        except Exception:
+            pass
+        return dlg.exec() == QDialog.Accepted
 
     def _enable(self, key: str, state: str) -> None:
         """Trigger the little native permission prompt for `key` and register
