@@ -20938,6 +20938,19 @@ Admin elevation
                 if prompt_result == "cancel":
                     self.last_action_label.setText("Last action: start cancelled")
                 return
+            # macOS: hand tracking can't start without Camera access. If it's
+            # missing, pop the permission wizard highlighting Camera (so the
+            # user sees exactly what unblocks Start) and abort rather than
+            # starting into a black feed. Mirrors the cancel early-return
+            # above; no-op on Windows.
+            if sys.platform == "darwin" and not self.ensure_mac_permission("camera"):
+                try:
+                    self.last_action_label.setText(
+                        "Last action: start needs Camera access"
+                    )
+                except Exception:
+                    pass
+                return
             try:
                 from ... import telemetry as _telemetry
                 _telemetry.track("engine_started")
@@ -22325,6 +22338,18 @@ Admin elevation
         just save the configured duration ending at the current
         moment into clips_save_dir.
         """
+        # macOS: the rolling clip buffer is captured via Screen Recording. If
+        # it's not granted, pop the wizard highlighting Screen Recording so
+        # the user knows what unblocks clipping, instead of hitting an empty
+        # "Clip not ready" buffer. No-op on Windows.
+        if sys.platform == "darwin" and not self.ensure_mac_permission("screen_recording"):
+            try:
+                self.last_action_label.setText(
+                    "Last action: clip needs Screen Recording access"
+                )
+            except Exception:
+                pass
+            return
         # Snapshot the click moment so the export trims the right edge
         # to "now" (matches the click), not the latest segment end
         # which can be 2-3 s later by the time export completes.
@@ -30644,6 +30669,18 @@ Admin elevation
                 return False
             return self._start_countdown_overlay(3, lambda region=QRect(target_region): self._start_screen_recording(region), label_prefix="screen record")
     def _start_screen_recording(self, region: QRect) -> None:
+        # macOS: screen recording needs the Screen Recording permission. If
+        # it's missing, highlight it in the wizard and abort so we don't spin
+        # up a recorder that captures a black frame. No-op on Windows.
+        if sys.platform == "darwin" and not self.ensure_mac_permission("screen_recording"):
+            try:
+                self.last_action_label.setText(
+                    "Last action: recording needs Screen Recording access"
+                )
+            except Exception:
+                pass
+            self._set_worker_utility_recording_active(False)
+            return
         region = self._normalized_record_region(region)
         if self._start_screen_recording_ffmpeg(region):
             return
