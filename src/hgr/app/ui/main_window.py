@@ -30837,6 +30837,12 @@ Admin elevation
                     if (with_audio and mic_idx is not None) else f"{screen_idx}")
             cmd = [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "info", "-stats", "-y",
+                # Stamp EVERY incoming packet (video AND audio) with the wall
+                # clock. avfoundation's own timestamps were compressing the
+                # whole timeline to ~half real-time, so both streams played ~2x
+                # fast. Wall-clock PTS = real elapsed time -> correct speed.
+                # (Input option: must precede -i.)
+                "-use_wallclock_as_timestamps", "1",
                 "-f", "avfoundation",
                 "-capture_cursor", "1",
                 "-framerate", f"{fps:.3f}",
@@ -30845,9 +30851,10 @@ Admin elevation
             ]
             cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
                     else ["-preset", "veryfast", "-crf", "23"])
-            # Constant output rate. avfoundation stamps real capture PTS, so a
-            # plain -r resample keeps real-time speed without a GIL-heavy path.
-            cmd += ["-r", f"{fps:.3f}"]
+            # Variable frame rate: keep the real wall-clock PTS rather than
+            # resampling to a forced constant rate (which reintroduced the
+            # speed skew). -vsync 2 == vfr.
+            cmd += ["-vsync", "2"]
             if with_audio and mic_idx is not None:
                 cmd += ["-c:a", acodec, "-b:a", "128k"]
             else:
