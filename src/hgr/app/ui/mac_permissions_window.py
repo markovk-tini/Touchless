@@ -36,9 +36,10 @@ import subprocess
 import sys
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QTimer, QRect
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QDialog,
     QFrame,
     QHBoxLayout,
@@ -201,6 +202,49 @@ def _app_bundle_path() -> Optional[str]:
     return None
 
 
+class MacToggle(QAbstractButton):
+    """macOS-style on/off switch: grey track + left knob when off, accent track
+    + right knob when on. It REFLECTS the real permission state (set via
+    setOn); clicking fires the row action rather than freely flipping."""
+
+    def __init__(self, accent: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self._on = False
+        self._accent = QColor(accent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(42, 24)
+        self.setFocusPolicy(Qt.NoFocus)
+
+    def setOn(self, on: bool) -> None:
+        on = bool(on)
+        if on != self._on:
+            self._on = on
+            self.update()
+
+    def isOn(self) -> bool:
+        return self._on
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(1, 1, -1, -1)
+        radius = r.height() / 2.0
+        if not self.isEnabled():
+            track = QColor(130, 130, 138, 60)
+        elif self._on:
+            track = QColor(self._accent)
+        else:
+            track = QColor(130, 130, 138, 130)
+        p.setPen(Qt.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(r, radius, radius)
+        d = r.height() - 4
+        x = (r.right() - d - 1) if self._on else (r.left() + 2)
+        y = r.top() + 2
+        p.setBrush(QColor("#FFFFFF") if self.isEnabled() else QColor(230, 230, 230, 140))
+        p.drawEllipse(QRect(int(x), int(y), int(d), int(d)))
+
+
 class MacPermissionsWizard(QDialog):
     """Modal onboarding dialog. Constructed only on macOS."""
 
@@ -244,7 +288,8 @@ class MacPermissionsWizard(QDialog):
         # One control (button) per permission row, keyed by permission key,
         # plus a last-rendered-state cache so the 1.2s poll only re-styles a
         # control when its state actually changes (avoids flicker).
-        self._controls: dict[str, QPushButton] = {}
+        self._controls: dict[str, QWidget] = {}
+        self._hints: dict[str, QLabel] = {}
         self._last_state: dict[str, str] = {}
         self._relaunch_btn: Optional[QPushButton] = None
         self._build_ui()
@@ -321,50 +366,6 @@ class MacPermissionsWizard(QDialog):
             "  border: none; border-radius: 12px; padding: 8px 20px; font-weight: 800;"
             "}"
             f"QPushButton#relaunchBtn:hover {{ background: {self._rgba(self._accent, 0.82)}; }}"
-        )
-
-    def _control_qss(self, kind: str) -> str:
-        """Per-control stylesheet for the single row control.
-          - 'action'  : grey translucent, accent on hover (the settings-panel
-                        button language) — used for Enable / Manage.
-          - 'granted' : accent-tinted badge — used for Enabled ✓ (still
-                        clickable to open Settings and review / turn off).
-          - 'blocked' : faint grey, non-actionable — MDM/parental Restricted."""
-        base = (
-            "  border-radius: 12px; padding: 8px 16px;"
-            "  font-weight: 800; min-width: 116px;"
-        )
-        if kind == "granted":
-            return (
-                "QPushButton {"
-                f"  background: {self._rgba(self._accent, 0.16)};"
-                f"  color: {self._accent};"
-                f"  border: 1px solid {self._rgba(self._accent, 0.55)};"
-                f"{base}"
-                "}"
-                f"QPushButton:hover {{ background: {self._rgba(self._accent, 0.24)}; }}"
-            )
-        if kind == "blocked":
-            return (
-                "QPushButton {"
-                "  background: rgba(127,127,127,0.10);"
-                "  color: rgba(229,246,255,0.45);"
-                "  border: 1px solid transparent;"
-                f"{base}"
-                "}"
-            )
-        # 'action'
-        return (
-            "QPushButton {"
-            "  background: rgba(255,255,255,0.08);"
-            f"  color: {self._text};"
-            "  border: 1px solid rgba(255,255,255,0.18);"
-            f"{base}"
-            "}"
-            f"QPushButton:hover {{"
-            f"  background: {self._rgba(self._accent, 0.20)};"
-            f"  border: 1px solid {self._rgba(self._accent, 0.85)};"
-            f"}}"
         )
 
     # ---- UI ------------------------------------------------------------------
@@ -453,14 +454,25 @@ class MacPermissionsWizard(QDialog):
         text_col.addWidget(why)
         lay.addLayout(text_col, 1)
 
-        # ONE control per row. Its label + style carry the whole state; there
-        # is no separate status pill (that dual "Granted ✓ + Granted ✓" was
-        # the confusing bit). _refresh() drives label/style/enabled per state.
-        btn = QPushButton("…")
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.clicked.connect(lambda _=False, k=key: self._on_control(k))
-        self._controls[key] = btn
-        lay.addWidget(btn, 0)
+        # One control per row. Automation isn't an on/off grant (it's approved
+        # per app on first use), so it shows a static "Per app" tag; every
+        # other permission is a macOS toggle slider driven by _refresh().
+        if key == "automation":
+            tag = QLabel("Per app")
+            tag.setStyleSheet(
+                f"color: {self._rgba(self._text, 0.55)}; font-size: 11px; font-weight: 700;"
+            )
+            self._controls[key] = tag
+            lay.addWidget(tag, 0, Qt.AlignVCenter)
+        else:
+            hint = QLabel("")
+            hint.setStyleSheet(f"color: {self._rgba(self._text, 0.55)}; font-size: 10px;")
+            self._hints[key] = hint
+            lay.addWidget(hint, 0, Qt.AlignVCenter)
+            toggle = MacToggle(self._accent, self)
+            toggle.clicked.connect(lambda _=False, k=key: self._on_control(k))
+            self._controls[key] = toggle
+            lay.addWidget(toggle, 0, Qt.AlignVCenter)
         return frame
 
     # ---- actions -------------------------------------------------------------
@@ -576,16 +588,6 @@ class MacPermissionsWizard(QDialog):
 
     # ---- polling refresh -----------------------------------------------------
 
-    def _control_view(self, key: str, state: str, reopen_pending: bool) -> tuple:
-        """(label, qss_kind, enabled) for a row's single control."""
-        if key == "automation":
-            return "Manage", "action", True
-        if state == "granted":
-            return ("Enabled • reopen" if reopen_pending else "Enabled ✓"), "granted", True
-        if state == "restricted":
-            return "Blocked", "blocked", False
-        return "Enable", "action", True
-
     def _refresh(self, force: bool = False) -> None:
         any_reopen = False
         for row in _ROWS:
@@ -597,20 +599,25 @@ class MacPermissionsWizard(QDialog):
                 and not self._granted_at_open.get(key, False)
             )
             any_reopen = any_reopen or reopen_pending
-            btn = self._controls.get(key)
-            if btn is None:
-                continue
-            # Only re-render when something actually changed (avoids the
-            # per-tick stylesheet re-polish flicker). Encode reopen into the
-            # cache key so the hint appears the moment a grant flips.
+            ctl = self._controls.get(key)
+            if not isinstance(ctl, MacToggle):
+                continue  # automation "Per app" tag — nothing to update
+            # Only re-render when something actually changed (avoids per-tick
+            # churn). Encode reopen so the hint appears the moment a grant flips.
             cache_key = f"{state}:{int(reopen_pending)}"
             if not force and self._last_state.get(key) == cache_key:
                 continue
             self._last_state[key] = cache_key
-            label, kind, enabled = self._control_view(key, state, reopen_pending)
-            btn.setText(label)
-            btn.setEnabled(enabled)
-            btn.setStyleSheet(self._control_qss(kind))
+            ctl.setOn(state == "granted")
+            ctl.setEnabled(state != "restricted")   # MDM-blocked -> not togglable
+            hint = self._hints.get(key)
+            if hint is not None:
+                if state == "restricted":
+                    hint.setText("Blocked")
+                elif reopen_pending:
+                    hint.setText("reopen ↻")
+                else:
+                    hint.setText("")
 
         if self._relaunch_btn is not None:
             self._relaunch_btn.setVisible(any_reopen)
