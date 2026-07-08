@@ -23533,6 +23533,15 @@ Admin elevation
                 candidates.append(contents / "Resources" / exe_name)
             except Exception:
                 pass
+            # Source/dev run: the same static ffmpeg the .pkg bundles is
+            # vendored under builder/macos/vendor/ (fetched by run_mac.sh /
+            # _fetch_ffmpeg.sh), so a dev run needs NO brew install either.
+            if not getattr(sys, "frozen", False):
+                try:
+                    repo_root = Path(__file__).resolve().parents[4]
+                    candidates.append(repo_root / "builder" / "macos" / "vendor" / exe_name)
+                except Exception:
+                    pass
             for brew_dir in ("/opt/homebrew/bin", "/usr/local/bin"):
                 candidates.append(Path(brew_dir) / exe_name)
         for candidate in candidates:

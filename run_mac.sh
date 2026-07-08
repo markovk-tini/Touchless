@@ -70,6 +70,16 @@ else
   echo "[run_mac] using existing deps (pass --reinstall to refresh)"
 fi
 
+# ---- static ffmpeg (recording audio) ---------------------------------------
+# Same self-contained ffmpeg the .pkg bundles, vendored under builder/macos/
+# vendor/ so a SOURCE run gets off-thread recording + mic audio with NO
+# `brew install` (matches the zero-setup shipped app). Non-fatal.
+if [[ ! -x "$ROOT/builder/macos/vendor/ffmpeg" ]]; then
+  echo "[run_mac] fetching static ffmpeg (recording audio; one-time) ..."
+  bash "$ROOT/builder/macos/_fetch_ffmpeg.sh" || \
+    echo "[run_mac] ffmpeg fetch failed (recording will be disabled until it's present)."
+fi
+
 # ---- run --------------------------------------------------------------------
 if [[ "$SMOKE_ONLY" == "1" ]]; then
   exec "$VPY" "$ROOT/scripts/mac_smoke_test.py"
