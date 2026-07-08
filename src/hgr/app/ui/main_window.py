@@ -20136,6 +20136,31 @@ Admin elevation
         except Exception:
             pass
 
+    def ensure_mac_permission(self, key: str) -> bool:
+        """Gate a feature on a macOS TCC permission. Returns True if `key`
+        ('camera' | 'microphone' | 'accessibility' | 'screen_recording') is
+        granted; otherwise pops the permission wizard with that row
+        HIGHLIGHTED so the user sees exactly what unblocks the action they
+        just tried, and returns whether it's granted after they close it.
+
+        Always True off macOS, and True (never blocks) on any error — a
+        feature must never be dead-ended by a wizard failure. This is the
+        'a feature was used but its permission isn't allowed' entry point."""
+        if sys.platform != "darwin":
+            return True
+        try:
+            from .mac_permissions_window import (
+                MacPermissionsWizard,
+                permission_granted,
+            )
+            if permission_granted(key):
+                return True
+            dialog = MacPermissionsWizard(self, highlight=key)
+            dialog.exec()
+            return permission_granted(key)
+        except Exception:
+            return True
+
     def _maybe_show_spotify_reauth_toast(self) -> None:
         """One-shot 'reconnect Spotify' toast. Fires when EITHER:
           1. controller.needs_reauth — refresh token rejected by

@@ -13,17 +13,19 @@ Camera + Microphone prompt in-process and take effect immediately; the
 other three must be toggled by the user in System Settings and (for
 Accessibility / Screen Recording) require an app RESTART to activate.
 
-This wizard shows one row per permission with a live status pill and a
-one-click action that either fires the in-process prompt (camera/mic) or
-opens the exact System Settings pane (deep link) and registers the app
-there. A ~1.2 s poll keeps the pills current so the user watches grants
-land without reopening the window.
+This wizard shows one row per permission with a SINGLE state-aware control:
+an accent "Enabled ✓" badge when granted, an "Enable" button when not (which
+fires the in-process prompt for camera/mic or deep-links to the exact System
+Settings pane for the rest), or a greyed "Blocked" when MDM/parental controls
+forbid it. A ~1.2 s poll keeps the controls current so the user watches grants
+land without reopening the window. Colors come from the live app theme so the
+dialog matches the rest of the Touchless UI.
 
-Windows/Linux never see this window — it is only constructed on darwin
-(the caller guards on ``sys.platform == "darwin"``). It is a plain modal
-``QDialog`` (like the privacy prompt and the update dialog): at first run
-the engine/live camera is not running yet, so there is no hand-driven
-cursor to keep alive, and a modal is the simplest correct choice.
+Windows/Linux never see this window — it is only constructed on darwin (the
+caller guards on ``sys.platform == "darwin"``). It is a plain modal
+``QDialog`` (like the privacy prompt and the update dialog): at first run the
+engine/live camera is not running yet, so there is no hand-driven cursor to
+keep alive, and a modal is the simplest correct choice.
 
 Author: Konstantin Markov (macOS port)
 """
@@ -35,6 +37,7 @@ import sys
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QDialog,
     QFrame,
@@ -77,17 +80,40 @@ _ROWS = (
     {"key": "screen_recording", "name": "Screen Recording",
      "why": "Capture clips, recordings, and window titles.", "restart": True},
     {"key": "automation", "name": "Automation",
-     "why": "Control apps like Spotify and Chrome.",
+     "why": "Control apps like Spotify and Chrome — approved per app on first use.",
      "restart": False, "info_only": True},
 )
+
+
+# In a source (dev) run we can't meaningfully change TCC, and the developer
+# has usually already granted everything — which makes the wizard impossible
+# to exercise. So in source builds we SIMULATE: permissions start ungranted
+# and clicking a row toggles an in-memory store, giving a full visual test
+# loop (Enable -> Enabled -> Relaunch hint, and back) without touching real
+# TCC. Frozen (shipped) builds always read the real OS state.
+_DEV_SIMULATE = not getattr(sys, "frozen", False)
+_DEV_STATE: dict[str, str] = {}
+
+
+def _dev_default(key: str) -> str:
+    if key == "automation":
+        return "perapp"
+    if key in ("camera", "microphone"):
+        return "pending"   # never asked -> renders "Enable"
+    return "denied"
 
 
 # ---- status probes (all safe/no-op off macOS) --------------------------------
 
 def _status(key: str) -> str:
-    """Return 'granted' | 'denied' | 'pending' | 'perapp' for a permission key.
-    'pending' = not decided yet (macOS will still prompt). 'perapp' is the
-    Automation row (granted per-target on first use — nothing to check)."""
+    """Return 'granted' | 'denied' | 'pending' | 'restricted' | 'perapp' for a
+    permission key. 'pending' = not decided yet (macOS will still prompt).
+    'restricted' = blocked by MDM/parental controls (user can't grant it).
+    'perapp' is the Automation row (granted per-target on first use)."""
+    if _DEV_SIMULATE:
+        # Dev/source: report the simulated store so the wizard can be tested
+        # with everything starting disabled. Real TCC is never consulted.
+        return _DEV_STATE.get(key, _dev_default(key))
     try:
         if key == "camera":
             state = caps.camera_permission_state()
@@ -114,6 +140,16 @@ def _status(key: str) -> str:
         # sends them to a Settings pane with a disabled toggle.
         return "restricted"
     return "denied"
+
+
+def permission_granted(key: str) -> bool:
+    """Public: True if the given TCC permission ('camera' | 'microphone' |
+    'accessibility' | 'screen_recording') is granted. Always True off macOS.
+    Feature code uses this to gate an action and, when False, pop the wizard
+    highlighting the offending permission (see MainWindow.ensure_mac_permission)."""
+    if sys.platform != "darwin":
+        return True
+    return _status(key) == "granted"
 
 
 def has_all_critical_permissions() -> bool:
@@ -148,48 +184,39 @@ def _app_bundle_path() -> Optional[str]:
 class MacPermissionsWizard(QDialog):
     """Modal onboarding dialog. Constructed only on macOS."""
 
-    # palette matches UpdateDialog / the app's dark-blue chrome
-    _BG = "#0B3D91"
-    _TEXT = "#E5F6FF"
-    _ACCENT = "#1DE9B6"
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None,
+                 highlight: Optional[str] = None) -> None:
         super().__init__(parent)
         apply_touchless_chrome(self)
         self.setWindowTitle("Touchless — macOS Permissions")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(540)
         self.setSizeGripEnabled(False)
-        self.setStyleSheet(
-            f"QDialog {{ background: {self._BG}; color: {self._TEXT}; }}"
-            f"QLabel {{ color: {self._TEXT}; }}"
-            "QPushButton {"
-            f"  background: {self._ACCENT}; color: #003d2a; border: none;"
-            "  border-radius: 8px; padding: 7px 14px; font-weight: 600;"
-            "}"
-            "QPushButton:hover { background: #29f0c1; }"
-            "QPushButton:disabled {"
-            "  background: rgba(255,255,255,0.15); color: rgba(255,255,255,0.5);"
-            "}"
-            "QPushButton#linkBtn {"
-            "  background: transparent; color: rgba(255,255,255,0.82);"
-            "  font-weight: 600; padding: 6px 6px;"
-            "}"
-            "QPushButton#linkBtn:hover { color: white; }"
-            "QFrame#permRow {"
-            "  background: rgba(0,0,0,0.20);"
-            "  border: 1px solid rgba(255,255,255,0.10);"
-            "  border-radius: 10px;"
-            "}"
-        )
-        # Per-row widget handles, keyed by permission key.
-        self._pills: dict[str, QLabel] = {}
-        self._buttons: dict[str, QPushButton] = {}
+        # When opened because a feature was blocked, `highlight` names the
+        # permission row to emphasise (accent glow) so the user sees exactly
+        # which grant unblocks what they just tried to do.
+        self._highlight = highlight if highlight in _ANCHORS else None
+
+        # Pull the live theme so the dialog matches the rest of the app
+        # instead of hardcoding a palette. Falls back to the brand defaults
+        # when a parent/config isn't available (e.g. a standalone test).
+        cfg = getattr(parent, "config", None)
+        self._accent = str(getattr(cfg, "accent_color", None) or "#1DE9B6")
+        self._text = str(getattr(cfg, "text_color", None) or "#E5F6FF")
+        self._primary = str(getattr(cfg, "primary_color", None) or "#0B3D91")
+        self.setStyleSheet(self._dialog_qss())
+
+        # One control (button) per permission row, keyed by permission key,
+        # plus a last-rendered-state cache so the 1.2s poll only re-styles a
+        # control when its state actually changes (avoids flicker).
+        self._controls: dict[str, QPushButton] = {}
+        self._last_state: dict[str, str] = {}
+        self._relaunch_btn: Optional[QPushButton] = None
         self._build_ui()
 
         # Snapshot restart-gated permissions' grant state at open. A grant
         # already in place when this process launched is already effective —
         # only a grant that flips DURING this session needs a relaunch, so
-        # only those show the "• reopen" hint.
+        # only those surface the "reopen" hint + Relaunch button.
         self._granted_at_open = {
             row["key"]: (_status(row["key"]) == "granted")
             for row in _ROWS if row.get("restart")
@@ -200,13 +227,97 @@ class MacPermissionsWizard(QDialog):
         self._poll.setInterval(1200)
         self._poll.timeout.connect(self._refresh)
         self._poll.start()
-        self._refresh()
+        self._refresh(force=True)
         # Stop the poll and release the dialog once it closes (Done, Esc, or
         # the window close button all emit finished). Without this the hidden,
         # parent-owned dialog would keep probing TCC APIs every 1.2s for the
         # app's life, and reopening from Settings would stack timers.
         self.finished.connect(self._poll.stop)
         self.finished.connect(self.deleteLater)
+
+    # ---- styling -------------------------------------------------------------
+
+    @staticmethod
+    def _rgba(hex_color: str, alpha: float) -> str:
+        c = QColor(hex_color)
+        return f"rgba({c.red()},{c.green()},{c.blue()},{alpha})"
+
+    def _dialog_qss(self) -> str:
+        """Base chrome: matches the settings panel — translucent innerCard
+        rows on the primary background, accent-tinted borders, and a footer
+        with an accent 'Done' primary action + a flat 'Relaunch' link."""
+        return (
+            f"QDialog {{ background: {self._primary}; color: {self._text}; }}"
+            f"QLabel {{ color: {self._text}; background: transparent; }}"
+            "QFrame#permRow {"
+            "  background: rgba(255,255,255,0.04);"
+            f"  border: 1px solid {self._rgba(self._accent, 0.22)};"
+            "  border-radius: 16px;"
+            "}"
+            # Emphasised row when the wizard is opened for a specific blocked
+            # feature — brighter accent fill + a 2px accent ring.
+            "QFrame#permRowHi {"
+            f"  background: {self._rgba(self._accent, 0.12)};"
+            f"  border: 2px solid {self._rgba(self._accent, 0.90)};"
+            "  border-radius: 16px;"
+            "}"
+            "QPushButton#doneBtn {"
+            f"  background: {self._rgba(self._accent, 0.16)};"
+            f"  color: {self._text};"
+            f"  border: 1px solid {self._rgba(self._accent, 0.55)};"
+            "  border-radius: 12px; padding: 8px 22px; font-weight: 800;"
+            "}"
+            f"QPushButton#doneBtn:hover {{ background: {self._rgba(self._accent, 0.28)}; }}"
+            "QPushButton#relaunchBtn {"
+            f"  background: transparent; color: {self._accent};"
+            "  border: none; font-weight: 700; padding: 8px 6px; text-align: left;"
+            "}"
+            "QPushButton#relaunchBtn:hover { text-decoration: underline; }"
+        )
+
+    def _control_qss(self, kind: str) -> str:
+        """Per-control stylesheet for the single row control.
+          - 'action'  : grey translucent, accent on hover (the settings-panel
+                        button language) — used for Enable / Manage.
+          - 'granted' : accent-tinted badge — used for Enabled ✓ (still
+                        clickable to open Settings and review / turn off).
+          - 'blocked' : faint grey, non-actionable — MDM/parental Restricted."""
+        base = (
+            "  border-radius: 12px; padding: 8px 16px;"
+            "  font-weight: 800; min-width: 116px;"
+        )
+        if kind == "granted":
+            return (
+                "QPushButton {"
+                f"  background: {self._rgba(self._accent, 0.16)};"
+                f"  color: {self._accent};"
+                f"  border: 1px solid {self._rgba(self._accent, 0.55)};"
+                f"{base}"
+                "}"
+                f"QPushButton:hover {{ background: {self._rgba(self._accent, 0.24)}; }}"
+            )
+        if kind == "blocked":
+            return (
+                "QPushButton {"
+                "  background: rgba(127,127,127,0.10);"
+                "  color: rgba(229,246,255,0.45);"
+                "  border: 1px solid transparent;"
+                f"{base}"
+                "}"
+            )
+        # 'action'
+        return (
+            "QPushButton {"
+            "  background: rgba(255,255,255,0.08);"
+            f"  color: {self._text};"
+            "  border: 1px solid rgba(255,255,255,0.18);"
+            f"{base}"
+            "}"
+            f"QPushButton:hover {{"
+            f"  background: {self._rgba(self._accent, 0.20)};"
+            f"  border: 1px solid {self._rgba(self._accent, 0.85)};"
+            f"}}"
+        )
 
     # ---- UI ------------------------------------------------------------------
 
@@ -215,43 +326,58 @@ class MacPermissionsWizard(QDialog):
         root.setContentsMargins(22, 20, 22, 18)
         root.setSpacing(12)
 
-        title = QLabel("Touchless needs a few macOS permissions")
+        hi_name = None
+        if self._highlight:
+            hi_name = next((r["name"] for r in _ROWS if r["key"] == self._highlight), None)
+
+        title = QLabel(
+            f"Enable {hi_name} to continue" if hi_name
+            else "Touchless needs a few macOS permissions"
+        )
         title.setStyleSheet("font-size: 18px; font-weight: 700;")
         root.addWidget(title)
 
         subtitle = QLabel(
+            f"That action needs {hi_name} access (highlighted below). "
+            "Grant it, then try again — you can review the rest here too."
+            if hi_name else
             "Grant these so hand tracking, voice, and desktop control work. "
             "You can change them anytime in System Settings — or reopen this "
             "from Settings ▸ General ▸ Permissions."
         )
         subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("font-size: 12px; color: rgba(229,246,255,0.82);")
+        subtitle.setStyleSheet(f"font-size: 12px; color: {self._rgba(self._text, 0.82)};")
         root.addWidget(subtitle)
 
         for row in _ROWS:
             root.addWidget(self._build_row(row))
 
-        note = QLabel(
-            "Accessibility and Screen Recording take effect after you "
-            "reopen Touchless."
+        self._note = QLabel(
+            "Accessibility and Screen Recording take effect after you reopen "
+            "Touchless."
         )
-        note.setWordWrap(True)
-        note.setStyleSheet("font-size: 11px; color: rgba(229,246,255,0.62);")
-        root.addWidget(note)
+        self._note.setWordWrap(True)
+        self._note.setStyleSheet(f"font-size: 11px; color: {self._rgba(self._text, 0.60)};")
+        root.addWidget(self._note)
 
         footer = QHBoxLayout()
         footer.setSpacing(10)
-        restart_btn = QPushButton("Quit & Reopen")
-        restart_btn.setObjectName("linkBtn")
-        restart_btn.setCursor(Qt.PointingHandCursor)
-        restart_btn.setToolTip(
-            "Relaunch Touchless so newly-granted Accessibility / Screen "
-            "Recording permissions take effect."
+        # Relaunch: only shown once a restart-gated grant flips this session
+        # (see _refresh). Label avoids '&' — Qt would eat it as a mnemonic
+        # accelerator (that's what turned "Quit & Reopen" into "Quit  Reopen").
+        self._relaunch_btn = QPushButton("Relaunch Touchless")
+        self._relaunch_btn.setObjectName("relaunchBtn")
+        self._relaunch_btn.setCursor(Qt.PointingHandCursor)
+        self._relaunch_btn.setToolTip(
+            "Quit and reopen Touchless so newly-granted Accessibility / "
+            "Screen Recording permissions take effect."
         )
-        restart_btn.clicked.connect(self._restart_app)
-        footer.addWidget(restart_btn)
+        self._relaunch_btn.clicked.connect(self._restart_app)
+        self._relaunch_btn.setVisible(False)
+        footer.addWidget(self._relaunch_btn)
         footer.addStretch(1)
         done_btn = QPushButton("Done")
+        done_btn.setObjectName("doneBtn")
         done_btn.setCursor(Qt.PointingHandCursor)
         done_btn.clicked.connect(self.accept)
         footer.addWidget(done_btn)
@@ -260,10 +386,10 @@ class MacPermissionsWizard(QDialog):
     def _build_row(self, row: dict) -> QFrame:
         key = row["key"]
         frame = QFrame()
-        frame.setObjectName("permRow")
+        frame.setObjectName("permRowHi" if key == self._highlight else "permRow")
         frame.setAttribute(Qt.WA_StyledBackground, True)
         lay = QHBoxLayout(frame)
-        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setContentsMargins(16, 12, 16, 12)
         lay.setSpacing(12)
 
         text_col = QVBoxLayout()
@@ -272,44 +398,50 @@ class MacPermissionsWizard(QDialog):
         name.setStyleSheet("font-size: 14px; font-weight: 700;")
         why = QLabel(row["why"])
         why.setWordWrap(True)
-        why.setStyleSheet("font-size: 11px; color: rgba(229,246,255,0.72);")
+        why.setStyleSheet(f"font-size: 11px; color: {self._rgba(self._text, 0.72)};")
         text_col.addWidget(name)
         text_col.addWidget(why)
         lay.addLayout(text_col, 1)
 
-        pill = QLabel("…")
-        pill.setAlignment(Qt.AlignCenter)
-        pill.setMinimumWidth(96)
-        self._pills[key] = pill
-        lay.addWidget(pill, 0)
-
-        if not row.get("info_only"):
-            btn = QPushButton("Grant")
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _=False, k=key: self._on_action(k))
-            self._buttons[key] = btn
-            lay.addWidget(btn, 0)
-        else:
-            info_btn = QPushButton("Open")
-            info_btn.setObjectName("linkBtn")
-            info_btn.setCursor(Qt.PointingHandCursor)
-            info_btn.setToolTip(
-                "Automation is granted per app the first time Touchless "
-                "controls it. This opens the list so you can review it."
-            )
-            info_btn.clicked.connect(lambda _=False, k=key: self._open_pane(k))
-            self._buttons[key] = info_btn
-            lay.addWidget(info_btn, 0)
-
+        # ONE control per row. Its label + style carry the whole state; there
+        # is no separate status pill (that dual "Granted ✓ + Granted ✓" was
+        # the confusing bit). _refresh() drives label/style/enabled per state.
+        btn = QPushButton("…")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(lambda _=False, k=key: self._on_control(k))
+        self._controls[key] = btn
+        lay.addWidget(btn, 0)
         return frame
 
     # ---- actions -------------------------------------------------------------
 
-    def _on_action(self, key: str) -> None:
-        state = _status(key)
-        if state == "restricted":
-            # MDM / parental controls block this; nothing the user can do here.
+    def _on_control(self, key: str) -> None:
+        """Single click handler per row. Routes by current state:
+          granted -> open Settings to review / turn off
+          automation -> open the Automation list (approved per app)
+          restricted -> no-op (MDM/parental blocked)
+          pending/denied -> the enable flow (prompt or deep-link)."""
+        if _DEV_SIMULATE:
+            # Dev/source: clicking toggles the simulated grant so the whole
+            # enabled/disabled UI can be exercised without real TCC.
+            if key == "automation":
+                return
+            _DEV_STATE[key] = "denied" if _status(key) == "granted" else "granted"
+            self._refresh(force=True)
             return
+        state = _status(key)
+        if key == "automation":
+            self._open_pane(key)
+            return
+        if state == "granted":
+            self._open_pane(key)
+            return
+        if state == "restricted":
+            return
+        self._enable(key, state)
+        self._refresh(force=True)
+
+    def _enable(self, key: str, state: str) -> None:
         if key == "camera":
             # notDetermined -> in-process prompt; already decided -> the OS
             # won't re-ask, so send the user to the exact Settings pane.
@@ -337,7 +469,6 @@ class MacPermissionsWizard(QDialog):
             except Exception:
                 pass
             self._open_pane(key)
-        self._refresh()
 
     def _open_pane(self, key: str) -> None:
         anchor = _ANCHORS.get(key)
@@ -384,49 +515,41 @@ class MacPermissionsWizard(QDialog):
 
     # ---- polling refresh -----------------------------------------------------
 
-    def _refresh(self) -> None:
+    def _control_view(self, key: str, state: str, reopen_pending: bool) -> tuple:
+        """(label, qss_kind, enabled) for a row's single control."""
+        if key == "automation":
+            return "Manage", "action", True
+        if state == "granted":
+            return ("Enabled • reopen" if reopen_pending else "Enabled ✓"), "granted", True
+        if state == "restricted":
+            return "Blocked", "blocked", False
+        return "Enable", "action", True
+
+    def _refresh(self, force: bool = False) -> None:
+        any_reopen = False
         for row in _ROWS:
             key = row["key"]
             state = _status(key)
-            pill = self._pills.get(key)
-            btn = self._buttons.get(key)
-            # "• reopen" only for a restart-gated grant that flipped during
-            # THIS session; one already in place at launch is already active.
             reopen_pending = (
                 bool(row.get("restart"))
                 and state == "granted"
                 and not self._granted_at_open.get(key, False)
             )
-            if pill is not None:
-                text, color = self._pill_style(state, reopen_pending)
-                pill.setText(text)
-                pill.setStyleSheet(
-                    f"background: {color}; color: #04121f; border-radius: 9px;"
-                    "padding: 3px 8px; font-size: 11px; font-weight: 700;"
-                )
-            if btn is not None and not row.get("info_only"):
-                # Only "pending" (never asked) and "denied" (can re-request /
-                # deep-link) are actionable. "granted" and "restricted"
-                # (MDM-blocked) disable the button so we never offer a Grant
-                # that would dead-end at a disabled Settings toggle.
-                actionable = state in ("pending", "denied")
-                btn.setEnabled(actionable)
-                if state == "granted":
-                    btn.setText("Granted ✓")
-                elif state == "restricted":
-                    btn.setText("Blocked")
-                else:
-                    btn.setText("Grant")
+            any_reopen = any_reopen or reopen_pending
+            btn = self._controls.get(key)
+            if btn is None:
+                continue
+            # Only re-render when something actually changed (avoids the
+            # per-tick stylesheet re-polish flicker). Encode reopen into the
+            # cache key so the hint appears the moment a grant flips.
+            cache_key = f"{state}:{int(reopen_pending)}"
+            if not force and self._last_state.get(key) == cache_key:
+                continue
+            self._last_state[key] = cache_key
+            label, kind, enabled = self._control_view(key, state, reopen_pending)
+            btn.setText(label)
+            btn.setEnabled(enabled)
+            btn.setStyleSheet(self._control_qss(kind))
 
-    @staticmethod
-    def _pill_style(state: str, reopen_pending: bool) -> tuple[str, str]:
-        if state == "granted":
-            label = "Granted • reopen" if reopen_pending else "Granted ✓"
-            return label, "#1DE9B6"
-        if state == "restricted":
-            return "Restricted", "#9EC1FF"
-        if state == "pending":
-            return "Not set", "#FFD166"
-        if state == "perapp":
-            return "Per app", "#9EC1FF"
-        return "Needed", "#FF8A8A"
+        if self._relaunch_btn is not None:
+            self._relaunch_btn.setVisible(any_reopen)
