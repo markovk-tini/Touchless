@@ -30860,6 +30860,14 @@ Admin elevation
                 cmd += ["-f", "avfoundation", "-thread_queue_size", "1024",
                         "-i", f":{mic_idx}",
                         "-map", "0:v", "-map", "1:a"]
+            # Downscale the physical-Retina capture (e.g. 2940x1912) to its
+            # logical resolution (halved). At full Retina the h264_videotoolbox
+            # encode runs right at the real-time limit (speed ~0.998x); any
+            # hiccup then drops/duplicates frames (playback speeds up) AND
+            # starves the mic packet queue (choppy audio). Quartering the pixel
+            # count gives the encoder ample headroom -> correct speed + clean
+            # audio + smaller files. -2 keeps height even for yuv420p.
+            cmd += ["-vf", "scale=iw/2:-2"]
             cmd += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
             cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
                     else ["-preset", "veryfast", "-crf", "23"])
