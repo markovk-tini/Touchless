@@ -1688,6 +1688,13 @@ class VoiceCommandListener:
                         device=dev,
                         compute_type=ctype,
                         download_root=str(self._model_root),
+                        # macOS: cap CTranslate2 to 4 CPU threads so a voice
+                        # transcription doesn't saturate every core and starve
+                        # the gesture MediaPipe pipeline (both are CPU-bound on
+                        # Apple Silicon), which was tanking fps whenever a voice
+                        # command ran. 0 = faster-whisper default (all cores) on
+                        # every other platform, so Windows behavior is unchanged.
+                        cpu_threads=(4 if platform.system() == "Darwin" else 0),
                     )
                     self._model_name = candidate
                     return self._model
