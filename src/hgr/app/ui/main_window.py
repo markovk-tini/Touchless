@@ -23267,6 +23267,12 @@ Admin elevation
             candidates.append(Path.cwd() / exe_name)
         except Exception:
             pass
+        # macOS: a GUI-launched .app has a minimal PATH (no Homebrew), so
+        # shutil.which misses a brew-installed ffmpeg. Check the standard
+        # Homebrew prefixes explicitly (Apple Silicon + Intel).
+        if sys.platform == "darwin":
+            for brew_dir in ("/opt/homebrew/bin", "/usr/local/bin"):
+                candidates.append(Path(brew_dir) / exe_name)
         for candidate in candidates:
             try:
                 if candidate.exists():
@@ -23299,6 +23305,11 @@ Admin elevation
         if not self._ffmpeg_path:
             return capabilities
         capabilities["available"] = True
+        if sys.platform == "darwin":
+            # macOS: distinct capability set — hardware h264_videotoolbox +
+            # avfoundation screen/mic device indices. The Windows GPU-encoder
+            # probes (nvenc/amf/qsv/gdigrab) don't apply.
+            return self._detect_ffmpeg_capabilities_mac(capabilities)
         encoders_text = self._run_external_probe(self._ffmpeg_path, "-hide_banner", "-encoders")
         for encoder_name in ("h264_nvenc", "h264_amf", "h264_qsv", "libx264"):
             if encoder_name in encoders_text:
@@ -23478,6 +23489,68 @@ Admin elevation
         except Exception:
             pass
         return capabilities
+    def _detect_ffmpeg_capabilities_mac(self, capabilities: dict) -> dict:
+        """macOS capability probe: prefer the hardware h264_videotoolbox
+        encoder, and resolve the avfoundation screen + default-mic device
+        indices once so recording can capture both in a single process."""
+        encoders_text = self._run_external_probe(self._ffmpeg_path, "-hide_banner", "-encoders")
+        if "h264_videotoolbox" in encoders_text:
+            capabilities["encoders"].add("h264_videotoolbox")
+            capabilities["preferred_encoder"] = "h264_videotoolbox"
+        else:
+            capabilities["encoders"].add("libx264")
+            capabilities["preferred_encoder"] = "libx264"
+        if "aac_at" in encoders_text:
+            capabilities["audio_encoder"] = "aac_at"   # Apple AudioToolbox AAC
+        else:
+            capabilities["audio_encoder"] = "aac"
+        capabilities["devices"].add("avfoundation")
+        screen_idx, mic_idx = self._mac_avfoundation_devices()
+        capabilities["mac_screen_index"] = screen_idx
+        capabilities["mac_mic_index"] = mic_idx
+        try:
+            sys.stderr.write(
+                f"[ffmpeg-caps] macOS: encoder={capabilities['preferred_encoder']} "
+                f"screen_idx={screen_idx} mic_idx={mic_idx}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return capabilities
+
+    def _mac_avfoundation_devices(self) -> tuple[int | None, int | None]:
+        """Parse `ffmpeg -f avfoundation -list_devices true -i ""` to find the
+        'Capture screen' video device index and the default (first) audio input
+        index. Returns (screen_index, mic_index); either may be None if the
+        listing can't be parsed (caller falls back to sane defaults)."""
+        import re
+
+        out = self._run_external_probe(
+            self._ffmpeg_path, "-hide_banner", "-f", "avfoundation",
+            "-list_devices", "true", "-i", "",
+        )
+        screen_idx: int | None = None
+        mic_idx: int | None = None
+        section: str | None = None
+        for line in out.splitlines():
+            low = line.lower()
+            if "avfoundation video devices" in low:
+                section = "video"
+                continue
+            if "avfoundation audio devices" in low:
+                section = "audio"
+                continue
+            m = re.search(r"\[(\d+)\]\s+(.*)$", line)
+            if not m:
+                continue
+            idx = int(m.group(1))
+            name = m.group(2).strip().lower()
+            if section == "video" and "capture screen" in name and screen_idx is None:
+                screen_idx = idx
+            elif section == "audio" and mic_idx is None:
+                mic_idx = idx   # first audio device = system default input
+        return screen_idx, mic_idx
+
     def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: float | None = None) -> list[str]:
         encoder = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
         gop = max(1, int(round(float(fps) * float(segment_seconds if segment_seconds is not None else 2.0))))
@@ -23755,7 +23828,14 @@ Admin elevation
             except Exception:
                 pass
     def _ffmpeg_ready(self) -> bool:
-        return bool(sys.platform.startswith("win") and self._ffmpeg_path and self._ffmpeg_capabilities.get("available"))
+        # macOS uses ffmpeg (avfoundation) for screen+mic recording just like
+        # Windows uses it for gdigrab; without darwin here mac never took the
+        # ffmpeg path and recordings were always silent.
+        return bool(
+            (sys.platform.startswith("win") or sys.platform == "darwin")
+            and self._ffmpeg_path
+            and self._ffmpeg_capabilities.get("available")
+        )
     def _clip_cache_session_id(self) -> str:
         """Per-session suffix shared by video + audio manifest/segment
         paths so files from a previous Touchless session can't
@@ -30458,6 +30538,70 @@ Admin elevation
             self._queue_post_action_save_prompt("clips", Path(output_path))
         except Exception:
             pass
+    def _start_screen_recording_ffmpeg_mac(self) -> bool:
+        """macOS screen+mic recording via ffmpeg avfoundation, in a single
+        muxed process. Captures the WHOLE screen (avfoundation has no region
+        crop without a Retina-aware filter — region recording is a future
+        item) plus the default mic. Retries video-only if the mic input fails
+        (device busy / Microphone not granted). Needs the Screen Recording
+        (and, for audio, Microphone) TCC grants — handled by the wizard."""
+        caps = self._ffmpeg_capabilities
+        screen_idx = caps.get("mac_screen_index")
+        if screen_idx is None:
+            screen_idx = 1   # screen usually sits right after the FaceTime cam
+        mic_idx = caps.get("mac_mic_index")
+        vcodec = ("h264_videotoolbox"
+                  if "h264_videotoolbox" in caps.get("encoders", set()) else "libx264")
+        acodec = str(caps.get("audio_encoder", "aac") or "aac")
+        fps = float(self._screen_record_fps)
+        output_path = self._record_output_specs()[0][0]
+
+        def build(with_audio: bool) -> list[str]:
+            spec = (f"{screen_idx}:{mic_idx}"
+                    if (with_audio and mic_idx is not None) else f"{screen_idx}:none")
+            cmd = [
+                self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "avfoundation",
+                "-capture_cursor", "1",
+                "-framerate", f"{fps:.3f}",
+                "-i", spec,
+                "-c:v", vcodec, "-pix_fmt", "yuv420p",
+            ]
+            cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
+                    else ["-preset", "veryfast", "-crf", "23"])
+            cmd += (["-c:a", acodec, "-b:a", "128k"]
+                    if (with_audio and mic_idx is not None) else ["-an"])
+            cmd += [str(output_path)]
+            return cmd
+
+        self._last_ffmpeg_startup_error = None
+        process = self._start_ffmpeg_process(build(with_audio=True))
+        if process is None and mic_idx is not None:
+            # Mic input failed (busy / permission) — record video-only rather
+            # than nothing.
+            try:
+                sys.stderr.write(
+                    "[screen-record] mac audio input failed; retrying video-only\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            process = self._start_ffmpeg_process(build(with_audio=False))
+        if process is None:
+            return False
+        self._screen_record_process = process
+        self._screen_record_backend = "ffmpeg"
+        self._screen_record_region = None
+        self._screen_record_path = output_path
+        self._screen_record_frame_size = None
+        self._screen_recording_active = True
+        self._set_worker_utility_recording_active(True)
+        self.recording_overlay.show_indicator()
+        self.last_action_label.setText(
+            f"Last action: screen recording started {output_path}"
+        )
+        return True
+
     def _start_screen_recording_ffmpeg(self, region: QRect) -> bool:
         if not self._ffmpeg_ready():
             if sys.platform == "darwin":
@@ -30484,6 +30628,8 @@ Admin elevation
             except Exception:
                 pass
             return False
+        if sys.platform == "darwin":
+            return self._start_screen_recording_ffmpeg_mac()
         region = self._normalized_record_region(region)
         if region.isNull() or region.width() <= 1 or region.height() <= 1:
             try:
