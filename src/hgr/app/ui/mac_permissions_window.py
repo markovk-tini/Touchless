@@ -202,7 +202,10 @@ class MacPermissionsWizard(QDialog):
         cfg = getattr(parent, "config", None)
         self._accent = str(getattr(cfg, "accent_color", None) or "#1DE9B6")
         self._text = str(getattr(cfg, "text_color", None) or "#E5F6FF")
-        self._primary = str(getattr(cfg, "primary_color", None) or "#0B3D91")
+        # Match the main app PAGE background (surface_color, the slate #0F172A),
+        # NOT primary_color (the old royal-blue brand accent) — that mismatch
+        # was why the wizard's blue looked off against the rest of the UI.
+        self._surface = str(getattr(cfg, "surface_color", None) or "#0F172A")
         self.setStyleSheet(self._dialog_qss())
 
         # One control (button) per permission row, keyed by permission key,
@@ -247,7 +250,7 @@ class MacPermissionsWizard(QDialog):
         rows on the primary background, accent-tinted borders, and a footer
         with an accent 'Done' primary action + a flat 'Relaunch' link."""
         return (
-            f"QDialog {{ background: {self._primary}; color: {self._text}; }}"
+            f"QDialog {{ background: {self._surface}; color: {self._text}; }}"
             f"QLabel {{ color: {self._text}; background: transparent; }}"
             "QFrame#permRow {"
             "  background: rgba(255,255,255,0.04);"
@@ -421,23 +424,28 @@ class MacPermissionsWizard(QDialog):
           automation -> open the Automation list (approved per app)
           restricted -> no-op (MDM/parental blocked)
           pending/denied -> the enable flow (prompt or deep-link)."""
-        if _DEV_SIMULATE:
-            # Dev/source: clicking toggles the simulated grant so the whole
-            # enabled/disabled UI can be exercised without real TCC.
-            if key == "automation":
-                return
-            _DEV_STATE[key] = "denied" if _status(key) == "granted" else "granted"
-            self._refresh(force=True)
-            return
         state = _status(key)
         if key == "automation":
             self._open_pane(key)
             return
-        if state == "granted":
-            self._open_pane(key)
-            return
         if state == "restricted":
             return
+        if _DEV_SIMULATE:
+            # Dev/source: still open the REAL System Settings pane for this
+            # specific permission (so the deep-link behaviour is what you
+            # test), then flip the simulated grant so the UI advances.
+            # Clicking an already-"granted" row opens the pane and flips it
+            # back off so the whole enabled/disabled loop is exercisable.
+            self._open_pane(key)
+            _DEV_STATE[key] = "denied" if state == "granted" else "granted"
+            self._refresh(force=True)
+            return
+        if state == "granted":
+            # Already on -> open Settings so the user can review / turn it off.
+            self._open_pane(key)
+            return
+        # pending/denied -> real enable flow (native prompt for a first-run
+        # camera/mic, or the specific Settings pane).
         self._enable(key, state)
         self._refresh(force=True)
 
