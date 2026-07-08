@@ -30856,6 +30856,15 @@ Admin elevation
             cmd += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
             cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
                     else ["-preset", "veryfast", "-crf", "23"])
+            # Normalize the output video to a real CFR rate + sane timebase.
+            # avfoundation screen capture reports a BOGUS 1,000,000-fps timebase
+            # ("not enough frames to estimate rate"); -framerate on the input is
+            # ignored. Players choke on a 1000k-fps mp4 and then refuse to play
+            # the audio track (which IS captured/muxed — the log shows 532KiB of
+            # aac). Forcing output -r + constant-rate + a 30000 timescale yields
+            # a clean, universally-playable file with working audio.
+            cmd += ["-r", f"{fps:.3f}", "-vsync", "cfr",
+                    "-video_track_timescale", "30000"]
             if with_audio and mic_idx is not None:
                 cmd += ["-c:a", acodec, "-b:a", "128k", "-af", "aresample=async=1"]
             else:
