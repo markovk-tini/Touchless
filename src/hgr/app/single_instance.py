@@ -46,6 +46,52 @@ _ACTION_MESSAGE_NAMES = {
 
 
 _handle: int | None = None
+# macOS: an open file descriptor holding an exclusive fcntl.flock for the
+# process lifetime. Held in a module global so it isn't garbage-collected (which
+# would release the lock). The kernel releases the flock automatically when the
+# process exits — even on crash — so there is no stale-lock problem.
+_mac_lock_fd = None
+
+
+def _acquire_mac() -> bool:
+    """macOS single-instance via an exclusive fcntl.flock on a per-user lockfile.
+    Returns True if we got the lock (only instance), False if another Touchless
+    already holds it. Permissive (True) on any unexpected error — never block a
+    legitimate launch."""
+    global _mac_lock_fd
+    try:
+        import fcntl
+        import os
+        from pathlib import Path
+
+        lock_dir = Path.home() / "Library" / "Application Support" / "Touchless"
+        try:
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_path = lock_dir / "touchless.lock"
+        except Exception:
+            lock_path = Path("/tmp/touchless_singleinstance.lock")
+        fd = open(lock_path, "a+")
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Lock held by another live Touchless -> this is a second instance.
+            try:
+                fd.close()
+            except Exception:
+                pass
+            return False
+        # Got it — hold the fd open for the whole process lifetime.
+        _mac_lock_fd = fd
+        try:
+            fd.seek(0)
+            fd.truncate()
+            fd.write(str(os.getpid()))
+            fd.flush()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return True
 
 
 def action_message_id(action_arg: str) -> int | None:
@@ -92,6 +138,8 @@ def acquire(args: list[str] | None = None) -> bool:
     so the user's right-click-task fires the same action as the
     tray menu."""
     global _handle
+    if sys.platform == "darwin":
+        return _acquire_mac()
     if sys.platform != "win32":
         return True
     try:

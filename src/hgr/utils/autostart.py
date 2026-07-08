@@ -21,9 +21,70 @@ from typing import Optional
 _RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _RUN_VALUE_NAME = "Touchless"
 
+# macOS: a per-user LaunchAgent plist with RunAtLoad=True starts Touchless at
+# login. Written to ~/Library/LaunchAgents/<label>.plist (per-user, no admin).
+_MAC_LABEL = "com.touchless.app"
+
 
 def is_supported() -> bool:
-    return platform.system() == "Windows"
+    return platform.system() in ("Windows", "Darwin")
+
+
+def _mac_plist_path():
+    return Path.home() / "Library" / "LaunchAgents" / f"{_MAC_LABEL}.plist"
+
+
+def _mac_program_arguments() -> Optional[list]:
+    """The argv the LaunchAgent runs at login. A frozen .app's sys.executable is
+    Contents/MacOS/Touchless (run it directly); from source, launch the
+    interpreter with -m hgr.app.main (dev convenience)."""
+    exe = sys.executable
+    if not exe:
+        return None
+    if getattr(sys, "frozen", False):
+        return [exe]
+    return [exe, "-m", "hgr.app.main"]
+
+
+def _set_enabled_mac(enabled: bool) -> bool:
+    try:
+        import plistlib
+        path = _mac_plist_path()
+        if enabled:
+            args = _mac_program_arguments()
+            if not args:
+                return False
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                return False
+            plist = {
+                "Label": _MAC_LABEL,
+                "ProgramArguments": args,
+                "RunAtLoad": True,
+                "ProcessType": "Interactive",
+            }
+            with open(path, "wb") as fh:
+                plistlib.dump(plist, fh)
+            # Best-effort register now (also harmless if already loaded).
+            try:
+                import subprocess
+                subprocess.run(["launchctl", "load", str(path)], capture_output=True, timeout=5)
+            except Exception:
+                pass
+        else:
+            try:
+                import subprocess
+                subprocess.run(["launchctl", "unload", str(_mac_plist_path())], capture_output=True, timeout=5)
+            except Exception:
+                pass
+            try:
+                _mac_plist_path().unlink(missing_ok=True)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
 
 
 def _resolve_launch_command() -> Optional[str]:
@@ -55,6 +116,8 @@ def set_enabled(enabled: bool) -> bool:
     """Add or remove the Run-key value. Returns True on success,
     False on any failure. Idempotent -- removing an absent value
     or adding an existing one is not an error."""
+    if platform.system() == "Darwin":
+        return _set_enabled_mac(enabled)
     if not is_supported():
         return False
     try:
@@ -94,6 +157,11 @@ def is_enabled() -> bool:
     """Read the registry to confirm the Run-key value is present.
     Used by the Settings checkbox to recover from external removal
     (e.g., msconfig disabling startup items)."""
+    if platform.system() == "Darwin":
+        try:
+            return _mac_plist_path().exists()
+        except Exception:
+            return False
     if not is_supported():
         return False
     try:
