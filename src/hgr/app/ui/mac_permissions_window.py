@@ -224,6 +224,9 @@ class MacPermissionsWizard(QDialog):
             row["key"]: (_status(row["key"]) == "granted")
             for row in _ROWS if row.get("restart")
         }
+        # Snapshot every row's state at open so Done can stay greyed until the
+        # user actually changes a permission (any row differing from here).
+        self._opening_states = {row["key"]: _status(row["key"]) for row in _ROWS}
 
         # Live refresh so grants land visibly without reopening the window.
         self._poll = QTimer(self)
@@ -264,6 +267,8 @@ class MacPermissionsWizard(QDialog):
             f"  border: 2px solid {self._rgba(self._accent, 0.90)};"
             "  border-radius: 16px;"
             "}"
+            # Done = secondary action, greyed out until a permission actually
+            # changes (disabled state below).
             "QPushButton#doneBtn {"
             f"  background: {self._rgba(self._accent, 0.16)};"
             f"  color: {self._text};"
@@ -271,11 +276,18 @@ class MacPermissionsWizard(QDialog):
             "  border-radius: 12px; padding: 8px 22px; font-weight: 800;"
             "}"
             f"QPushButton#doneBtn:hover {{ background: {self._rgba(self._accent, 0.28)}; }}"
-            "QPushButton#relaunchBtn {"
-            f"  background: transparent; color: {self._accent};"
-            "  border: none; font-weight: 700; padding: 8px 6px; text-align: left;"
+            "QPushButton#doneBtn:disabled {"
+            "  background: rgba(127,127,127,0.10);"
+            f"  color: {self._rgba(self._text, 0.40)};"
+            "  border: 1px solid transparent;"
             "}"
-            "QPushButton#relaunchBtn:hover { text-decoration: underline; }"
+            # Relaunch = a real PRIMARY button (solid accent), shown only once
+            # a restart-gated grant flips this session.
+            "QPushButton#relaunchBtn {"
+            f"  background: {self._accent}; color: #04121f;"
+            "  border: none; border-radius: 12px; padding: 8px 20px; font-weight: 800;"
+            "}"
+            f"QPushButton#relaunchBtn:hover {{ background: {self._rgba(self._accent, 0.82)}; }}"
         )
 
     def _control_qss(self, kind: str) -> str:
@@ -365,9 +377,17 @@ class MacPermissionsWizard(QDialog):
 
         footer = QHBoxLayout()
         footer.setSpacing(10)
-        # Relaunch: only shown once a restart-gated grant flips this session
-        # (see _refresh). Label avoids '&' — Qt would eat it as a mnemonic
-        # accelerator (that's what turned "Quit & Reopen" into "Quit  Reopen").
+        footer.addStretch(1)
+        # Done: greyed out until a permission actually changes (see _refresh).
+        self._done_btn = QPushButton("Done")
+        self._done_btn.setObjectName("doneBtn")
+        self._done_btn.setCursor(Qt.PointingHandCursor)
+        self._done_btn.clicked.connect(self.accept)
+        self._done_btn.setEnabled(False)
+        footer.addWidget(self._done_btn)
+        # Relaunch: a real primary button at bottom-right, shown only once a
+        # restart-gated grant flips this session. Label avoids '&' — Qt would
+        # eat it as a mnemonic (that turned "Quit & Reopen" into "Quit  Reopen").
         self._relaunch_btn = QPushButton("Relaunch Touchless")
         self._relaunch_btn.setObjectName("relaunchBtn")
         self._relaunch_btn.setCursor(Qt.PointingHandCursor)
@@ -378,12 +398,6 @@ class MacPermissionsWizard(QDialog):
         self._relaunch_btn.clicked.connect(self._restart_app)
         self._relaunch_btn.setVisible(False)
         footer.addWidget(self._relaunch_btn)
-        footer.addStretch(1)
-        done_btn = QPushButton("Done")
-        done_btn.setObjectName("doneBtn")
-        done_btn.setCursor(Qt.PointingHandCursor)
-        done_btn.clicked.connect(self.accept)
-        footer.addWidget(done_btn)
         root.addLayout(footer)
 
     def _build_row(self, row: dict) -> QFrame:
@@ -559,3 +573,12 @@ class MacPermissionsWizard(QDialog):
 
         if self._relaunch_btn is not None:
             self._relaunch_btn.setVisible(any_reopen)
+        # Done stays greyed until at least one permission differs from its
+        # state when the wizard opened.
+        done = getattr(self, "_done_btn", None)
+        if done is not None:
+            changed = any(
+                _status(row["key"]) != self._opening_states.get(row["key"])
+                for row in _ROWS
+            )
+            done.setEnabled(changed)
