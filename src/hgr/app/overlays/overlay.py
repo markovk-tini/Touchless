@@ -35,7 +35,13 @@ class HelloOverlay(QWidget):
         super().__init__(parent)
         flags = Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool
         transparent_flag = getattr(Qt, "WindowTransparentForInput", None)
-        if transparent_flag is not None:
+        # macOS: Qt.WindowTransparentForInput SUPPRESSES paintEvent delivery on a
+        # translucent, layered, non-activating NSPanel (ProcessingOverlay
+        # documents the same). It silently blanked these HUD overlays (the
+        # countdown never drew; the drawing/recording overlays only survived via
+        # their own repaint timers). Skip the flag on darwin — click-through is
+        # already preserved by WA_TransparentForMouseEvents (set on each).
+        if transparent_flag is not None and sys.platform != "darwin":
             flags |= transparent_flag
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -206,7 +212,13 @@ class ScreenDrawOverlay(QWidget):
         super().__init__(parent)
         flags = Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool
         transparent_flag = getattr(Qt, "WindowTransparentForInput", None)
-        if transparent_flag is not None:
+        # macOS: Qt.WindowTransparentForInput SUPPRESSES paintEvent delivery on a
+        # translucent, layered, non-activating NSPanel (ProcessingOverlay
+        # documents the same). It silently blanked these HUD overlays (the
+        # countdown never drew; the drawing/recording overlays only survived via
+        # their own repaint timers). Skip the flag on darwin — click-through is
+        # already preserved by WA_TransparentForMouseEvents (set on each).
+        if transparent_flag is not None and sys.platform != "darwin":
             flags |= transparent_flag
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -1026,7 +1038,13 @@ class CountdownOverlay(QWidget):
         super().__init__(parent)
         flags = Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool
         transparent_flag = getattr(Qt, "WindowTransparentForInput", None)
-        if transparent_flag is not None:
+        # macOS: Qt.WindowTransparentForInput SUPPRESSES paintEvent delivery on a
+        # translucent, layered, non-activating NSPanel (ProcessingOverlay
+        # documents the same). It silently blanked these HUD overlays (the
+        # countdown never drew; the drawing/recording overlays only survived via
+        # their own repaint timers). Skip the flag on darwin — click-through is
+        # already preserved by WA_TransparentForMouseEvents (set on each).
+        if transparent_flag is not None and sys.platform != "darwin":
             flags |= transparent_flag
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -1050,7 +1068,10 @@ class CountdownOverlay(QWidget):
         self._resize_to_primary_screen()
         self.show()
         _front_overlay(self)
-        self.update()
+        # repaint() (synchronous) not update(): each digit is shown once with no
+        # repeating timer, so a deferred/coalesced paint that never lands would
+        # blank the digit — flush it immediately.
+        self.repaint()
 
     def hide_countdown(self) -> None:
         self.hide()
@@ -1078,7 +1099,13 @@ class RecordingIndicatorOverlay(QWidget):
         super().__init__(parent)
         flags = Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool
         transparent_flag = getattr(Qt, "WindowTransparentForInput", None)
-        if transparent_flag is not None:
+        # macOS: Qt.WindowTransparentForInput SUPPRESSES paintEvent delivery on a
+        # translucent, layered, non-activating NSPanel (ProcessingOverlay
+        # documents the same). It silently blanked these HUD overlays (the
+        # countdown never drew; the drawing/recording overlays only survived via
+        # their own repaint timers). Skip the flag on darwin — click-through is
+        # already preserved by WA_TransparentForMouseEvents (set on each).
+        if transparent_flag is not None and sys.platform != "darwin":
             flags |= transparent_flag
         self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
