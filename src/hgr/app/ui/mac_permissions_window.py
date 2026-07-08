@@ -419,40 +419,43 @@ class MacPermissionsWizard(QDialog):
     # ---- actions -------------------------------------------------------------
 
     def _on_control(self, key: str) -> None:
-        """Single click handler per row. Routes by current state:
-          granted -> open Settings to review / turn off
-          automation -> open the Automation list (approved per app)
-          restricted -> no-op (MDM/parental blocked)
-          pending/denied -> the enable flow (prompt or deep-link)."""
+        """Single click handler per row. Fires the REAL request API — which
+        shows the little native permission prompt (while the permission is
+        still undecided) AND registers Touchless under that permission in
+        System Settings — instead of dumping the user in the full Settings
+        page. Automation has no grant API (it's approved per-app on first
+        control), so it opens the Automation list."""
         state = _status(key)
         if key == "automation":
             self._open_pane(key)
             return
         if state == "restricted":
             return
+        if state == "granted" and not _DEV_SIMULATE:
+            # Already on; there's nothing to prompt. Reviewing / turning it
+            # off is a System Settings task, so open that specific pane.
+            self._open_pane(key)
+            return
+        # Fire the real request. Dev-sim forces the 'pending' path so the
+        # prompt/registration always fires, then flips the simulated badge so
+        # the enabled/disabled loop stays exercisable in a source build.
+        self._enable(key, "pending" if _DEV_SIMULATE else state)
         if _DEV_SIMULATE:
-            # Dev/source: still open the REAL System Settings pane for this
-            # specific permission (so the deep-link behaviour is what you
-            # test), then flip the simulated grant so the UI advances.
-            # Clicking an already-"granted" row opens the pane and flips it
-            # back off so the whole enabled/disabled loop is exercisable.
-            self._open_pane(key)
             _DEV_STATE[key] = "denied" if state == "granted" else "granted"
-            self._refresh(force=True)
-            return
-        if state == "granted":
-            # Already on -> open Settings so the user can review / turn it off.
-            self._open_pane(key)
-            return
-        # pending/denied -> real enable flow (native prompt for a first-run
-        # camera/mic, or the specific Settings pane).
-        self._enable(key, state)
         self._refresh(force=True)
 
     def _enable(self, key: str, state: str) -> None:
+        """Trigger the little native permission prompt for `key` and register
+        Touchless under that permission.
+
+        macOS only shows the camera/mic prompt while the status is 'pending'
+        (undecided) — once decided it NEVER re-prompts, so a decided camera/mic
+        falls back to its specific Settings pane (the only way left to change
+        it). Accessibility and Screen Recording have no in-place grant at all:
+        their request API shows a little 'Open System Settings' prompt and
+        registers the app in the list — exactly the popup we want, so we do NOT
+        also open the full-page pane for them."""
         if key == "camera":
-            # notDetermined -> in-process prompt; already decided -> the OS
-            # won't re-ask, so send the user to the exact Settings pane.
             if state == "pending":
                 caps.request_camera_access()
             else:
@@ -463,20 +466,15 @@ class MacPermissionsWizard(QDialog):
             else:
                 self._open_pane(key)
         elif key == "accessibility":
-            # prompt=True registers the app under the Accessibility list AND
-            # shows the OS prompt; also open the pane so the toggle is right
-            # in front of the user.
             try:
                 caps.is_accessibility_trusted(prompt=True)
             except Exception:
                 pass
-            self._open_pane(key)
         elif key == "screen_recording":
             try:
                 caps.is_screen_recording_trusted(prompt=True)
             except Exception:
                 pass
-            self._open_pane(key)
 
     def _open_pane(self, key: str) -> None:
         anchor = _ANCHORS.get(key)
