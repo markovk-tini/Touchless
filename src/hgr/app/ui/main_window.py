@@ -30830,36 +30830,34 @@ Admin elevation
         vcodec = ("h264_videotoolbox"
                   if "h264_videotoolbox" in caps.get("encoders", set()) else "libx264")
         acodec = str(caps.get("audio_encoder", "aac") or "aac")
-        fps = float(self._screen_record_fps)
+        # 30 is a standard, well-supported avfoundation screen rate (24 is
+        # unusual and was in play when playback came out ~2x fast).
+        fps = 30.0
         output_path = self._record_output_specs()[0][0]
 
         log_path = Path(f"{output_path}.ffmpeg.log")
 
         def build(with_audio: bool) -> list[str]:
-            # avfoundation device spec is "<video>:<audio>". Video-only is the
-            # BARE index — ":none" is not valid avfoundation syntax and makes
-            # ffmpeg try to open an audio device literally named "none".
-            spec = (f"{screen_idx}:{mic_idx}"
-                    if (with_audio and mic_idx is not None) else f"{screen_idx}")
-            # Clean baseline avfoundation command. Earlier attempts
-            # (-use_wallclock_as_timestamps, -r/-vsync juggling) made the audio
-            # static and didn't fix the 2x, so we go back to the standard form
-            # and diagnose the 2x from the log (Stream fps + final time=) rather
-            # than guessing more flags.
             cmd = [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "info", "-stats", "-y",
-                "-f", "avfoundation",
-                "-capture_cursor", "1",
-                "-framerate", f"{fps:.3f}",
-                "-i", spec,
-                "-c:v", vcodec, "-pix_fmt", "yuv420p",
             ]
+            # Input 0: screen video.
+            cmd += [
+                "-f", "avfoundation", "-capture_cursor", "1",
+                "-framerate", f"{fps:.3f}", "-i", f"{screen_idx}",
+            ]
+            if with_audio and mic_idx is not None:
+                # Input 1: mic as a SEPARATE avfoundation input so it keeps its
+                # own clean clock. A combined "screen:mic" session dragged BOTH
+                # streams to ~2x speed + static; splitting them + aresample
+                # async=1 (absorbs A/V drift) is the robust fix.
+                cmd += ["-f", "avfoundation", "-i", f":{mic_idx}",
+                        "-map", "0:v", "-map", "1:a"]
+            cmd += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
             cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
                     else ["-preset", "veryfast", "-crf", "23"])
             if with_audio and mic_idx is not None:
-                # Let aac negotiate the mic's native rate; explicit -ar/-ac
-                # avoids garbled/static audio from a format mismatch.
-                cmd += ["-c:a", acodec, "-b:a", "128k", "-ar", "48000", "-ac", "1"]
+                cmd += ["-c:a", acodec, "-b:a", "128k", "-af", "aresample=async=1"]
             else:
                 cmd += ["-an"]
             cmd += [str(output_path)]
