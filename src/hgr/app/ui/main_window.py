@@ -25209,8 +25209,6 @@ Admin elevation
             self._finalize_clip_cache_segment()
 
     def _start_clip_cache(self) -> bool:
-        if self._ffmpeg_ready() and self._start_clip_cache_ffmpeg():
-            return True
         if sys.platform == "darwin":
             # macOS: record the rolling buffer on an OFF-GUI-THREAD Quartz
             # capturer (CGDisplayCreateImage) instead of the main-thread
@@ -25218,7 +25216,15 @@ Admin elevation
             # throttled the gesture loop to ~15 fps. Keeps backend == "opencv"
             # so _buffered_clip_seconds + the OpenCV export reader work
             # unchanged. Requires the Screen Recording TCC grant.
+            #
+            # MUST come BEFORE the ffmpeg branch: the ffmpeg clip-cache path
+            # uses `-f gdigrab` (Windows-only), so once _ffmpeg_ready() started
+            # returning True on mac (for avfoundation *recording*), the clip
+            # cache was spawning gdigrab, failing with "Unrecognized option
+            # 'draw_mouse'" / returncode 8, and clips silently stopped working.
             return self._start_clip_cache_macos()
+        if self._ffmpeg_ready() and self._start_clip_cache_ffmpeg():
+            return True
         if self._clip_cache_segment_writer is not None and self._clip_cache_timer.isActive():
             return True
         region = self._normalized_record_region(self._screens_union_geometry())
