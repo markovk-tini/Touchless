@@ -30818,6 +30818,8 @@ Admin elevation
         fps = float(self._screen_record_fps)
         output_path = self._record_output_specs()[0][0]
 
+        log_path = Path(f"{output_path}.ffmpeg.log")
+
         def build(with_audio: bool) -> list[str]:
             # avfoundation device spec is "<video>:<audio>". Video-only is the
             # BARE index — ":none" is not valid avfoundation syntax and makes
@@ -30825,22 +30827,17 @@ Admin elevation
             spec = (f"{screen_idx}:{mic_idx}"
                     if (with_audio and mic_idx is not None) else f"{screen_idx}")
             cmd = [
-                self._ffmpeg_path, "-hide_banner", "-loglevel", "warning", "-y",
+                self._ffmpeg_path, "-hide_banner", "-loglevel", "info", "-stats", "-y",
                 "-f", "avfoundation",
                 "-capture_cursor", "1",
                 "-framerate", f"{fps:.3f}",
-                # Timestamp each frame with the wall clock instead of trusting
-                # the requested framerate. avfoundation screen capture delivers
-                # frames at the display's refresh rate (often 60), so tagging
-                # them at the requested 24 fps compressed the timeline and made
-                # playback ~2x too fast. Wall-clock PTS = real-time duration.
-                "-use_wallclock_as_timestamps", "1",
                 "-i", spec,
                 "-c:v", vcodec, "-pix_fmt", "yuv420p",
             ]
             cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
                     else ["-preset", "veryfast", "-crf", "23"])
-            # Resample to a constant output rate at real speed.
+            # Constant output rate. avfoundation stamps real capture PTS, so a
+            # plain -r resample keeps real-time speed without a GIL-heavy path.
             cmd += ["-r", f"{fps:.3f}"]
             if with_audio and mic_idx is not None:
                 cmd += ["-c:a", acodec, "-b:a", "128k"]
@@ -30851,38 +30848,25 @@ Admin elevation
 
         try:
             sys.stderr.write(
-                f"[screen-record] mac avfoundation: screen_idx={screen_idx} "
-                f"mic_idx={mic_idx} vcodec={vcodec}\n"
-                f"[screen-record] cmd: {' '.join(build(with_audio=True))}\n"
+                f"[screen-record] mac avfoundation screen_idx={screen_idx} "
+                f"mic_idx={mic_idx} vcodec={vcodec}; ffmpeg log -> {log_path}\n"
             )
             sys.stderr.flush()
         except Exception:
             pass
 
+        # Spawn with ffmpeg's stderr going to a FILE, NOT a PIPE we drain on a
+        # Python thread — draining flooded avfoundation output on the GIL was
+        # starving the Qt UI (fps<10, laggy clicks). The file doubles as a full
+        # diagnostic log for the speed/audio issues.
         self._last_ffmpeg_startup_error = None
-        process = self._start_ffmpeg_process(build(with_audio=True))
+        process, stderr_file = self._spawn_ffmpeg_to_logfile(build(with_audio=True), log_path)
         if process is None and mic_idx is not None:
-            # Mic input failed (busy / permission) — record video-only rather
-            # than nothing.
-            try:
-                sys.stderr.write(
-                    "[screen-record] mac audio input failed "
-                    f"({self._last_ffmpeg_startup_error}); retrying video-only\n"
-                )
-                sys.stderr.flush()
-            except Exception:
-                pass
-            process = self._start_ffmpeg_process(build(with_audio=False))
+            process, stderr_file = self._spawn_ffmpeg_to_logfile(build(with_audio=False), log_path)
         if process is None:
             return False
-        # Drain ffmpeg's stderr to the log so avfoundation device/audio errors
-        # that fire AFTER the startup window are visible (mic silently dropped,
-        # sample-rate negotiation, etc.).
-        try:
-            self._spawn_ffmpeg_stderr_drain(process, "screen-record-mac")
-        except Exception:
-            pass
         self._screen_record_process = process
+        self._mac_record_stderr_file = stderr_file
         self._screen_record_backend = "ffmpeg"
         self._screen_record_region = None
         self._screen_record_path = output_path
@@ -30894,6 +30878,51 @@ Admin elevation
             f"Last action: screen recording started {output_path}"
         )
         return True
+
+    def _spawn_ffmpeg_to_logfile(self, command: list[str], log_path: "Path"):
+        """Spawn ffmpeg with stderr redirected to a log FILE (OS-level — no
+        GIL-churning drain thread and no pipe-full stall). Returns
+        (process|None, file_handle|None) with the same ~200ms liveness check
+        as _start_ffmpeg_process."""
+        try:
+            stderr_file = open(log_path, "w", encoding="utf-8", errors="replace")
+        except Exception:
+            stderr_file = None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=(stderr_file if stderr_file is not None else subprocess.DEVNULL),
+            )
+        except Exception as exc:
+            self._last_ffmpeg_startup_error = f"{type(exc).__name__}: {exc}"
+            if stderr_file is not None:
+                try:
+                    stderr_file.close()
+                except Exception:
+                    pass
+            return None, None
+        try:
+            process.wait(timeout=0.2)
+            # Exited within the startup window — capture the log tail.
+            try:
+                if stderr_file is not None:
+                    stderr_file.flush()
+                tail = Path(log_path).read_text(encoding="utf-8", errors="replace")[-300:]
+                self._last_ffmpeg_startup_error = f"exit {process.returncode}: {tail.strip()}"
+                sys.stderr.write(f"[screen-record] ffmpeg exited at startup: {self._last_ffmpeg_startup_error}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            if stderr_file is not None:
+                try:
+                    stderr_file.close()
+                except Exception:
+                    pass
+            return None, None
+        except subprocess.TimeoutExpired:
+            return process, stderr_file
 
     def _start_screen_recording_ffmpeg(self, region: QRect) -> bool:
         if not self._ffmpeg_ready():
@@ -31206,6 +31235,15 @@ Admin elevation
             elif writer is not None:
                 writer.release()
         finally:
+            # macOS: close the ffmpeg stderr log file handle opened by
+            # _spawn_ffmpeg_to_logfile (no-op on Windows / other backends).
+            _rec_log = getattr(self, "_mac_record_stderr_file", None)
+            if _rec_log is not None:
+                try:
+                    _rec_log.close()
+                except Exception:
+                    pass
+                self._mac_record_stderr_file = None
             try:
                 self.processing_overlay.hide_processing()
             except Exception:
