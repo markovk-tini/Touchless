@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -46,6 +47,13 @@ INSTALLER_ASSET_NAME = "Touchless_Installer.exe"
 # the install lives under %LOCALAPPDATA%\Programs\Touchless\, which
 # the per-user installer puts it in by default).
 APP_UPDATE_ZIP_PREFIX = "Touchless_App_Update"   # matches Touchless_App_Update_<ver>.zip
+# macOS update assets. A Windows .exe/.zip can't be applied on a Mac (and
+# vice-versa), so on macOS the checker matches these platform-specific names
+# instead — a zipped .app bundle for in-place updates, and a .pkg for full
+# (re)installs. Their prefixes are distinct from the Windows ones so a single
+# GitHub release can carry both platforms' assets without cross-matching.
+MAC_INSTALLER_ASSET_NAME = "Touchless.pkg"
+MAC_APP_UPDATE_ZIP_PREFIX = "Touchless_Mac_Update"   # matches Touchless_Mac_Update_<ver>.zip
 HTTP_TIMEOUT_SECONDS = 8.0
 
 # When the full installer is too big for GitHub's 2GB asset limit,
@@ -94,11 +102,22 @@ _APP_UPDATE_ZIP_SHA256_RE = re.compile(
     r"<!--\s*app-update-zip-sha256:\s*([0-9A-Fa-f]{64})\s*-->",
     re.IGNORECASE,
 )
+# macOS-specific SHA-256 markers (kept distinct from the Windows ones so a
+# combined release can publish both platforms' hashes side by side).
+_MAC_INSTALLER_SHA256_RE = re.compile(
+    r"<!--\s*mac-installer-sha256:\s*([0-9A-Fa-f]{64})\s*-->",
+    re.IGNORECASE,
+)
+_MAC_APP_UPDATE_ZIP_SHA256_RE = re.compile(
+    r"<!--\s*mac-app-update-zip-sha256:\s*([0-9A-Fa-f]{64})\s*-->",
+    re.IGNORECASE,
+)
 # Combined regex used to strip the markers from the body before
-# showing it to the user. Captures any <!-- (full-installer-*|app-update-*) ... -->
+# showing it to the user. Captures any <!-- (full-installer-*|app-update-*|mac-*) ... -->
 # line, including its trailing newline if present.
 _FULL_INSTALLER_MARKER_RE = re.compile(
-    r"<!--\s*(?:full-installer-(?:url|size|sha256)|app-update-zip-sha256):[^>]*-->\s*\n?",
+    r"<!--\s*(?:full-installer-(?:url|size|sha256)|app-update-zip-sha256"
+    r"|mac-installer-sha256|mac-app-update-zip-sha256):[^>]*-->\s*\n?",
     re.IGNORECASE,
 )
 
@@ -137,6 +156,24 @@ def _parse_app_update_zip_sha256(body: str) -> str:
     if not body:
         return ""
     m = _APP_UPDATE_ZIP_SHA256_RE.search(body)
+    return m.group(1).lower() if m else ""
+
+
+def _parse_mac_installer_sha256(body: str) -> str:
+    """Pull the macOS .pkg SHA-256 marker from the release body.
+    Returns "" if no marker. Lowercased hex."""
+    if not body:
+        return ""
+    m = _MAC_INSTALLER_SHA256_RE.search(body)
+    return m.group(1).lower() if m else ""
+
+
+def _parse_mac_app_update_zip_sha256(body: str) -> str:
+    """Pull the macOS app-zip SHA-256 marker from the release body.
+    Returns "" if no marker. Lowercased hex."""
+    if not body:
+        return ""
+    m = _MAC_APP_UPDATE_ZIP_SHA256_RE.search(body)
     return m.group(1).lower() if m else ""
 
 
@@ -283,6 +320,11 @@ class _CheckWorker(QObject):
             installer_size = 0
             zip_url = ""
             zip_size = 0
+            # Match this platform's asset names. On macOS a Windows .exe/.zip
+            # is useless (and vice-versa), so the target names differ per OS.
+            is_mac = sys.platform == "darwin"
+            installer_name = (MAC_INSTALLER_ASSET_NAME if is_mac else INSTALLER_ASSET_NAME).lower()
+            zip_prefix = (MAC_APP_UPDATE_ZIP_PREFIX if is_mac else APP_UPDATE_ZIP_PREFIX).lower()
             for asset in assets:
                 name = str(asset.get("name") or "").strip()
                 lname = name.lower()
@@ -291,10 +333,10 @@ class _CheckWorker(QObject):
                     size = int(asset.get("size") or 0)
                 except (TypeError, ValueError):
                     size = 0
-                if lname == INSTALLER_ASSET_NAME.lower():
+                if lname == installer_name:
                     installer_url = url
                     installer_size = size
-                elif lname.startswith(APP_UPDATE_ZIP_PREFIX.lower()) and lname.endswith(".zip"):
+                elif lname.startswith(zip_prefix) and lname.endswith(".zip"):
                     zip_url = url
                     zip_size = size
 
@@ -304,8 +346,9 @@ class _CheckWorker(QObject):
             # the <!-- full-installer-url: ... --> marker. The
             # developer adds this when uploading the .exe to their
             # CDN; the auto-updater treats the external URL as
-            # equivalent to a GitHub-hosted asset.
-            if not installer_url:
+            # equivalent to a GitHub-hosted asset. macOS .pkg is small
+            # enough to live on GitHub, so this CDN fallback is Windows-only.
+            if not installer_url and not is_mac:
                 ext_url, ext_size = _parse_external_full_installer(body_raw)
                 if ext_url:
                     installer_url = ext_url
@@ -381,9 +424,17 @@ class _CheckWorker(QObject):
         # which the Updater logs but proceeds with (backward compat for
         # legacy releases that pre-date the marker convention).
         if kind == "app-zip":
-            expected_sha256 = _parse_app_update_zip_sha256(body_raw)
+            expected_sha256 = (
+                _parse_mac_app_update_zip_sha256(body_raw)
+                if is_mac
+                else _parse_app_update_zip_sha256(body_raw)
+            )
         else:
-            expected_sha256 = _parse_full_installer_sha256(body_raw)
+            expected_sha256 = (
+                _parse_mac_installer_sha256(body_raw)
+                if is_mac
+                else _parse_full_installer_sha256(body_raw)
+            )
         info = ReleaseInfo(
             version=version_clean,
             body=body,

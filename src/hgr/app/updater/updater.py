@@ -56,6 +56,17 @@ def _update_work_dir() -> Path:
     temp dir if LOCALAPPDATA is somehow unset (shouldn't happen on
     Windows but the fallback keeps source-runs / unusual envs working).
     """
+    # macOS: stage under the app's own per-user Application Support dir
+    # (the mac analog of %LOCALAPPDATA%). Same "app staging its own
+    # update in its working area" legitimacy argument.
+    if sys.platform == "darwin":
+        d = Path.home() / "Library" / "Application Support" / "Touchless" / "Updates"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            d = Path(tempfile.gettempdir()) / "Touchless_Update"
+            d.mkdir(parents=True, exist_ok=True)
+        return d
     base = os.environ.get("LOCALAPPDATA")
     if not base:
         base = tempfile.gettempdir()
@@ -174,7 +185,13 @@ class Updater(QObject):
         # specifically to avoid Norton SONAR's "drops exe in temp,
         # runs it" heuristic — see _update_work_dir for context.
         target_dir = _update_work_dir()
-        if info.update_kind == "app-zip":
+        if sys.platform == "darwin":
+            # mac app-zip = a zipped .app bundle; full = a .pkg installer.
+            if info.update_kind == "app-zip":
+                target_path = target_dir / f"Touchless_Mac_Update_{info.version}.zip"
+            else:
+                target_path = target_dir / f"Touchless_{info.version}.pkg"
+        elif info.update_kind == "app-zip":
             target_path = target_dir / f"Touchless_App_Update_{info.version}.zip"
         else:
             target_path = target_dir / f"Touchless_Installer_{info.version}.exe"
@@ -320,6 +337,18 @@ class Updater(QObject):
         and exit the current app. Used for full-installer updates."""
         if not os.path.exists(installer_path):
             return False
+        if sys.platform == "darwin":
+            # macOS full update = a .pkg. There's no silent per-user install
+            # equivalent (a .pkg targeting / needs admin), so hand it to the
+            # GUI Installer via `open` and let the user click through — then
+            # quit ourselves so the installer can replace a non-running app.
+            try:
+                import subprocess
+                subprocess.Popen(["open", installer_path], start_new_session=True)
+            except Exception:
+                return False
+            QTimer.singleShot(0, self._quit_app)
+            return True
         # Inno Setup flags:
         #   /SILENT — minimal install UI (just a progress dialog)
         #   /CLOSEAPPLICATIONS — close any running Touchless first
@@ -365,6 +394,8 @@ class Updater(QObject):
         if not os.path.exists(zip_path):
             _plog("FAIL: zip_path does not exist on disk")
             return False
+        if sys.platform == "darwin":
+            return self._apply_zip_and_exit_mac(zip_path, _plog)
         install_dir = self._resolve_install_dir()
         _plog(f"install_dir={install_dir}")
         if install_dir is None:
@@ -413,14 +444,160 @@ class Updater(QObject):
         return True
 
     def _resolve_install_dir(self) -> Optional[Path]:
-        """Where is Touchless.exe installed? In a frozen PyInstaller
-        bundle, sys.executable IS Touchless.exe — its parent is the
-        install dir. In a dev source-run, we don't have an install
-        to upgrade and bail."""
+        """Where is Touchless installed? In a frozen PyInstaller bundle
+        on Windows, sys.executable IS Touchless.exe — its parent is the
+        install dir. On macOS the app-zip apply replaces the whole .app
+        bundle, so we return the bundle path itself (sys.executable is
+        <Touchless.app>/Contents/MacOS/Touchless). In a dev source-run,
+        we don't have an install to upgrade and bail."""
         if not getattr(sys, "frozen", False):
             return None
         try:
-            return Path(sys.executable).resolve().parent
+            exe = Path(sys.executable).resolve()
+            if sys.platform == "darwin":
+                # .../Touchless.app/Contents/MacOS/Touchless -> the .app
+                if exe.parent.name == "MacOS" and exe.parent.parent.name == "Contents":
+                    return exe.parent.parent.parent
+                return exe.parent
+            return exe.parent
+        except Exception:
+            return None
+
+    def _apply_zip_and_exit_mac(self, zip_path: str, plog) -> bool:
+        """macOS app-zip apply: spawn a detached shell helper that waits
+        for this process to quit, unpacks the new .app from the zip, swaps
+        it into the install location (with rollback on failure), clears the
+        Gatekeeper quarantine flag, and relaunches. No admin prompt when
+        the .app lives in a user-writable location (~/Applications or a
+        user-owned /Applications entry)."""
+        app_path = self._resolve_install_dir()
+        plog(f"[mac] app_path={app_path}")
+        if app_path is None:
+            plog("[mac] FAIL: install dir resolved to None (source-run?)")
+            return False
+        helper = self._write_apply_helper_mac(zip_path, app_path)
+        plog(f"[mac] helper={helper}")
+        if helper is None:
+            plog("[mac] FAIL: _write_apply_helper_mac returned None")
+            return False
+        try:
+            os.chmod(helper, 0o755)
+        except Exception:
+            pass
+        try:
+            import subprocess
+            # start_new_session detaches the helper from our process group so
+            # it survives our imminent exit; redirect stdio to devnull so it
+            # doesn't hold our terminal open.
+            subprocess.Popen(
+                ["/bin/bash", str(helper)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            plog(f"[mac] FAIL: could not spawn helper: {type(exc).__name__}: {exc!s}")
+            return False
+        plog("[mac] helper spawned; scheduling quit")
+        QTimer.singleShot(0, self._quit_app)
+        return True
+
+    def _write_apply_helper_mac(self, zip_path: str, app_path: Path) -> Optional[Path]:
+        """Write the macOS apply-update shell helper next to the zip.
+
+        Why a shell script and not Python: we can't run the bundled
+        interpreter while its own .app is being replaced, and macOS ships
+        /bin/bash + `ditto` + `xattr` + `open` on every install. `ditto`
+        is used for BOTH unzip (`-x -k`) and copy because it preserves
+        code signatures and extended attributes (the quarantine xattr and
+        the notarization ticket), which a plain `unzip`/`cp` would strip —
+        stripping them makes Gatekeeper block the relaunched app.
+
+        The script:
+          1. Waits up to ~30s for our PID to exit (can't replace a running
+             bundle cleanly).
+          2. Extracts the zip to a staging dir and locates the staged .app.
+          3. Moves the old bundle aside, ditto-copies the new one into
+             place, and rolls back if the copy fails (so a failed update
+             never leaves the user with no app).
+          4. Clears com.apple.quarantine and relaunches via `open`.
+          5. Logs every step to the Updates work dir.
+        """
+        try:
+            import os as _os
+            work = _update_work_dir()
+            helper = Path(zip_path).parent / "_apply_update.sh"
+            log_path = work / "_apply_update_mac.log"
+            staging = work / "staging"
+            pid = _os.getpid()
+            content = f"""#!/bin/bash
+# Touchless macOS auto-update apply helper (generated by updater.py).
+set -u
+APP_PATH="{app_path}"
+UPDATE_ZIP="{zip_path}"
+PARENT_PID="{pid}"
+STAGING="{staging}"
+LOG="{log_path}"
+
+log() {{ echo "[$(date '+%H:%M:%S')] $1" >> "$LOG" 2>&1; }}
+relaunch_and_exit() {{ open "$APP_PATH" >/dev/null 2>&1; exit "$1"; }}
+
+echo "[start] $(date)" > "$LOG" 2>&1
+log "APP_PATH=$APP_PATH PID=$PARENT_PID"
+
+# 1. Wait for the old Touchless process to exit (up to ~30s).
+count=0
+while kill -0 "$PARENT_PID" 2>/dev/null; do
+  if [ "$count" -ge 60 ]; then log "warn: pid still alive after 30s, proceeding"; break; fi
+  sleep 0.5
+  count=$((count+1))
+done
+sleep 1
+
+# 2. Extract to a clean staging dir (ditto preserves signature + xattrs).
+rm -rf "$STAGING" >> "$LOG" 2>&1
+mkdir -p "$STAGING" >> "$LOG" 2>&1
+log "extracting to $STAGING"
+if ! ditto -x -k "$UPDATE_ZIP" "$STAGING" >> "$LOG" 2>&1; then
+  log "error: ditto extract failed"
+  relaunch_and_exit 1
+fi
+
+NEW_APP="$STAGING/Touchless.app"
+if [ ! -d "$NEW_APP" ]; then
+  NEW_APP="$(find "$STAGING" -maxdepth 2 -name '*.app' -type d 2>/dev/null | head -n 1)"
+fi
+if [ -z "$NEW_APP" ] || [ ! -d "$NEW_APP" ]; then
+  log "error: no .app found in archive"
+  relaunch_and_exit 1
+fi
+
+# 3. Swap the bundle into place with rollback on failure.
+log "swapping bundle -> $APP_PATH"
+BACKUP="$APP_PATH.old-$$"
+if [ -d "$APP_PATH" ]; then mv "$APP_PATH" "$BACKUP" >> "$LOG" 2>&1; fi
+if ditto "$NEW_APP" "$APP_PATH" >> "$LOG" 2>&1 && [ -d "$APP_PATH" ]; then
+  rm -rf "$BACKUP" >/dev/null 2>&1
+else
+  log "error: install copy failed, restoring previous bundle"
+  rm -rf "$APP_PATH" >/dev/null 2>&1
+  [ -d "$BACKUP" ] && mv "$BACKUP" "$APP_PATH" >> "$LOG" 2>&1
+  relaunch_and_exit 1
+fi
+
+# 4. Clear quarantine (best effort) and relaunch.
+xattr -dr com.apple.quarantine "$APP_PATH" >> "$LOG" 2>&1
+log "success, relaunching"
+open "$APP_PATH" >/dev/null 2>&1
+
+# 5. Clean up staging + the downloaded zip.
+rm -rf "$STAGING" >/dev/null 2>&1
+rm -f "$UPDATE_ZIP" >/dev/null 2>&1
+exit 0
+"""
+            helper.write_text(content, encoding="utf-8")
+            return helper
         except Exception:
             return None
 

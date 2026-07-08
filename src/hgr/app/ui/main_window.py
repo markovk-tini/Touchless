@@ -6486,6 +6486,11 @@ class MainWindow(QMainWindow):
           - Registry write fails for any reason (rare on per-user HKCU)
         """
         try:
+            # Windows-only: the Inno Setup uninstall registry key + `reg`
+            # tool don't exist on macOS, so there's nothing to self-heal
+            # there (and spawning `reg` would just FileNotFoundError).
+            if sys.platform != "win32":
+                return
             from ... import __version__ as RUNNING_VERSION
             if not getattr(sys, "frozen", False):
                 return
@@ -6780,10 +6785,13 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         if not ok and self._update_dialog is not None:
+            log_hint = (
+                "~/Library/Application Support/Touchless/Updates/_apply_update_mac.log"
+                if sys.platform == "darwin"
+                else "%LOCALAPPDATA%\\Touchless\\Updates\\_apply_update.log"
+            )
             self._update_dialog.set_failure(
-                "Couldn't apply the update. Check the log under "
-                "%LOCALAPPDATA%\\Touchless\\Updates\\_apply_update.log "
-                "for details."
+                f"Couldn't apply the update. Check the log under {log_hint} for details."
             )
         elif not ok:
             # Auto-update path: no dialog to show the error in, surface
