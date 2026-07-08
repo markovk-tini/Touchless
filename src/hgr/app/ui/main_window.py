@@ -305,13 +305,37 @@ class WindowControlButton(QAbstractButton):
             self._hovered = hovered
             self.update()
 
+    def _update_mac_siblings(self) -> None:
+        """Repaint the other two traffic lights so all glyphs appear/disappear
+        together (macOS shows every glyph when the cluster is hovered)."""
+        tb = self.title_bar
+        for b in (getattr(tb, "min_button", None), getattr(tb, "max_button", None),
+                  getattr(tb, "close_button", None)):
+            if b is not None and b is not self:
+                b.update()
+
     def enterEvent(self, event) -> None:  # noqa: N802
         self.set_hovered(True)
+        if self._mac:
+            self._update_mac_siblings()
+            # Green (max) reveals the Move & Resize / Fill & Arrange popover,
+            # like macOS. Small hover delay so a quick pass-through doesn't flash it.
+            if self.kind == "max":
+                QTimer.singleShot(320, self._maybe_show_resize_popover)
         super().enterEvent(event)
+
+    def _maybe_show_resize_popover(self) -> None:
+        if self._hovered and self.kind == "max":
+            try:
+                self.title_bar.show_resize_popover(self)
+            except Exception:
+                pass
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         self._pressed = False
         self.set_hovered(False)
+        if self._mac:
+            self._update_mac_siblings()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
@@ -354,12 +378,15 @@ class WindowControlButton(QAbstractButton):
         painter.setPen(QPen(fill.darker(125), 0.5))
         painter.setBrush(fill.darker(112) if self._pressed else fill)
         painter.drawEllipse(circle)
-        show_glyph = (
-            self._hovered
-            or self._pressed
-            or getattr(self.title_bar, "_mac_controls_hovered", False)
+        # Group hover: any traffic light hovered -> all three show their glyph.
+        tb = self.title_bar
+        show_glyph = self.isEnabled() and any(
+            getattr(b, "_hovered", False) or getattr(b, "_pressed", False)
+            for b in (getattr(tb, "min_button", None), getattr(tb, "max_button", None),
+                      getattr(tb, "close_button", None))
+            if b is not None
         )
-        if show_glyph and self.isEnabled():
+        if show_glyph:
             gp = QPen(fill.darker(200))
             gp.setWidthF(1.3)
             gp.setCapStyle(Qt.RoundCap)
@@ -411,6 +438,150 @@ class WindowControlButton(QAbstractButton):
         elif self.kind == "close":
             painter.drawLine(cx - 3, cy - 3, cx + 3, cy + 3)
             painter.drawLine(cx + 3, cy - 3, cx - 3, cy + 3)
+
+
+class _ResizeTile(QAbstractButton):
+    """One position tile in the green-button resize popover: a mini window
+    frame with the target region filled. Emits its position key on click."""
+
+    def __init__(self, pos_key: str, accent: str, parent=None):
+        super().__init__(parent)
+        self.pos_key = pos_key
+        self._accent = QColor(accent)
+        self._hover = False
+        self.setFixedSize(52, 36)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def enterEvent(self, e):  # noqa: N802
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):  # noqa: N802
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def _region(self, r: QRect) -> QRect:
+        x, y, w, h = r.x(), r.y(), r.width(), r.height()
+        k = self.pos_key
+        if k == "left_half":
+            return QRect(x, y, w // 2 - 1, h)
+        if k == "right_half":
+            return QRect(x + w // 2 + 1, y, w // 2 - 1, h)
+        if k == "top_half":
+            return QRect(x, y, w, h // 2 - 1)
+        if k == "bottom_half":
+            return QRect(x, y + h // 2 + 1, w, h // 2 - 1)
+        if k == "center":
+            return QRect(x + int(w * 0.22), y + int(h * 0.22), int(w * 0.56), int(h * 0.56))
+        # fill / fullscreen
+        return QRect(x, y, w, h)
+
+    def paintEvent(self, e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        frame = self.rect().adjusted(3, 3, -3, -3)
+        p.setPen(QPen(QColor(255, 255, 255, 150 if self._hover else 80), 1.2))
+        p.setBrush(QColor(255, 255, 255, 20) if self._hover else Qt.NoBrush)
+        p.drawRoundedRect(frame, 4, 4)
+        region = self._region(frame)
+        p.setPen(Qt.NoPen)
+        p.setBrush(self._accent if self._hover else QColor(255, 255, 255, 165))
+        p.drawRoundedRect(region, 2, 2)
+
+
+class MacResizePopover(QWidget):
+    """macOS-style Move & Resize / Fill & Arrange / Full Screen popover shown
+    on hover of the green traffic light. Tiles retile the MAIN window on its
+    current screen's available area."""
+
+    def __init__(self, main_window: "MainWindow"):
+        super().__init__(main_window, Qt.Popup)
+        self.main_window = main_window
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        accent = str(getattr(main_window.config, "accent_color", None) or "#1DE9B6")
+        self._accent = accent
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        def section(title: str) -> QLabel:
+            lbl = QLabel(title)
+            lbl.setStyleSheet("color: rgba(235,240,255,0.55); font-size: 11px; font-weight: 700;")
+            return lbl
+
+        def tile_row(keys: list[str]) -> QHBoxLayout:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            for k in keys:
+                t = _ResizeTile(k, accent, self)
+                t.clicked.connect(lambda _=False, key=k: self._apply(key))
+                row.addWidget(t)
+            row.addStretch(1)
+            return row
+
+        root.addWidget(section("Move & Resize"))
+        root.addLayout(tile_row(["left_half", "right_half", "top_half", "bottom_half"]))
+        root.addWidget(section("Fill & Arrange"))
+        root.addLayout(tile_row(["fill", "center"]))
+        fs = QPushButton("Full Screen")
+        fs.setCursor(Qt.PointingHandCursor)
+        fs.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,0.08); color: #EAF2FF;"
+            "  border: 1px solid rgba(255,255,255,0.14); border-radius: 8px;"
+            "  padding: 6px 10px; font-weight: 700; text-align: left; }"
+            f"QPushButton:hover {{ background: rgba(29,233,182,0.20);"
+            f"  border: 1px solid {accent}; }}"
+        )
+        fs.clicked.connect(lambda: self._apply("fullscreen"))
+        root.addWidget(fs)
+
+    def paintEvent(self, e):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = self.rect().adjusted(0, 0, -1, -1)
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.setBrush(QColor(30, 34, 52, 245))
+        p.drawRoundedRect(r, 12, 12)
+
+    def _apply(self, pos_key: str) -> None:
+        mw = self.main_window
+        try:
+            if pos_key == "fullscreen":
+                mw.showFullScreen()
+                self.close()
+                return
+            if mw.isFullScreen():
+                mw.showNormal()
+            screen = mw.screen() or QApplication.primaryScreen()
+            a = screen.availableGeometry()
+            x, y, w, h = a.x(), a.y(), a.width(), a.height()
+            if pos_key == "left_half":
+                g = QRect(x, y, w // 2, h)
+            elif pos_key == "right_half":
+                g = QRect(x + w // 2, y, w - w // 2, h)
+            elif pos_key == "top_half":
+                g = QRect(x, y, w, h // 2)
+            elif pos_key == "bottom_half":
+                g = QRect(x, y + h // 2, w, h - h // 2)
+            elif pos_key == "fill":
+                g = QRect(a)
+            elif pos_key == "center":
+                cw, ch = int(w * 0.7), int(h * 0.7)
+                g = QRect(x + (w - cw) // 2, y + (h - ch) // 2, cw, ch)
+            else:
+                self.close()
+                return
+            try:
+                mw.is_custom_maximized = (pos_key == "fill")
+                mw.title_bar.refresh()
+            except Exception:
+                pass
+            mw.setGeometry(g)
+        except Exception:
+            pass
+        self.close()
 
 
 class TitleBar(QFrame):
@@ -529,6 +700,23 @@ class TitleBar(QFrame):
         self.max_button.update()
         self.close_button.update()
         QTimer.singleShot(0, self._sync_control_hover_state)
+
+    def show_resize_popover(self, anchor: "WindowControlButton") -> None:
+        """macOS only: show the Move & Resize / Fill & Arrange popover under the
+        green traffic light. Reuses one instance; positioned just below the
+        anchor button."""
+        existing = getattr(self, "_resize_popover", None)
+        if existing is not None:
+            try:
+                existing.close()
+            except Exception:
+                pass
+        pop = MacResizePopover(self.parent_window)
+        self._resize_popover = pop
+        pop.adjustSize()
+        gp = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        pop.move(gp.x() - 12, gp.y() + 6)
+        pop.show()
 
     def set_walkthrough_active(self, active: bool) -> None:
         """Toggle the centred 'Tutorial' indicator + the title-bar
