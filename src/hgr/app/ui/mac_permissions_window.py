@@ -85,22 +85,46 @@ _ROWS = (
 )
 
 
-# In a source (dev) run we can't meaningfully change TCC, and the developer
-# has usually already granted everything — which makes the wizard impossible
-# to exercise. So in source builds we SIMULATE: permissions start ungranted
-# and clicking a row toggles an in-memory store, giving a full visual test
-# loop (Enable -> Enabled -> Relaunch hint, and back) without touching real
-# TCC. Frozen (shipped) builds always read the real OS state.
-_DEV_SIMULATE = not getattr(sys, "frozen", False)
-_DEV_STATE: dict[str, str] = {}
+# The app's bundle id (must match builder/macos/hgr_app_mac.spec BUNDLE_ID).
+_APP_BUNDLE_ID = "com.touchless.app"
+
+# Guards the once-per-process dev reset so reopening the wizard (Settings /
+# context-trigger) doesn't wipe grants the user just made this session.
+_reverted_this_process = False
 
 
-def _dev_default(key: str) -> str:
-    if key == "automation":
-        return "perapp"
-    if key in ("camera", "microphone"):
-        return "pending"   # never asked -> renders "Enable"
-    return "denied"
+def revert_test_permissions() -> None:
+    """DEV testing helper: reset Touchless's TCC grants so the wizard starts
+    with everything disabled and the REAL macOS prompt fires on Enable.
+
+    By default targets the app bundle id (com.touchless.app) + the runtime
+    bundle id — harmless to other apps, and correct for the packaged .app. In
+    a SOURCE run the process identity is the launching Terminal (not
+    Touchless), so a bundle-scoped reset can't flip what the dev process sees;
+    set HGR_MAC_PERMS_RESET_ALL=1 to instead reset each service GLOBALLY
+    (which does start the dev build disabled + shows real prompts, but also
+    re-prompts your other apps). No-op off macOS."""
+    if sys.platform != "darwin":
+        return
+    bundle_ids = [_APP_BUNDLE_ID]
+    try:
+        from Foundation import NSBundle  # type: ignore
+
+        bid = NSBundle.mainBundle().bundleIdentifier()
+        if bid and str(bid) not in bundle_ids:
+            bundle_ids.append(str(bid))
+    except Exception:
+        pass
+    reset_all = bool(os.environ.get("HGR_MAC_PERMS_RESET_ALL"))
+    # tccutil service names (distinct from our internal keys).
+    for svc in ("Camera", "Microphone", "Accessibility", "ScreenCapture", "AppleEvents"):
+        targets = [None] if reset_all else bundle_ids  # None = global reset
+        for bid in targets:
+            cmd = ["tccutil", "reset", svc] + ([bid] if bid else [])
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=5)
+            except Exception:
+                pass
 
 
 # ---- status probes (all safe/no-op off macOS) --------------------------------
@@ -110,10 +134,6 @@ def _status(key: str) -> str:
     permission key. 'pending' = not decided yet (macOS will still prompt).
     'restricted' = blocked by MDM/parental controls (user can't grant it).
     'perapp' is the Automation row (granted per-target on first use)."""
-    if _DEV_SIMULATE:
-        # Dev/source: report the simulated store so the wizard can be tested
-        # with everything starting disabled. Real TCC is never consulted.
-        return _DEV_STATE.get(key, _dev_default(key))
     try:
         if key == "camera":
             state = caps.camera_permission_state()
@@ -195,6 +215,15 @@ class MacPermissionsWizard(QDialog):
         # permission row to emphasise (accent glow) so the user sees exactly
         # which grant unblocks what they just tried to do.
         self._highlight = highlight if highlight in _ANCHORS else None
+
+        # DEV only: on the first wizard open of a source run, revert Touchless's
+        # own TCC grants so it starts disabled and Enable fires the REAL macOS
+        # prompt. Once-per-process so reopening from Settings doesn't wipe grants
+        # made this session. Never runs in a frozen/shipped build.
+        global _reverted_this_process
+        if not getattr(sys, "frozen", False) and not _reverted_this_process:
+            revert_test_permissions()
+            _reverted_this_process = True
 
         # Pull the live theme so the dialog matches the rest of the app
         # instead of hardcoding a palette. Falls back to the brand defaults
@@ -445,116 +474,15 @@ class MacPermissionsWizard(QDialog):
             return
         if state == "restricted":
             return
-        if _DEV_SIMULATE:
-            # Dev/source: the real permission is already granted to Terminal,
-            # so macOS won't show its prompt. Show a faithful MOCK of the
-            # system prompt so the enable flow is visible + drivable; clicking
-            # an already-on row just flips it back off (re-test loop).
-            if state == "granted":
-                _DEV_STATE[key] = "denied"
-            elif self._show_simulated_prompt(key):
-                _DEV_STATE[key] = "granted"
-            self._refresh(force=True)
-            return
         if state == "granted":
             # Already on; there's nothing to prompt. Reviewing / turning it
             # off is a System Settings task, so open that specific pane.
             self._open_pane(key)
             return
-        # Frozen build: fire the real request (native prompt + registration).
+        # pending/denied -> fire the REAL request: the native macOS prompt
+        # (when the permission is undecided) + registers Touchless in the list.
         self._enable(key, state)
         self._refresh(force=True)
-
-    def _show_simulated_prompt(self, key: str) -> bool:
-        """DEV-ONLY faithful mock of the macOS TCC permission prompt. Returns
-        True on Allow. Never runs in a frozen build — there the real system
-        prompt fires from _enable(). Exists because a source run's permissions
-        are already granted to Terminal, so macOS won't re-prompt and the
-        enable flow would otherwise be invisible."""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
-
-        titles = {
-            "camera": '“Touchless” would like to access the camera.',
-            "microphone": '“Touchless” would like to access the microphone.',
-            "accessibility": '“Touchless” would like to control this '
-                             'computer using accessibility features.',
-            "screen_recording": '“Touchless” would like to record this '
-                                 'computer’s screen.',
-        }
-        bodies = {
-            "camera": "Touchless uses the camera to recognize your hand gestures.",
-            "microphone": "Touchless uses the microphone for voice commands and dictation.",
-            "accessibility": "Grant this in System Settings, then reopen Touchless.",
-            "screen_recording": "Grant this in System Settings, then reopen Touchless.",
-        }
-        deny_txt, allow_txt = ("Don’t Allow", "Allow")
-        if key in ("accessibility", "screen_recording"):
-            deny_txt, allow_txt = ("Deny", "Open System Settings")
-
-        dlg = QDialog(self)
-        dlg.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
-        dlg.setModal(True)
-        dlg.setFixedWidth(300)
-        # Styled to resemble the SYSTEM prompt (light panel, not app-themed) —
-        # the real macOS prompt isn't drawn by the app either.
-        dlg.setStyleSheet(
-            "QDialog { background: #ECECEC; border-radius: 14px; }"
-            "QLabel#t { color: #111; font-size: 13px; font-weight: 700; }"
-            "QLabel#b { color: #444; font-size: 12px; }"
-            "QPushButton { background: #FBFBFB; color: #111;"
-            "  border: 1px solid #C4C4C4; border-radius: 7px; padding: 7px 10px;"
-            "  font-weight: 600; min-width: 110px; }"
-            "QPushButton:hover { background: #F0F0F0; }"
-            "QPushButton#allow { background: #DCEBFF; border-color: #A9CBFF; }"
-            "QPushButton#allow:hover { background: #CFE3FF; }"
-        )
-        lay = QVBoxLayout(dlg)
-        lay.setContentsMargins(22, 20, 22, 16)
-        lay.setSpacing(10)
-
-        icon = QLabel()
-        icon.setAlignment(Qt.AlignCenter)
-        try:
-            pm = self.windowIcon().pixmap(52, 52)
-            if not pm.isNull():
-                icon.setPixmap(pm)
-        except Exception:
-            pass
-        lay.addWidget(icon)
-
-        t = QLabel(titles.get(key, '“Touchless” would like access.'))
-        t.setObjectName("t")
-        t.setWordWrap(True)
-        t.setAlignment(Qt.AlignCenter)
-        lay.addWidget(t)
-
-        b = QLabel(bodies.get(key, ""))
-        b.setObjectName("b")
-        b.setWordWrap(True)
-        b.setAlignment(Qt.AlignCenter)
-        lay.addWidget(b)
-
-        row = QHBoxLayout()
-        row.setSpacing(10)
-        deny = QPushButton(deny_txt)
-        deny.setCursor(Qt.PointingHandCursor)
-        deny.clicked.connect(dlg.reject)
-        allow = QPushButton(allow_txt)
-        allow.setObjectName("allow")
-        allow.setCursor(Qt.PointingHandCursor)
-        allow.clicked.connect(dlg.accept)
-        row.addWidget(deny)
-        row.addWidget(allow)
-        lay.addLayout(row)
-
-        dlg.adjustSize()
-        try:
-            if self.isVisible():
-                c = self.geometry().center()
-                dlg.move(c.x() - dlg.width() // 2, c.y() - dlg.height() // 2)
-        except Exception:
-            pass
-        return dlg.exec() == QDialog.Accepted
 
     def _enable(self, key: str, state: str) -> None:
         """Trigger the little native permission prompt for `key` and register
