@@ -31152,6 +31152,28 @@ Admin elevation
         region = self._normalized_record_region(region)
         if self._start_screen_recording_ffmpeg(region):
             return
+        if sys.platform == "darwin":
+            # No ffmpeg -> do NOT fall back to the Qt-grab recorder: it captures
+            # the screen + writes frames on the MAIN thread, which freezes the
+            # UI (can't click anything) and can't keep real-time (fast-forward
+            # + no audio). The shipped .app bundles ffmpeg; a dev source run
+            # needs `brew install ffmpeg`. Abort cleanly instead of freezing.
+            self.last_action_label.setText(
+                "Last action: recording needs ffmpeg (brew install ffmpeg)"
+            )
+            self._set_worker_utility_recording_active(False)
+            try:
+                QMessageBox.information(
+                    self,
+                    "Screen recording — ffmpeg required",
+                    "Screen recording on macOS needs ffmpeg (for off-thread "
+                    "capture + audio).\n\nThe installed Touchless app bundles it "
+                    "automatically. For a source/dev run, install it once:\n\n"
+                    "    brew install ffmpeg\n\nthen try recording again.",
+                )
+            except Exception:
+                pass
+            return
         writer = None
         path = None
         for candidate_path, codec_name in self._record_output_specs():
