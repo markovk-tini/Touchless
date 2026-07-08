@@ -51,6 +51,40 @@ Many phases **cannot be verified without Mac hardware** (see the porting plan).
 
 ---
 
+## Port progress log (code implemented on `feat/macos-port`)
+
+Landed and confirmed working on a Mac (user-verified): camera + MediaPipe
+tracking at parity fps (root cause was the instant-clip rolling buffer grabbing
+the screen on the GUI thread — moved off-thread via Quartz `CGDisplayCreateImage`),
+gesture recognition + gating, hand cursor + clicks, drawing, gesture wheels
+(no focus-steal), voice command + dictation (loud & soft), Spotify control
+(AppleScript playback + Web-API search/library + connect pill), foreign-window
+control (close/min/max via AX), media keys, screenshot + countdown overlay,
+instant-clip export, and screen recording (video).
+
+Landed in code, inert until the Mac packaging pipeline exists (no Mac build yet):
+
+- **Single-instance lock** — `fcntl.flock` on `~/Library/Application Support/
+  Touchless/touchless.lock` (`single_instance._acquire_mac`).
+- **Auto-start on login** — per-user LaunchAgent plist + `launchctl`
+  (`autostart._set_enabled_mac`).
+- **Metal-aware native finders** — whisper/llama resolvers now search
+  `build_metal/` + extensionless Mach-O names and prefer the Metal backend on
+  macOS (`whisper_stream`, `whisper_refiner`, `llama_server`, `local_backend`).
+- **Auto-update apply path** — `release_checker` matches macOS assets
+  (`Touchless.pkg`, `Touchless_Mac_Update_<ver>.zip`) with distinct SHA markers;
+  `updater` writes a detached `_apply_update.sh` that `ditto`-swaps the `.app`
+  (rollback on failure) + clears quarantine + relaunches; `.pkg` path hands off
+  to the GUI Installer via `open`. SHA-256 verification shared; Authenticode
+  no-ops off Windows.
+
+Still open: recording **mic audio** (needs ffmpeg present — avfoundation path
+staged but gated), first-run **permission onboarding wizard**, **system audio**
+capture (BlackHole/ScreenCaptureKit), and the full **.pkg packaging + Metal
+binary builds + codesign/notarize** pipeline (needs Mac + Apple Developer creds).
+
+---
+
 ## How to read this
 
 Every feature below carries one of four verdicts:
