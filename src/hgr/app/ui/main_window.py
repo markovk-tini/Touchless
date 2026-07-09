@@ -25398,9 +25398,21 @@ Admin elevation
                     # fully released on engine restart — documented limitation).
                     if not bool(getattr(self.config, "clip_capture_microphone", False)):
                         return
-                    arr = indata
-                    mono = arr[:, 0] if getattr(arr, "ndim", 1) > 1 else arr
-                    mono = np.asarray(mono, dtype=np.float32).copy()
+                    if indata is None:
+                        return
+                    # Channel extraction MUST mirror the voice pipeline exactly
+                    # (voice_command_listener._audio_callback): some mac drivers
+                    # deliver 1-D INTERLEAVED stereo even when channels=1 is
+                    # requested — reading it as-is is the "low robotic"/garbled
+                    # symptom. Take [::2] in that case.
+                    arr = np.asarray(indata, dtype=np.float32)
+                    if arr.ndim > 1:
+                        mono = np.ascontiguousarray(arr[:, 0])
+                    elif arr.size == frames * 2:
+                        mono = np.ascontiguousarray(arr[::2])
+                    else:
+                        mono = arr
+                    mono = mono.copy()
                     t_end = time.time() - float(getattr(self, "_mac_clip_audio_latency", 0.0))
                     lock = getattr(self, "_mac_clip_audio_lock", None)
                     chunks = getattr(self, "_mac_clip_audio_chunks", None)
@@ -25466,16 +25478,20 @@ Admin elevation
                 pass
 
     def _extract_mac_clip_audio(self, left: float, right: float):
-        """Return a float32 mono buffer spanning the FULL [left, right] window,
-        with the mic-ring samples placed at their true wall-clock position and
-        SILENCE (zeros) everywhere the ring had no data — the leading warmup
-        gap, any interior dropped-block gaps, and the trailing edge.
+        """Return a float32 mono buffer spanning the FULL [left, right] window.
 
-        Returning a full-window buffer (not bare concatenated samples) is what
-        keeps A/V in sync: sample i is exactly at left + i/fs, so muxing it at
-        container t=0 aligns it with the video (whose t=0 is also `left`), and
-        its length == the video length so `-shortest` can never truncate the
-        video. Returns None only if NO real samples fall in the window."""
+        The mic stream is a CONTIGUOUS sample flow; chunk boundaries are
+        arbitrary but the samples are gapless. So we concatenate the chunks in
+        order (NOT re-position each by its own timestamp — the callback's
+        time.time() carries scheduling jitter, and placing each block by that
+        jittery stamp leaves ~ms gaps/overlaps between every block = the
+        garbled/"static" artifact). We anchor only the FIRST chunk to the wall
+        clock, append the rest contiguously, and insert silence ONLY where a
+        real, large gap is detected (a genuinely dropped block). Then we window
+        [left, right] out of that stream, silence-padding the leading warmup and
+        trailing edge so the result is exactly the window length (== the video
+        length, so `-shortest` can never truncate the video). Returns None only
+        if NO real samples fall in the window."""
         fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
         lock = getattr(self, "_mac_clip_audio_lock", None)
         chunks_ref = getattr(self, "_mac_clip_audio_chunks", None)
@@ -25494,36 +25510,43 @@ Admin elevation
             return None
         if not chunks:
             return None
-        out = np.zeros(total, dtype=np.float32)  # silence baseline for gaps
-        placed = 0
+        # Build one contiguous stream. first_start = wall-clock time of its
+        # first sample. Insert silence only for gaps > ~20 ms (a real drop),
+        # never for the per-block sub-ms jitter.
+        first_t_end, first_arr = chunks[0]
+        first_start = first_t_end - len(first_arr) / fs
+        pieces: list = []
+        prev_t_end = None
         for (t_end, arr) in chunks:
             n = len(arr)
             if n == 0:
                 continue
-            t_start = t_end - n / fs
-            ov_l = max(left, t_start)
-            ov_r = min(right, t_end)
-            if ov_r <= ov_l:
-                continue
-            # source slice within this chunk
-            s0 = max(0, min(n, int(round((ov_l - t_start) * fs))))
-            s1 = max(0, min(n, int(round((ov_r - t_start) * fs))))
-            if s1 <= s0:
-                continue
-            seg = arr[s0:s1]
-            # destination slice within the window, positioned by wall-clock
-            d0 = int(round((ov_l - left) * fs))
-            if d0 < 0:
-                seg = seg[-d0:]
-                d0 = 0
-            d1 = min(total, d0 + len(seg))
-            if d1 <= d0:
-                continue
-            seg = seg[: d1 - d0]
-            out[d0:d1] = seg
-            placed += (d1 - d0)
-        if placed <= 0:
+            if prev_t_end is not None:
+                gap = (t_end - n / fs) - prev_t_end
+                if gap > 0.020:
+                    pieces.append(np.zeros(int(round(gap * fs)), dtype=np.float32))
+            pieces.append(arr)
+            prev_t_end = t_end
+        if not pieces:
             return None
+        try:
+            full = np.concatenate(pieces).astype(np.float32)
+        except Exception:
+            return None
+        if full.size == 0:
+            return None
+        # Window [left, right] out of `full` (full[0] is at first_start).
+        out = np.zeros(total, dtype=np.float32)
+        start_idx = int(round((left - first_start) * fs))
+        src0 = max(0, start_idx)
+        src1 = min(full.size, start_idx + total)
+        if src1 <= src0:
+            return None
+        dst0 = src0 - start_idx           # >0 when the window starts before capture
+        dst1 = dst0 + (src1 - src0)
+        if dst0 < 0 or dst1 > total or dst1 <= dst0:
+            return None
+        out[dst0:dst1] = full[src0:src1]
         return out
 
     def _mux_mac_clip_audio(self, video_path: Path, left: float, right: float) -> None:
