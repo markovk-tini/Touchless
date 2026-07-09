@@ -31111,57 +31111,43 @@ Admin elevation
         except Exception:
             pass
     def _start_screen_recording_ffmpeg_mac(self) -> bool:
-        """macOS screen recording via ffmpeg avfoundation.
+        """macOS screen recording: ffmpeg avfoundation for VIDEO, sounddevice
+        for AUDIO, muxed on stop.
 
-        Video (screen) and audio (mic) are captured in TWO SEPARATE ffmpeg
-        processes, then copy-muxed together on stop. This split is deliberate.
-        A single process with both an avfoundation screen input AND a mic input
-        shares one read loop, and the heavy raw screen frames (~11 MB each at
-        Retina) hog it. That does two bad things to the audio: (1) the mic
-        packet queue drains raggedly while ffmpeg is busy encoding the big
-        video frame -> choppy "bad reception" static; and (2) the mic PTS gets
-        rebased onto the screen input's bogus 1,000,000-fps timebase -> playback
-        comes out slightly fast. Both persisted even with the Retina downscale
-        because at speed~0.997x the process runs right at the real-time edge.
-
-        An audio-only process is trivially cheap, never runs at that edge, and
-        keeps its own clean 48 kHz clock — the same reason our sounddevice voice
-        capture is clean on this exact Mac. Audio is captured as raw PCM (no aac
-        encoder priming/tail-drop). On stop we mux the two temp files into the
-        final mp4, correcting the exact capture-start offset (see
-        _finalize_mac_recording) so the audio isn't left leading the video.
+        History: capturing the mic as a second ffmpeg avfoundation input (either
+        in one process or a sidecar) dropped ~11% of the mic samples on this Mac
+        — two concurrent avfoundation sessions (screen + mic) contend, and the
+        mic PCM came out ~0.89x its nominal sample count, i.e. TIME-COMPRESSED,
+        which plays back "sped up". No mux trick fixes an already-compressed
+        source. sounddevice/PortAudio is a different capture API (no second
+        avfoundation session) and captures at the true rate — it's the same path
+        the voice pipeline and clip audio use cleanly here. So the mic goes
+        through sounddevice (_start_mac_record_audio) and is muxed into the video
+        on stop, with the capture-start offset corrected via a common mach clock
+        (see _finalize_mac_recording).
 
         Captures the WHOLE screen (avfoundation has no region crop without a
-        Retina-aware filter — region recording is a future item). The mic
-        sidecar is best-effort: if it fails to start (device busy / Microphone
-        not granted) the recording is still saved, just silent. Needs the
-        Screen Recording (and, for audio, Microphone) TCC grants — handled by
-        the wizard."""
+        Retina-aware filter — region recording is a future item). Audio is
+        best-effort: if the mic can't start (device busy / Microphone not
+        granted) the recording is still saved, just silent. Needs the Screen
+        Recording (and, for audio, Microphone) TCC grants — handled by the
+        wizard."""
         caps = self._ffmpeg_capabilities
         screen_idx = caps.get("mac_screen_index")
         if screen_idx is None:
             screen_idx = 1   # screen usually sits right after the FaceTime cam
-        mic_idx = caps.get("mac_mic_index")
         vcodec = ("h264_videotoolbox"
                   if "h264_videotoolbox" in caps.get("encoders", set()) else "libx264")
-        acodec = str(caps.get("audio_encoder", "aac") or "aac")
         # 30 is a standard, well-supported avfoundation screen rate (24 is
         # unusual and was in play when playback came out ~2x fast).
         fps = 30.0
         output_path = self._record_output_specs()[0][0]
 
-        # Video and audio each capture to their own temp; copy-muxed into
-        # output_path on stop. output_path stays the FINAL name so the rest of
-        # the save flow (save-prompt, last-action label) is unchanged.
+        # Video captures to a temp; the sounddevice mic buffer is muxed in on
+        # stop. output_path stays the FINAL name so the rest of the save flow
+        # (save-prompt, last-action label) is unchanged.
         video_temp = Path(f"{output_path}.video.mp4")
-        # Audio captured as raw PCM WAV, NOT aac. aac_at (AudioToolbox) adds
-        # ~44 ms encoder priming AND drops its buffered final frames when the
-        # capture is stopped with `q` -> the "unclean cutoff". PCM has no
-        # encoder buffer: no priming front-shift, no tail drop, exact sample
-        # count. We encode to aac once, offline, during the mux.
-        audio_temp = Path(f"{output_path}.audio.wav")
         log_path = Path(f"{output_path}.ffmpeg.log")
-        audio_log_path = Path(f"{output_path}.audio.log")
 
         def build_video() -> list[str]:
             cmd = [
@@ -31187,22 +31173,10 @@ Admin elevation
                     "-video_track_timescale", "30000", "-an", str(video_temp)]
             return cmd
 
-        def build_audio() -> list[str]:
-            # Audio-only sidecar: its own process => its own read loop and
-            # clean 48 kHz clock, immune to the video encode. A generous thread
-            # queue is cheap insurance against any brief scheduling hiccup.
-            # pcm_s16le @ 48 kHz: raw PCM, no encoder priming/tail-drop.
-            return [
-                self._ffmpeg_path, "-hide_banner", "-loglevel", "info", "-stats", "-y",
-                "-f", "avfoundation", "-thread_queue_size", "4096",
-                "-i", f":{mic_idx}",
-                "-c:a", "pcm_s16le", "-ar", "48000", str(audio_temp),
-            ]
-
         try:
             sys.stderr.write(
                 f"[screen-record] mac avfoundation screen_idx={screen_idx} "
-                f"mic_idx={mic_idx} vcodec={vcodec} (video+audio split); "
+                f"vcodec={vcodec} (video=ffmpeg, audio=sounddevice); "
                 f"video log -> {log_path}\n"
             )
             sys.stderr.flush()
@@ -31218,30 +31192,14 @@ Admin elevation
         if process is None:
             return False
 
-        # Best-effort mic sidecar. Non-fatal: a failure leaves a silent (but
-        # valid) recording rather than aborting the whole capture.
-        audio_process = None
-        audio_stderr_file = None
-        if mic_idx is not None:
-            audio_process, audio_stderr_file = self._spawn_ffmpeg_to_logfile(
-                build_audio(), audio_log_path
-            )
-            if audio_process is None:
-                try:
-                    sys.stderr.write(
-                        "[screen-record] mic sidecar failed to start; recording "
-                        f"will be silent. See {audio_log_path}\n"
-                    )
-                    sys.stderr.flush()
-                except Exception:
-                    pass
+        # Mic via sounddevice (NOT a second ffmpeg avfoundation input — that
+        # drops ~11% of samples and time-compresses the audio). Best-effort:
+        # silent recording if it can't start.
+        self._start_mac_record_audio()
 
         self._screen_record_process = process
         self._mac_record_stderr_file = stderr_file
-        self._mac_record_audio_process = audio_process
-        self._mac_record_audio_stderr_file = audio_stderr_file
         self._mac_record_video_temp = video_temp
-        self._mac_record_audio_temp = audio_temp if audio_process is not None else None
         self._screen_record_backend = "ffmpeg"
         self._screen_record_region = None
         self._screen_record_path = output_path
@@ -31253,6 +31211,119 @@ Admin elevation
             f"Last action: screen recording started {output_path}"
         )
         return True
+
+    def _start_mac_record_audio(self) -> bool:
+        """Dedicated sounddevice mic capture for screen recording. Accumulates
+        the WHOLE take (recordings are bounded by the user) into contiguous
+        chunks and records the mach-clock time of the first sample so the mux
+        can align to the ffmpeg video's avfoundation `start:` (same clock).
+        Best-effort; on any failure the recording is simply silent."""
+        if sys.platform != "darwin":
+            return False
+        # Reset state up front so a stale buffer from a prior take can't leak in.
+        self._mac_record_audio_stream = None
+        self._mac_record_audio_lock = threading.Lock()
+        self._mac_record_audio_chunks = []
+        self._mac_record_audio_first_perf = None
+        self._mac_record_audio_fs = 48000
+        self._mac_record_audio_latency = 0.0
+        try:
+            import sounddevice as sd
+            fs = 48000
+            try:
+                device = self._selected_mic_test_device()
+            except Exception:
+                device = None
+
+            def _cb(indata, frames, time_info, status):
+                # PortAudio audio thread — must not block. Extraction mirrors the
+                # voice pipeline (handles the 1-D interleaved-stereo driver quirk
+                # that otherwise sounds garbled).
+                try:
+                    if indata is None:
+                        return
+                    arr = np.asarray(indata, dtype=np.float32)
+                    if arr.ndim > 1:
+                        mono = np.ascontiguousarray(arr[:, 0])
+                    elif arr.size == frames * 2:
+                        mono = np.ascontiguousarray(arr[::2])
+                    else:
+                        mono = arr
+                    mono = mono.copy()
+                    now_perf = time.perf_counter()
+                    lat = float(getattr(self, "_mac_record_audio_latency", 0.0))
+                    lock = getattr(self, "_mac_record_audio_lock", None)
+                    chunks = getattr(self, "_mac_record_audio_chunks", None)
+                    if lock is None or chunks is None:
+                        return
+                    with lock:
+                        if self._mac_record_audio_first_perf is None:
+                            # mach-clock time of this block's FIRST sample
+                            self._mac_record_audio_first_perf = (
+                                now_perf - lat - len(mono) / fs
+                            )
+                        chunks.append(mono)
+                except Exception:
+                    pass
+
+            stream = sd.InputStream(
+                samplerate=fs, channels=1, dtype="float32",
+                device=device, blocksize=0, callback=_cb,
+            )
+            try:
+                self._mac_record_audio_latency = float(getattr(stream, "latency", 0.0) or 0.0)
+            except Exception:
+                self._mac_record_audio_latency = 0.0
+            stream.start()
+            self._mac_record_audio_stream = stream
+            try:
+                sys.stderr.write(f"[screen-record] mic via sounddevice device={device}\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            self._mac_record_audio_stream = None
+            try:
+                sys.stderr.write(
+                    f"[screen-record] sounddevice mic failed: {type(exc).__name__}: {exc}; "
+                    "recording will be silent\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return False
+
+    def _stop_mac_record_audio(self):
+        """Stop the recording mic capture. Returns (audio_float32|None,
+        first_sample_perf|None) — the whole take concatenated contiguously."""
+        stream = getattr(self, "_mac_record_audio_stream", None)
+        self._mac_record_audio_stream = None
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        lock = getattr(self, "_mac_record_audio_lock", None)
+        chunks = getattr(self, "_mac_record_audio_chunks", None)
+        first_perf = getattr(self, "_mac_record_audio_first_perf", None)
+        self._mac_record_audio_chunks = None
+        if not chunks:
+            return None, None
+        try:
+            if lock is not None:
+                with lock:
+                    data = list(chunks)
+            else:
+                data = list(chunks)
+            full = np.concatenate(data).astype(np.float32) if data else None
+        except Exception:
+            full = None
+        return full, first_perf
 
     def _avfoundation_input_start(self, log_path) -> float | None:
         """Parse the avfoundation input `start:` timestamp (seconds, mach host
@@ -31274,21 +31345,23 @@ Admin elevation
                 return None
         return None
 
-    def _finalize_mac_recording(self, video_temp, audio_temp, final_path) -> bool:
-        """Mux the mac screen-recording video temp + mic PCM-WAV temp into the
-        final mp4, correcting the capture-start offset so audio is in sync.
+    def _finalize_mac_recording(self, video_temp, audio_full, first_perf, final_path) -> bool:
+        """Mux the ffmpeg video temp + the sounddevice mic buffer into the final
+        mp4, correcting the capture-start offset so audio is in sync.
 
-        The mic device starts a bit AFTER the screen device (dominated by our
-        own 0.2 s liveness wait on the video spawn before the audio spawn), yet
-        both temp files begin at container t=0 — so without correction the audio
-        LEADS the video by that delta (the "audio ahead / sped up" complaint;
-        ~156 ms measured, well past the ~45 ms lip-sync threshold). We read the
-        avfoundation `start:` from BOTH logs (same clock), compute the exact
-        delta, and push the audio later by it with `adelay`. Video is stream-
-        copied (pristine); audio is encoded to aac once here (the WAV had no
-        encoder artifacts to begin with). Falls back to the silent video if the
-        audio temp is missing/empty or the mux fails. Returns True if final_path
-        ends up with a valid file."""
+        Both clocks are mach `seconds-since-boot`: the video's avfoundation
+        `start:` (parsed from the ffmpeg log) and the audio's first-sample
+        `time.perf_counter()`. Their difference is the exact offset. If audio
+        started LATER (offset>0) it would lead the video in the muxed file (both
+        at t=0), so we push it later with `adelay`; if it started EARLIER we trim
+        that much off the front. If the offset looks implausible (clock epochs
+        somehow don't match) we skip the correction — the audio is still true-
+        rate (no "sped up"), just possibly a small constant lead.
+
+        The mic buffer is true-rate PCM (sounddevice), so there's no time
+        compression to fix. Video is stream-copied (pristine); audio encoded to
+        aac once. Falls back to the silent video if there's no audio or the mux
+        fails. Returns True if final_path ends up valid."""
         import os as _os
 
         def _ok(p) -> bool:
@@ -31299,7 +31372,42 @@ Admin elevation
 
         if not _ok(video_temp):
             return False
-        if not _ok(audio_temp):
+
+        fs = int(getattr(self, "_mac_record_audio_fs", 48000))
+        # No usable audio -> just promote the silent video to the final name.
+        if audio_full is None or len(audio_full) < int(0.05 * fs):
+            try:
+                _os.replace(str(video_temp), str(final_path))
+                return True
+            except Exception:
+                return False
+
+        # Offset via the common mach clock.
+        v_start = self._avfoundation_input_start(Path(f"{final_path}.ffmpeg.log"))
+        offset = None
+        if v_start is not None and first_perf is not None:
+            offset = float(first_perf) - float(v_start)   # >0: audio started later
+        delay_ms = 0
+        if offset is not None and -2.0 <= offset <= 5.0:
+            if offset >= 0:
+                delay_ms = int(round(min(offset, 1.0) * 1000.0))
+            else:
+                trim = int(round(min(-offset, 1.0) * fs))
+                if 0 < trim < len(audio_full):
+                    audio_full = audio_full[trim:]
+        # else: implausible/unavailable -> no correction (audio still true-rate)
+
+        try:
+            import wave
+            wav_path = Path(f"{final_path}.audio.wav")
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(fs)
+                pcm16 = np.clip(audio_full * 32767.0, -32768.0, 32767.0).astype(np.int16)
+                wf.writeframes(pcm16.tobytes())
+        except Exception:
+            # Couldn't write the WAV -> silent video fallback.
             try:
                 _os.replace(str(video_temp), str(final_path))
                 return True
@@ -31307,61 +31415,46 @@ Admin elevation
                 return False
 
         acodec = str(self._ffmpeg_capabilities.get("audio_encoder", "aac") or "aac")
-
-        # Exact offset from the two avfoundation `start:` stamps (same clock).
-        # Fall back to 0.15 s (the structural serial-spawn lead) if a log can't
-        # be parsed — better than 0 given we KNOW the cause is our spawn order.
-        v_start = self._avfoundation_input_start(Path(f"{final_path}.ffmpeg.log"))
-        a_start = self._avfoundation_input_start(Path(f"{final_path}.audio.log"))
-        if v_start is not None and a_start is not None:
-            delta = a_start - v_start
-        else:
-            delta = 0.15
-        # Only a positive delta (audio started later -> audio leads) is
-        # correctable with adelay. Clamp to a sane window so a bad parse can't
-        # inject a huge silence.
-        delay_ms = int(round(max(0.0, min(delta, 1.0)) * 1000.0))
-
-        # adelay: prepend `delay_ms` of silence -> shifts real audio later,
-        # removing the lead. apad: pad the tail with silence so -shortest trims
-        # padding rather than clipping real audio. -c:v copy keeps video
-        # pristine; audio re-encoded once from clean PCM.
+        # adelay shifts real audio later (removing a lead); apad pads the tail so
+        # -shortest trims padding, never real audio. -c:v copy keeps video pristine.
         af = f"adelay={delay_ms}:all=1,apad" if delay_ms > 0 else "apad"
         mux_cmd = [
             self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(video_temp), "-i", str(audio_temp),
+            "-i", str(video_temp), "-i", str(wav_path),
             "-map", "0:v", "-map", "1:a", "-c:v", "copy",
-            "-af", af, "-c:a", acodec, "-b:a", "192k", "-ar", "48000",
+            "-af", af, "-c:a", acodec, "-b:a", "192k", "-ar", str(fs),
             "-shortest", str(final_path),
         ]
         try:
             sys.stderr.write(
                 f"[screen-record] mux: audio delay {delay_ms}ms "
-                f"(v_start={v_start} a_start={a_start}) acodec={acodec}\n"
+                f"(offset={offset} v_start={v_start} first_perf={first_perf}) "
+                f"acodec={acodec} samples={len(audio_full)}\n"
             )
             sys.stderr.flush()
         except Exception:
             pass
+        proc = None
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 mux_cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=120,
             )
         except Exception:
-            pass
-        if _ok(final_path):
-            for tmp in (video_temp, audio_temp):
+            proc = None
+        if proc is not None and proc.returncode == 0 and _ok(final_path):
+            for tmp in (video_temp, wav_path):
                 try:
                     Path(tmp).unlink()
                 except Exception:
                     pass
             return True
-        # Mux failed — fall back to the silent video so the user still gets it.
+        # Mux failed -> fall back to the silent video so the user still gets it.
         try:
             _os.replace(str(video_temp), str(final_path))
             try:
-                Path(audio_temp).unlink()
+                wav_path.unlink()
             except Exception:
                 pass
             return True
@@ -31744,27 +31837,21 @@ Admin elevation
             if backend == "ffmpeg" and process is not None:
                 self._stop_ffmpeg_process(process)
                 if sys.platform == "darwin":
-                    # Stop the mic sidecar, then copy-mux video+audio into the
-                    # final path. Video ffmpeg wrote to a temp (video-only), so
-                    # `path` doesn't exist until the mux below.
-                    audio_process = getattr(self, "_mac_record_audio_process", None)
-                    if audio_process is not None:
-                        self._stop_ffmpeg_process(audio_process)
-                    self._mac_record_audio_process = None
-                    _a_log = getattr(self, "_mac_record_audio_stderr_file", None)
-                    if _a_log is not None:
-                        try:
-                            _a_log.close()
-                        except Exception:
-                            pass
-                        self._mac_record_audio_stderr_file = None
+                    # Stop the sounddevice mic capture, then mux its buffer into
+                    # the final path. Video ffmpeg wrote to a temp (video-only),
+                    # so `path` doesn't exist until the mux below.
+                    audio_full, first_perf = (None, None)
+                    try:
+                        audio_full, first_perf = self._stop_mac_record_audio()
+                    except Exception:
+                        audio_full, first_perf = (None, None)
                     video_temp = getattr(self, "_mac_record_video_temp", None)
-                    audio_temp = getattr(self, "_mac_record_audio_temp", None)
                     self._mac_record_video_temp = None
-                    self._mac_record_audio_temp = None
                     if path is not None and video_temp is not None:
                         try:
-                            self._finalize_mac_recording(video_temp, audio_temp, path)
+                            self._finalize_mac_recording(
+                                video_temp, audio_full, first_perf, path
+                            )
                         except Exception:
                             pass
             elif writer is not None:
