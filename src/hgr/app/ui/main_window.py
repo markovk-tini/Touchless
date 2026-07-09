@@ -25148,6 +25148,9 @@ Admin elevation
         grant instruction via _clip_cache_health_warning."""
         capturer = getattr(self, "_mac_clip_capturer", None)
         if capturer is not None and getattr(capturer, "_thread", None) is not None and capturer._thread.is_alive():
+            # Cache already running — make sure the mic ring is too (idempotent;
+            # honors the 'Record microphone' setting, no-op if off).
+            self._start_clip_cache_audio_macos()
             return True
         from ...platform_compat.capabilities import is_screen_recording_trusted
         if not is_screen_recording_trusted(prompt=True):
@@ -25171,6 +25174,10 @@ Admin elevation
         ok = self._mac_clip_capturer.start()
         if not ok:
             self._mac_clip_capturer = None
+        else:
+            # Start the rolling mic buffer alongside the video buffer (honors
+            # the 'Record microphone' setting; best-effort, never blocks clips).
+            self._start_clip_cache_audio_macos()
         return ok
 
     def _mac_capture_open_segment(self) -> bool:
@@ -25331,6 +25338,8 @@ Admin elevation
             except Exception:
                 pass
             self._mac_clip_capturer = None
+        # Stop the rolling mic buffer (no-op if it was never started).
+        self._stop_clip_cache_audio_macos()
         self._clip_cache_timer.stop()
         self._finalize_clip_cache_segment()
         for meta in self._clip_cache_segments:
@@ -25341,6 +25350,249 @@ Admin elevation
         self._clip_cache_segments = []
         self._clip_cache_region = None
         self._clip_cache_backend = ""
+
+    # ---- macOS clip audio (rolling mic ring + mux-on-export) -----------
+    # Windows captures clip audio via WASAPI loopback + a live ffmpeg encoder
+    # (see _start_clip_cache_audio). None of that exists on macOS: there is no
+    # zero-setup system-audio loopback, and the ffmpeg clip path is skipped in
+    # favor of the Quartz video ring. So mac clip audio is MIC-ONLY, captured
+    # with the same proven-clean 48 kHz mono sounddevice callback the voice
+    # pipeline uses, into a wall-clock-stamped ring the exporter slices to the
+    # clip's [left, right] window and muxes in. All best-effort: any failure
+    # leaves the clip video-only (exactly today's behavior).
+    def _start_clip_cache_audio_macos(self) -> None:
+        if sys.platform != "darwin":
+            return
+        if not bool(getattr(self.config, "clip_capture_microphone", False)):
+            return
+        if getattr(self, "_mac_clip_audio_stream", None) is not None:
+            return  # already running (idempotent)
+        try:
+            import sounddevice as sd
+            from collections import deque
+            fs = 48000
+            self._mac_clip_audio_fs = fs
+            self._mac_clip_audio_lock = threading.Lock()
+            # Ring bound = the video cache window + a small margin.
+            self._mac_clip_audio_max_seconds = (
+                float(getattr(self, "_clip_cache_max_seconds", 305.0)) + 5.0
+            )
+            self._mac_clip_audio_chunks = deque()
+            # Input latency (seconds) — the block is DELIVERED ~this long after
+            # its samples were captured. Subtracting it makes the ring's wall
+            # clock line up with the video segment stamps (which are at capture
+            # time). Set before start() so the first callback sees it.
+            self._mac_clip_audio_latency = 0.0
+            try:
+                device = self._selected_mic_test_device()
+            except Exception:
+                device = None
+
+            def _cb(indata, frames, time_info, status):
+                # Runs on the PortAudio audio thread — must not block. Stamp each
+                # block with wall-clock time.time() (same clock the video
+                # segments use) so the exporter can align by window.
+                try:
+                    # Respect a live toggle-off: stop retaining audio the moment
+                    # 'Record microphone' is unchecked (the stream itself is only
+                    # fully released on engine restart — documented limitation).
+                    if not bool(getattr(self.config, "clip_capture_microphone", False)):
+                        return
+                    arr = indata
+                    mono = arr[:, 0] if getattr(arr, "ndim", 1) > 1 else arr
+                    mono = np.asarray(mono, dtype=np.float32).copy()
+                    t_end = time.time() - float(getattr(self, "_mac_clip_audio_latency", 0.0))
+                    lock = getattr(self, "_mac_clip_audio_lock", None)
+                    chunks = getattr(self, "_mac_clip_audio_chunks", None)
+                    if lock is None or chunks is None:
+                        return
+                    with lock:
+                        chunks.append((t_end, mono))
+                        cutoff = t_end - self._mac_clip_audio_max_seconds
+                        while chunks and chunks[0][0] < cutoff:
+                            chunks.popleft()
+                except Exception:
+                    pass
+
+            stream = sd.InputStream(
+                samplerate=fs, channels=1, dtype="float32",
+                device=device, blocksize=0, callback=_cb,
+            )
+            try:
+                self._mac_clip_audio_latency = float(getattr(stream, "latency", 0.0) or 0.0)
+            except Exception:
+                self._mac_clip_audio_latency = 0.0
+            stream.start()
+            self._mac_clip_audio_stream = stream
+            try:
+                sys.stderr.write(
+                    f"[clip-audio] mac mic ring started fs={fs} device={device}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+        except Exception as exc:
+            self._mac_clip_audio_stream = None
+            try:
+                sys.stderr.write(
+                    f"[clip-audio] mac mic ring failed: {type(exc).__name__}: {exc}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+    def _stop_clip_cache_audio_macos(self) -> None:
+        stream = getattr(self, "_mac_clip_audio_stream", None)
+        self._mac_clip_audio_stream = None
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        lock = getattr(self, "_mac_clip_audio_lock", None)
+        chunks = getattr(self, "_mac_clip_audio_chunks", None)
+        if chunks is not None:
+            try:
+                if lock is not None:
+                    with lock:
+                        chunks.clear()
+                else:
+                    chunks.clear()
+            except Exception:
+                pass
+
+    def _extract_mac_clip_audio(self, left: float, right: float):
+        """Return a float32 mono buffer spanning the FULL [left, right] window,
+        with the mic-ring samples placed at their true wall-clock position and
+        SILENCE (zeros) everywhere the ring had no data — the leading warmup
+        gap, any interior dropped-block gaps, and the trailing edge.
+
+        Returning a full-window buffer (not bare concatenated samples) is what
+        keeps A/V in sync: sample i is exactly at left + i/fs, so muxing it at
+        container t=0 aligns it with the video (whose t=0 is also `left`), and
+        its length == the video length so `-shortest` can never truncate the
+        video. Returns None only if NO real samples fall in the window."""
+        fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
+        lock = getattr(self, "_mac_clip_audio_lock", None)
+        chunks_ref = getattr(self, "_mac_clip_audio_chunks", None)
+        if chunks_ref is None or right <= left:
+            return None
+        total = int(round((right - left) * fs))
+        if total <= 0:
+            return None
+        try:
+            if lock is not None:
+                with lock:
+                    chunks = list(chunks_ref)
+            else:
+                chunks = list(chunks_ref)
+        except Exception:
+            return None
+        if not chunks:
+            return None
+        out = np.zeros(total, dtype=np.float32)  # silence baseline for gaps
+        placed = 0
+        for (t_end, arr) in chunks:
+            n = len(arr)
+            if n == 0:
+                continue
+            t_start = t_end - n / fs
+            ov_l = max(left, t_start)
+            ov_r = min(right, t_end)
+            if ov_r <= ov_l:
+                continue
+            # source slice within this chunk
+            s0 = max(0, min(n, int(round((ov_l - t_start) * fs))))
+            s1 = max(0, min(n, int(round((ov_r - t_start) * fs))))
+            if s1 <= s0:
+                continue
+            seg = arr[s0:s1]
+            # destination slice within the window, positioned by wall-clock
+            d0 = int(round((ov_l - left) * fs))
+            if d0 < 0:
+                seg = seg[-d0:]
+                d0 = 0
+            d1 = min(total, d0 + len(seg))
+            if d1 <= d0:
+                continue
+            seg = seg[: d1 - d0]
+            out[d0:d1] = seg
+            placed += (d1 - d0)
+        if placed <= 0:
+            return None
+        return out
+
+    def _mux_mac_clip_audio(self, video_path: Path, left: float, right: float) -> None:
+        """Best-effort: mux the mic-ring window [left, right] into the exported
+        clip, in place. Never raises; on any failure the clip stays video-only
+        and the original file is left UNTOUCHED (the in-place replace only
+        happens on a clean, verified mux)."""
+        try:
+            if not self._ffmpeg_ready():
+                return
+            # aac only muxes cleanly into .mp4. The .avi fallback (mp4v writer
+            # unavailable -> XVID/MJPG) takes aac non-standardly and would leave
+            # a clip whose audio many players ignore/reject — worse than silent.
+            if str(video_path.suffix).lower() != ".mp4":
+                return
+            fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
+            audio = self._extract_mac_clip_audio(left, right)
+            # Require at least ~50 ms so a near-empty ring doesn't produce a
+            # broken 0-sample track.
+            if audio is None or len(audio) < int(0.05 * fs):
+                return
+            import wave
+            wav_path = Path(f"{video_path}.clipaudio.wav")
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(fs)
+                pcm16 = np.clip(audio * 32767.0, -32768.0, 32767.0).astype(np.int16)
+                wf.writeframes(pcm16.tobytes())
+            acodec = str(self._ffmpeg_capabilities.get("audio_encoder", "aac") or "aac")
+            out_tmp = Path(f"{video_path}.withaudio.mp4")
+            # apad + -shortest: pad audio with trailing silence so -shortest
+            # trims the PADDING to the video length, never the video itself.
+            mux_cmd = [
+                self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(video_path), "-i", str(wav_path),
+                "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+                "-af", "apad", "-c:a", acodec, "-b:a", "192k", "-ar", str(fs),
+                "-shortest", str(out_tmp),
+            ]
+            proc = None
+            try:
+                proc = subprocess.run(
+                    mux_cmd, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+                )
+            except Exception:
+                proc = None
+            # Only clobber the good silent clip if ffmpeg EXITED CLEANLY and the
+            # output is real. A non-zero exit that still wrote a >1KB partial
+            # (disk full, killed mid-mux) must NOT replace the working file.
+            if (
+                proc is not None and proc.returncode == 0
+                and out_tmp.exists() and out_tmp.stat().st_size > 1024
+            ):
+                import os as _os
+                _os.replace(str(out_tmp), str(video_path))
+            try:
+                wav_path.unlink()
+            except Exception:
+                pass
+            try:
+                if out_tmp.exists():
+                    out_tmp.unlink()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     # ---- Streamer-mode audio capture helpers --------------------------
     def _ffmpeg_has_wasapi_support(self) -> bool:
         """LEGACY. No released ffmpeg has a `wasapi` indev (trac
@@ -29741,6 +29993,26 @@ Admin elevation
             and output_path.stat().st_size > 1024
         ):
             actual_seconds = written / float(output_fps) if output_fps > 0 else 0.0
+            # macOS clip audio: mux the mic-ring window matching this clip.
+            # right_edge = the spoken/anchor moment (end_ts) or the newest
+            # selected segment's end; left_edge spans the video's real length.
+            # Best-effort — leaves the clip video-only on any hiccup.
+            if sys.platform == "darwin" and bool(
+                getattr(self.config, "clip_capture_microphone", False)
+            ):
+                try:
+                    if end_ts_f is not None:
+                        right_edge = end_ts_f
+                    else:
+                        right_edge = max(
+                            float(m.get("end_time", 0.0) or 0.0)
+                            for m, _h, _t in selected_segments
+                        )
+                    self._mux_mac_clip_audio(
+                        output_path, right_edge - actual_seconds, right_edge
+                    )
+                except Exception:
+                    pass
             return (True, output_path, actual_seconds)
         return (False, None, 0.0)
 
@@ -30994,6 +31266,8 @@ Admin elevation
         encoder artifacts to begin with). Falls back to the silent video if the
         audio temp is missing/empty or the mux fails. Returns True if final_path
         ends up with a valid file."""
+        import os as _os
+
         def _ok(p) -> bool:
             try:
                 return p is not None and Path(p).exists() and Path(p).stat().st_size > 1024
@@ -31004,7 +31278,7 @@ Admin elevation
             return False
         if not _ok(audio_temp):
             try:
-                os.replace(str(video_temp), str(final_path))
+                _os.replace(str(video_temp), str(final_path))
                 return True
             except Exception:
                 return False
@@ -31062,7 +31336,7 @@ Admin elevation
             return True
         # Mux failed — fall back to the silent video so the user still gets it.
         try:
-            os.replace(str(video_temp), str(final_path))
+            _os.replace(str(video_temp), str(final_path))
             try:
                 Path(audio_temp).unlink()
             except Exception:
