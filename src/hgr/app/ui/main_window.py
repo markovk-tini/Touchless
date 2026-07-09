@@ -25361,27 +25361,54 @@ Admin elevation
     # clip's [left, right] window and muxes in. All best-effort: any failure
     # leaves the clip video-only (exactly today's behavior).
     def _start_clip_cache_audio_macos(self) -> None:
+        """Clips want the shared mic ring iff 'Record microphone' is on. The
+        actual stream is SHARED with screen recording (see _sync_mac_mic_ring)
+        so the two features never open two InputStreams on the same CoreAudio
+        device at once — dual-open contends and drops samples, which is what
+        made both the recording and any clip taken during a recording play back
+        sped up."""
         if sys.platform != "darwin":
             return
-        if not bool(getattr(self.config, "clip_capture_microphone", False)):
+        self._mac_mic_want_clip = bool(getattr(self.config, "clip_capture_microphone", False))
+        self._sync_mac_mic_ring()
+
+    def _sync_mac_mic_ring(self) -> None:
+        """Start/stop the ONE shared mic stream to match demand. It runs iff a
+        consumer wants it: clips (mic setting on) OR an active screen recording.
+        Exactly one InputStream ever exists — no dual-open contention."""
+        if sys.platform != "darwin":
+            return
+        want = (bool(getattr(self, "_mac_mic_want_clip", False))
+                or bool(getattr(self, "_mac_mic_want_record", False)))
+        running = getattr(self, "_mac_clip_audio_stream", None) is not None
+        if want and not running:
+            self._ensure_mac_mic_ring_started()
+        elif not want and running:
+            self._stop_mac_mic_ring()
+
+    def _ensure_mac_mic_ring_started(self) -> None:
+        """Open the single shared mic InputStream (idempotent). Ungated — the
+        caller (_sync_mac_mic_ring) decides whether it should run. Feeds ONE
+        wall-clock-stamped ring that both clips and recording window out of."""
+        if sys.platform != "darwin":
             return
         if getattr(self, "_mac_clip_audio_stream", None) is not None:
-            return  # already running (idempotent)
+            return  # already running
         try:
             import sounddevice as sd
             from collections import deque
             fs = 48000
             self._mac_clip_audio_fs = fs
             self._mac_clip_audio_lock = threading.Lock()
-            # Ring bound = the video cache window + a small margin.
+            # Ring bound = the video cache window + a small margin (suspended
+            # while a recording holds it unbounded).
             self._mac_clip_audio_max_seconds = (
                 float(getattr(self, "_clip_cache_max_seconds", 305.0)) + 5.0
             )
             self._mac_clip_audio_chunks = deque()
             # Input latency (seconds) — the block is DELIVERED ~this long after
             # its samples were captured. Subtracting it makes the ring's wall
-            # clock line up with the video segment stamps (which are at capture
-            # time). Set before start() so the first callback sees it.
+            # clock line up with the video segment stamps (capture-time).
             self._mac_clip_audio_latency = 0.0
             try:
                 device = self._selected_mic_test_device()
@@ -25389,18 +25416,18 @@ Admin elevation
                 device = None
 
             def _cb(indata, frames, time_info, status):
-                # Runs on the PortAudio audio thread — must not block. Stamp each
-                # block with wall-clock time.time() (same clock the video
-                # segments use) so the exporter can align by window.
+                # PortAudio audio thread — must not block. Stamp each block with
+                # wall-clock time.time() (the clock clips + recording window by).
                 try:
-                    # Respect a live toggle-off: stop retaining audio the moment
-                    # 'Record microphone' is unchecked (the stream itself is only
-                    # fully released on engine restart — documented limitation).
-                    if not bool(getattr(self.config, "clip_capture_microphone", False)):
+                    # Buffer while EITHER consumer wants audio: the clip mic
+                    # setting is on, OR a recording is active (a recording must
+                    # be captured even if the clip mic setting is off).
+                    if not (bool(getattr(self.config, "clip_capture_microphone", False))
+                            or bool(getattr(self, "_mac_mic_want_record", False))):
                         return
                     if indata is None:
                         return
-                    # Channel extraction MUST mirror the voice pipeline exactly
+                    # Channel extraction MUST mirror the voice pipeline
                     # (voice_command_listener._audio_callback): some mac drivers
                     # deliver 1-D INTERLEAVED stereo even when channels=1 is
                     # requested — reading it as-is is the "low robotic"/garbled
@@ -25420,9 +25447,12 @@ Admin elevation
                         return
                     with lock:
                         chunks.append((t_end, mono))
-                        cutoff = t_end - self._mac_clip_audio_max_seconds
-                        while chunks and chunks[0][0] < cutoff:
-                            chunks.popleft()
+                        # Don't prune while a recording holds the ring unbounded
+                        # (a long take must keep its whole span).
+                        if not bool(getattr(self, "_mac_clip_audio_unbounded", False)):
+                            cutoff = t_end - self._mac_clip_audio_max_seconds
+                            while chunks and chunks[0][0] < cutoff:
+                                chunks.popleft()
                 except Exception:
                     pass
 
@@ -25438,7 +25468,7 @@ Admin elevation
             self._mac_clip_audio_stream = stream
             try:
                 sys.stderr.write(
-                    f"[clip-audio] mac mic ring started fs={fs} device={device}\n"
+                    f"[clip-audio] shared mic ring started fs={fs} device={device}\n"
                 )
                 sys.stderr.flush()
             except Exception:
@@ -25447,13 +25477,20 @@ Admin elevation
             self._mac_clip_audio_stream = None
             try:
                 sys.stderr.write(
-                    f"[clip-audio] mac mic ring failed: {type(exc).__name__}: {exc}\n"
+                    f"[clip-audio] shared mic ring failed: {type(exc).__name__}: {exc}\n"
                 )
                 sys.stderr.flush()
             except Exception:
                 pass
 
     def _stop_clip_cache_audio_macos(self) -> None:
+        # Clips no longer want the mic; the shared stream stays up only if a
+        # recording still needs it (see _sync_mac_mic_ring).
+        self._mac_mic_want_clip = False
+        self._sync_mac_mic_ring()
+
+    def _stop_mac_mic_ring(self) -> None:
+        """Stop + close the shared mic stream and clear the ring."""
         stream = getattr(self, "_mac_clip_audio_stream", None)
         self._mac_clip_audio_stream = None
         if stream is not None:
@@ -31114,17 +31151,20 @@ Admin elevation
         """macOS screen recording: ffmpeg avfoundation for VIDEO, sounddevice
         for AUDIO, muxed on stop.
 
-        History: capturing the mic as a second ffmpeg avfoundation input (either
-        in one process or a sidecar) dropped ~11% of the mic samples on this Mac
-        — two concurrent avfoundation sessions (screen + mic) contend, and the
-        mic PCM came out ~0.89x its nominal sample count, i.e. TIME-COMPRESSED,
-        which plays back "sped up". No mux trick fixes an already-compressed
-        source. sounddevice/PortAudio is a different capture API (no second
-        avfoundation session) and captures at the true rate — it's the same path
-        the voice pipeline and clip audio use cleanly here. So the mic goes
-        through sounddevice (_start_mac_record_audio) and is muxed into the video
-        on stop, with the capture-start offset corrected via a common mach clock
-        (see _finalize_mac_recording).
+        History: capturing the mic as a second ffmpeg avfoundation input dropped
+        ~11% of samples (two avfoundation sessions contend) -> time-compressed
+        "sped up" audio. Switching to sounddevice fixed that ONLY when it was the
+        sole mic stream: a dedicated recording InputStream running ALONGSIDE the
+        always-on clip-audio ring meant TWO InputStreams on one CoreAudio device,
+        which contend and drop samples just the same — so both the recording and
+        any clip taken during it came out sped up.
+
+        Fix: ONE shared mic stream. Recording marks itself a consumer of the
+        clip-audio ring (_mac_mic_want_record) and holds it UNBOUNDED (so a long
+        take keeps its whole span); _sync_mac_mic_ring guarantees exactly one
+        InputStream exists. On stop we window that ring to the recording's span
+        (aligned to the ffmpeg video's avfoundation `start:` via a mach<->wall
+        bridge) and mux it into the video (see _finalize_mac_recording).
 
         Captures the WHOLE screen (avfoundation has no region crop without a
         Retina-aware filter — region recording is a future item). Audio is
@@ -31192,10 +31232,14 @@ Admin elevation
         if process is None:
             return False
 
-        # Mic via sounddevice (NOT a second ffmpeg avfoundation input — that
-        # drops ~11% of samples and time-compresses the audio). Best-effort:
-        # silent recording if it can't start.
-        self._start_mac_record_audio()
+        # Mic via the SHARED sounddevice ring — NEVER a second stream. Two
+        # InputStreams on one CoreAudio device contend and drop samples, which
+        # time-compressed both the recording AND any clip taken during it
+        # ("sped up"). Mark recording as a consumer and hold the ring UNBOUNDED
+        # so a long take keeps its whole span, then (re)sync the single stream.
+        self._mac_mic_want_record = True
+        self._mac_clip_audio_unbounded = True
+        self._sync_mac_mic_ring()
 
         self._screen_record_process = process
         self._mac_record_stderr_file = stderr_file
@@ -31211,119 +31255,6 @@ Admin elevation
             f"Last action: screen recording started {output_path}"
         )
         return True
-
-    def _start_mac_record_audio(self) -> bool:
-        """Dedicated sounddevice mic capture for screen recording. Accumulates
-        the WHOLE take (recordings are bounded by the user) into contiguous
-        chunks and records the mach-clock time of the first sample so the mux
-        can align to the ffmpeg video's avfoundation `start:` (same clock).
-        Best-effort; on any failure the recording is simply silent."""
-        if sys.platform != "darwin":
-            return False
-        # Reset state up front so a stale buffer from a prior take can't leak in.
-        self._mac_record_audio_stream = None
-        self._mac_record_audio_lock = threading.Lock()
-        self._mac_record_audio_chunks = []
-        self._mac_record_audio_first_perf = None
-        self._mac_record_audio_fs = 48000
-        self._mac_record_audio_latency = 0.0
-        try:
-            import sounddevice as sd
-            fs = 48000
-            try:
-                device = self._selected_mic_test_device()
-            except Exception:
-                device = None
-
-            def _cb(indata, frames, time_info, status):
-                # PortAudio audio thread — must not block. Extraction mirrors the
-                # voice pipeline (handles the 1-D interleaved-stereo driver quirk
-                # that otherwise sounds garbled).
-                try:
-                    if indata is None:
-                        return
-                    arr = np.asarray(indata, dtype=np.float32)
-                    if arr.ndim > 1:
-                        mono = np.ascontiguousarray(arr[:, 0])
-                    elif arr.size == frames * 2:
-                        mono = np.ascontiguousarray(arr[::2])
-                    else:
-                        mono = arr
-                    mono = mono.copy()
-                    now_perf = time.perf_counter()
-                    lat = float(getattr(self, "_mac_record_audio_latency", 0.0))
-                    lock = getattr(self, "_mac_record_audio_lock", None)
-                    chunks = getattr(self, "_mac_record_audio_chunks", None)
-                    if lock is None or chunks is None:
-                        return
-                    with lock:
-                        if self._mac_record_audio_first_perf is None:
-                            # mach-clock time of this block's FIRST sample
-                            self._mac_record_audio_first_perf = (
-                                now_perf - lat - len(mono) / fs
-                            )
-                        chunks.append(mono)
-                except Exception:
-                    pass
-
-            stream = sd.InputStream(
-                samplerate=fs, channels=1, dtype="float32",
-                device=device, blocksize=0, callback=_cb,
-            )
-            try:
-                self._mac_record_audio_latency = float(getattr(stream, "latency", 0.0) or 0.0)
-            except Exception:
-                self._mac_record_audio_latency = 0.0
-            stream.start()
-            self._mac_record_audio_stream = stream
-            try:
-                sys.stderr.write(f"[screen-record] mic via sounddevice device={device}\n")
-                sys.stderr.flush()
-            except Exception:
-                pass
-            return True
-        except Exception as exc:
-            self._mac_record_audio_stream = None
-            try:
-                sys.stderr.write(
-                    f"[screen-record] sounddevice mic failed: {type(exc).__name__}: {exc}; "
-                    "recording will be silent\n"
-                )
-                sys.stderr.flush()
-            except Exception:
-                pass
-            return False
-
-    def _stop_mac_record_audio(self):
-        """Stop the recording mic capture. Returns (audio_float32|None,
-        first_sample_perf|None) — the whole take concatenated contiguously."""
-        stream = getattr(self, "_mac_record_audio_stream", None)
-        self._mac_record_audio_stream = None
-        if stream is not None:
-            try:
-                stream.stop()
-            except Exception:
-                pass
-            try:
-                stream.close()
-            except Exception:
-                pass
-        lock = getattr(self, "_mac_record_audio_lock", None)
-        chunks = getattr(self, "_mac_record_audio_chunks", None)
-        first_perf = getattr(self, "_mac_record_audio_first_perf", None)
-        self._mac_record_audio_chunks = None
-        if not chunks:
-            return None, None
-        try:
-            if lock is not None:
-                with lock:
-                    data = list(chunks)
-            else:
-                data = list(chunks)
-            full = np.concatenate(data).astype(np.float32) if data else None
-        except Exception:
-            full = None
-        return full, first_perf
 
     def _avfoundation_input_start(self, log_path) -> float | None:
         """Parse the avfoundation input `start:` timestamp (seconds, mach host
@@ -31373,7 +31304,7 @@ Admin elevation
         if not _ok(video_temp):
             return False
 
-        fs = int(getattr(self, "_mac_record_audio_fs", 48000))
+        fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
         # No usable audio -> just promote the silent video to the final name.
         if audio_full is None or len(audio_full) < int(0.05 * fs):
             try:
@@ -31837,20 +31768,44 @@ Admin elevation
             if backend == "ffmpeg" and process is not None:
                 self._stop_ffmpeg_process(process)
                 if sys.platform == "darwin":
-                    # Stop the sounddevice mic capture, then mux its buffer into
-                    # the final path. Video ffmpeg wrote to a temp (video-only),
-                    # so `path` doesn't exist until the mux below.
-                    audio_full, first_perf = (None, None)
-                    try:
-                        audio_full, first_perf = self._stop_mac_record_audio()
-                    except Exception:
-                        audio_full, first_perf = (None, None)
+                    # Window the SHARED mic ring to the recording's span, aligned
+                    # to the ffmpeg video's avfoundation start via the mach<->wall
+                    # bridge (perf_counter and avfoundation `start:` are both mach
+                    # seconds-since-boot; time.time()-perf_counter() converts to
+                    # the ring's wall clock). Window BEFORE releasing the ring so
+                    # its chunks are still present. Video ffmpeg wrote to a temp
+                    # (video-only), so `path` doesn't exist until the mux below.
+                    stop_wall = time.time()
+                    wall_minus_mach = stop_wall - time.perf_counter()
                     video_temp = getattr(self, "_mac_record_video_temp", None)
                     self._mac_record_video_temp = None
+                    audio_full = None
+                    try:
+                        v_start = (
+                            self._avfoundation_input_start(Path(f"{path}.ffmpeg.log"))
+                            if path is not None else None
+                        )
+                        if v_start is not None:
+                            video_wall_start = float(v_start) + wall_minus_mach
+                            audio_full = self._extract_mac_clip_audio(
+                                video_wall_start, stop_wall
+                            )
+                    except Exception:
+                        audio_full = None
+                    # Release the ring: recording no longer needs it, resume
+                    # pruning. Stops the stream unless clips still want it.
+                    self._mac_mic_want_record = False
+                    self._mac_clip_audio_unbounded = False
+                    try:
+                        self._sync_mac_mic_ring()
+                    except Exception:
+                        pass
                     if path is not None and video_temp is not None:
                         try:
+                            # first_perf=None -> no adelay; the window is already
+                            # aligned to the video start.
                             self._finalize_mac_recording(
-                                video_temp, audio_full, first_perf, path
+                                video_temp, audio_full, None, path
                             )
                         except Exception:
                             pass
