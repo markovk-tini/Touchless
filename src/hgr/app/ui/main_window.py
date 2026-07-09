@@ -30816,12 +30816,30 @@ Admin elevation
         except Exception:
             pass
     def _start_screen_recording_ffmpeg_mac(self) -> bool:
-        """macOS screen+mic recording via ffmpeg avfoundation, in a single
-        muxed process. Captures the WHOLE screen (avfoundation has no region
-        crop without a Retina-aware filter — region recording is a future
-        item) plus the default mic. Retries video-only if the mic input fails
-        (device busy / Microphone not granted). Needs the Screen Recording
-        (and, for audio, Microphone) TCC grants — handled by the wizard."""
+        """macOS screen recording via ffmpeg avfoundation.
+
+        Video (screen) and audio (mic) are captured in TWO SEPARATE ffmpeg
+        processes, then copy-muxed together on stop. This split is deliberate.
+        A single process with both an avfoundation screen input AND a mic input
+        shares one read loop, and the heavy raw screen frames (~11 MB each at
+        Retina) hog it. That does two bad things to the audio: (1) the mic
+        packet queue drains raggedly while ffmpeg is busy encoding the big
+        video frame -> choppy "bad reception" static; and (2) the mic PTS gets
+        rebased onto the screen input's bogus 1,000,000-fps timebase -> playback
+        comes out slightly fast. Both persisted even with the Retina downscale
+        because at speed~0.997x the process runs right at the real-time edge.
+
+        An audio-only process is trivially cheap, never runs at that edge, and
+        keeps its own clean 48 kHz clock — the same reason our sounddevice voice
+        capture is clean on this exact Mac. On stop we copy-mux the two temp
+        files into the final mp4 (no re-encode -> fast + lossless).
+
+        Captures the WHOLE screen (avfoundation has no region crop without a
+        Retina-aware filter — region recording is a future item). The mic
+        sidecar is best-effort: if it fails to start (device busy / Microphone
+        not granted) the recording is still saved, just silent. Needs the
+        Screen Recording (and, for audio, Microphone) TCC grants — handled by
+        the wizard."""
         caps = self._ffmpeg_capabilities
         screen_idx = caps.get("mac_screen_index")
         if screen_idx is None:
@@ -30835,62 +30853,54 @@ Admin elevation
         fps = 30.0
         output_path = self._record_output_specs()[0][0]
 
+        # Video and audio each capture to their own temp; copy-muxed into
+        # output_path on stop. output_path stays the FINAL name so the rest of
+        # the save flow (save-prompt, last-action label) is unchanged.
+        video_temp = Path(f"{output_path}.video.mp4")
+        audio_temp = Path(f"{output_path}.audio.m4a")
         log_path = Path(f"{output_path}.ffmpeg.log")
+        audio_log_path = Path(f"{output_path}.audio.log")
 
-        def build(with_audio: bool) -> list[str]:
+        def build_video() -> list[str]:
             cmd = [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "info", "-stats", "-y",
-            ]
-            # Input 0: screen video. A big thread queue keeps the reader from
-            # stalling while the heavy video encode runs.
-            cmd += [
+                # Input 0: screen video. A big thread queue keeps the reader
+                # from stalling while the heavy video encode runs.
                 "-f", "avfoundation", "-capture_cursor", "1",
                 "-framerate", f"{fps:.3f}", "-thread_queue_size", "1024",
                 "-i", f"{screen_idx}",
             ]
-            if with_audio and mic_idx is not None:
-                # Input 1: mic as a SEPARATE avfoundation input so it keeps its
-                # own clean clock (a combined "screen:mic" session dragged BOTH
-                # to ~2x). A GENEROUS thread_queue_size is the key to clean
-                # audio: without it the mic packet queue overflows while ffmpeg
-                # is busy encoding the big video frame, dropping samples ->
-                # the choppy/"bad reception" static. NO aresample=async (that
-                # continuously stretches/drops samples to chase avfoundation's
-                # jittery PTS, which itself sounds glitchy).
-                cmd += ["-f", "avfoundation", "-thread_queue_size", "1024",
-                        "-i", f":{mic_idx}",
-                        "-map", "0:v", "-map", "1:a"]
             # Downscale the physical-Retina capture (e.g. 2940x1912) to its
-            # logical resolution (halved). At full Retina the h264_videotoolbox
-            # encode runs right at the real-time limit (speed ~0.998x); any
-            # hiccup then drops/duplicates frames (playback speeds up) AND
-            # starves the mic packet queue (choppy audio). Quartering the pixel
-            # count gives the encoder ample headroom -> correct speed + clean
-            # audio + smaller files. -2 keeps height even for yuv420p.
+            # logical resolution (halved) so the h264_videotoolbox encode has
+            # ample headroom. -2 keeps height even for yuv420p.
             cmd += ["-vf", "scale=iw/2:-2"]
             cmd += ["-c:v", vcodec, "-pix_fmt", "yuv420p"]
             cmd += (["-b:v", "8M"] if vcodec == "h264_videotoolbox"
                     else ["-preset", "veryfast", "-crf", "23"])
-            # Normalize the output video to a real CFR rate + sane timebase.
             # avfoundation screen capture reports a BOGUS 1,000,000-fps timebase
             # ("not enough frames to estimate rate"); -framerate on the input is
-            # ignored. Players choke on a 1000k-fps mp4 and then refuse to play
-            # the audio track (which IS captured/muxed — the log shows 532KiB of
-            # aac). Forcing output -r + constant-rate + a 30000 timescale yields
-            # a clean, universally-playable file with working audio.
+            # ignored. Normalize the output to a real CFR rate + 30000 timescale
+            # so players don't choke. -an: this process is video-only.
             cmd += ["-r", f"{fps:.3f}", "-fps_mode", "cfr",
-                    "-video_track_timescale", "30000"]
-            if with_audio and mic_idx is not None:
-                cmd += ["-c:a", acodec, "-b:a", "128k"]
-            else:
-                cmd += ["-an"]
-            cmd += [str(output_path)]
+                    "-video_track_timescale", "30000", "-an", str(video_temp)]
             return cmd
+
+        def build_audio() -> list[str]:
+            # Audio-only sidecar: its own process => its own read loop and
+            # clean 48 kHz clock, immune to the video encode. A generous thread
+            # queue is cheap insurance against any brief scheduling hiccup.
+            return [
+                self._ffmpeg_path, "-hide_banner", "-loglevel", "info", "-stats", "-y",
+                "-f", "avfoundation", "-thread_queue_size", "4096",
+                "-i", f":{mic_idx}",
+                "-c:a", acodec, "-b:a", "128k", str(audio_temp),
+            ]
 
         try:
             sys.stderr.write(
                 f"[screen-record] mac avfoundation screen_idx={screen_idx} "
-                f"mic_idx={mic_idx} vcodec={vcodec}; ffmpeg log -> {log_path}\n"
+                f"mic_idx={mic_idx} vcodec={vcodec} (video+audio split); "
+                f"video log -> {log_path}\n"
             )
             sys.stderr.flush()
         except Exception:
@@ -30901,13 +30911,34 @@ Admin elevation
         # starving the Qt UI (fps<10, laggy clicks). The file doubles as a full
         # diagnostic log for the speed/audio issues.
         self._last_ffmpeg_startup_error = None
-        process, stderr_file = self._spawn_ffmpeg_to_logfile(build(with_audio=True), log_path)
-        if process is None and mic_idx is not None:
-            process, stderr_file = self._spawn_ffmpeg_to_logfile(build(with_audio=False), log_path)
+        process, stderr_file = self._spawn_ffmpeg_to_logfile(build_video(), log_path)
         if process is None:
             return False
+
+        # Best-effort mic sidecar. Non-fatal: a failure leaves a silent (but
+        # valid) recording rather than aborting the whole capture.
+        audio_process = None
+        audio_stderr_file = None
+        if mic_idx is not None:
+            audio_process, audio_stderr_file = self._spawn_ffmpeg_to_logfile(
+                build_audio(), audio_log_path
+            )
+            if audio_process is None:
+                try:
+                    sys.stderr.write(
+                        "[screen-record] mic sidecar failed to start; recording "
+                        f"will be silent. See {audio_log_path}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+
         self._screen_record_process = process
         self._mac_record_stderr_file = stderr_file
+        self._mac_record_audio_process = audio_process
+        self._mac_record_audio_stderr_file = audio_stderr_file
+        self._mac_record_video_temp = video_temp
+        self._mac_record_audio_temp = audio_temp if audio_process is not None else None
         self._screen_record_backend = "ffmpeg"
         self._screen_record_region = None
         self._screen_record_path = output_path
@@ -30919,6 +30950,58 @@ Admin elevation
             f"Last action: screen recording started {output_path}"
         )
         return True
+
+    def _finalize_mac_recording(self, video_temp, audio_temp, final_path) -> bool:
+        """Copy-mux the mac screen-recording video temp + mic audio temp into
+        the final mp4. No re-encode -> fast + lossless. Falls back to just the
+        (silent) video, renamed, if the audio temp is missing/empty or the mux
+        fails. Returns True if final_path ends up with a valid file."""
+        def _ok(p) -> bool:
+            try:
+                return p is not None and Path(p).exists() and Path(p).stat().st_size > 1024
+            except Exception:
+                return False
+
+        if not _ok(video_temp):
+            return False
+        if not _ok(audio_temp):
+            try:
+                os.replace(str(video_temp), str(final_path))
+                return True
+            except Exception:
+                return False
+        # -shortest aligns both tracks from t=0 and trims the tail so a
+        # slightly-longer track can't leave a black/silent gap.
+        mux_cmd = [
+            self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(video_temp), "-i", str(audio_temp),
+            "-c", "copy", "-shortest", str(final_path),
+        ]
+        try:
+            subprocess.run(
+                mux_cmd, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=60,
+            )
+        except Exception:
+            pass
+        if _ok(final_path):
+            for tmp in (video_temp, audio_temp):
+                try:
+                    Path(tmp).unlink()
+                except Exception:
+                    pass
+            return True
+        # Mux failed — fall back to the silent video so the user still gets it.
+        try:
+            os.replace(str(video_temp), str(final_path))
+            try:
+                Path(audio_temp).unlink()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
 
     def _spawn_ffmpeg_to_logfile(self, command: list[str], log_path: "Path"):
         """Spawn ffmpeg with stderr redirected to a log FILE (OS-level — no
@@ -31295,6 +31378,30 @@ Admin elevation
         try:
             if backend == "ffmpeg" and process is not None:
                 self._stop_ffmpeg_process(process)
+                if sys.platform == "darwin":
+                    # Stop the mic sidecar, then copy-mux video+audio into the
+                    # final path. Video ffmpeg wrote to a temp (video-only), so
+                    # `path` doesn't exist until the mux below.
+                    audio_process = getattr(self, "_mac_record_audio_process", None)
+                    if audio_process is not None:
+                        self._stop_ffmpeg_process(audio_process)
+                    self._mac_record_audio_process = None
+                    _a_log = getattr(self, "_mac_record_audio_stderr_file", None)
+                    if _a_log is not None:
+                        try:
+                            _a_log.close()
+                        except Exception:
+                            pass
+                        self._mac_record_audio_stderr_file = None
+                    video_temp = getattr(self, "_mac_record_video_temp", None)
+                    audio_temp = getattr(self, "_mac_record_audio_temp", None)
+                    self._mac_record_video_temp = None
+                    self._mac_record_audio_temp = None
+                    if path is not None and video_temp is not None:
+                        try:
+                            self._finalize_mac_recording(video_temp, audio_temp, path)
+                        except Exception:
+                            pass
             elif writer is not None:
                 writer.release()
         finally:
