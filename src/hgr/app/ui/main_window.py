@@ -30831,8 +30831,10 @@ Admin elevation
 
         An audio-only process is trivially cheap, never runs at that edge, and
         keeps its own clean 48 kHz clock — the same reason our sounddevice voice
-        capture is clean on this exact Mac. On stop we copy-mux the two temp
-        files into the final mp4 (no re-encode -> fast + lossless).
+        capture is clean on this exact Mac. Audio is captured as raw PCM (no aac
+        encoder priming/tail-drop). On stop we mux the two temp files into the
+        final mp4, correcting the exact capture-start offset (see
+        _finalize_mac_recording) so the audio isn't left leading the video.
 
         Captures the WHOLE screen (avfoundation has no region crop without a
         Retina-aware filter — region recording is a future item). The mic
@@ -30857,7 +30859,12 @@ Admin elevation
         # output_path on stop. output_path stays the FINAL name so the rest of
         # the save flow (save-prompt, last-action label) is unchanged.
         video_temp = Path(f"{output_path}.video.mp4")
-        audio_temp = Path(f"{output_path}.audio.m4a")
+        # Audio captured as raw PCM WAV, NOT aac. aac_at (AudioToolbox) adds
+        # ~44 ms encoder priming AND drops its buffered final frames when the
+        # capture is stopped with `q` -> the "unclean cutoff". PCM has no
+        # encoder buffer: no priming front-shift, no tail drop, exact sample
+        # count. We encode to aac once, offline, during the mux.
+        audio_temp = Path(f"{output_path}.audio.wav")
         log_path = Path(f"{output_path}.ffmpeg.log")
         audio_log_path = Path(f"{output_path}.audio.log")
 
@@ -30889,11 +30896,12 @@ Admin elevation
             # Audio-only sidecar: its own process => its own read loop and
             # clean 48 kHz clock, immune to the video encode. A generous thread
             # queue is cheap insurance against any brief scheduling hiccup.
+            # pcm_s16le @ 48 kHz: raw PCM, no encoder priming/tail-drop.
             return [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "info", "-stats", "-y",
                 "-f", "avfoundation", "-thread_queue_size", "4096",
                 "-i", f":{mic_idx}",
-                "-c:a", acodec, "-b:a", "128k", str(audio_temp),
+                "-c:a", "pcm_s16le", "-ar", "48000", str(audio_temp),
             ]
 
         try:
@@ -30951,11 +30959,41 @@ Admin elevation
         )
         return True
 
+    def _avfoundation_input_start(self, log_path) -> float | None:
+        """Parse the avfoundation input `start:` timestamp (seconds, mach host
+        clock) from an ffmpeg log. Both the video and audio sidecars log this
+        for their single avfoundation input, in the SAME clock, so the delta
+        between the two is the exact capture-start offset — no cross-API clock
+        guessing. Returns the float, or None if not found."""
+        import re
+        try:
+            text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        # e.g. "  Duration: N/A, start: 31133.913833, bitrate: N/A"
+        m = re.search(r"start:\s*([0-9]+\.[0-9]+)", text)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                return None
+        return None
+
     def _finalize_mac_recording(self, video_temp, audio_temp, final_path) -> bool:
-        """Copy-mux the mac screen-recording video temp + mic audio temp into
-        the final mp4. No re-encode -> fast + lossless. Falls back to just the
-        (silent) video, renamed, if the audio temp is missing/empty or the mux
-        fails. Returns True if final_path ends up with a valid file."""
+        """Mux the mac screen-recording video temp + mic PCM-WAV temp into the
+        final mp4, correcting the capture-start offset so audio is in sync.
+
+        The mic device starts a bit AFTER the screen device (dominated by our
+        own 0.2 s liveness wait on the video spawn before the audio spawn), yet
+        both temp files begin at container t=0 — so without correction the audio
+        LEADS the video by that delta (the "audio ahead / sped up" complaint;
+        ~156 ms measured, well past the ~45 ms lip-sync threshold). We read the
+        avfoundation `start:` from BOTH logs (same clock), compute the exact
+        delta, and push the audio later by it with `adelay`. Video is stream-
+        copied (pristine); audio is encoded to aac once here (the WAV had no
+        encoder artifacts to begin with). Falls back to the silent video if the
+        audio temp is missing/empty or the mux fails. Returns True if final_path
+        ends up with a valid file."""
         def _ok(p) -> bool:
             try:
                 return p is not None and Path(p).exists() and Path(p).stat().st_size > 1024
@@ -30970,18 +31008,48 @@ Admin elevation
                 return True
             except Exception:
                 return False
-        # -shortest aligns both tracks from t=0 and trims the tail so a
-        # slightly-longer track can't leave a black/silent gap.
+
+        acodec = str(self._ffmpeg_capabilities.get("audio_encoder", "aac") or "aac")
+
+        # Exact offset from the two avfoundation `start:` stamps (same clock).
+        # Fall back to 0.15 s (the structural serial-spawn lead) if a log can't
+        # be parsed — better than 0 given we KNOW the cause is our spawn order.
+        v_start = self._avfoundation_input_start(Path(f"{final_path}.ffmpeg.log"))
+        a_start = self._avfoundation_input_start(Path(f"{final_path}.audio.log"))
+        if v_start is not None and a_start is not None:
+            delta = a_start - v_start
+        else:
+            delta = 0.15
+        # Only a positive delta (audio started later -> audio leads) is
+        # correctable with adelay. Clamp to a sane window so a bad parse can't
+        # inject a huge silence.
+        delay_ms = int(round(max(0.0, min(delta, 1.0)) * 1000.0))
+
+        # adelay: prepend `delay_ms` of silence -> shifts real audio later,
+        # removing the lead. apad: pad the tail with silence so -shortest trims
+        # padding rather than clipping real audio. -c:v copy keeps video
+        # pristine; audio re-encoded once from clean PCM.
+        af = f"adelay={delay_ms}:all=1,apad" if delay_ms > 0 else "apad"
         mux_cmd = [
             self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(video_temp), "-i", str(audio_temp),
-            "-c", "copy", "-shortest", str(final_path),
+            "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+            "-af", af, "-c:a", acodec, "-b:a", "192k", "-ar", "48000",
+            "-shortest", str(final_path),
         ]
+        try:
+            sys.stderr.write(
+                f"[screen-record] mux: audio delay {delay_ms}ms "
+                f"(v_start={v_start} a_start={a_start}) acodec={acodec}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         try:
             subprocess.run(
                 mux_cmd, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=60,
+                timeout=120,
             )
         except Exception:
             pass
