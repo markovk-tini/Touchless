@@ -447,7 +447,7 @@ class ChromeController:
             chrome_pids = set()
         if not chrome_pids:
             self._handles_cache = []
-            self._handles_cache_until = now + 1.0
+            self._handles_cache_until = now + 5.0
             return []
 
         user32 = ctypes.windll.user32
@@ -472,7 +472,10 @@ class ChromeController:
         except Exception:
             handles = []
         self._handles_cache = list(handles)
-        self._handles_cache_until = now + 1.0
+        # r42: raised TTL 1.0s -> 5.0s so opening a new app (Spotify
+        # etc.) that adds ~10-20 processes doesn't force a hot-path
+        # frame to run psutil.process_iter + EnumWindows every second.
+        self._handles_cache_until = now + 5.0
         return handles
 
     def _invalidate_handles_cache(self) -> None:

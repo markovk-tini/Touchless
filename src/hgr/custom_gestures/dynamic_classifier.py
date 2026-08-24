@@ -33,6 +33,7 @@ from .dynamic_recording import (
     NUM_LANDMARKS,
     RESAMPLED_FRAME_COUNT,
     _resample_landmarks,
+    _resample_wrist,
 )
 
 
@@ -58,7 +59,7 @@ _MOTION_WINDOW_FRAMES = 5
 # ~3 of 21 landmarks, so a mean would be dominated by the 18 static
 # landmarks and miss the gesture entirely.
 #
-# Reference numbers (synthetic + real MediaPipe testing):
+# Reference numbers (synthetic + real MediaPipe testing at 30 fps):
 #   * still hand + MediaPipe jitter: per-frame max ~0.008-0.015
 #   * one-finger swipe at moderate speed: per-frame max ~0.030-0.050
 #   * fast clap: per-frame max ~0.060-0.120
@@ -68,6 +69,22 @@ _MOTION_WINDOW_FRAMES = 5
 # 2-3 frames.
 _MOTION_GATE_LOW = 0.018    # below this → "settled"
 _MOTION_GATE_HIGH = 0.030   # above this → "in progress"
+
+# r45 (opt-in fps-invariant path — HGR_DYNAMIC_FPS_INVARIANT=1).
+# The original gates above are calibrated per-FRAME at 30 fps. At
+# 15 fps a still hand's jitter per-frame doubles and can trip HIGH;
+# at 60 fps the per-frame step halves and slow deliberate gestures
+# never clear it. When the env flag is ON we swap in per-SECOND
+# equivalents and divide each per-frame step by real dt so gating
+# becomes fps-invariant. DEFAULT OFF preserves existing behaviour
+# for all users on all fps (per backward-compat critique — off-30-fps
+# users have templates calibrated to the old per-frame semantics).
+_MOTION_GATE_LOW_PER_SEC = _MOTION_GATE_LOW * 30.0   # ≈ 0.54
+_MOTION_GATE_HIGH_PER_SEC = _MOTION_GATE_HIGH * 30.0  # ≈ 0.90
+_NOMINAL_FRAME_DT = 1.0 / 30.0
+# Duration floor for the fps-invariant close-out: 8 frames @ 30 fps ≈
+# 0.267 s. Only consulted when the env flag is ON.
+_MIN_SEGMENT_DURATION_S = 0.25
 
 # Minimum number of "in progress" frames before we accept a segment.
 # Filters out tiny twitches that briefly cross the high gate.
@@ -85,18 +102,21 @@ _DTW_BAND = 8
 # the looser threshold matched almost any open-hand motion.
 _DEFAULT_MATCH_THRESHOLD = 0.18
 
-# Minimum wrist travel (in palm units) within a closed segment for
-# the segment to even be considered a gesture candidate. Frames are
-# wrist-relative-normalized, so DTW alone can't tell a real swipe
-# (wrist moves) from "user brought their hand into view and held it"
-# (wrist moves but the wrist-relative landmarks look identical).
-# This gate uses the absolute wrist trajectory (passed alongside the
-# normalized landmarks) to require real whole-hand motion.
-#
-# 0.4 palm units = roughly half a palm width — easily cleared by an
-# intentional swipe (which usually traces 2–4 palm widths) but not
-# by the small jitter of a hand entering view and settling.
-_MIN_WRIST_TRAVEL_PALM_UNITS = 0.4
+# Reference wrist path length (palm units) used to map a template's
+# per-take wrist motion into a [0, 1] strength weight. A take whose
+# wrist travels this many palm units in total is treated as "fully
+# wrist-driven" (weight clamps near MAX). A take whose wrist barely
+# moves yields weight ≈ 0 — the wrist channel then contributes
+# nothing and the classifier matches on fingers alone. Tuned so a
+# moderate swipe (~1.5 palm units of total path) lands near 1.0.
+_WRIST_MOTION_REFERENCE_PALM_UNITS = 1.5
+
+# Cap on the wrist-channel weight so finger features always retain
+# at least 1 - MAX influence on the combined distance. Stops a big
+# swipe template from matching ANY fast hand path regardless of
+# finger pose. 0.7 = wrist dominates (70%) for big-motion templates
+# but fingers still keep 30% weight.
+_WRIST_WEIGHT_MAX = 0.7
 
 
 @dataclass(frozen=True)
@@ -109,11 +129,24 @@ class DynamicGestureTemplate:
     static / inconsistent landmarks. Storing all N takes (rather than
     just a centroid) lets DTW match against the variant the user is
     most closely reproducing on the current attempt.
+
+    `wrist_trajectories` is a parallel list of N (resampled_length, 3)
+    arrays — the absolute (palm-scaled) wrist position per frame for
+    each take. This is the second DTW channel: DTW on the finger
+    features alone can't distinguish a swipe from "hand entered view
+    and held still" (both look like a stationary wrist-relative hand),
+    so we also DTW the wrist path and combine the distances weighted
+    by how much wrist motion the template's takes actually contained.
+    `wrist_motion_strength` is computed at build time in [0, 1] from
+    the takes' wrist path lengths and capped at _WRIST_WEIGHT_MAX so
+    finger features always retain some influence.
     """
 
     name: str
     key_point_indices: List[int]
     sample_trajectories: List[np.ndarray]
+    wrist_trajectories: List[np.ndarray] = field(default_factory=list)
+    wrist_motion_strength: float = 0.0
     # Optional per-gesture threshold. None → use classifier default.
     match_threshold: Optional[float] = None
 
@@ -143,8 +176,24 @@ class DynamicGestureClassifier:
     ) -> None:
         self._templates: List[DynamicGestureTemplate] = list(templates)
         self._match_threshold = float(match_threshold)
-        self._motion_gate_low = float(motion_gate_low)
-        self._motion_gate_high = float(motion_gate_high)
+        # r45: HGR_DYNAMIC_FPS_INVARIANT=1 opts in to per-second gates.
+        # DEFAULT OFF — the constructor arg semantics (per-frame) are
+        # preserved byte-for-byte for every existing caller.
+        try:
+            import os as _os
+            self._fps_invariant = _os.environ.get("HGR_DYNAMIC_FPS_INVARIANT", "0") == "1"
+        except Exception:
+            self._fps_invariant = False
+        if self._fps_invariant:
+            # Scale the per-frame constructor arg to a per-second gate
+            # using the 30-fps identity — a caller passing the default
+            # 0.018/0.030 pair gets 0.54/0.90 per-second gates so 30-fps
+            # trip points are byte-identical.
+            self._motion_gate_low = float(motion_gate_low) / _NOMINAL_FRAME_DT
+            self._motion_gate_high = float(motion_gate_high) / _NOMINAL_FRAME_DT
+        else:
+            self._motion_gate_low = float(motion_gate_low)
+            self._motion_gate_high = float(motion_gate_high)
         self._min_segment_frames = int(min_segment_frames)
         self._dtw_band = int(dtw_band)
         # Each entry: (timestamp, normalized_landmarks, wrist_palm_scaled_or_None).
@@ -226,13 +275,25 @@ class DynamicGestureClassifier:
     # ---- internal ----
 
     def _recent_motion_energy(self) -> float:
-        """Per-frame max-landmark motion, averaged over the trailing window.
+        """Per-frame motion magnitude, averaged over the trailing window.
 
-        Max (not mean) across landmarks because one-finger gestures
-        only move a small subset — averaging dilutes the signal with
-        18 static landmarks. The frame-by-frame MAX captures "the
-        fastest-moving landmark this frame", which is what actually
-        triggers the user's perception of "the hand is moving".
+        Two channels considered, MAX taken:
+          * Wrist-relative landmark MAX — the fastest-moving landmark
+            in palm-scaled wrist-subtracted space. Captures finger
+            motion (curl, spread, wiggle, fist squeeze).
+          * Absolute wrist step — the wrist's own palm-scaled
+            displacement. Captures whole-hand translation (swipe,
+            wave) that wrist-relative landmarks erase.
+
+        Taking MAX means EITHER channel can open the gate, so a rigid-
+        hand swipe (still fingers + moving wrist) trips it just as
+        readily as an in-place fist squeeze (moving fingers + still
+        wrist). Using max-across-landmarks (not mean) for the relative
+        channel preserves single-finger gestures the same way; the
+        wrist channel is single-valued so it's just the step norm.
+
+        Pre-wrist-channel callers (no wrist data in the deque) fall
+        back to the relative channel only — same behaviour as before.
         """
         if len(self._frames) < 2:
             return 0.0
@@ -241,22 +302,44 @@ class DynamicGestureClassifier:
             return 0.0
         total = 0.0
         for prev, current in zip(window[:-1], window[1:]):
-            diff = current[1] - prev[1]  # (21, 3)
+            diff = current[1] - prev[1]  # (21, 3) wrist-relative
             step_norms = np.linalg.norm(diff, axis=-1)  # (21,)
-            total += float(step_norms.max())
+            finger_max = float(step_norms.max())
+            wrist_step = 0.0
+            prev_wrist = prev[2]
+            curr_wrist = current[2]
+            if prev_wrist is not None and curr_wrist is not None:
+                wrist_step = float(np.linalg.norm(curr_wrist - prev_wrist))
+            step = max(finger_max, wrist_step)
+            # r45: scale by real dt WHEN the fps-invariant flag is on so
+            # the summed energy is displacement/second; otherwise emit
+            # per-frame displacement exactly as before. Guarded against
+            # zero/negative dt (falls back to nominal 30-fps step).
+            if self._fps_invariant:
+                dt = float(current[0]) - float(prev[0])
+                if not (dt > 1e-6):
+                    dt = _NOMINAL_FRAME_DT
+                total += step / dt
+            else:
+                total += step
         return total / max(1, (len(window) - 1))
 
-    def _segment_wrist_travel(self, segment: List[Tuple[float, np.ndarray, Optional[np.ndarray]]]) -> Optional[float]:
-        """Maximum L2 distance between any two wrist positions in
-        the segment (in palm units). Returns None when wrist data
-        wasn't supplied — callers should treat that as "skip the
-        gate" so older 2-arg `update()` callers still match."""
+    def _segment_wrist_resampled(
+        self,
+        segment: List[Tuple[float, np.ndarray, Optional[np.ndarray]]],
+    ) -> Optional[np.ndarray]:
+        """Resample the segment's absolute wrist trajectory to the
+        canonical length. Returns None when the caller didn't supply
+        wrist data (older 2-arg `update()` callers).
+        """
         wrists = [w for _, _, w in segment if w is not None]
         if len(wrists) < 2:
             return None
         stacked = np.stack(wrists, axis=0).astype(np.float32)
-        bbox = stacked.max(axis=0) - stacked.min(axis=0)
-        return float(np.linalg.norm(bbox))
+        try:
+            return _resample_wrist(stacked, RESAMPLED_FRAME_COUNT)
+        except Exception:
+            return None
 
     def _close_and_match(self, timestamp: float) -> Optional[Match]:
         if self._segment_start_idx is None:
@@ -269,16 +352,14 @@ class DynamicGestureClassifier:
         if len(segment) < self._min_segment_frames:
             return None
 
-        # Wrist-motion gate: reject segments where the wrist barely
-        # travelled in palm units. Skipped when callers didn't pass
-        # wrist data (preserves the older 2-arg `update()` contract
-        # used by tests and by any future caller that opts out).
-        wrist_travel = self._segment_wrist_travel(segment)
-        if wrist_travel is not None and wrist_travel < _MIN_WRIST_TRAVEL_PALM_UNITS:
-            return None
-
         landmarks_stack = np.stack([lm for _, lm, _ in segment], axis=0).astype(np.float32)
         self._last_segment_motion = float(landmarks_stack.std())
+
+        # Resample the segment's wrist trajectory once (used across
+        # every template that carries a wrist channel). None when the
+        # caller didn't pass wrist data — older 2-arg update() shape,
+        # in which case we silently fall back to finger-only matching.
+        seg_wrist_resampled = self._segment_wrist_resampled(segment)
 
         best: Optional[Match] = None
         for template in self._templates:
@@ -301,6 +382,20 @@ class DynamicGestureClassifier:
                 if template.match_threshold is not None
                 else self._match_threshold
             )
+            # Weight for the wrist channel. Falls to 0 (finger-only)
+            # whenever the template carries no wrist data (e.g. legacy
+            # records loaded from registry without wrist_trajectories)
+            # OR the live caller didn't supply wrist positions.
+            template_wrist = template.wrist_trajectories or []
+            wrist_weight = 0.0
+            if (
+                seg_wrist_resampled is not None
+                and len(template_wrist) == len(template.sample_trajectories)
+                and template.wrist_motion_strength > 0.0
+            ):
+                wrist_weight = float(template.wrist_motion_strength)
+            wrist_weight = max(0.0, min(_WRIST_WEIGHT_MAX, wrist_weight))
+            finger_weight = 1.0 - wrist_weight
             for sample_idx, sample in enumerate(template.sample_trajectories):
                 try:
                     sample_features = sample.reshape(sample.shape[0], -1)
@@ -309,7 +404,19 @@ class DynamicGestureClassifier:
                 if sample_features.shape[1] != seg_features.shape[1]:
                     # Schema mismatch (different key-point count).
                     continue
-                distance = _dtw_distance(seg_features, sample_features, band=self._dtw_band)
+                finger_dist = _dtw_distance(seg_features, sample_features, band=self._dtw_band)
+                if wrist_weight > 0.0 and sample_idx < len(template_wrist):
+                    wrist_sample = template_wrist[sample_idx]
+                    try:
+                        wrist_dist = _dtw_distance(
+                            seg_wrist_resampled, wrist_sample.astype(np.float32),
+                            band=self._dtw_band,
+                        )
+                    except Exception:
+                        wrist_dist = finger_dist  # neutral on failure
+                else:
+                    wrist_dist = 0.0
+                distance = finger_weight * finger_dist + wrist_weight * wrist_dist
                 if distance < threshold and (best is None or distance < best.distance):
                     best = Match(
                         gesture_name=template.name,
@@ -380,9 +487,12 @@ def build_template_from_takes(
 
     Run this AFTER `select_key_points` has picked the indices. Each
     take's landmarks are resampled to `resampled_length` and projected
-    onto the selected key-point indices.
+    onto the selected key-point indices. The absolute wrist trajectory
+    is captured as a parallel channel and the template's overall wrist-
+    motion strength is derived from the per-take path lengths.
     """
     sample_trajectories: List[np.ndarray] = []
+    wrist_trajectories: List[np.ndarray] = []
     indices = list(int(i) for i in key_point_indices)
     for take in takes:
         resampled = take.resampled(resampled_length)  # (L, 21, 3)
@@ -393,9 +503,46 @@ def build_template_from_takes(
         # takes that include whole-hand translation.
         normalized = resampled - resampled[:, 0:1, :]
         sample_trajectories.append(normalized[:, indices, :].astype(np.float32))
+        # Absolute (palm-scaled) wrist channel — carries whole-hand
+        # translation that the wrist-relative `normalized` discards.
+        try:
+            wrist_resampled = take.resampled_wrist(resampled_length)
+        except Exception:
+            wrist_resampled = np.zeros((resampled_length, 3), dtype=np.float32)
+        wrist_trajectories.append(wrist_resampled.astype(np.float32))
+    strength = _wrist_motion_strength_from_trajectories(wrist_trajectories)
     return DynamicGestureTemplate(
         name=str(name),
         key_point_indices=indices,
         sample_trajectories=sample_trajectories,
+        wrist_trajectories=wrist_trajectories,
+        wrist_motion_strength=float(strength),
         match_threshold=match_threshold,
     )
+
+
+def _wrist_motion_strength_from_trajectories(wrists: Sequence[np.ndarray]) -> float:
+    """Map the takes' wrist motion to a [0, _WRIST_WEIGHT_MAX] weight.
+
+    For each take, total path length (sum of per-frame step norms) in
+    palm units. Median across takes is robust to one outlier (a
+    fumbled retake). The result is clamped to _WRIST_WEIGHT_MAX so
+    the finger channel never drops below 1 - MAX of influence.
+
+    A still-hand template (fist squeeze, finger wiggle) → ~0.
+    A moderate swipe (~1.5 palm units of total path) → ~_WRIST_WEIGHT_MAX.
+    """
+    if not wrists:
+        return 0.0
+    lengths: List[float] = []
+    for w in wrists:
+        if w is None or w.shape[0] < 2:
+            continue
+        diffs = np.diff(w.astype(np.float32), axis=0)
+        step_norms = np.linalg.norm(diffs, axis=1)
+        lengths.append(float(step_norms.sum()))
+    if not lengths:
+        return 0.0
+    median_path = float(np.median(np.asarray(lengths, dtype=np.float32)))
+    raw = median_path / max(_WRIST_MOTION_REFERENCE_PALM_UNITS, 1e-6)
+    return float(min(max(raw, 0.0), _WRIST_WEIGHT_MAX))

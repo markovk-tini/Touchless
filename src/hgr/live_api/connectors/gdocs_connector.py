@@ -9,10 +9,15 @@ Author: Konstantin Markov
 """
 from __future__ import annotations
 
+import concurrent.futures
 from typing import Any, Dict, List
 
-from .base import Connector, connector_result
+from .base import Connector, connector_result, friendly_api_error
 from .google_client import GoogleClient
+
+_GDOCS_CALL_TIMEOUT_SEC = 25.0
+_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="gdocs")
 
 
 class GoogleDocsConnector(Connector):
@@ -36,18 +41,20 @@ class GoogleDocsConnector(Connector):
                 "type": "function",
                 "name": "gdocs_create",
                 "description": (
-                    "Create a new Google Doc with a title and optional "
-                    "body text. PREFER passing the body via `text` in this "
-                    "single call when possible (1-step path). Returns "
-                    "{created, id, title, link}; chain id into "
-                    "gdocs_append_text for additional content."
+                    "Create a new Google Doc with a title and body content. "
+                    "Pass the document content via `text` (or `body`) in "
+                    "this single call — do NOT call gdocs_create then "
+                    "gdocs_append_text separately when the body is known up "
+                    "front. Returns {created, id, title, link}."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "title": {"type": "string"},
                         "text": {"type": "string",
-                                 "description": "Optional body text."},
+                                 "description": "Body text to insert (alias: body)."},
+                        "body": {"type": "string",
+                                 "description": "Body text to insert (alias of text)."},
                     },
                     "required": ["title"],
                     "additionalProperties": False,
@@ -77,6 +84,17 @@ class GoogleDocsConnector(Connector):
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return _pool.submit(self._execute_locked, name, args).result(
+                timeout=_GDOCS_CALL_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            return connector_result(
+                "error",
+                error=f"{name} timed out after {_GDOCS_CALL_TIMEOUT_SEC}s",
+                code="timeout",
+            )
+
+    def _execute_locked(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         svc = self._svc()
         if svc is None:
             return connector_result("error", error="Google Docs not authorized",
@@ -86,7 +104,7 @@ class GoogleDocsConnector(Connector):
             title = str(args.get("title") or "").strip()
             if not title:
                 return connector_result("error", error="title is required")
-            text = str(args.get("text") or "")
+            text = str(args.get("text") or args.get("body") or "")
             try:
                 doc = svc.documents().create(body={"title": title}).execute()
                 doc_id = doc.get("documentId")
@@ -98,11 +116,23 @@ class GoogleDocsConnector(Connector):
                         ]}).execute()
                 link = (f"https://docs.google.com/document/d/{doc_id}/edit"
                         if doc_id else None)
+                # Warm the picker cache — a follow-up "append to X" by
+                # title hits the cache instead of triggering Picker
+                # (drive.file scope's Drive.list won't find it by name
+                # if the token was refreshed mid-session).
+                if doc_id:
+                    try:
+                        from .google_picker_cache import shared as _picker_cache
+                        _picker_cache().remember(
+                            title, "doc", doc_id, title,
+                            "application/vnd.google-apps.document")
+                    except Exception:
+                        pass
                 return connector_result("ok", created=True, id=doc_id,
                                         title=title, link=link)
             except Exception as exc:
                 return connector_result("error",
-                                        error=f"{type(exc).__name__}: {exc}")
+                                        error=friendly_api_error(exc, api_label="Google Docs"))
 
         if name == "gdocs_append_text":
             doc_id = str(args.get("doc_id") or "").strip()
@@ -126,7 +156,7 @@ class GoogleDocsConnector(Connector):
                                         chars=len(text), link=link)
             except Exception as exc:
                 return connector_result("error",
-                                        error=f"{type(exc).__name__}: {exc}")
+                                        error=friendly_api_error(exc, api_label="Google Docs"))
 
         return connector_result("error",
                                 error=f"unknown gdocs tool: {name}",

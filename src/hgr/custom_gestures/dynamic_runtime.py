@@ -25,6 +25,7 @@ import numpy as np
 
 from .action import fire_once
 from .dynamic_classifier import (
+    _DEFAULT_MATCH_THRESHOLD,
     DynamicGestureClassifier,
     DynamicGestureTemplate,
 )
@@ -225,12 +226,16 @@ class DynamicGestureRuntime:
     @staticmethod
     def _live_match_threshold() -> float:
         """Allow override via env var, same pattern as the static
-        runner uses for HGR_CUSTOM_GESTURES_LIVE_THRESHOLD."""
+        runner uses for HGR_CUSTOM_GESTURES_LIVE_THRESHOLD. Default
+        matches the classifier's tuned _DEFAULT_MATCH_THRESHOLD (0.18)
+        — the previous 0.30 default left the live engine ~67% LOOSER
+        than the classifier was tuned for, which is why every
+        moderate hand motion fired a match."""
         raw = os.environ.get("HGR_DYNAMIC_GESTURES_THRESHOLD", "").strip()
         try:
-            return float(raw) if raw else 0.30
+            return float(raw) if raw else float(_DEFAULT_MATCH_THRESHOLD)
         except (TypeError, ValueError):
-            return 0.30
+            return float(_DEFAULT_MATCH_THRESHOLD)
 
     @staticmethod
     def _template_from_registry_entry(gesture) -> Optional[DynamicGestureTemplate]:
@@ -252,10 +257,36 @@ class DynamicGestureRuntime:
             ]
             if not valid:
                 return None
+            # Wrist channel — rehydrate only when the registry stored
+            # a 1-to-1 parallel set of well-shaped (T, 3) wrist
+            # trajectories. Legacy records (pre-wrist-channel) have an
+            # empty list here; we silently fall back to finger-only
+            # matching by passing an empty wrist list and strength 0.
+            raw_wrist = getattr(gesture, "wrist_trajectories", None) or []
+            wrist: List[np.ndarray] = []
+            if len(raw_wrist) == len(valid):
+                for w in raw_wrist:
+                    try:
+                        arr = np.asarray(w, dtype=np.float32)
+                    except Exception:
+                        wrist = []
+                        break
+                    if arr.ndim != 2 or arr.shape[1] != 3:
+                        wrist = []
+                        break
+                    wrist.append(arr)
+            try:
+                strength = float(getattr(gesture, "wrist_motion_strength", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                strength = 0.0
+            if not wrist:
+                strength = 0.0
             return DynamicGestureTemplate(
                 name=str(gesture.name),
                 key_point_indices=indices,
                 sample_trajectories=valid,
+                wrist_trajectories=wrist,
+                wrist_motion_strength=strength,
             )
         except Exception:
             return None

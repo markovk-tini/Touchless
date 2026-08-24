@@ -75,6 +75,18 @@ CLIENT_HTML = r"""<!DOCTYPE html>
       -webkit-appearance: none; }
     button:disabled { opacity: 0.5; }
     button.secondary { background: rgba(255,255,255,0.15); color: #E5F6FF; }
+    /* Text-command prompt row. Input fills available width; Send is
+       sized to its label. iOS Safari likes explicit min-heights here
+       so the input doesn't render at 28px (default) on a tall phone. */
+    .command-row { display: flex; gap: 8px; margin-top: 12px; }
+    .command-row input { flex: 1; min-width: 0; padding: 14px 12px;
+      font-size: 15px; border: 1px solid rgba(255,255,255,0.22);
+      border-radius: 10px; background: rgba(255,255,255,0.06);
+      color: #E5F6FF; -webkit-appearance: none; }
+    .command-row input::placeholder { color: rgba(229,246,255,0.4); }
+    .command-row input:focus { outline: none;
+      border-color: rgba(29,233,182,0.65); }
+    .command-row button { flex: 0 0 auto; min-width: 80px; }
     .hint { font-size: 12px; opacity: 0.75; margin-top: 12px; line-height: 1.4; }
     .hint.compact { display: none; }
     body.mini h1,
@@ -198,6 +210,19 @@ CLIENT_HTML = r"""<!DOCTYPE html>
     <button id="start">Start</button>
     <button id="fs" class="secondary" type="button">Fullscreen</button>
     <button id="mini" class="secondary" type="button">Mini</button>
+  </div>
+
+  <!-- Text command prompt. Same intent surface as voice commands —
+       "pause spotify", "open chrome", "play despacito on spotify",
+       "open touchless settings", etc. The PC dispatches via the
+       existing voice-command processor on the GUI thread and reports
+       the outcome back through the SSE stream (kind="command_result")
+       which the listener below renders as a toast. -->
+  <div class="command-row">
+    <input id="commandInput" type="text" inputmode="text"
+           autocomplete="off" autocapitalize="sentences"
+           placeholder="Type a command, e.g. pause spotify" />
+    <button id="commandSend" type="button">Send</button>
   </div>
 
   <div class="hint">
@@ -884,6 +909,45 @@ CLIENT_HTML = r"""<!DOCTYPE html>
   }
 
   startBtn.addEventListener("click", () => { if (sending) stopLoop(); else startLoop(); });
+
+  // Text command prompt — POST {text} to /command. Same intent surface
+  // as voice commands. The PC dispatches via the voice command
+  // processor on the GUI thread; the outcome arrives back via the SSE
+  // stream below (kind="command_result") and gets rendered as a toast.
+  const commandInputEl = document.getElementById("commandInput");
+  const commandSendBtn = document.getElementById("commandSend");
+  async function sendCommandPrompt() {
+    if (!commandInputEl) return;
+    const text = (commandInputEl.value || "").trim();
+    if (!text) return;
+    commandSendBtn.disabled = true;
+    try {
+      const resp = await fetch("/command", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+        cache: "no-store",
+        keepalive: false,
+      });
+      if (resp.status === 503) {
+        showToast("", "Start Touchless on the PC first.", "Command");
+      } else if (resp.ok || resp.status === 202) {
+        showToast("", text, "Sent");
+        commandInputEl.value = "";
+      } else {
+        showToast("", "Send failed (" + resp.status + ")", "Command");
+      }
+    } catch (err) {
+      showToast("", "Network error", "Command");
+    } finally {
+      commandSendBtn.disabled = false;
+      commandInputEl.focus();
+    }
+  }
+  if (commandSendBtn) commandSendBtn.addEventListener("click", sendCommandPrompt);
+  if (commandInputEl) commandInputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); sendCommandPrompt(); }
+  });
   fsBtn.addEventListener("click", () => {
     if (previewWrap.classList.contains("fs-active")) exitFullscreen();
     else enterFullscreen();
@@ -985,6 +1049,16 @@ CLIENT_HTML = r"""<!DOCTYPE html>
       } else if (kind === "status") {
         const message = String(payload.message || "");
         if (message) showToast("", message, "");
+      } else if (kind === "command_result") {
+        // Result of a phone-side /command POST. `ok` true means the
+        // voice processor recognised + executed the intent; false means
+        // it was either unrecognised or the action itself failed.
+        const ok = Boolean(payload.ok);
+        const heard = String(payload.heard_text || "");
+        const detail = String(payload.info_text || payload.control_text || "");
+        const head = ok ? "Done" : "Couldn't run";
+        const body = detail || heard || "command";
+        showToast(ok ? "voice" : "", body, head);
       }
     };
     eventSource.onerror = () => {

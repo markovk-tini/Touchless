@@ -242,6 +242,65 @@ def request_camera_access_main_thread(max_index: int = 4) -> tuple[bool, str]:
     )
 
 
+# r50: auto-detect classifier for the r49 short-shutter camera hint.
+#
+# Allowlist is checked BEFORE the denylist so a Kiyo Pro (which contains
+# 'kiyo') can never be resolved to 'generic' even if a partial substring
+# also matched a denylist term. Both lists are conservative — the
+# denylist is trimmed to high-confidence keyword substrings ('realtek',
+# 'sonix', 'chicony', literal generic UVC names). Broad terms like
+# 'integrated camera' and 'hd webcam' were intentionally excluded to
+# avoid false-positives on premium built-in laptop cameras.
+_R50_PREMIUM_CAMERA_KEYWORDS = (
+    "kiyo",
+    "brio",
+    "c920",
+    "c922",
+    "c930",
+    "streamcam",
+    "elgato facecam",
+    "insta360 link",
+    "opal",
+    "poly studio",
+    "logitech mx brio",
+    "sony imx",
+)
+_R50_GENERIC_UVC_KEYWORDS = (
+    "full hd 1080p webcam",
+    "usb2.0 camera",
+    "usb camera",
+    "uvc camera",
+    "general webcam",
+    "realtek",
+    "sonix",
+    "chicony",
+)
+
+
+def classify_camera_shutter_hint(display_name: str) -> Optional[bool]:
+    """Return True if the camera's display name matches a known generic
+    UVC driver family that benefits from the short-shutter hint;
+    False if it matches a known premium camera family that must NOT
+    receive the hint; None if the name is unknown (caller should
+    fall through to the user's explicit config value).
+
+    Runtime-only classifier — the caller does NOT persist the result
+    to config. Every camera-open re-evaluates from the current
+    display_name, which stays deterministic across restarts and can
+    never diverge from a user's explicit Settings choice.
+    """
+    name = str(display_name or "").lower().strip()
+    if not name:
+        return None
+    for premium in _R50_PREMIUM_CAMERA_KEYWORDS:
+        if premium in name:
+            return False
+    for generic in _R50_GENERIC_UVC_KEYWORDS:
+        if generic in name:
+            return True
+    return None
+
+
 def is_eos_or_canon_name(display_name: str) -> bool:
     """Return True if the camera display name looks like Canon EOS
     Webcam Utility or another Canon EOS-style virtual camera.
@@ -532,8 +591,14 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
                     # C27: 640x480 to match Default's OpenCV cap res.
                     # Higher res introduced a persistent 1-2 s live-
                     # viewer lag through the frame-copy pipeline.
+                    # v1.1.7.1: luma_min_threshold=50 auto-downshifts
+                    # 60→30 fps when the driver responds to the higher
+                    # rate by cutting shutter below usable brightness
+                    # (HP HD Camera and similar built-in webcams that
+                    # can't sustain 60 fps in indoor lighting).
                     ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                        device_name, width=640, height=480
+                        device_name, width=640, height=480,
+                        luma_min_threshold=50.0,
                     )
                 except Exception:
                     ffmpeg_cap = None
@@ -571,8 +636,13 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
                     # C27: 640x480 to match Default's OpenCV cap res.
                     # Higher res introduced a persistent 1-2 s live-
                     # viewer lag through the frame-copy pipeline.
+                    # v1.1.7.1: luma_min_threshold=50 auto-downshifts
+                    # 60→30 fps if the driver responds by cutting
+                    # shutter too aggressively (see camera_utils.py
+                    # EOS path for the full rationale).
                     ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                        device_name, width=640, height=480
+                        device_name, width=640, height=480,
+                        luma_min_threshold=50.0,
                     )
                 except Exception:
                     ffmpeg_cap = None

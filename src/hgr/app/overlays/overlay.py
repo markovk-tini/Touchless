@@ -79,8 +79,12 @@ class DrawingSettingsDialog(QDialog):
         self.resize(420, 260)
         self._selected_color = QColor(color)
         self._auto_color_opened = False
+        # r51: give the dialog indigo chrome (was previously bare
+        # OS-default, showed white on Win10).
+        from ..ui.window_chrome import install_indigo_chrome
+        body = install_indigo_chrome(self, "Drawing Settings")
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(body)
         root.setContentsMargins(18, 18, 18, 18)
         root.setSpacing(14)
 
@@ -345,7 +349,20 @@ class ScreenDrawOverlay(QWidget):
     def begin_draw(self, pos: QPointF) -> None:
         self._last_draw_point = QPointF(pos)
         self._active_stroke_points = [(float(pos.x()), float(pos.y()))]
+        # r53 v3: seed the still-anchor at the start of every stroke
+        # so residual tremor from the previous stroke doesn't bias
+        # the dead-zone at the first sample of the new one.
+        self._draw_still_anchor = QPointF(pos)
         self.set_cursor(pos, "draw")
+
+    # r53 v3: still-anchor dead zone. A separate anchor point that
+    # DOESN'T update on every draw call — it only jumps when the
+    # cursor decisively breaks out of a larger radius. That prevents
+    # the "drift crawl" pattern where each tiny tremor step nudges
+    # the anchor forward, letting the next tremor step nudge it
+    # further in a new direction. With a fixed anchor, tremor within
+    # the radius produces zero ink regardless of duration.
+    _DRAW_ANCHOR_RADIUS_PX_SQ = 64.0  # 8 px squared
 
     def draw_to(self, pos: QPointF) -> None:
         self._ensure_canvas_size()
@@ -353,6 +370,30 @@ class ScreenDrawOverlay(QWidget):
             self._last_draw_point = QPointF(pos)
             if not self._active_stroke_points:
                 self._active_stroke_points = [(float(pos.x()), float(pos.y()))]
+            # Seed the still-anchor for this new stroke so tremor at
+            # the very first sample doesn't produce a wobbly leading
+            # segment.
+            self._draw_still_anchor = QPointF(pos)
+        # r53 v3: still-anchor dead zone. Only draw when the cursor
+        # is >8 px from the still anchor. Once we do draw, snap the
+        # anchor to the current position — subsequent samples within
+        # 8 px of THAT new anchor are again treated as still. This
+        # produces clean strokes during real motion and zero ink
+        # during holds, regardless of how long the hold lasts.
+        anchor = getattr(self, "_draw_still_anchor", None)
+        if anchor is None:
+            anchor = QPointF(pos)
+            self._draw_still_anchor = anchor
+        dx = float(pos.x()) - float(anchor.x())
+        dy = float(pos.y()) - float(anchor.y())
+        if (dx * dx + dy * dy) < self._DRAW_ANCHOR_RADIUS_PX_SQ:
+            self._cursor_pos = QPointF(pos)
+            self._cursor_mode = "draw"
+            self.update()
+            return
+        # Cursor broke out of the dead zone — draw and reset the
+        # anchor to the current position for the next still test.
+        self._draw_still_anchor = QPointF(pos)
         painter = QPainter(self._canvas)
         painter.setRenderHint(QPainter.Antialiasing)
         pen = QPen(self.brush_color)
@@ -1523,6 +1564,23 @@ class SavedLocationOverlay(QWidget):
         # Path the click handler will open. None disables the click
         # behaviour (falls back to a regular informational pill).
         self._click_target: Path | None = None
+        # v1.1.7: alternative click behaviour — a plain callable that
+        # runs on left-click instead of opening a file path. Used by
+        # the "clipping disabled" pill to route the user into
+        # Settings → General → Clip Presets. If both _click_target
+        # and _click_action are set, action wins.
+        self._click_action = None
+        # v1.1.7: per-invocation override for the vertical stack
+        # offset (None = default _STACK_ABOVE_OFFSET, so the pill
+        # rests above the standard pill row). Set to a smaller value
+        # to slide the pill LOWER on screen (e.g. 0 puts it flush
+        # against the standard bottom gap).
+        self._stack_offset_override: int | None = None
+        # v1.1.7: rich-text mode. When True, paintEvent renders via
+        # QTextDocument so HTML (<u>, <font color=>, etc.) styles the
+        # pill's text. Off by default so every existing plain-text
+        # caller stays bit-identical.
+        self._is_rich_text: bool = False
         # Hold-then-fade timers. Hold duration = total_ms - fade_ms.
         self._hold_timer = QTimer(self)
         self._hold_timer.setSingleShot(True)
@@ -1546,7 +1604,17 @@ class SavedLocationOverlay(QWidget):
         self._slide_timer.timeout.connect(self._tick_slide)
         self.resize(self._MIN_WIDTH, self._PILL_HEIGHT)
 
-    def show_saved(self, text: str, *, total_ms: int = 3000, fade_ms: int = 600, click_target: Path | None = None) -> None:
+    def show_saved(
+        self,
+        text: str,
+        *,
+        total_ms: int = 3000,
+        fade_ms: int = 600,
+        click_target: Path | None = None,
+        click_action=None,
+        stack_offset: int | None = None,
+        rich_text: bool = False,
+    ) -> None:
         """Show the saved-location pill above the standard pill row.
 
         Animates a slide-down entrance: pill starts ~60 px above its
@@ -1560,9 +1628,29 @@ class SavedLocationOverlay(QWidget):
         time (deleted between save and click), we fall back to
         opening the containing folder via Explorer. None target =
         informational pill only, click does nothing.
+
+        v1.1.7 additions:
+        - `click_action`: any callable — called on left-click instead
+          of opening a Path. Wins over `click_target` when both set.
+          Used by the "clipping disabled" pill to route into
+          Settings → General → Clip Presets.
+        - `stack_offset`: override the pill's vertical stacking offset.
+          Default (None) uses `_STACK_ABOVE_OFFSET=110` so the pill
+          sits above the ProcessingOverlay / VoiceStatusOverlay row.
+          Pass 0 to sit at the bottom-gap (LOWER on screen) — useful
+          for informational pills that don't need to stack above
+          concurrent status pills.
+        - `rich_text`: interpret `text` as HTML and render via
+          QTextDocument so inline styling (e.g. an underlined,
+          accent-coloured "Clip Presets" phrase) reaches the pill.
+          Default False keeps every existing plain-text caller
+          bit-identical.
         """
         self._text = str(text or "")
         self._click_target = Path(click_target) if click_target else None
+        self._click_action = click_action if callable(click_action) else None
+        self._stack_offset_override = stack_offset
+        self._is_rich_text = bool(rich_text)
         # Stop any prior cycle so a new save replaces the old pill
         # cleanly.
         self._hold_timer.stop()
@@ -1598,26 +1686,35 @@ class SavedLocationOverlay(QWidget):
 
     def mousePressEvent(self, event):  # noqa: N802
         """Left-click → open the saved file (or its folder if the
-        file's been moved / deleted in the interim)."""
+        file's been moved / deleted in the interim). If a
+        `click_action` callable was supplied to `show_saved`, that
+        runs INSTEAD of any file-open behaviour."""
         if event.button() != Qt.LeftButton:
             super().mousePressEvent(event)
             return
+        action = self._click_action
         target = self._click_target
-        if target is None:
+        if action is None and target is None:
             event.accept()
             return
-        try:
-            import os
-            if target.exists():
-                os.startfile(str(target))
-            elif target.parent.exists():
-                # File gone — open the folder so the user can see
-                # where it WAS / find a renamed version.
-                os.startfile(str(target.parent))
-        except Exception:
-            pass
+        if action is not None:
+            try:
+                action()
+            except Exception:
+                pass
+        else:
+            try:
+                import os
+                if target.exists():
+                    os.startfile(str(target))
+                elif target.parent.exists():
+                    # File gone — open the folder so the user can see
+                    # where it WAS / find a renamed version.
+                    os.startfile(str(target.parent))
+            except Exception:
+                pass
         # Hide immediately on click so the pill doesn't linger
-        # while the OS opens the file.
+        # while the OS opens the file / navigates the app.
         self._hold_timer.stop()
         self._fade_timer.stop()
         self._slide_timer.stop()
@@ -1649,8 +1746,27 @@ class SavedLocationOverlay(QWidget):
         max_pill_w = max(self._MIN_WIDTH, int(screen_w * self._MAX_WIDTH_FRAC))
         font = QFont("Segoe UI", 12)
         font.setBold(True)
-        metrics = QFontMetrics(font)
         self._displayed_text = self._text
+        # v1.1.7: rich-text branch uses QTextDocument for layout so
+        # the pill sizes correctly around inline HTML styling.
+        if self._is_rich_text:
+            from PySide6.QtGui import QTextDocument
+            doc = QTextDocument()
+            doc.setDefaultFont(font)
+            doc.setHtml(self._text)
+            doc.setTextWidth(-1)
+            ideal_w = int(doc.idealWidth()) + 2 * self._PILL_PADDING_X
+            if ideal_w <= max_pill_w:
+                self.resize(max(self._MIN_WIDTH, ideal_w), self._PILL_HEIGHT)
+                return
+            target_text_w = max_pill_w - 2 * self._PILL_PADDING_X
+            doc.setTextWidth(target_text_w)
+            wrapped_h = int(doc.size().height()) + 2 * self._PILL_PADDING_Y
+            height = min(self._MAX_HEIGHT, max(self._PILL_HEIGHT, wrapped_h))
+            self.resize(max_pill_w, int(height))
+            return
+        # Plain-text (default) branch — unchanged.
+        metrics = QFontMetrics(font)
         single_line_w = metrics.horizontalAdvance(self._text) + 2 * self._PILL_PADDING_X
         if single_line_w <= max_pill_w:
             self.resize(max(self._MIN_WIDTH, single_line_w), self._PILL_HEIGHT)
@@ -1680,8 +1796,14 @@ class SavedLocationOverlay(QWidget):
         # Without the offset, this overlay landed at the same y as
         # ProcessingOverlay's "Processing clip" and VoiceStatusOverlay's
         # "Executing command", producing a visible overlap on every
-        # save flow that involved either of those pills.
-        y = geo.bottom() - self.height() - self._SCREEN_BOTTOM_GAP - self._STACK_ABOVE_OFFSET
+        # save flow that involved either of those pills. Individual
+        # show_saved calls can override the offset via `stack_offset`
+        # to sit lower on screen (e.g. clip-disabled hint uses 0 so
+        # it lands below where the "Clipping last N" pill would be).
+        offset = self._stack_offset_override
+        if offset is None:
+            offset = self._STACK_ABOVE_OFFSET
+        y = geo.bottom() - self.height() - self._SCREEN_BOTTOM_GAP - int(offset)
         # Store the resting position; the slide animation will
         # interpolate the y from start_y down to this target.
         self._slide_x = x
@@ -1722,6 +1844,30 @@ class SavedLocationOverlay(QWidget):
 
         font = QFont("Segoe UI", 12)
         font.setBold(True)
+        # v1.1.7: rich-text branch — render via QTextDocument so
+        # inline HTML (<u>, <font color=>) styles reach the pill.
+        if self._is_rich_text:
+            from PySide6.QtGui import QTextDocument, QTextOption
+            doc = QTextDocument()
+            doc.setDefaultFont(font)
+            doc.setDefaultStyleSheet(
+                f"body {{ color: rgba{(text_color.red(), text_color.green(), text_color.blue(), text_color.alpha())}; }}"
+            )
+            doc.setHtml(self._displayed_text)
+            doc.setTextWidth(rect.width() - 2 * self._PILL_PADDING_X)
+            option = QTextOption(Qt.AlignCenter)
+            option.setWrapMode(QTextOption.WordWrap)
+            doc.setDefaultTextOption(option)
+            painter.save()
+            # Centre vertically in the pill.
+            doc_h = doc.size().height()
+            y_offset = max(0.0, (rect.height() - doc_h) / 2.0)
+            painter.translate(self._PILL_PADDING_X + rect.left(), rect.top() + y_offset)
+            painter.setPen(QPen(text_color))
+            doc.drawContents(painter)
+            painter.restore()
+            return
+
         painter.setFont(font)
         painter.setPen(QPen(text_color))
         # Word-wrap so multi-line text (paths too long for a single

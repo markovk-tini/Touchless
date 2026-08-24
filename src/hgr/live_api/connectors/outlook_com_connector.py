@@ -47,18 +47,39 @@ from .base import Connector, connector_result
 
 # Outlook folder constants we use. From MSDN's OlDefaultFolders enum.
 _OL_FOLDER_INBOX = 6
+_OL_FOLDER_CONTACTS = 10
 
 # How long to cache the discovered inbox list before re-walking Stores.
 _INBOX_CACHE_TTL = 60.0
 
 
+def _diag_path() -> str:
+    """Persistent log file the user can open to see what this connector
+    actually did. Lives under %TEMP%\\Touchless_Iris\\outlook_com.log
+    so it's findable without grepping the codebase."""
+    base = os.environ.get("TEMP") or os.environ.get("TMP") or "."
+    folder = os.path.join(base, "Touchless_Iris")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(folder, "outlook_com.log")
+
+
 def _diag(msg: str) -> None:
-    """Stderr diagnostic for dev visibility. Production users won't see
-    this directly, but execute()'s returned error strings ALSO carry
-    the same detail so the cascade can surface it."""
+    """Diagnostic that goes to BOTH stderr AND a persistent log file the
+    user can open. The file path is printed via the first call's
+    'log_at=' marker so the user knows where to look."""
     try:
         sys.stderr.write(f"[outlook_com] {msg}\n")
         sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(_diag_path(), "a", encoding="utf-8", errors="ignore") as f:
+            f.write(f"{ts}  {msg}\n")
     except Exception:
         pass
 
@@ -123,6 +144,147 @@ class OutlookComConnector(Connector):
         self._inbox_cache: List[Any] = []
         self._inbox_cache_at = 0.0
 
+    # ---- .ics fallback (works on New Outlook, no COM) -------------------
+
+    def _create_event_via_ics(
+            self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Write a one-off .ics file and ShellExecute it. Both New
+        Outlook (UWP) and Classic Outlook register .ics as their
+        default handler, so the user gets a one-click 'Add to
+        calendar' prompt that lands in the right calendar with no
+        auth, COM, or Graph. This is our shipping path for the
+        majority of users (New Outlook default since 2024).
+
+        Returns connector_result('ok', requires_user_confirm=True, ...)
+        so the LLM tells the user 'I've opened the event in Outlook
+        for you to confirm' instead of falsely claiming it's saved."""
+        import datetime as _dt
+        import uuid as _uuid
+        subject = str(args.get("subject")
+                      or args.get("title") or "").strip()
+        start_s = str(args.get("start") or "").strip()
+        end_s = str(args.get("end") or "").strip()
+        duration_min = args.get("duration_minutes")
+        location = str(args.get("location") or "").strip()
+        body_text = str(args.get("body")
+                        or args.get("description") or "").strip()
+        if not subject:
+            return connector_result(
+                "error", error="'subject' is required.",
+                code="invalid_args")
+        if not start_s:
+            return connector_result(
+                "error",
+                error=("'start' is required (ISO 8601 like "
+                       "'2026-06-10T13:50:00')."),
+                code="invalid_args")
+        try:
+            start_dt = _dt.datetime.fromisoformat(
+                start_s.replace("Z", "+00:00"))
+            if start_dt.tzinfo is not None:
+                start_dt = start_dt.astimezone().replace(tzinfo=None)
+        except Exception:
+            return connector_result(
+                "error",
+                error=f"Couldn't parse start={start_s!r}.",
+                code="invalid_args")
+        end_dt = None
+        if end_s:
+            try:
+                end_dt = _dt.datetime.fromisoformat(
+                    end_s.replace("Z", "+00:00"))
+                if end_dt.tzinfo is not None:
+                    end_dt = end_dt.astimezone().replace(tzinfo=None)
+            except Exception:
+                end_dt = None
+        if end_dt is None:
+            try:
+                mins = int(duration_min or 60)
+            except (TypeError, ValueError):
+                mins = 60
+            end_dt = start_dt + _dt.timedelta(
+                minutes=max(5, mins))
+
+        def _esc(s: str) -> str:
+            return (s or "").replace("\\", "\\\\").replace(
+                ",", "\\,").replace(";", "\\;").replace("\n", "\\n")
+
+        def _fmt(d: _dt.datetime) -> str:
+            return d.strftime("%Y%m%dT%H%M%S")
+
+        uid = f"{_uuid.uuid4().hex}@touchless.local"
+        dtstamp = _dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        ics_lines = [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//Touchless//Iris//EN",
+            "CALSCALE:GREGORIAN",
+            "METHOD:PUBLISH",
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{dtstamp}",
+            f"DTSTART:{_fmt(start_dt)}",
+            f"DTEND:{_fmt(end_dt)}",
+            f"SUMMARY:{_esc(subject)}",
+        ]
+        if location:
+            ics_lines.append(f"LOCATION:{_esc(location)}")
+        if body_text:
+            ics_lines.append(f"DESCRIPTION:{_esc(body_text)}")
+        ics_lines += ["END:VEVENT", "END:VCALENDAR"]
+        ics_text = "\r\n".join(ics_lines) + "\r\n"
+
+        # Drop the .ics into a stable folder so old files don't pile up
+        # in TEMP and so the user can find them if needed for debugging.
+        base = (os.environ.get("LOCALAPPDATA")
+                or os.environ.get("APPDATA") or os.path.expanduser("~"))
+        ics_dir = os.path.join(base, "Touchless", "calendar_ics")
+        try:
+            os.makedirs(ics_dir, exist_ok=True)
+        except Exception:
+            ics_dir = os.environ.get("TEMP") or "."
+        safe_name = re.sub(r"[^A-Za-z0-9_\-]+", "_", subject)[:40] or "event"
+        ics_path = os.path.join(
+            ics_dir, f"{safe_name}_{_fmt(start_dt)}.ics")
+        try:
+            with open(ics_path, "w", encoding="utf-8") as f:
+                f.write(ics_text)
+        except Exception as exc:
+            _diag(f"ics write failed: {type(exc).__name__}: {exc}")
+            return connector_result(
+                "error",
+                error=(f"Couldn't write the calendar file: "
+                       f"{type(exc).__name__}: {exc}"),
+                code="ics_write_failed")
+        try:
+            os.startfile(ics_path)  # type: ignore[attr-defined]
+        except Exception as exc:
+            _diag(f"ics open failed: {type(exc).__name__}: {exc}")
+            return connector_result(
+                "error",
+                error=(f"Wrote the event file but Windows couldn't "
+                       f"open it: {type(exc).__name__}: {exc}. "
+                       f"You can manually open it at: {ics_path}"),
+                code="ics_open_failed")
+        _diag(
+            f"ics fallback opened subject={subject!r} "
+            f"start={start_dt.isoformat()} end={end_dt.isoformat()} "
+            f"path={ics_path}")
+        return connector_result(
+            "ok",
+            created=False,
+            requires_user_confirm=True,
+            subject=subject,
+            start=start_dt.isoformat(timespec="minutes"),
+            end=end_dt.isoformat(timespec="minutes"),
+            location=location,
+            calendar="Outlook (via .ics import)",
+            source="ics_fallback",
+            file=ics_path,
+            note=("Outlook has opened a confirmation window. The user "
+                  "needs to click 'Save & Close' (or 'Accept') for the "
+                  "event to appear in their calendar. Tell them this."))
+
     # ---- COM lifecycle ----------------------------------------------------
 
     def _ensure_com_apartment(self) -> bool:
@@ -137,19 +299,47 @@ class OutlookComConnector(Connector):
         except Exception:
             return False
 
-    def _dispatch(self) -> Optional[Any]:
+    def _dispatch(self, allow_launch: bool = False) -> Optional[Any]:
         """Get or create the Outlook.Application COM object. Returns
-        None if Outlook isn't installed or refuses to start."""
+        None if Outlook isn't installed or (when allow_launch=False)
+        isn't already running.
+
+        allow_launch semantics — this is load-bearing for the email
+        cascade UX. `win32com.client.Dispatch('Outlook.Application')`
+        will *launch* Outlook.exe as a side effect if no instance is
+        running, which surprises users who only asked Iris to
+        "check my email" (the silent email_summary cascade used to
+        open the entire desktop client behind their back). So we
+        default to `GetActiveObject` — attach only to an already-
+        running Outlook — and only fall back to Dispatch when the
+        caller is an EXPLICIT user action (creating a calendar event,
+        an explicit "connect Outlook" wizard flow) where the user
+        clearly wants Outlook to start if it isn't already.
+        """
         if self._app is not None:
             return self._app
         if not self._ensure_com_apartment():
             return None
         try:
             import win32com.client
-            # `Dispatch` connects to a running Outlook instance if one
-            # exists, otherwise launches a new one. Both flavors return
-            # the same Application object.
-            self._app = win32com.client.Dispatch("Outlook.Application")
+            # Attach-first: GetActiveObject only sees a running COM
+            # server, never spawns one. This is the safe path for
+            # silent cascades (email_summary, contacts_search).
+            try:
+                self._app = win32com.client.GetActiveObject(
+                    "Outlook.Application")
+            except Exception:
+                if not allow_launch:
+                    _diag("outlook not running; refusing to auto-launch "
+                          "during silent cascade (allow_launch=False)")
+                    self._app = None
+                    self._namespace = None
+                    return None
+                # Explicit user action — Dispatch() will start Outlook
+                # if it isn't running. This is the historical behavior,
+                # preserved for outlook_com_create_event and any future
+                # "connect Outlook" wizard.
+                self._app = win32com.client.Dispatch("Outlook.Application")
             self._namespace = self._app.GetNamespace("MAPI")
             return self._app
         except Exception as exc:
@@ -287,18 +477,41 @@ class OutlookComConnector(Connector):
     # ---- Connector API ----------------------------------------------------
 
     def available(self) -> bool:
-        """Cheap probe: are the libs present + can we dispatch? Cached
-        for 30 s to avoid hammering COM on a tight loop. A failure is
-        also cached so the cascade doesn't pay the full Dispatch cost
-        on every retry."""
-        if not _libs_available():
+        """Available on Windows whenever we can attempt ANY path:
+        - Classic Outlook COM (full read + write)
+        - .ics fallback (write only — needs no COM, no pywin32)
+        We must return True on Windows even when COM dispatch fails,
+        otherwise outlook_com_create_event drops out of the LLM's
+        tool list and it can't be called at all. The .ics fallback
+        in execute() handles the COM-failed case for create_event;
+        outlook_com_list returns a clean 'not_ready' error in that
+        case and the email cascade falls through to other paths."""
+        if sys.platform != "win32":
             return False
+        # _diag is cheap; logging here lets us see in outlook_com.log
+        # whether the LLM's tool list ever included our tools.
         now = time.time()
         if now - self._last_probe < 30.0:
-            return self._last_probe_result
+            return True  # cached "yes we're in the toolset" decision
         self._last_probe = now
-        self._last_probe_result = self._dispatch() is not None
-        return self._last_probe_result
+        # Probe whether COM works, but don't gate availability on it
+        # — just cache it so execute() can route to .ics fast.
+        com_ok = False
+        if _libs_available():
+            try:
+                # Probe only — never launch Outlook during a health
+                # check. If Outlook isn't running the probe simply
+                # reports False and the connector still advertises
+                # itself (available() unconditionally returns True on
+                # Windows so tools stay in the LLM's list).
+                com_ok = self._dispatch(allow_launch=False) is not None
+            except Exception:
+                com_ok = False
+        self._last_probe_result = com_ok
+        _diag(f"available() probe: com_ok={com_ok} "
+              f"(connector advertised as AVAILABLE regardless — "
+              f".ics fallback handles no-COM case)")
+        return True
 
     def tools(self) -> List[Dict[str, Any]]:
         def fn(name: str, desc: str,
@@ -348,10 +561,70 @@ class OutlookComConnector(Connector):
                                            "the Outlook account name to "
                                            "filter results to one "
                                            "account. Empty = read all."}}),
+            fn("outlook_com_create_event",
+               "Create a calendar event / appointment on the user's "
+               "Outlook desktop calendar via COM. FREE — no OAuth, no "
+               "MS Graph CASA verification, no scope grants. Works for "
+               "whatever account Outlook is configured to sync to "
+               "(Exchange / Outlook.com / Microsoft 365). The event "
+               "syncs to the cloud automatically through Outlook's "
+               "own sync engine. PREFER this for any user request to "
+               "create / schedule / book an appointment on the local "
+               "Outlook calendar — it's the path that will actually "
+               "show up in their Outlook UI, unlike ms_calendar_create "
+               "which only writes via Graph and requires OAuth. "
+               "`subject` is the event title (required). `start` is "
+               "ISO 8601 LOCAL time without timezone (e.g. "
+               "'2026-06-10T13:50:00'). `end` OR `duration_minutes` "
+               "(default 60 min) sets the length. Optional `location` "
+               "and `body` (notes).",
+               {"subject": {"type": "string",
+                            "description": "Event title."},
+                "start": {"type": "string",
+                          "description": "ISO 8601 local time "
+                                         "'YYYY-MM-DDTHH:MM:SS'."},
+                "end": {"type": "string",
+                        "description": "ISO 8601 local end time. "
+                                       "Optional — falls back to "
+                                       "duration_minutes."},
+                "duration_minutes": {"type": "integer",
+                                     "description": "Length in "
+                                                    "minutes if `end` "
+                                                    "not given. "
+                                                    "Default 60."},
+                "location": {"type": "string",
+                             "description": "Optional location."},
+                "body": {"type": "string",
+                         "description": "Optional event notes / "
+                                        "description."}},
+               ["subject", "start"]),
+            fn("outlook_com_contacts_search",
+               "Search the user's Classic Outlook desktop Contacts "
+               "folder via COM. FREE, no OAuth — works for whatever "
+               "contacts are stored in the local Outlook profile. "
+               "Substring-matches `query` (case-insensitive) against "
+               "FullName, FirstName, LastName, CompanyName and the "
+               "three primary email fields. Returns {count, contacts: "
+               "[{display_name, given_name, family_name, emails: "
+               "[{value, type}], phones: [{value, type}], "
+               "organization}]}. Falls back to a clean `com_unavailable` "
+               "error on New Outlook (UWP) so the contacts cascade can "
+               "drop to Google / Microsoft 365 sources.",
+               {"query": {"type": "string",
+                          "description": "Substring to match against "
+                                         "name, company, or email."},
+                "max": {"type": "integer",
+                        "description": "Max contacts 1-50 "
+                                       "(default 25)."}},
+               ["query"]),
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        if name != "outlook_com_list":
+        if name not in (
+            "outlook_com_list",
+            "outlook_com_create_event",
+            "outlook_com_contacts_search",
+        ):
             return connector_result(
                 "error", error=f"Unknown tool: {name}",
                 code="unknown_tool")
@@ -367,6 +640,8 @@ class OutlookComConnector(Connector):
                 code="not_ready")
         if not self._ensure_com_apartment():
             _diag("CoInitialize failed")
+            if name == "outlook_com_create_event":
+                return self._create_event_via_ics(args)
             return connector_result(
                 "error",
                 error=("Couldn't initialize the Windows COM apartment "
@@ -374,7 +649,32 @@ class OutlookComConnector(Connector):
                        "pywin32 is installed but corrupt — try `pip "
                        "install --upgrade --force-reinstall pywin32`."),
                 code="not_ready")
-        app = self._dispatch()
+        # Only outlook_com_create_event is an explicit user action
+        # where Outlook can reasonably be spawned if it isn't running
+        # (and even then the .ics fallback below covers the "no COM"
+        # case cleanly). outlook_com_list is the silent email cascade
+        # path — never spawn Outlook there. outlook_com_contacts_search
+        # is also silently cascaded from contacts_lookup, same rule.
+        allow_launch = (name == "outlook_com_create_event")
+        app = self._dispatch(allow_launch=allow_launch)
+        if app is None and name == "outlook_com_contacts_search":
+            _diag("COM dispatch=None on contacts_search — "
+                  "returning com_unavailable for cascade fallback")
+            return connector_result(
+                "error",
+                error=("Outlook desktop COM not available — falling "
+                       "back to other contact sources."),
+                code="com_unavailable")
+        if app is None and name == "outlook_com_create_event":
+            # New Outlook (UWP) has no COM. For *creating* an event we
+            # can sidestep COM entirely — write a one-shot .ics file
+            # and ShellExecute it. Both New Outlook and Classic Outlook
+            # register .ics as their default handler, so the user gets
+            # a one-click "Add to calendar" prompt that lands in the
+            # right calendar with no auth, no Graph, no COM.
+            _diag("COM dispatch=None — falling back to .ics path "
+                  "(New Outlook / no Classic install)")
+            return self._create_event_via_ics(args)
         if app is None:
             elev = _process_is_elevated()
             extra = ""
@@ -417,6 +717,224 @@ class OutlookComConnector(Connector):
             except Exception:
                 pass
 
+        # ---- outlook_com_create_event ---------------------------
+        # Creates an appointment on the user's default calendar via
+        # the Outlook desktop COM Application.CreateItem(1) path
+        # (1 = olAppointmentItem). Zero OAuth — works for whatever
+        # account Outlook is configured to sync to. The event syncs
+        # to Exchange / Outlook.com / etc. automatically. We use the
+        # Outlook session's local time zone so what the user typed
+        # ("today at 1:50 pm") lands at their wall-clock time.
+        if name == "outlook_com_create_event":
+            _diag(f"create_event ENTRY args={args!r}")
+            subject = str(args.get("subject")
+                          or args.get("title") or "").strip()
+            start_s = str(args.get("start") or "").strip()
+            end_s = str(args.get("end") or "").strip()
+            duration_min = args.get("duration_minutes")
+            location = str(args.get("location") or "").strip()
+            body_text = str(args.get("body")
+                            or args.get("description") or "").strip()
+            if not subject:
+                return connector_result(
+                    "error",
+                    error="'subject' is required (event title).",
+                    code="invalid_args")
+            if not start_s:
+                return connector_result(
+                    "error",
+                    error="'start' is required "
+                          "(ISO 8601 like '2026-06-10T13:50:00').",
+                    code="invalid_args")
+            # Parse start.
+            import datetime as _dt
+            try:
+                start_dt = _dt.datetime.fromisoformat(
+                    start_s.replace("Z", "+00:00"))
+                if start_dt.tzinfo is not None:
+                    start_dt = start_dt.astimezone().replace(
+                        tzinfo=None)
+            except Exception:
+                return connector_result(
+                    "error",
+                    error=(f"Couldn't parse start={start_s!r}. "
+                           "Use ISO 8601 like "
+                           "'2026-06-10T13:50:00'."),
+                    code="invalid_args")
+            # End: from explicit field OR duration_minutes OR
+            # default 60 min.
+            end_dt = None
+            if end_s:
+                try:
+                    end_dt = _dt.datetime.fromisoformat(
+                        end_s.replace("Z", "+00:00"))
+                    if end_dt.tzinfo is not None:
+                        end_dt = end_dt.astimezone().replace(
+                            tzinfo=None)
+                except Exception:
+                    end_dt = None
+            if end_dt is None:
+                try:
+                    mins = int(duration_min or 60)
+                except (TypeError, ValueError):
+                    mins = 60
+                end_dt = start_dt + _dt.timedelta(
+                    minutes=max(5, mins))
+            try:
+                # 1 = olAppointmentItem
+                appt = app.CreateItem(1)
+                appt.Subject = subject
+                appt.Start = start_dt
+                appt.End = end_dt
+                if location:
+                    appt.Location = location
+                if body_text:
+                    appt.Body = body_text
+                appt.Save()
+                entry_id = ""
+                try:
+                    entry_id = str(appt.EntryID or "")
+                except Exception:
+                    pass
+                _diag(
+                    f"appointment created subject={subject!r} "
+                    f"start={start_dt.isoformat()} "
+                    f"end={end_dt.isoformat()} "
+                    f"entry_id={entry_id[:24]}")
+                return connector_result(
+                    "ok", created=True,
+                    subject=subject,
+                    start=start_dt.isoformat(timespec="minutes"),
+                    end=end_dt.isoformat(timespec="minutes"),
+                    location=location,
+                    entry_id=entry_id,
+                    calendar="Outlook (desktop)",
+                    source="outlook_desktop")
+            except Exception as exc:
+                _diag(
+                    f"appointment create failed: "
+                    f"{type(exc).__name__}: {exc}")
+                return connector_result(
+                    "error",
+                    error=(f"Outlook desktop couldn't create the "
+                           f"event: {type(exc).__name__}: "
+                           f"{str(exc)[:160]}"),
+                    code="com_create_failed")
+
+        # ---- outlook_com_contacts_search ------------------------
+        if name == "outlook_com_contacts_search":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return connector_result(
+                    "error", error="'query' is required.",
+                    code="invalid_args")
+            try:
+                max_n = int(args.get("max") or 25)
+            except (TypeError, ValueError):
+                max_n = 25
+            max_n = max(1, min(50, max_n))
+            qlow = query.lower()
+            try:
+                contacts_folder = self._namespace.GetDefaultFolder(
+                    _OL_FOLDER_CONTACTS)
+            except Exception as exc:
+                _diag(
+                    f"contacts folder failed: "
+                    f"{type(exc).__name__}: {exc}")
+                return connector_result(
+                    "error",
+                    error=("Couldn't open the Outlook Contacts folder: "
+                           f"{type(exc).__name__}: {exc}"),
+                    code="connector_failed")
+            try:
+                items = contacts_folder.Items
+                total = int(items.Count)
+            except Exception as exc:
+                _diag(
+                    f"contacts items failed: "
+                    f"{type(exc).__name__}: {exc}")
+                return connector_result(
+                    "error",
+                    error=("Couldn't enumerate the Outlook Contacts "
+                           f"folder: {type(exc).__name__}: {exc}"),
+                    code="connector_failed")
+
+            matches: List[Dict[str, Any]] = []
+            walk_cap = min(total, 5000)
+            for idx in range(1, walk_cap + 1):
+                if len(matches) >= max_n:
+                    break
+                try:
+                    c = items.Item(idx)
+                except Exception:
+                    continue
+                try:
+                    if int(getattr(c, "Class", 0)) != 40:
+                        continue
+                except Exception:
+                    continue
+
+                def _s(attr: str) -> str:
+                    try:
+                        return str(getattr(c, attr, "") or "").strip()
+                    except Exception:
+                        return ""
+
+                full_name = _s("FullName")
+                first = _s("FirstName")
+                last = _s("LastName")
+                company = _s("CompanyName")
+                e1 = _s("Email1Address")
+                e2 = _s("Email2Address")
+                e3 = _s("Email3Address")
+
+                haystack = " ".join((
+                    full_name, first, last, company, e1, e2, e3
+                )).lower()
+                if qlow not in haystack:
+                    continue
+
+                emails: List[Dict[str, str]] = []
+                for value, kind in (
+                    (e1, "email1"),
+                    (e2, "email2"),
+                    (e3, "email3"),
+                ):
+                    if value and "@" in value:
+                        emails.append({"value": value, "type": kind})
+
+                phones: List[Dict[str, str]] = []
+                for attr, kind in (
+                    ("MobileTelephoneNumber", "mobile"),
+                    ("BusinessTelephoneNumber", "work"),
+                    ("HomeTelephoneNumber", "home"),
+                ):
+                    val = _s(attr)
+                    if val:
+                        phones.append({"value": val, "type": kind})
+
+                display = (full_name
+                           or " ".join(p for p in (first, last) if p).strip()
+                           or company
+                           or (emails[0]["value"] if emails else ""))
+
+                matches.append({
+                    "display_name": display,
+                    "given_name": first,
+                    "family_name": last,
+                    "emails": emails,
+                    "phones": phones,
+                    "organization": company or None,
+                    "source": "outlook_com",
+                })
+
+            _diag(
+                f"contacts_search query={query!r} scanned={walk_cap} "
+                f"total={total} matches={len(matches)}")
+            return connector_result(
+                "ok", count=len(matches), contacts=matches)
+
+        # ---- outlook_com_list (inbox read) ----------------------
         unread_only = bool(args.get("unread_only", True))
         max_n = max(1, min(50, int(args.get("max") or 50)))
         include_body = bool(args.get("include_body"))

@@ -59,7 +59,7 @@ from hgr.custom_gestures.dynamic_recorder import (
 from hgr.custom_gestures.dynamic_recording import palm_scale_from_landmarks
 from hgr.custom_gestures.registry import GestureRegistry
 from .custom_gestures_chrome import apply_touchless_titlebar
-from .window_chrome import apply_touchless_chrome, touchless_message_box
+from .window_chrome import apply_touchless_chrome, install_indigo_chrome, touchless_message_box
 
 
 def _landmarks_array_from_mediapipe(mp_landmarks) -> np.ndarray:
@@ -100,10 +100,11 @@ class DynamicGestureRecorderWindow(QDialog):
         config=None,
     ) -> None:
         super().__init__(parent)
-        apply_touchless_chrome(self)
         self.setWindowTitle(f"Recording: {name}")
         self.setModal(True)
         self.setMinimumSize(820, 560)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        self._body = install_indigo_chrome(self, f"Recording: {name}")
 
         self._worker = worker
         self._accent_color = accent_color or "#1DE9B6"
@@ -216,7 +217,7 @@ class DynamicGestureRecorderWindow(QDialog):
             """
         )
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
 
@@ -668,6 +669,14 @@ class DynamicGestureRecorderWindow(QDialog):
                 name=self._name,
                 key_point_indices=artifacts.key_points.indices,
                 sample_trajectories=artifacts.template.sample_trajectories,
+                # Persist the wrist channel + auto-computed strength so
+                # the runtime classifier can do its weighted DTW without
+                # rebuilding the template from raw takes. Critical for
+                # swipes (high strength → wrist trajectory disambiguates
+                # from "hand entered view") and pure-finger gestures
+                # (strength ≈ 0 → finger-only matching, no false reject).
+                wrist_trajectories=artifacts.template.wrist_trajectories,
+                wrist_motion_strength=artifacts.template.wrist_motion_strength,
                 action=self._action,
                 description=self._description,
                 handedness=handedness,
@@ -877,11 +886,12 @@ class DynamicClipPickerDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        apply_touchless_chrome(self)
         self.setWindowTitle("Pick a clip for this gesture")
         self.setObjectName("dynamicClipPicker")
         self.setModal(True)
         self.setMinimumWidth(720)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        self._body = install_indigo_chrome(self, "Pick a clip for this gesture")
         self._clips = list(clips)
         self._accent = accent_color or "#1DE9B6"
         self._text = text_color or "#E5F6FF"
@@ -898,7 +908,7 @@ class DynamicClipPickerDialog(QDialog):
     def _build(self, gesture_name: str, description: str) -> None:
         from PySide6.QtWidgets import QGridLayout
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(20, 18, 20, 16)
         root.setSpacing(12)
 

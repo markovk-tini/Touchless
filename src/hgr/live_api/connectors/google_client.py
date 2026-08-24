@@ -32,9 +32,23 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-# SEND-only mail (gmail.send), full calendar, create docs, per-file Drive.
-# gmail.send / calendar / documents / drive.file are all "sensitive" scopes
+# SEND-only mail (gmail.send), full calendar, per-file Drive.
+# gmail.send / calendar / drive.file are all "sensitive" scopes
 # — free public verification, NO paid CASA assessment.
+#
+# DOCS / SHEETS / SLIDES broad scopes removed 2026-07-29: Google
+# rejected `documents`, `spreadsheets`, and `presentations` during
+# OAuth verification (they read/write every file in the user's
+# Drive and are restricted-tier). We now reach individual Docs,
+# Sheets, and Slides files via the `drive.file` scope, which the
+# Docs v1 / Sheets v4 / Slides v1 APIs accept for reads AND writes
+# as long as the caller has a file_id that was either
+#   (a) CREATED by this app (all *_connector.create paths satisfy
+#       this automatically), or
+#   (b) explicitly opened by the user via the Google Picker widget.
+# See app/ui/google_picker_dialog.py + live_api/connectors/
+# google_picker_cache.py for the name->file_id resolution flow
+# that replaces the old drive.files().list(q=name) search path.
 #
 # gmail.readonly is "restricted" and would require CASA for PUBLIC release,
 # but it's fine for PERSONAL / DEV use (the OAuth consent screen just shows
@@ -44,10 +58,26 @@ from typing import List, Optional
 SCOPES: List[str] = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/documents",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/presentations",
     "https://www.googleapis.com/auth/drive.file",
+    # Round-2 connectors. All sensitive-tier (free verification) EXCEPT
+    # user.birthday.read which is restricted — flagged in OPEN_ISSUES.md
+    # for OAuth review before public ship.
+    "https://www.googleapis.com/auth/contacts",
+    "https://www.googleapis.com/auth/tasks",
+    "https://www.googleapis.com/auth/forms.body",
+    "https://www.googleapis.com/auth/forms.responses.readonly",
+    # NOTE: youtube.readonly CANNOT be requested in the same OAuth flow as
+    # drive.file — Google returns 400 invalid_request "cannot be requested
+    # together". YouTube would need its own OAuth client (separate
+    # client_id + separate consent flow). Dropped for now; add via a
+    # dedicated YouTubeClient later if the feature becomes must-have.
+    "https://www.googleapis.com/auth/photoslibrary.appendonly",
+    # Identity / profile reads. openid + userinfo.* are non-sensitive
+    # basic scopes; user.birthday.read is sensitive and gated by Google.
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/user.birthday.read",
 ]
 # gmail.readonly is a Google "restricted" scope that requires CASA Tier 2
 # security assessment ($10-30k upfront + annual renewal) for verified
@@ -121,6 +151,29 @@ def client_configured() -> bool:
     """True if an OAuth client is available to start the consent flow with
     (embedded env/bundled config, or a developer's client_secret.json)."""
     return bool(_embedded_client_config()) or _client_secret_path().exists()
+
+
+def _picker_api_key() -> Optional[str]:
+    """API key for the Google Picker widget (server-issued, restricted to
+    the Picker API by IP/referer in Cloud Console).
+
+    Resolution mirrors _embedded_client_config():
+      1) env override GOOGLE_PICKER_API_KEY,
+      2) bundled asset assets/google_picker_api_key.txt (single line),
+      3) None (Picker path degrades to "manually paste a file id").
+    """
+    override = (os.environ.get("GOOGLE_PICKER_API_KEY") or "").strip()
+    if override:
+        return override
+    try:
+        from ...utils.runtime_paths import resource_path
+        p = resource_path("assets", "google_picker_api_key.txt")
+        if p.exists():
+            key = p.read_text(encoding="utf-8").strip()
+            return key or None
+    except Exception:
+        pass
+    return None
 
 
 def _token_path() -> Path:
@@ -199,6 +252,17 @@ class GoogleClient:
                 token_path.write_text(creds.to_json(), encoding="utf-8")
             if creds and creds.valid:
                 self._creds = creds
+                if not getattr(self, "_logged_missing_scopes", False):
+                    self._logged_missing_scopes = True
+                    missing = set(SCOPES) - (self._granted_scopes or set())
+                    if missing:
+                        try:
+                            print(f"[google_client] stored token is "
+                                  f"missing {len(missing)} scope(s); "
+                                  f"reconnect Google to grant: "
+                                  f"{sorted(missing)}")
+                        except Exception:
+                            pass
                 return creds
         except Exception:
             return None
@@ -211,18 +275,58 @@ class GoogleClient:
             return False
         return scope in getattr(self, "_granted_scopes", set())
 
-    def service(self, api: str, version: str):
-        """Return a cached googleapiclient service, or None if not ready."""
+    def missing_scopes(self) -> set:
+        """Scopes the app declares in SCOPES that the stored token does
+        NOT yet grant. Empty set when grant matches (or exceeds) SCOPES.
+        Returns a copy of SCOPES if the token is unloadable / absent."""
+        if self._load_creds() is None:
+            return set(SCOPES)
+        granted = getattr(self, "_granted_scopes", set()) or set()
+        return set(SCOPES) - granted
+
+    @staticmethod
+    def scope_missing_result(scope: str, *, friendly: str = "") -> dict:
+        """Uniform `scope_missing` connector_result. `friendly` is an
+        optional short label for the capability (e.g. 'Google Tasks');
+        the user-facing error always tells them to re-click Connect
+        Google in Settings so the new consent screen re-grants the
+        added scope."""
+        from .base import connector_result
+        label = friendly or scope
+        return connector_result(
+            "error",
+            code="scope_missing",
+            error=(f"I need {label} access (Google scope '{scope}') — "
+                   f"please click 'Connect Google' in Settings to "
+                   f"re-authorize. The consent screen will include it."),
+            missing_scope=scope,
+        )
+
+    def service(self, api: str, version: str, *, http_timeout: float = 20.0):
+        """Return a cached googleapiclient service, or None if not ready.
+
+        `http_timeout` gives the underlying httplib2 socket a wall-clock
+        ceiling so a wedged TLS handshake / dropped keep-alive / captive-
+        portal stall cannot block a calling thread indefinitely. Without
+        this googleapiclient builds a default httplib2.Http() whose
+        socket timeout is None (see drive_connector hang trace).
+        """
         creds = self._load_creds()
         if creds is None:
             return None
-        key = f"{api}:{version}"
+        key = f"{api}:{version}:{http_timeout}"
         svc = self._services.get(key)
         if svc is not None:
             return svc
         try:
             from googleapiclient.discovery import build
-            svc = build(api, version, credentials=creds, cache_discovery=False)
+            try:
+                import httplib2
+                from google_auth_httplib2 import AuthorizedHttp
+                http = AuthorizedHttp(creds, http=httplib2.Http(timeout=http_timeout))
+                svc = build(api, version, http=http, cache_discovery=False)
+            except Exception:
+                svc = build(api, version, credentials=creds, cache_discovery=False)
             self._services[key] = svc
             return svc
         except Exception:
@@ -241,15 +345,67 @@ def status() -> str:
     return "needs_client"
 
 
+# Short human labels for each scope, used to surface a friendly
+# "you declined: Google Tasks, Google Slides, Google Sheets" message
+# when the user un-checks boxes on the consent screen. Anything not
+# listed here falls back to the raw scope URL.
+_SCOPE_FRIENDLY: dict = {
+    "https://www.googleapis.com/auth/gmail.send": "Gmail (send)",
+    "https://www.googleapis.com/auth/gmail.readonly": "Gmail (read)",
+    "https://www.googleapis.com/auth/calendar": "Google Calendar",
+    "https://www.googleapis.com/auth/drive.file": "Google Drive",
+    "https://www.googleapis.com/auth/contacts": "Google Contacts",
+    "https://www.googleapis.com/auth/tasks": "Google Tasks",
+    "https://www.googleapis.com/auth/forms.body": "Google Forms",
+    "https://www.googleapis.com/auth/forms.responses.readonly":
+        "Google Forms responses",
+    "https://www.googleapis.com/auth/youtube.readonly": "YouTube",
+    "https://www.googleapis.com/auth/photoslibrary.appendonly":
+        "Google Photos",
+    "openid": "OpenID",
+    "https://www.googleapis.com/auth/userinfo.email": "Email address",
+    "https://www.googleapis.com/auth/userinfo.profile": "Profile",
+    "https://www.googleapis.com/auth/user.birthday.read": "Birthday",
+}
+
+
+def _friendly_scope_labels(scopes) -> list:
+    """Map a list/set of scope URLs to short human names, deduped while
+    preserving order of the iterable for stable UI output."""
+    out: list = []
+    seen: set = set()
+    for s in scopes:
+        label = _SCOPE_FRIENDLY.get(s, s)
+        if label in seen:
+            continue
+        seen.add(label)
+        out.append(label)
+    return out
+
+
 def connect() -> tuple[bool, str]:
     """Run the interactive OAuth consent flow (opens the user's browser) and
     persist the token. Returns (ok, message). Safe to call from a background
     thread — it blocks on the local consent server, so never call it on the
     Qt/UI thread. This is what the 'Connect Gmail' button invokes.
+
+    Post-connect we audit the freshly-written token against SCOPES; if the
+    user un-checked any of the optional boxes on the consent screen we
+    surface a clear "you declined N scopes" warning in the returned
+    message so the UI can echo it (otherwise a partial grant is silent
+    until a tool happens to need a missing scope).
     """
     if not libs_available():
         return False, ("Google libraries not installed. Run: pip install "
                        "google-api-python-client google-auth google-auth-oauthlib")
+    # include_granted_scopes='true' below makes Google legitimately return a
+    # SUPERSET token (union with previously-granted scopes, e.g. legacy
+    # gmail.readonly). Without this env var oauthlib's token-response parser
+    # raises Warning('Scope has changed from ... to ...') and aborts the flow
+    # even though the response is a strict superset. The post-connect audit
+    # further down still verifies every required SCOPE is present, so extras
+    # are harmless. setdefault preserves any user override.
+    os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
     from google_auth_oauthlib.flow import InstalledAppFlow
 
     config = _embedded_client_config()
@@ -266,12 +422,52 @@ def connect() -> tuple[bool, str]:
         # prompt="consent" always shows the grant screen (even if the account
         # already authorized) and guarantees a refresh token; access_type
         # offline keeps the refresh token across restarts.
-        creds = flow.run_local_server(port=0, prompt="consent", access_type="offline")
+        #
+        # include_granted_scopes='true' enables INCREMENTAL authorization:
+        # Google merges the newly-approved scopes on top of the existing
+        # grant rather than replacing it. So if the user un-checks one of
+        # the optional sensitive-scope boxes on a second consent run, they
+        # keep whatever they had granted before instead of regressing to
+        # only the subset they re-approved this time. (Google's OAuth lib
+        # forwards extra kwargs straight into authorization_url.)
+        creds = flow.run_local_server(
+            port=0,
+            prompt="consent",
+            access_type="offline",
+            include_granted_scopes="true",
+        )
         _config_dir().mkdir(parents=True, exist_ok=True)
         _token_path().write_text(creds.to_json(), encoding="utf-8")
-        # Reset the shared client so services rebuild with the new token.
+        # Reset the shared client so services rebuild with the new token,
+        # then immediately force a creds reload so missing_scopes() reads
+        # from the just-written file rather than a stale in-memory grant.
         GoogleClient._shared = None
-        return True, "Gmail connected."
+        shared = GoogleClient.shared()
+        try:
+            shared._load_creds()
+        except Exception:
+            pass
+        granted = sorted(getattr(shared, "_granted_scopes", set()) or set())
+        missing = sorted(set(SCOPES) - set(granted))
+        # Always emit a diagnostic line so the console / log shows the
+        # exact granted-vs-required set on every connect. Helpful for
+        # the partial-grant bug report ("token has only N of M scopes").
+        try:
+            print(f"[google_client] connect complete: granted "
+                  f"{len(granted)}/{len(SCOPES)} scope(s); "
+                  f"missing={_friendly_scope_labels(missing)}")
+        except Exception:
+            pass
+        if missing:
+            friendly = _friendly_scope_labels(missing)
+            return True, (
+                f"Google connected, but you declined {len(missing)} "
+                f"scope(s): {', '.join(friendly)}. Click "
+                f"'Google ✓ (reconnect)' and on the consent screen "
+                f"CHECK ALL CHECKBOXES (Google leaves new sensitive "
+                f"scopes UNCHECKED by default)."
+            )
+        return True, "Google connected."
     except Exception as exc:
         return False, f"Authorization failed: {type(exc).__name__}: {exc}"
 
@@ -283,8 +479,49 @@ def authorize() -> int:
     return 0 if ok else 2
 
 
+def scopes_report() -> int:
+    """CLI entry: `python -m hgr.live_api.connectors.google_client scopes`.
+
+    Prints the required-vs-granted scope diff for the current stored
+    token so a user (or support agent) can see exactly which boxes the
+    user un-checked on the consent screen, without running a fresh
+    OAuth flow. Exits 0 if all SCOPES granted, 1 if any missing, 2 if
+    no token present."""
+    if not libs_available():
+        print("[google_client] Google libraries not installed.")
+        return 2
+    shared = GoogleClient.shared()
+    if not _token_path().exists():
+        print(f"[google_client] No token at {_token_path()}.")
+        return 2
+    try:
+        shared._load_creds()
+    except Exception as exc:
+        print(f"[google_client] Failed to load token: {exc}")
+        return 2
+    granted = sorted(getattr(shared, "_granted_scopes", set()) or set())
+    missing = sorted(set(SCOPES) - set(granted))
+    print(f"Token: {_token_path()}")
+    print(f"Required scopes ({len(SCOPES)}):")
+    for s in SCOPES:
+        marker = "OK " if s in granted else "-- "
+        print(f"  {marker}{_SCOPE_FRIENDLY.get(s, s)}  ({s})")
+    if missing:
+        print("")
+        print(f"MISSING {len(missing)} scope(s): "
+              f"{', '.join(_friendly_scope_labels(missing))}")
+        print("Run the 'Connect Google' button in Settings and CHECK ALL "
+              "CHECKBOXES on the consent screen.")
+        return 1
+    print("\nAll required scopes granted.")
+    return 0
+
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "authorize":
         raise SystemExit(authorize())
-    print("Usage: python -m hgr.live_api.connectors.google_client authorize")
+    if len(sys.argv) > 1 and sys.argv[1] == "scopes":
+        raise SystemExit(scopes_report())
+    print("Usage: python -m hgr.live_api.connectors.google_client "
+          "{authorize|scopes}")

@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...config.app_config import save_config
-from .window_chrome import apply_touchless_chrome
+from .window_chrome import apply_touchless_chrome, install_indigo_chrome
 
 
 class _TightWrapLabel(QLabel):
@@ -214,7 +214,12 @@ class DiscordSetupWizard(QDialog):
                               # (single redirect URI, fewer steps)
             2: (580, 460),   # collect — two input fields
         }
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome replaces apply_touchless_chrome
+        # (works on Win10, not just Win11).
+        body = install_indigo_chrome(self, "Set up your own Discord app")
+        # r51 fix: scope background to body only (see spotify_setup_wizard).
+        body.setObjectName("wizardBody")
+        body.setStyleSheet(f"QWidget#wizardBody {{ background: {self._surface}; }}")
         self.setStyleSheet(
             f"QDialog {{ background: {self._surface}; }}"
             f"QLabel {{ color: {self._text_color}; font-size: 13px; }}"
@@ -241,7 +246,7 @@ class DiscordSetupWizard(QDialog):
             "QPushButton#wizardSecondary:hover { color: #FFFFFF; }"
         )
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(body)
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(16)
 

@@ -317,6 +317,20 @@ class CustomGesture:
     # ALL takes (not a centroid) so DTW can match against the
     # variant that best resembles the user's current attempt.
     sample_trajectories: List[List[List[List[float]]]] = field(default_factory=list)
+    # Dynamic-only: parallel list of absolute (palm-scaled) wrist
+    # trajectories — one (resampled_length, 3) per take. Carries the
+    # whole-hand translation signal that the wrist-relative
+    # `sample_trajectories` discards, so the classifier can match
+    # swipes by the wrist's path and stationary-wrist gestures (fist
+    # squeeze, finger wiggle) by fingers alone — no binary
+    # wrist-travel gate required. Empty for legacy records (loaded
+    # back with wrist_motion_strength=0 → finger-only matching).
+    wrist_trajectories: List[List[List[float]]] = field(default_factory=list)
+    # Dynamic-only: [0, _WRIST_WEIGHT_MAX] weight derived from the
+    # takes' wrist path lengths at save time. Drives the classifier's
+    # finger-vs-wrist DTW blend. Stored on the record so the runtime
+    # doesn't have to recompute it on every reload.
+    wrist_motion_strength: float = 0.0
     # Dynamic-only: recording duration policy used when the takes
     # were captured. Useful for the wizard's "edit gesture" flow so
     # the user re-records with the same mode by default. One of:
@@ -342,6 +356,10 @@ class CustomGesture:
             out["key_point_indices"] = list(self.key_point_indices)
         if self.sample_trajectories:
             out["sample_trajectories"] = self.sample_trajectories
+        if self.wrist_trajectories:
+            out["wrist_trajectories"] = self.wrist_trajectories
+        if self.wrist_motion_strength:
+            out["wrist_motion_strength"] = float(self.wrist_motion_strength)
         if self.duration_mode:
             out["duration_mode"] = self.duration_mode
         return out
@@ -371,6 +389,12 @@ class CustomGesture:
         # We accept it as-is and rely on the runtime template builder
         # to validate shape (the registry doesn't own numpy import).
         sample_trajectories = list(raw_traj)
+        raw_wrist = data.get("wrist_trajectories") or []
+        wrist_trajectories = list(raw_wrist)
+        try:
+            wrist_motion_strength = float(data.get("wrist_motion_strength", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            wrist_motion_strength = 0.0
         duration_mode = str(data.get("duration_mode", "") or "")
         return cls(
             name=str(data["name"]),
@@ -383,6 +407,8 @@ class CustomGesture:
             kind=kind,
             key_point_indices=key_point_indices,
             sample_trajectories=sample_trajectories,
+            wrist_trajectories=wrist_trajectories,
+            wrist_motion_strength=wrist_motion_strength,
             duration_mode=duration_mode,
         )
 
@@ -489,12 +515,21 @@ class GestureRegistry:
         handedness: Optional[str] = None,
         image_filename: str = "",
         duration_mode: str = "",
+        wrist_trajectories=None,  # parallel iterable of (T, 3) per take
+        wrist_motion_strength: float = 0.0,
     ) -> CustomGesture:
         """Register a dynamic gesture. `sample_trajectories` is an
         iterable of arrays/lists with shape (resampled_length,
         num_key_points, 3). We coerce each to nested lists for JSON
         serialization so callers can pass numpy arrays directly from
-        the recorder."""
+        the recorder.
+
+        `wrist_trajectories` (optional) is a parallel iterable of
+        (resampled_length, 3) absolute-wrist arrays — one per take —
+        and `wrist_motion_strength` is the [0, _WRIST_WEIGHT_MAX]
+        weight derived at template-build time. Pre-existing dynamic
+        records persist without these; loading falls back to
+        finger-only matching for them."""
         if not self._loaded:
             self.load()
         name = name.strip()
@@ -517,6 +552,12 @@ class GestureRegistry:
                 serialized.append(traj.tolist())
             else:
                 serialized.append([[[float(v) for v in coord] for coord in frame] for frame in traj])
+        serialized_wrist: List[List[List[float]]] = []
+        for w in (wrist_trajectories or []):
+            if hasattr(w, "tolist"):
+                serialized_wrist.append(w.tolist())
+            else:
+                serialized_wrist.append([[float(v) for v in coord] for coord in w])
         with self._lock:
             if name in self._gestures and not overwrite:
                 raise ValueError(
@@ -533,6 +574,8 @@ class GestureRegistry:
                 kind="dynamic",
                 key_point_indices=[int(i) for i in key_point_indices],
                 sample_trajectories=serialized,
+                wrist_trajectories=serialized_wrist,
+                wrist_motion_strength=float(wrist_motion_strength or 0.0),
                 duration_mode=str(duration_mode or ""),
             )
             self._gestures[name] = gesture

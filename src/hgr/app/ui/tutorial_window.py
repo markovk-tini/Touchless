@@ -993,8 +993,9 @@ class TutorialWindow(QDialog):
 
     def __init__(self, config: AppConfig, parent=None) -> None:
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
+        self._body = install_indigo_chrome(self, "Touchless Tutorial")
         # Connect the off-thread media-check bridges to their slots.
         self._voice_media_check_signal.connect(self._on_voice_media_check_result)
         self._spotify_periodic_poll_signal.connect(self._on_spotify_periodic_poll)
@@ -1238,7 +1239,7 @@ class TutorialWindow(QDialog):
         self._starting_pill = _TutorialStartingPill(self)
         self._starting_pill.setVisible(False)
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
@@ -1986,17 +1987,16 @@ class TutorialWindow(QDialog):
         dialog.setProperty("tutorialStepKey", step.key)
         dialog.setWindowTitle(f"{step.title} Example")
         dialog.resize(960, 740)
-        # Match the main app's Win11 DWM caption colour so the popup
-        # doesn't fall back to the system-default light grey title bar
-        # against our dark Touchless theme.
+        # r51: install_indigo_chrome for Win10 + Win11 parity (was
+        # apply_touchless_chrome, Win11 only).
         try:
-            from .window_chrome import apply_touchless_chrome
-            apply_touchless_chrome(dialog)
+            from .window_chrome import install_indigo_chrome
+            example_body = install_indigo_chrome(dialog, f"{step.title} Example")
         except Exception:
-            pass
+            example_body = dialog
         self._apply_example_dialog_theme(dialog)
 
-        outer = QVBoxLayout(dialog)
+        outer = QVBoxLayout(example_body)
         outer.setContentsMargins(18, 18, 18, 18)
         outer.setSpacing(12)
 
@@ -2190,6 +2190,35 @@ class TutorialWindow(QDialog):
                 "them back on the same way.",
             ),
             (
+                "App Performance",
+                "If gestures feel slow or drop frames, Settings → General has "
+                "four toggles that trade a feature or a bit of fidelity for "
+                "speed. Tap Show more to see what each one does.",
+                (
+                    "<p style='margin:0 0 6px 0;'><b>Disable Clip Cache</b> "
+                    "(Settings → General → Clip Presets) &mdash; stops the "
+                    "rolling clip recorder from running in the background. "
+                    "Saves CPU and disk if you never use &lsquo;clip that&rsquo;.</p>"
+                    "<p style='margin:0 0 6px 0;'><b>Low FPS Mode</b> "
+                    "(Settings → General → System Modes) &mdash; loosens "
+                    "tracking thresholds so gestures still register when the "
+                    "camera runs slow (around 10-17 FPS). Touchless can also "
+                    "offer to turn this on automatically if your measured FPS "
+                    "stays low for too long.</p>"
+                    "<p style='margin:0 0 6px 0;'><b>Lite Mode</b> "
+                    "(Settings → General → System Modes) &mdash; improves "
+                    "processing by about 2.5&times; for simple gestures and "
+                    "commands. For very extreme angles or heavy occlusion it "
+                    "may be slightly less stable. A &lsquo;Lite&rsquo; badge "
+                    "appears in live viewers when active.</p>"
+                    "<p style='margin:0;'><b>GPU Mode</b> "
+                    "(Settings → General → System Modes) &mdash; if your "
+                    "machine can run it, Touchless uses the graphics card to "
+                    "speed up hand tracking. If not, Touchless quietly falls "
+                    "back to the regular path so gestures keep working.</p>"
+                ),
+            ),
+            (
                 "Adjust mouse sensitivity",
                 "Settings → General → Mouse. Smaller control box = a tiny hand "
                 "movement covers the whole screen (high sensitivity); larger "
@@ -2236,7 +2265,7 @@ class TutorialWindow(QDialog):
         text_color = self.config.text_color or "#E5F6FF"
         divider_color = "rgba(29,233,182,0.18)"
 
-        def _add_tip(parent_layout, headline, body, is_first):
+        def _add_tip(parent_layout, headline, body, is_first, details=None):
             # Soft horizontal divider between tips so the eye can find
             # each tip without straining.
             if not is_first:
@@ -2262,9 +2291,51 @@ class TutorialWindow(QDialog):
             )
             parent_layout.addWidget(head_label)
             parent_layout.addWidget(body_label)
+            # v1.1.7: optional inline "Show more..." expander for tips
+            # that carry a longer explanation. Mirrors the settings-
+            # panel expander pattern inline (no cross-module import).
+            if details:
+                toggle_row = QHBoxLayout()
+                toggle_row.setContentsMargins(0, 4, 0, 0)
+                toggle_row.addStretch(1)
+                more_btn = QPushButton("Show more...")
+                more_btn.setCursor(Qt.PointingHandCursor)
+                more_btn.setFlat(True)
+                more_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                more_btn.setStyleSheet(
+                    f"QPushButton {{ color: {accent}; "
+                    f"background: transparent; border: none; "
+                    f"padding: 0; font-size: 12px; font-weight: 700; "
+                    f"text-decoration: underline; }}"
+                    f"QPushButton:hover {{ color: {accent}; }}"
+                )
+                toggle_row.addWidget(more_btn)
+                parent_layout.addLayout(toggle_row)
+                detail_label = QLabel(details)
+                detail_label.setTextFormat(Qt.RichText)
+                detail_label.setWordWrap(True)
+                detail_label.setStyleSheet(
+                    f"color: {text_color}; font-size: 13px; "
+                    f"line-height: 150%; background: transparent; "
+                    f"margin-top: 6px;"
+                )
+                detail_label.hide()
+                parent_layout.addWidget(detail_label)
 
-        for i, (headline, body) in enumerate(primary_tips):
-            _add_tip(tips_card_layout, headline, body, is_first=(i == 0))
+                def _toggle_details():
+                    expanded = not detail_label.isVisible()
+                    detail_label.setVisible(expanded)
+                    more_btn.setText("Show less..." if expanded else "Show more...")
+
+                more_btn.clicked.connect(_toggle_details)
+
+        for i, tip in enumerate(primary_tips):
+            headline, body = tip[0], tip[1]
+            details = tip[2] if len(tip) > 2 else None
+            _add_tip(
+                tips_card_layout, headline, body,
+                is_first=(i == 0), details=details,
+            )
 
         # Hidden-by-default container for secondary tips. Toggled by
         # the "More tips" / "Fewer tips" link below the card.
@@ -2272,8 +2343,13 @@ class TutorialWindow(QDialog):
         more_layout = QVBoxLayout(self._completion_more_tips_container)
         more_layout.setContentsMargins(0, 0, 0, 0)
         more_layout.setSpacing(0)
-        for headline, body in secondary_tips:
-            _add_tip(more_layout, headline, body, is_first=False)
+        for tip in secondary_tips:
+            headline, body = tip[0], tip[1]
+            details = tip[2] if len(tip) > 2 else None
+            _add_tip(
+                more_layout, headline, body,
+                is_first=False, details=details,
+            )
         self._completion_more_tips_container.setVisible(False)
         tips_card_layout.addWidget(self._completion_more_tips_container)
 

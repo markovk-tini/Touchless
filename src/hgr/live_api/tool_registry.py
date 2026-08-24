@@ -47,6 +47,14 @@ class ToolRegistry:
         # matches (helped by system-prompt guidance), falling back to GUI.
         return all_tool_schemas() + self._connectors.available_tool_schemas()
 
+    def eager_tools(self) -> List[Dict[str, Any]]:
+        """Built-ins + non-MCP connectors. The live-session tool list uses
+        this so an arbitrarily large set of MCP servers doesn't bloat the
+        realtime model's context — MCP tools are discovered on demand via
+        find_capability and pushed into the live session at that point."""
+        return all_tool_schemas() + self._connectors.available_tool_schemas(
+            exclude_lazy=True)
+
     def names(self) -> List[str]:
         return [s["name"] for s in self.openai_tools()]
 

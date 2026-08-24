@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from .release_checker import ReleaseInfo
 from ... import __version__ as RUNNING_VERSION
-from ..ui.window_chrome import apply_touchless_chrome
+from ..ui.window_chrome import apply_touchless_chrome, install_indigo_chrome
 
 
 class UpdateDialog(QDialog):
@@ -46,7 +46,12 @@ class UpdateDialog(QDialog):
 
     def __init__(self, info: ReleaseInfo, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        apply_touchless_chrome(self)
+        # r51: replaced apply_touchless_chrome (Win11-only DWM) with
+        # install_indigo_chrome (frameless indigo bar, works on Win10 too).
+        body = install_indigo_chrome(self, "Touchless Update Available")
+        # r51 fix: scope background to body only (see spotify_setup_wizard).
+        body.setObjectName("updateDialogBody")
+        body.setStyleSheet("QWidget#updateDialogBody { background: #0B3D91; }")
         self._info = info
         self._showing_changelog = False
         self.setWindowTitle("Touchless Update Available")
@@ -111,7 +116,7 @@ class UpdateDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        layout = QVBoxLayout(body)
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(10)
 

@@ -76,6 +76,7 @@ class WasapiLoopbackWriter:
         close_stdin_on_exit: bool = True,
         align_to_wall_time: Optional[float] = None,
         use_callback_mode: bool = False,
+        apply_master_scalar: bool = False,
     ) -> None:
         self._stdin = ffmpeg_stdin
         self._device_index = int(device_index)
@@ -142,6 +143,28 @@ class WasapiLoopbackWriter:
         # historically been finicky in callback mode); main_window
         # passes True for the mic bridge.
         self._use_callback_mode = bool(use_callback_mode)
+        # Opt-in: multiply each real captured chunk by the current
+        # Windows master-volume scalar before writing to ffmpeg's
+        # pipe, so lowering the Windows volume slider mid-clip
+        # fades the SAVED clip's system-audio track too. Default
+        # False keeps byte-for-byte identical loopback behavior;
+        # main_window passes True only for the sys-loopback writer
+        # when clip_audio_follows_master_volume is set. See
+        # `_current_master_scalar` for the (cached, COM-failure-
+        # tolerant) scalar source. CALLER CONTRACT: NEVER pass
+        # True for a MIC writer -- the master slider governs
+        # PLAYBACK, not capture, and scaling a mic recording by
+        # the playback volume produces surprising results (user
+        # lowers Windows volume to be polite, mic in the clip
+        # goes quiet too even though they were still speaking
+        # normally).
+        self._apply_master_scalar = bool(apply_master_scalar)
+        # Cached (scalar, wall_time) for `_current_master_scalar`.
+        # Seeded at 1.0 so any COM failure before the first
+        # successful read returns pass-through instead of muting
+        # the entire recording.
+        self._cached_master_scalar: float = 1.0
+        self._cached_master_scalar_at: float = 0.0
         # Bounded queue from PortAudio callback to the writer
         # thread. Callback must return fast (PortAudio realtime
         # thread); writer thread does the IO to stdin/socket.
@@ -406,6 +429,74 @@ class WasapiLoopbackWriter:
             # have slightly-mistimed audio than no audio at all.
             return data
 
+    # TODO(OPEN_ISSUES.md, Option B): the pycaw call below reads the
+    # CURRENT Windows default render endpoint. Apps routed to a
+    # different endpoint via per-app-volume (Windows Sound settings ->
+    # App volume and device preferences) are not tracked. The
+    # follow-up is to bind an IMMDevice per endpoint and install an
+    # IMMNotificationClient so per-endpoint scalar changes drive the
+    # multiply too; the default-endpoint majority case is fine on the
+    # current path.
+    def _current_master_scalar(self) -> float:
+        """Return the current Windows master-volume scalar [0.0, 1.0]
+        for the default render endpoint, cached for 100 ms so
+        successive per-chunk reads at ~21 ms cadence don't hammer
+        COM. Any pycaw / COM failure returns the previously cached
+        value (seeded at 1.0 so a very-early failure just passes
+        audio through). A negative scalar (shouldn't happen from
+        the API but paranoia) is clipped to 0.0 so the waveform
+        can't get phase-inverted.
+
+        Deliberately does NOT call GetMute(): if the user mutes
+        mid-clip we still want the recording captured, and the
+        master slider already drops to 0.0 on mute anyway, so
+        GetMute would only add a way for a stale-cache read to
+        zero out an otherwise-audible chunk."""
+        import time as _t
+        now = _t.time()
+        if (now - self._cached_master_scalar_at) < 0.1:
+            return self._cached_master_scalar
+        try:
+            from pycaw.pycaw import AudioUtilities  # type: ignore
+            spk = AudioUtilities.GetSpeakers()
+            if spk is not None:
+                ev = spk.EndpointVolume
+                if ev is not None:
+                    raw = float(ev.GetMasterVolumeLevelScalar())
+                    if raw < 0.0:
+                        raw = 0.0
+                    self._cached_master_scalar = raw
+                    self._cached_master_scalar_at = now
+                    return raw
+        except Exception:
+            # pycaw missing / COM error / device gone. Do NOT update
+            # _cached_master_scalar_at so the next call retries
+            # immediately instead of holding the stale value for the
+            # full 100 ms TTL.
+            pass
+        return self._cached_master_scalar
+
+    def _scale_chunk(self, data: bytes) -> bytes:
+        """Multiply a raw int16-LE PCM chunk by the current master
+        scalar. int16 -> float32 * scalar -> clip -> int16 via
+        numpy. Called only when `self._apply_master_scalar` is True
+        and the chunk is real (non-silence) audio. On any numpy /
+        import failure the original bytes are returned so a hiccup
+        never silences the recording."""
+        try:
+            scalar = self._current_master_scalar()
+            if scalar >= 0.999:
+                return data  # near-unity: skip the multiply
+            import numpy as np
+            arr = np.frombuffer(data, dtype=np.int16)
+            if arr.size == 0:
+                return data
+            scaled = arr.astype(np.float32) * scalar
+            np.clip(scaled, -32768.0, 32767.0, out=scaled)
+            return scaled.astype(np.int16).tobytes()
+        except Exception:
+            return data
+
     def start(self) -> bool:
         """Open the loopback stream + spawn the writer thread.
         Returns True on success, False if PyAudioWPatch is missing,
@@ -605,6 +696,15 @@ class WasapiLoopbackWriter:
                 data = q.get(timeout=0.1)
             except queue.Empty:
                 continue
+            # Opt-in: fade real captured PCM by the current Windows
+            # master-volume scalar. Callback-mode init silence is
+            # written directly to stdin by `_write_init_silence`
+            # BEFORE the stream starts, so every chunk that reaches
+            # this queue is real audio -- no silence identity check
+            # needed here (unlike _run's polling path where the
+            # shared silence_chunk sentinel gates scaling).
+            if self._apply_master_scalar:
+                data = self._scale_chunk(data)
             try:
                 self._stdin.write(data)
             except (BrokenPipeError, OSError, ValueError):
@@ -915,10 +1015,41 @@ class WasapiLoopbackWriter:
                                                 pass
                                         import pyaudiowpatch as _pa_w  # type: ignore
                                         new_pa_local = _pa_w.PyAudio()
+                                        # v1.1.7 silent-stream trap fix:
+                                        # WASAPI shared-mode accepts a
+                                        # mismatched open WITHOUT raising
+                                        # an exception, then silently
+                                        # delivers zero bytes. The old
+                                        # code tried the pre-swap
+                                        # (self.rate, self.channels)
+                                        # first — on dad's speaker→
+                                        # headset switch the open
+                                        # "succeeded" but produced
+                                        # nothing, no exception was
+                                        # thrown, no fallback to the
+                                        # native rate/channels + software
+                                        # resampler ever fired. Every
+                                        # clip after the swap was pure
+                                        # silence. Fix: always open at
+                                        # the freshly PROBED (new_rate,
+                                        # new_ch) directly, and install
+                                        # the resampler unconditionally
+                                        # when the probed format
+                                        # differs from the writer's
+                                        # canonical (self.rate,
+                                        # self.channels). _maybe_resample
+                                        # is a no-op when they match, so
+                                        # same-format swaps still pay
+                                        # nothing. Keep an OLD-format
+                                        # last-resort fallback only for
+                                        # the pathological case where
+                                        # the probe returned None/zero.
+                                        target_rate = int(_new_rate) if _new_rate else int(_rate or 48000)
+                                        target_channels = max(1, int(_new_ch) if _new_ch else int(_channels or 2))
                                         open_kwargs = dict(
                                             format=_pa_w.paInt16,
-                                            channels=_channels,
-                                            rate=_rate,
+                                            channels=target_channels,
+                                            rate=target_rate,
                                             input=True,
                                             input_device_index=_new_idx,
                                             frames_per_buffer=1024,
@@ -926,11 +1057,25 @@ class WasapiLoopbackWriter:
                                         try:
                                             new_stream_local = new_pa_local.open(**open_kwargs)
                                         except Exception:
-                                            open_kwargs["rate"] = _new_rate or 48000
-                                            open_kwargs["channels"] = max(1, _new_ch or 1)
+                                            # Fresh probe format rejected —
+                                            # last-resort try the writer's
+                                            # canonical (self.rate,
+                                            # self.channels) so we at least
+                                            # get *some* stream open even
+                                            # if it silently produces
+                                            # silence (better than raising
+                                            # and killing the cache).
+                                            open_kwargs["rate"] = int(_rate or 48000)
+                                            open_kwargs["channels"] = max(1, int(_channels or 2))
                                             new_stream_local = new_pa_local.open(**open_kwargs)
-                                            new_resample_src_rate = int(open_kwargs["rate"])
-                                            new_resample_src_channels = int(open_kwargs["channels"])
+                                        # Install resampler when the
+                                        # opened rate/ch differ from the
+                                        # writer's canonical format.
+                                        opened_rate = int(open_kwargs["rate"])
+                                        opened_channels = int(open_kwargs["channels"])
+                                        if opened_rate != int(_rate) or opened_channels != int(_channels):
+                                            new_resample_src_rate = opened_rate
+                                            new_resample_src_channels = opened_channels
                                     except Exception as _exc:
                                         err = _exc
                                         if new_pa_local is not None:
@@ -1295,6 +1440,18 @@ class WasapiLoopbackWriter:
                 if (data is not silence_chunk
                         and self._resample_src_rate is not None):
                     data = self._maybe_resample(data)
+                # Opt-in: fade real captured PCM by the current
+                # Windows master-volume scalar. Skips the shared
+                # silence_chunk sentinel via the same identity
+                # check as _maybe_resample above -- scaling zeros
+                # is wasted work AND would allocate a fresh bytes
+                # object that breaks silence_chunk singleton reuse.
+                # Runs AFTER resample so both feature composes
+                # cleanly (resample-then-scale on the final bytes
+                # heading to ffmpeg).
+                if (self._apply_master_scalar
+                        and data is not silence_chunk):
+                    data = self._scale_chunk(data)
                 try:
                     stdin.write(data)
                 except (BrokenPipeError, OSError, ValueError):
@@ -1466,11 +1623,27 @@ def probe_input_device_format(
             try:
                 info = p.get_device_info_by_index(int(device_index))
                 if int(info.get("maxInputChannels", 0) or 0) > 0:
-                    rate = int(info.get("defaultSampleRate", fallback_rate)
-                               or fallback_rate)
-                    ch = min(max_channels, int(
-                        info.get("maxInputChannels", 1) or 1))
-                    return (int(device_index), rate, max(1, ch))
+                    # v1.1.7 belt-and-braces: when the caller passed
+                    # BOTH device_name and device_index, verify the
+                    # device at that index still has a matching name
+                    # before accepting it. Pre-fix, a stale index
+                    # (from a hot-plug that reshuffled the device
+                    # list) would silently return a wrong device
+                    # here — clips would capture from the wrong
+                    # input while the user thought their preferred
+                    # mic was recording. If name doesn't match, fall
+                    # through to the name-search branch below.
+                    idx_name = str(info.get("name", "") or "").strip()
+                    name_matches = (
+                        not device_name
+                        or (device_name and idx_name == device_name.strip())
+                    )
+                    if name_matches:
+                        rate = int(info.get("defaultSampleRate", fallback_rate)
+                                   or fallback_rate)
+                        ch = min(max_channels, int(
+                            info.get("maxInputChannels", 1) or 1))
+                        return (int(device_index), rate, max(1, ch))
             except Exception:
                 pass  # fall through to name / default resolution
         # Resolve the WASAPI host API index. Inputs from other host
@@ -1569,6 +1742,68 @@ def probe_input_device_format(
                 pass
 
 
+_BLUETOOTH_NAME_RE = None  # lazily compiled
+
+
+def is_default_output_bluetooth() -> bool:
+    """Return True if the current Windows default OUTPUT endpoint's
+    friendly name matches a Bluetooth device pattern.
+
+    v1.1.7 round-11: when Touchless opens a shared-mode WASAPI
+    loopback on a BT A2DP output, many BT drivers force a HFP
+    profile renegotiation that silences the endpoint for several
+    seconds — dad reported his BT headphones losing all audio
+    every time Touchless started. Skipping the sys-loopback when
+    the default output is BT avoids the renegotiation trigger
+    entirely. Detects by friendly-name regex against common BT
+    device patterns: AirPods, Bose QC/QCII, Sony WH-1000, Beats,
+    Jabra, Sennheiser Momentum, generic Bluetooth Hands-Free /
+    Headset / Headphones.
+    """
+    friendly = _query_default_render_friendly_name_via_com()
+    return _matches_bluetooth_name(friendly)
+
+
+def is_input_name_bluetooth(mic_name: Optional[str]) -> bool:
+    """Return True if the given microphone friendly name matches
+    a Bluetooth device pattern.
+
+    v1.1.7 round-16: opening a shared-mode WASAPI CAPTURE stream on
+    a BT mic endpoint forces the same HFP renegotiation as the sys-
+    loopback path — dad's BT headset lost both input AND output
+    audio when Touchless started. Also prevents wake-word listener
+    and clip-cache mic bridge from tripping the same renegotiation.
+    """
+    return _matches_bluetooth_name(mic_name)
+
+
+def _matches_bluetooth_name(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    global _BLUETOOTH_NAME_RE
+    if _BLUETOOTH_NAME_RE is None:
+        import re as _re
+        _BLUETOOTH_NAME_RE = _re.compile(
+            r"(?i)"
+            r"(?:"
+            r"bluetooth|"                 # generic BT string
+            r"hands.?free|hfp|"            # BT HFP profile marker
+            r"airpods?|"                   # Apple AirPods (Pro/Max)
+            r"bose\s*(?:qc|quiet|soundlink)|"  # Bose consumer BT lineup
+            r"beats\b|"                    # Beats
+            r"jabra\b|"                    # Jabra Evolve etc.
+            r"sony\s*wh-|wh-\d|"           # Sony WH-1000XM, WH-CH*
+            r"sennheiser.*(?:momentum|hd\s*4)|"
+            r"jbl.*(?:flip|clip|charge)|"
+            r"soundcore|anker\s+life|"
+            r"powerbeats|"
+            r"a2dp|"                       # BT A2DP profile marker
+            r"logitech\s+.*(?:zone|h800|h820)"
+            r")"
+        )
+    return bool(_BLUETOOTH_NAME_RE.search(name))
+
+
 def _query_default_render_friendly_name_via_com() -> Optional[str]:
     """Query Windows' IMMDeviceEnumerator for the CURRENT default
     render endpoint's friendly name. Bypasses PortAudio entirely —
@@ -1665,7 +1900,23 @@ def probe_default_loopback_identity() -> Optional[tuple[int, str]]:
                 if name.startswith(friendly) and name.endswith("[Loopback]"):
                     return (int(i), name)
         # Path 3 (legacy fallback): PA's cached default lookup.
+        # v1.1.7: this legacy path is used only when COM/pycaw
+        # failed to return a friendly name (rare — pycaw ships in
+        # the installer). PA's get_default_wasapi_loopback caches
+        # at PA_Initialize, so a single PyAudio instance never
+        # sees the runtime default switch. Force a fresh PyAudio
+        # instance before the lookup — some Windows builds DO
+        # refresh the default on a fresh PA_Initialize (empirically
+        # varies by PortAudio build). Cheap (~50-100 ms) and only
+        # fires on the pycaw-missing branch, so pycaw-present
+        # users see zero change. Better a probably-refreshed
+        # fingerprint than a definitely-stale one.
         try:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+            p = pa.PyAudio()
             info = p.get_default_wasapi_loopback()
             return (int(info.get("index", -1)), str(info.get("name", "")))
         except Exception:
@@ -1705,7 +1956,19 @@ def probe_input_device_identity(
             try:
                 info = p.get_device_info_by_index(int(device_index))
                 if int(info.get("maxInputChannels", 0) or 0) > 0:
-                    return (int(device_index), str(info.get("name", "")))
+                    # v1.1.7 fix: verify the device AT this index
+                    # still has a matching name when a hint is
+                    # supplied. Without this, a stale index (from
+                    # a hot-plug or USB re-enumeration since the
+                    # index was cached) silently returned the
+                    # WRONG device — polluting the watchdog
+                    # fingerprint with a fake identity that never
+                    # differed from itself, so mic swaps never
+                    # fired. Mirrors the fix already applied to
+                    # probe_input_device_format at ~L1510.
+                    idx_name = str(info.get("name", "") or "").strip()
+                    if not name_hint or idx_name == str(name_hint).strip():
+                        return (int(device_index), idx_name)
             except Exception:
                 pass
         if name_hint:
@@ -1798,7 +2061,18 @@ def probe_default_loopback_format() -> Optional[tuple[int, int, int]]:
                 return None
         idx = int(target_info.get("index"))
         rate = int(target_info.get("defaultSampleRate") or 48000) or 48000
-        channels = int(target_info.get("maxInputChannels") or 2) or 2
+        # v1.1.7 fix: cap channels at 2 (stereo). On multichannel
+        # speaker configs (5.1 / 7.1 gaming setups) PortAudio
+        # advertises maxInputChannels=6 or 8, so probe would spawn
+        # ffmpeg with -ac 6 and pull raw multichannel PCM. ffmpeg
+        # later downmixes to stereo AAC at clip export, where the
+        # LFE contribution routinely clips the encoder — heard as
+        # harsh/muffled/distorted clip audio (exactly dad's report
+        # on his 5.1 speaker setup). Downmixing at capture time
+        # instead avoids the encoder clip entirely. Does not affect
+        # mono / stereo defaults (min(2, 2) = 2, min(1, 2) = 1).
+        raw_channels = int(target_info.get("maxInputChannels") or 2) or 2
+        channels = min(raw_channels, 2)
         return (idx, rate, max(1, channels))
     except Exception:
         return None

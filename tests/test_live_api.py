@@ -606,25 +606,38 @@ class IrisPlannerClassifierTests(unittest.TestCase):
     def test_email_compose_send_an_email_to_form(self) -> None:
         """Live-bug fix: 'can you send an email to X saying Y' used to miss
         the classifier and fall to realtime, which got stuck on
-        ask_user_confirmation. Now Tier 1 catches it."""
+        ask_user_confirmation. Now Tier 1 catches it.
+
+        Verb-aware routing: an explicit "send" verb produces email_send
+        (with needs_confirm=True so the confirm gate is forced on the
+        Step, independent of RISKY_TOOLS). Verbless "email X saying Y"
+        stays on outlook_compose (draft only)."""
+        # "send"-prefixed forms → email_send with needs_confirm=True
         for text in [
             "send an email to vesselin.markov@gmail.com saying iris says Hi!",
             "can you send an email to vesselin.markov@gmail.com saying iris says Hi!",
             "send email to dani@x.io saying hi",
-            "email to dani@x.io saying hi from iris",
             "send a message to vesselin.markov@gmail.com saying hello",
             "send me an email to dani@x.io saying test",
         ]:
             step = self.c.classify(text)
             self.assertIsNotNone(step, f"missed: {text!r}")
-            self.assertEqual(step.tool, "outlook_compose",
+            self.assertEqual(step.tool, "email_send",
                              f"text={text!r}: tool={step.tool}")
+            self.assertTrue(step.needs_confirm,
+                            f"text={text!r}: send verb must force confirm")
             recipient = step.args.get("recipient", "")
             self.assertTrue("@" in recipient or recipient.lower() in
                             ("dani", "vesselin"),
                             f"text={text!r}: recipient={recipient!r}")
             self.assertTrue(step.args.get("body"),
                             f"text={text!r}: empty body")
+
+        # Verbless "email to X saying Y" stays on the draft tool.
+        step = self.c.classify("email to dani@x.io saying hi from iris")
+        self.assertIsNotNone(step)
+        self.assertEqual(step.tool, "outlook_compose")
+        self.assertFalse(step.needs_confirm)
 
     def test_misses_safely(self) -> None:
         # Things that must NOT classify (they need the LLM / fall through):
@@ -763,6 +776,123 @@ class IrisPlannerOrchestratorTests(unittest.TestCase):
         # send step args were resolved from lookup's output:
         send_args = next(a for t, a in reg.calls if t == "send")
         self.assertEqual(send_args["ref"], "abc")
+
+
+class IrisPlannerOrchestratorArtifactAmbiguityTests(unittest.TestCase):
+    """Regression: 'delete scratch-notes' silently deleted the task
+    when both a sheet and a task existed with that name. Verifies:
+      1. tasks_add now records artifacts with kind='task' (was 'page').
+      2. find_all_artifacts_by_name returns EVERY matching artifact
+         across kinds, newest-first, deduped.
+      3. Dispatching tasks_delete when 2+ kinds share the name returns
+         needs_clarification with a candidates list instead of
+         silently picking the newest artifact and wiping it."""
+
+    def _make_planner(self):
+        from hgr.live_api.planner.orchestrator import IrisPlanner
+        reg = _StubRegistry({
+            # tasks_delete should NEVER be called in the ambiguity test
+            # — if the backstop failed we'd see this canned output.
+            "tasks_delete": {"status": "ok", "title": "scratch-notes"},
+        })
+        return IrisPlanner(reg), reg
+
+    def test_tasks_add_records_task_kind_not_page(self) -> None:
+        # FIX 1a — _ARTIFACT_KIND_BY_TOOL now maps tasks_add -> 'task'.
+        from hgr.live_api.planner.orchestrator import (
+            _artifact_kind_from_tool,
+        )
+        self.assertEqual(_artifact_kind_from_tool("tasks_add"), "task")
+        self.assertEqual(_artifact_kind_from_tool("tasks_complete"),
+                         "task")
+        self.assertEqual(_artifact_kind_from_tool("tasks_delete"), "task")
+
+    def test_find_all_artifacts_by_name_returns_every_kind(self) -> None:
+        planner, _ = self._make_planner()
+        # Simulate a sheet 'scratch-notes' created earlier in the turn,
+        # then a task 'scratch-notes' created just now. Set explicit
+        # timestamps so the newest-first assertion is deterministic
+        # on Windows (time.time() resolution can be ~15 ms — two
+        # consecutive calls often return identical values).
+        planner._record_artifact(kind="sheet", title="scratch-notes",
+                                 link="https://sheets/x",
+                                 tool="sheets_create")
+        planner._last_artifacts["sheet"]["ts"] = 100.0
+        planner._record_artifact(kind="task", title="scratch-notes",
+                                 link="tasks://y", tool="tasks_add")
+        planner._last_artifacts["task"]["ts"] = 200.0
+        matches = planner.find_all_artifacts_by_name("scratch-notes")
+        self.assertEqual(len(matches), 2)
+        kinds = {m["kind"] for m in matches}
+        self.assertEqual(kinds, {"sheet", "task"})
+        # Newest-first: the task was recorded after the sheet.
+        self.assertEqual(matches[0]["kind"], "task")
+
+    def test_find_all_artifacts_by_name_empty_when_no_match(self) -> None:
+        planner, _ = self._make_planner()
+        self.assertEqual(planner.find_all_artifacts_by_name("nope"), [])
+        self.assertEqual(planner.find_all_artifacts_by_name(""), [])
+
+    def test_delete_backstop_returns_needs_clarification(self) -> None:
+        # FIX 1c — the deterministic backstop refuses the delete when
+        # a name matches artifacts of 2+ different kinds.
+        from hgr.live_api.planner.plan import Step
+        planner, reg = self._make_planner()
+        planner._record_artifact(kind="sheet", title="scratch-notes",
+                                 link="https://sheets/x",
+                                 tool="sheets_create")
+        planner._record_artifact(kind="task", title="scratch-notes",
+                                 link="tasks://y", tool="tasks_add")
+        step = Step(tool="tasks_delete",
+                    args={"title_match": "scratch-notes"})
+        payload = planner._dispatch_connector_step(step, "delete scratch-notes")
+        self.assertIsNotNone(payload)
+        # Backstop MUST short-circuit before the registry is called.
+        self.assertNotIn("tasks_delete", [t for t, _ in reg.calls])
+        # Payload carries the clarification signal + candidates.
+        self.assertTrue(payload.get("needs_clarification"))
+        candidates = payload.get("candidates")
+        self.assertIsInstance(candidates, list)
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual({c["kind"] for c in candidates},
+                         {"sheet", "task"})
+        # Result mirrors the same info for downstream consumers.
+        self.assertEqual(len(payload["results"]), 1)
+        sr = payload["results"][0]
+        self.assertEqual(sr.status, "needs_clarification")
+        self.assertEqual(len(sr.output["candidates"]), 2)
+
+    def test_delete_backstop_lets_unambiguous_id_through(self) -> None:
+        # When the args identify the target by task_id, the backstop
+        # must NOT fire — the caller already picked a specific task.
+        from hgr.live_api.planner.plan import Step
+        planner, reg = self._make_planner()
+        planner._record_artifact(kind="sheet", title="scratch-notes",
+                                 link="https://sheets/x",
+                                 tool="sheets_create")
+        planner._record_artifact(kind="task", title="scratch-notes",
+                                 link="tasks://y", tool="tasks_add")
+        step = Step(tool="tasks_delete",
+                    args={"task_id": "abc123"})
+        payload = planner._dispatch_connector_step(step, "delete it")
+        self.assertIsNotNone(payload)
+        # Dispatch went through to the registry — no clarification.
+        self.assertIn("tasks_delete", [t for t, _ in reg.calls])
+        self.assertFalse(payload.get("needs_clarification"))
+
+    def test_delete_backstop_skips_single_kind_match(self) -> None:
+        # Only ONE artifact matches 'scratch-notes' (a task) — the
+        # backstop should NOT fire; the delete proceeds.
+        from hgr.live_api.planner.plan import Step
+        planner, reg = self._make_planner()
+        planner._record_artifact(kind="task", title="scratch-notes",
+                                 link="tasks://y", tool="tasks_add")
+        step = Step(tool="tasks_delete",
+                    args={"title_match": "scratch-notes"})
+        payload = planner._dispatch_connector_step(step, "delete scratch-notes")
+        self.assertIsNotNone(payload)
+        self.assertIn("tasks_delete", [t for t, _ in reg.calls])
+        self.assertFalse(payload.get("needs_clarification"))
 
 
 class IrisPlannerSchedulerTests(unittest.TestCase):
@@ -3504,6 +3634,147 @@ class MemoryObserveConversationTests(unittest.TestCase):
             self.assertEqual(ext.call_count, 0)
 
 
+class MemoryDraftLatchTests(unittest.TestCase):
+    """Regression: multi-turn draft requests where the assistant first
+    asks a clarifying question and only delivers the actual draft body
+    1-2 turns later were capturing the CLARIFYING QUESTION as the
+    artifact and never the real draft. See manager._observe_safe
+    pending-draft latch."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.mkdtemp(prefix="iris-draft-latch-")
+        from hgr.live_api.memory import MemoryManager, MemoryStore
+        from hgr.live_api.memory.embedder import FakeEmbedder
+        self._mgr = MemoryManager(
+            store=MemoryStore(Path(self._tmp) / "m.db"),
+            embedder=FakeEmbedder(),
+            async_writes=False,
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _artifact_rows(self):
+        return [r for r in self._mgr._store.find_facts(limit=200)
+                if r.kind == "artifact"]
+
+    def test_multiturn_draft_captures_full_body_not_clarifier(self) -> None:
+        # Turn 1: draft request -> assistant asks a clarifying question.
+        # The pre-latch code wrote this clarifier as the artifact (bug);
+        # the fix must SUPPRESS the artifact and ARM the latch instead.
+        self._mgr._observe_safe(
+            "draft an email to my landlord about the leak under the sink",
+            "I don't have any details about the leak — what's going on?",
+        )
+        self.assertEqual(self._artifact_rows(), [],
+                         "clarifying-question reply must not become an artifact")
+
+        # Turn 2: user adds detail but the user_text itself isn't drafty;
+        # the assistant still hasn't produced a body — latch stays armed.
+        self._mgr._observe_safe(
+            "can you make up an issue?",
+            "Sure, give me one detail and I'll write it.",
+        )
+        self.assertEqual(self._artifact_rows(), [])
+
+        # Turn 3: user adds detail, assistant delivers the FULL draft.
+        # The latch promotes this assistant reply to an artifact keyed
+        # by the ORIGINAL topic ('email:leak-under-sink'), not the
+        # delivery-turn user text.
+        full_draft = (
+            "Got it. Here's a quick draft for your landlord:\n\n"
+            "Subject: Persistent Leak Under Kitchen Sink\n\n"
+            "Hi [Landlord's Name],\n\n"
+            "There's been a steady drip under my kitchen sink for the "
+            "last three days. I've tried tightening the visible fittings "
+            "but it hasn't helped, and water is starting to pool in the "
+            "cabinet below. Could you arrange a plumber visit as soon as "
+            "possible?\n\nThanks,\n[Your Name]"
+        )
+        self._mgr._observe_safe(
+            "steady drip for the last three days. Tightening things isn't helping",
+            full_draft,
+        )
+        rows = self._artifact_rows()
+        self.assertEqual(len(rows), 1,
+                         f"expected exactly one artifact, got {rows}")
+        row = rows[0]
+        self.assertEqual(row.source_kind, "llm_draft")
+        # Key must reflect the ORIGINAL request's topic, not turn-3.
+        self.assertTrue(row.key.startswith("email:"),
+                        f"expected email:* key, got {row.key!r}")
+        self.assertIn("leak", row.key,
+                      f"expected topic 'leak' in key, got {row.key!r}")
+        self.assertIn("Subject: Persistent Leak", row.value)
+
+    def test_same_turn_delivered_draft_still_captured(self) -> None:
+        # Sanity: when the same-turn assistant reply IS a full draft,
+        # the latch path doesn't break the original capture.
+        full_draft = (
+            "Subject: Quick hello\n\n"
+            "Hi Alex,\n\nLong time no see — hope you're well! Want to "
+            "grab coffee next week? Let me know what day works.\n\n"
+            "Cheers,\nDani"
+        ) + ("\n\nP.S. " + "padding " * 40)
+        self._mgr._observe_safe(
+            "draft an email to Alex about catching up",
+            full_draft,
+        )
+        rows = self._artifact_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].source_kind, "llm_draft")
+        self.assertIn("Subject: Quick hello", rows[0].value)
+
+    def test_recall_finds_draft_via_generic_verb(self) -> None:
+        # Seed an artifact directly (skip the latch path for simplicity).
+        self._mgr._store.add_semantic(
+            "artifact",
+            "email:leak-under-sink",
+            "Subject: Persistent Leak Under Kitchen Sink\n\n"
+            "Hi [Landlord's Name], please send a plumber.",
+            source="llm draft",
+            source_kind="llm_draft",
+        )
+        # Query that contains 'email' but NOT 'leak' — pre-fix, the
+        # whole colon-key was used as a regex literal and would miss
+        # because 'email:leak-under-sink' isn't in the goal.
+        recall = self._mgr.recall("show me the email we drafted")
+        artifact_hits = [f for f in recall["facts"] if f.kind == "artifact"]
+        self.assertTrue(artifact_hits,
+                        f"expected artifact in recall, got {recall['facts']}")
+        # Even a topic-less query with the verb 'wrote' should surface
+        # the most-recent llm_draft artifact.
+        recall2 = self._mgr.recall("show me what we wrote")
+        artifact_hits2 = [f for f in recall2["facts"] if f.kind == "artifact"]
+        self.assertTrue(artifact_hits2,
+                        "generic 'wrote' verb should surface artifact")
+
+    def test_purge_clarify_artifacts_removes_bogus_row(self) -> None:
+        # Simulate the inherited bad row from the pre-latch era.
+        self._mgr._store.add_semantic(
+            "artifact",
+            "email:leak-under-sink",
+            "I don't actually have any details about the leak — what's "
+            "going on?",
+            source="llm draft",
+            source_kind="llm_draft",
+        )
+        # Also seed a GOOD draft that must survive the purge.
+        self._mgr._store.add_semantic(
+            "artifact",
+            "email:catch-up",
+            "Subject: Coffee soon?\n\n" + ("Body line.\n" * 30),
+            source="llm draft",
+            source_kind="llm_draft",
+        )
+        removed = self._mgr._purge_bogus_clarify_artifacts()
+        self.assertEqual(removed, 1)
+        remaining = [r for r in self._mgr._store.find_facts(limit=200)
+                     if r.kind == "artifact"]
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].key, "email:catch-up")
+
+
 class MemoryPreferenceUniquenessTests(unittest.TestCase):
     """Preferences are last-write-wins on (kind, key) — never two
     simultaneous values for the same preference key."""
@@ -3899,6 +4170,51 @@ class GoogleAppendTests(unittest.TestCase):
         reqs = update["body"]["requests"]
         ops = [list(r.keys())[0] for r in reqs]
         self.assertEqual(ops, ["createSlide", "insertText", "insertText"])
+
+    def test_slides_add_slide_name_not_found_returns_need_presentation(
+            self) -> None:
+        """When the classifier routes 'add a slide to Nonexistent Deck' with
+        only presentation_name (no id), and the name resolves to nothing,
+        the connector must return a friendly need_presentation error rather
+        than raising or emitting 'presentation_id is required'."""
+        from hgr.live_api.connectors.slides_connector import (
+            GoogleSlidesConnector,
+        )
+
+        class _Drive:
+            def files(self_):
+                class _Files:
+                    def list(self__, **kw):
+                        class _Req:
+                            def execute(self___):
+                                return {"files": []}
+                        return _Req()
+                return _Files()
+
+        class _Client:
+            def ready(self_):
+                return True
+
+            def service(self_, api, ver):
+                if api == "drive":
+                    return _Drive()
+                # slides service — return a minimal stub; _add_slide should
+                # bail on need_presentation BEFORE touching it.
+                class _Svc:
+                    def presentations(self__):
+                        raise AssertionError(
+                            "should not reach Slides API when pid unresolved")
+                return _Svc()
+
+        conn = GoogleSlidesConnector(_Client())
+        out = conn.execute("slides_add_slide", {
+            "presentation_name": "Nonexistent Deck",
+            "title": "New slide",
+            "body": "Body text",
+        })
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["code"], "need_presentation")
+        self.assertIn("Nonexistent Deck", out["error"])
 
 
 class OpenLastIntentTests(unittest.TestCase):
@@ -4300,6 +4616,120 @@ class PhoneLinkConnectorTests(unittest.TestCase):
                 "error")
         finally:
             phone_link_connector._find_phone_link_appx = old
+
+
+class DeclineRecoveryTests(unittest.TestCase):
+    """Guard for the safety-gate decline-recovery hang fix.
+
+    Regression: after a user declined a destructive tool at the safety
+    gate, we called client.cancel_response() to stop the in-flight LLM
+    reply. The server then emits response.done(status="cancelled"). The
+    handler's retry block (built for TPM rate-limits) treated that
+    "cancelled" as a transient failure, slept, and fired a phantom
+    response.create — wedging the next user turn behind a stuck
+    _response_active latch. The fix latches _intentional_cancel_pending
+    on the gated-decline cancel and consumes it in response.done to
+    skip the retry block for user-declined cancels.
+    """
+
+    def test_intentional_cancel_absorbs_cancelled_response_done(self) -> None:
+        from PySide6.QtCore import QCoreApplication
+        from hgr.live_api.live_api_manager import LiveApiManager, LiveApiState
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        manager = LiveApiManager(
+            config=LiveApiConfig(api_key="x"), text_only=True)
+        # Simulate the exact state left behind by the gated-decline
+        # path: response was active, we sent cancel_response(), latched
+        # the intentional-cancel flag, then response.done(cancelled)
+        # from the server is about to be dispatched to _handle_event.
+        manager._response_active = True
+        manager._intentional_cancel_pending = True
+
+        # If the fix regressed, response.done(cancelled) would fall
+        # into the retry block, time.sleep(), and call
+        # _request_model_response() — a phantom that wedges the next
+        # user turn. Patch it so any call raises the regression loud.
+        called: list[bool] = []
+        with patch.object(manager, "_request_model_response",
+                          side_effect=lambda: called.append(True)):
+            # Also patch time.sleep so a regression can't hang the test
+            # process; we still want the assert to fire loudly.
+            with patch("hgr.live_api.live_api_manager.time.sleep"):
+                manager._handle_event({
+                    "type": "response.done",
+                    "response": {
+                        "status": "cancelled",
+                        "output": [],
+                        "status_details": {},
+                    },
+                })
+
+        # Latch consumed, no phantom response.create fired, response
+        # cycle latch cleared, retry counter reset, state back to
+        # LISTENING and ready to accept the next user turn.
+        self.assertFalse(manager._intentional_cancel_pending,
+                         "latch must be consumed on cancelled response.done")
+        self.assertFalse(manager._response_active,
+                         "_response_active must be cleared after cancel")
+        self.assertEqual(manager._failed_retries, 0,
+                         "retry counter must be reset")
+        self.assertEqual(called, [],
+                         "must NOT fire a phantom response.create — that "
+                         "would wedge the next user turn")
+        self.assertEqual(manager.state, LiveApiState.LISTENING,
+                         "must return to LISTENING after intentional cancel")
+        del app
+
+    def test_gated_decline_latches_even_when_cancel_fn_missing(self) -> None:
+        """Fix A regression: the intentional-cancel latch MUST be set
+        unconditionally at the top of the gated_decline branch —
+        BEFORE any callable(cancel_fn) check. Previously the latch was
+        set only inside `if callable(cancel_fn):` and inside a try, so
+        a client that didn't expose `cancel_response` (or a raising
+        cancel_fn) left the flag False. The next
+        response.done(cancelled) then fell into the TPM retry block
+        and fired a phantom response.create — exactly the wedge the
+        earlier absorb-test was written to prevent.
+        """
+        from PySide6.QtCore import QCoreApplication
+        from hgr.live_api.live_api_manager import LiveApiManager
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        manager = LiveApiManager(
+            config=LiveApiConfig(api_key="x"), text_only=True)
+        # Reproduce the exact state at gated-decline entry: a response
+        # is in flight, and the user is about to decline a destructive
+        # tool at the safety modal.
+        manager._response_active = True
+        # Confirm callback declines (gmail_send-style modal → False).
+        manager._confirm_callback = lambda title, detail: False
+        # Client WITHOUT cancel_response — the exact Fix A concern.
+        client = MagicMock(spec=["send_tool_result"])
+        client.send_tool_result = MagicMock(return_value=None)
+        self.assertFalse(hasattr(client, "cancel_response"),
+                         "spec must not expose cancel_response")
+        manager._client = client
+        manager._executor = MagicMock()   # any non-None is fine
+        manager._registry = None          # skip registry routing
+
+        manager._dispatch_function_call({
+            "name": "teams_send",         # in _CONFIRM_BEFORE_TOOLS
+            "call_id": "call_test_fixA",
+            "arguments": "{}",
+        })
+
+        self.assertTrue(
+            manager._intentional_cancel_pending,
+            "gated_decline must latch _intentional_cancel_pending "
+            "unconditionally — even when the client has no "
+            "cancel_response method — so the next response.done("
+            "cancelled) doesn't fire a phantom response.create that "
+            "wedges the next user turn.")
+        # Tool result was still submitted so the model's conversation
+        # log stays consistent (per the surrounding comment).
+        client.send_tool_result.assert_called_once()
+        del app
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -9,12 +9,17 @@ Author: Konstantin Markov
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import re
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
 
-from .base import Connector, connector_result
+from .base import Connector, connector_result, friendly_api_error
 from .google_client import GoogleClient
+
+_GMAIL_CALL_TIMEOUT_SEC = 25.0
+_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="gmail")
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -213,6 +218,17 @@ class GmailConnector(Connector):
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return _pool.submit(self._execute_locked, name, args).result(
+                timeout=_GMAIL_CALL_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            return connector_result(
+                "error",
+                error=f"{name} timed out after {_GMAIL_CALL_TIMEOUT_SEC}s",
+                code="timeout",
+            )
+
+    def _execute_locked(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         # Per-tool scope precondition: read tools need gmail.readonly,
         # send tools need gmail.send. If the user granted a partial
         # set of scopes (very common — Google's consent screen lets
@@ -224,12 +240,35 @@ class GmailConnector(Connector):
         need_readonly = name in ("gmail_list", "gmail_read")
         need_send = name == "gmail_send"
         if need_readonly and not self._has_readonly():
-            # The shipped app intentionally does NOT request gmail.readonly
-            # (it's a Google "restricted" scope requiring a $10-30k/yr
-            # CASA security assessment for verified distribution — not
-            # viable for free). Direct the user to the free read paths
-            # instead: Outlook desktop COM (covers Gmail via IMAP +
-            # everything else) or Microsoft Graph if they have an MSA.
+            # Two very different situations collapse here:
+            #
+            # (a) Shipped app default — TOUCHLESS_GMAIL_READONLY is
+            #     unset, so the OAuth consent screen never requested
+            #     gmail.readonly. The scope requires Google's paid
+            #     CASA verification ($10-30k/yr) so we don't ship it.
+            #     Return code='not_supported' so the email_summary
+            #     cascade silently skips to the next connector.
+            #
+            # (b) User opted IN via TOUCHLESS_GMAIL_READONLY=1 but
+            #     the stored token still pre-dates the opt-in (they
+            #     enabled the env var but never clicked Connect
+            #     Google again to re-consent with the Read Mail box
+            #     ticked). This is USER ERROR they can fix — return
+            #     code='scope_missing' so the cascade surfaces it as
+            #     an actionable error instead of silently skipping.
+            import os as _os
+            opted_in = _os.environ.get(
+                "TOUCHLESS_GMAIL_READONLY", "0") == "1"
+            if opted_in:
+                return connector_result(
+                    "error",
+                    error=("Gmail read scope not granted. "
+                           "TOUCHLESS_GMAIL_READONLY=1 is set but the "
+                           "stored token doesn't include gmail.readonly "
+                           "— click Connect Google in Settings to "
+                           "re-authorize with the Read Mail box ticked."),
+                    code="scope_missing",
+                    missing_scope="gmail.readonly")
             return connector_result(
                 "error",
                 error=("Reading Gmail directly via the Gmail API isn't "
@@ -269,7 +308,8 @@ class GmailConnector(Connector):
                 msg["subject"] = subject
                 raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
                 sent = svc.users().messages().send(userId="me", body={"raw": raw}).execute()
-                return connector_result("ok", sent=True, id=sent.get("id"), to=to)
+                return connector_result("ok", sent=True, id=sent.get("id"), to=to,
+                                        summary=f"Sent to {to}.")
 
             if name == "gmail_list":
                 max_n = max(1, min(50, int(args.get("max") or 10)))
@@ -346,5 +386,5 @@ class GmailConnector(Connector):
                     body_text=_walk_for_body(msg.get("payload") or {})[:5000],
                 )
         except Exception as exc:
-            return connector_result("error", error=f"{type(exc).__name__}: {exc}")
+            return connector_result("error", error=friendly_api_error(exc, api_label="Gmail"))
         return connector_result("error", error=f"unknown gmail tool: {name}", code="no_handler")

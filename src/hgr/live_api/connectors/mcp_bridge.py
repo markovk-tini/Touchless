@@ -44,7 +44,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .base import Connector, connector_result
+from .base import Connector, connector_result, friendly_api_error
 
 
 def libs_available() -> bool:
@@ -62,9 +62,63 @@ def _config_path() -> Path:
     return Path.home() / "Documents" / "Touchless" / "mcp_servers.json"
 
 
+def _seed_default_config_if_missing() -> None:
+    """First-launch zero-friction default: if the user has no
+    mcp_servers.json yet, write one with the zero-setup catalog entries
+    pre-enabled. This is what makes Iris feel like MCP "just works" out
+    of the box for shipped users — no picker visit required.
+
+    Idempotent: only runs when the file is genuinely missing. Existing
+    files (even empty/malformed ones) are left alone so the user's
+    saved state is never overwritten. Failures are silent — falling back
+    to an empty list keeps the bridge dormant, identical to the old
+    behavior."""
+    path = _config_path()
+    if path.exists():
+        return
+    try:
+        from .mcp_default_servers import DEFAULT_SERVERS, zero_setup_ids
+    except Exception:
+        return
+    auto = set(zero_setup_ids())
+    seeded: List[Dict[str, Any]] = []
+    for spec in DEFAULT_SERVERS:
+        env_block = {k: "" for k in spec.env_required}
+        seeded.append({
+            "id": spec.id,
+            "name": spec.id,
+            "command": spec.command,
+            "args": list(spec.args),
+            "env": env_block,
+            "env_required": list(spec.env_required),
+            "needs_args_keys": list(spec.needs_args),
+            "description": spec.description,
+            "enabled": spec.id in auto,
+            "_seeded_at": "first-launch",
+        })
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"servers": seeded}, indent=2),
+                        encoding="utf-8")
+    except Exception:
+        pass
+
+
 def load_server_configs() -> List[Dict[str, Any]]:
     """Parse the server list from the config file. Returns [] if absent or
-    malformed (bridge stays dormant)."""
+    malformed (bridge stays dormant).
+
+    Entries with `"enabled": false` are skipped here (so the picker UI's
+    on/off toggle takes effect without deleting the entry — preserves
+    the user's saved env vars / args for re-enabling later).
+
+    Entries that declare `env_required: [...]` and any of those vars are
+    missing from the env are ALSO skipped (otherwise the MCP server
+    spawns then immediately exits with auth errors, which looks broken
+    in the picker)."""
+    # First-launch UX: write a default config with zero-setup servers
+    # pre-enabled if no file exists yet. Idempotent + best-effort.
+    _seed_default_config_if_missing()
     path = _config_path()
     if not path.exists():
         return []
@@ -77,9 +131,49 @@ def load_server_configs() -> List[Dict[str, Any]]:
         return []
     out = []
     for s in servers:
-        if isinstance(s, dict) and s.get("name") and s.get("command"):
-            out.append(s)
+        if not isinstance(s, dict) or not s.get("name") or not s.get("command"):
+            continue
+        if s.get("enabled") is False:
+            continue
+        # Auth gate: required env vars must be set (in the system env OR
+        # in the entry's own `env` block — both count).
+        req = s.get("env_required") or []
+        entry_env = s.get("env") or {}
+        missing = [k for k in req
+                   if not (entry_env.get(k) or os.environ.get(k))]
+        if missing:
+            continue
+        out.append(s)
     return out
+
+
+def write_server_configs(servers: List[Dict[str, Any]]) -> None:
+    """Persist the full server list (including disabled entries) to the
+    config file. The MCP picker UI uses this to save toggles + tokens.
+    Creates the parent directory if missing."""
+    path = _config_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    payload = json.dumps({"servers": servers}, indent=2)
+    path.write_text(payload, encoding="utf-8")
+
+
+def load_raw_servers() -> List[Dict[str, Any]]:
+    """Like load_server_configs but returns EVERY entry (incl. disabled
+    and auth-blocked), for the picker UI to render their toggles."""
+    path = _config_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    servers = data.get("servers") if isinstance(data, dict) else None
+    if not isinstance(servers, list):
+        return []
+    return [s for s in servers if isinstance(s, dict)]
 
 
 def _sanitize(text: str) -> str:
@@ -139,7 +233,7 @@ class _ServerSession:
                 self._call_tool(tool_name, args or {}), self._loop)
             return fut.result(timeout=timeout)
         except Exception as exc:
-            return connector_result("error", error=f"{type(exc).__name__}: {exc}")
+            return connector_result("error", error=friendly_api_error(exc, api_label="MCP server"))
 
     # ---- loop-thread internals ----------------------------------------
     def _run_loop(self) -> None:
@@ -221,6 +315,41 @@ class MCPConnector(Connector):
         if not name.startswith(self._prefix):
             return connector_result("error", error=f"not an {self.id} tool: {name}",
                                     code="no_handler")
+        # Phase-1 MCP trust gate: an MCP server can ship any number
+        # of tools whose intent isn't obvious from the schema. Default
+        # everything to "not yet trusted" so a brand-new server can't
+        # surprise-execute a destructive tool on first invocation. The
+        # user explicitly grants trust per-server via the MCP picker
+        # (which calls mcp_trust.global_store().grant(...)). If the
+        # trust store says PENDING/REVOKED, refuse the call cleanly.
+        try:
+            from ..mcp_trust import gate_mcp_call, global_store
+            # Best-effort: a server we've never seen is auto-registered
+            # at PENDING so the user can see it in the picker.
+            try:
+                global_store().register(
+                    self.id, getattr(self, "_display_name", self.id),
+                    tool_count=len(self._session.tools()))
+            except Exception:
+                pass
+            # MCP tools have no per-tool destructiveness metadata
+            # today — treat as "write" by default (the most-common
+            # case is "do something"). Connector-side overrides can
+            # refine later. Pass destructiveness so TRUSTED_READ
+            # grants don't accidentally allow writes.
+            if not gate_mcp_call(self.id, tool_destructiveness="write"):
+                return connector_result(
+                    "error",
+                    error=(f"MCP server {self.id!r} is not granted "
+                           "write access yet — open the MCP picker "
+                           "to grant trust."),
+                    code="mcp_trust_required",
+                )
+        except Exception:
+            # Trust module absent / broken — fail-open to preserve
+            # backward compatibility for existing installs that
+            # haven't migrated to the trust store yet.
+            pass
         # Map the namespaced name back to the server's real tool name.
         suffix = name[len(self._prefix):]
         for schema in self._session.tools():

@@ -148,12 +148,79 @@ def resolve_dshow_device_for_index(index: int, qt_name_hint: str = "") -> str | 
     return None
 
 
+def _median_luma_from_bgr(frame: np.ndarray) -> float:
+    """Estimate the median luminance of a BGR frame in [0, 255].
+
+    Uses BT.709 coefficients (Y' = 0.0722*B + 0.7152*G + 0.2126*R) and
+    downsamples 4× on each axis to keep the compute cost negligible
+    (~15k pixels on a 640×480 frame). Median (not mean) so a bright
+    window in one corner doesn't mask a dark scene, and a single dark
+    letterbox doesn't drag the value below threshold either.
+    """
+    if frame is None or frame.size == 0 or frame.ndim < 3:
+        return 0.0
+    small = frame[::4, ::4]
+    b = small[:, :, 0].astype(np.float32)
+    g = small[:, :, 1].astype(np.float32)
+    r = small[:, :, 2].astype(np.float32)
+    y = 0.0722 * b + 0.7152 * g + 0.2126 * r
+    try:
+        return float(np.median(y))
+    except Exception:
+        return 0.0
+
+
+def _measure_cap_luma(
+    cap: "FfmpegMjpegCapture",
+    *,
+    n_frames: int = 18,
+    timeout_s: float = 1.5,
+    warmup_frames: int = 6,
+) -> Optional[float]:
+    """Sample frames off a live ffmpeg cap and return the median of their
+    per-frame median luma. Returns None if we couldn't gather enough
+    samples inside the timeout window — caller should treat that as
+    "no signal" and NOT downshift on that alone (the cap might just be
+    slow to warm up on a particular driver; we don't want a slow warmup
+    to be misread as darkness and cost the user their higher fps).
+
+    Reads the first `warmup_frames` off the cap and discards them so a
+    camera's auto-exposure has a chance to settle before we sample.
+    Consumers don't see these frames because the wrapper is called
+    from the open path, before the cap is returned to the caller."""
+    if cap is None or not cap.isOpened():
+        return None
+    deadline = time.monotonic() + max(0.5, timeout_s)
+    consumed = 0
+    samples: list[float] = []
+    while (consumed < warmup_frames + n_frames) and time.monotonic() < deadline:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            time.sleep(0.005)
+            continue
+        consumed += 1
+        if consumed <= warmup_frames:
+            continue
+        try:
+            samples.append(_median_luma_from_bgr(frame))
+        except Exception:
+            continue
+    # Need at least a quarter of the requested samples to make a call.
+    if len(samples) < max(4, n_frames // 4):
+        return None
+    try:
+        return float(np.median(samples))
+    except Exception:
+        return None
+
+
 def open_ffmpeg_cap_with_fps_fallback(
     device_name: str,
     *,
     width: int = 1280,
     height: int = 720,
     fps_candidates: tuple[int, ...] = (60, 30),
+    luma_min_threshold: float | None = None,
 ) -> "FfmpegMjpegCapture | None":
     """Try opening the ffmpeg MJPG cap at decreasing frame rates.
 
@@ -165,6 +232,30 @@ def open_ffmpeg_cap_with_fps_fallback(
     a major win over OpenCV's YUY2 — the hand-tracking loop sees fresh
     decompressed BGR frames without the per-frame uncompress cost
     YUY2 carries.
+
+    v1.1.7.1 luma safety net (`luma_min_threshold`): after a successful
+    open, sample the first ~18 post-warmup frames and compute their
+    median luma. If it's below the threshold (typical: 50/255) we
+    treat that as "camera driver cut shutter to keep up with fps",
+    close the cap, and continue to the next (lower) fps candidate.
+    A brighter frame is worth more to hand tracking than the extra
+    fps: MediaPipe simply cannot find hands in a dark image.
+
+    The safety net is scoped tightly:
+      * Only downshift — never brighten past the driver's natural
+        exposure. If the room is genuinely dark, downshifting doesn't
+        help but also doesn't hurt (lower fps just gives the driver a
+        larger shutter budget it may or may not use).
+      * Only fires on the primary open path. Cameras that are fine at
+        60 fps (Kiyo Pro, Brio, C920, most modern sensors in adequate
+        lighting) pass the threshold on the first attempt and never
+        pay a wall-clock cost beyond the ~0.4 s luma sample window.
+      * Env-var opt-out: `HGR_FFMPEG_LUMA_CHECK=0` disables it entirely
+        for users who want to force the highest fps regardless of
+        brightness.
+      * A None reading (couldn't read enough frames within timeout) is
+        NOT treated as "too dark" — we return the cap anyway. A slow-
+        warmup cap should not be misread as darkness and demoted.
 
     Single-retry budget for silent hangs:
       * Real failure (fatal stderr pattern OR non-None returncode) →
@@ -186,10 +277,23 @@ def open_ffmpeg_cap_with_fps_fallback(
       * Silent hang on first attempt, retry also hangs: ~6 s. Bail.
       * Real format-rejection at 60, success at 30: ~3 s. 30 fps.
       * Real failure on both: ~5 s. Caller falls to OpenCV.
+      * Luma downshift at 60, success at 30: ~4 s. 30 fps, brighter.
 
     Returns the opened capture, or None if every candidate failed.
     The caller should fall through to the OpenCV path on None.
     """
+    # Env-var opt-out for the luma safety net. Set HGR_FFMPEG_LUMA_CHECK=0
+    # to force the highest fps regardless of resulting brightness. Also
+    # respected when luma_min_threshold is None (default) — the env var
+    # only matters when the caller actually asked for the safety net.
+    luma_check_disabled = False
+    try:
+        _env_luma = os.environ.get("HGR_FFMPEG_LUMA_CHECK")
+        if _env_luma is not None and str(_env_luma).strip() == "0":
+            luma_check_disabled = True
+    except Exception:
+        pass
+
     retry_used = False
     for fps in fps_candidates:
         cap = FfmpegMjpegCapture(
@@ -199,6 +303,45 @@ def open_ffmpeg_cap_with_fps_fallback(
             fps=fps,
         )
         if cap.isOpened():
+            # Luma safety net — only fires when caller asked for it and
+            # env-var didn't opt out. If the reading is below threshold,
+            # release the cap and continue to the next fps candidate.
+            # A None reading means "couldn't sample confidently" and is
+            # NOT treated as darkness — we return the cap anyway.
+            if luma_min_threshold is not None and not luma_check_disabled:
+                try:
+                    median_luma = _measure_cap_luma(cap)
+                except Exception:
+                    median_luma = None
+                if median_luma is not None and median_luma < float(luma_min_threshold):
+                    try:
+                        print(
+                            f"[ffmpeg_capture] {fps} fps opened but median luma "
+                            f"{median_luma:.1f} < threshold {float(luma_min_threshold):.1f} — "
+                            f"driver likely cut shutter to keep up with fps. "
+                            f"Releasing and downshifting to next candidate.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    # Deliberate release — do NOT trigger the silent-hang
+                    # retry path (that's for genuine open failures).
+                    continue
+                if median_luma is not None:
+                    try:
+                        print(
+                            f"[ffmpeg_capture] {fps} fps luma check passed: "
+                            f"median={median_luma:.1f} (threshold={float(luma_min_threshold):.1f})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
             try:
                 print(
                     f"[ffmpeg_capture] engaged at {width}x{height} @ {fps} fps MJPG",

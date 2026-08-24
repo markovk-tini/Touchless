@@ -48,12 +48,8 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
         "Left Hand Four.png",
         "Face your left palm toward the monitor. Extend the index, middle, ring, and pinky fingers and fold the thumb across the palm. Hold for ~0.5s.",
     ),
-    (
-        "left_fist",
-        "Left Hand Fist",
-        "LeftFist.png",
-        "Face your left palm toward the monitor and close all five fingers into a tight, compact fist.",
-    ),
+    # r53: left_fist retired (was Cancel voice/dictation). Left hand
+    # fist gesture no longer surfaced in bindings, guide, or picker.
     (
         "right_two",
         "Right Hand Two",
@@ -120,10 +116,11 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
 # Each action: (action_id, display_label, default_pose_id).
 _GESTURE_BIND_ACTIONS: list[tuple[str, str, str]] = [
     ("voice_command_listen", "Start voice command listening", "left_one"),
-    ("dictation_toggle", "Start or stop dictation", "left_two"),
+    # r53: dictation_toggle temporarily removed; left_two now hosts
+    # instant_clip (moved from right_one). voice_cancel row also
+    # removed since its only default (left_fist) is retired.
     ("mouse_mode_toggle", "Toggle mouse mode on/off", "left_three"),
     ("drawing_mode_toggle", "Toggle drawing mode on/off", "left_four"),
-    ("voice_cancel", "Cancel voice command or dictation", "left_fist"),
     ("open_spotify", "Open or focus Spotify", "right_two"),
     ("play_pause", "Play or pause media", "right_fist"),
     ("chrome_mode_toggle", "Toggle Chrome mode on/off", "right_three_together"),
@@ -134,6 +131,12 @@ _GESTURE_BIND_ACTIONS: list[tuple[str, str, str]] = [
     ("open_gesture_wheel", "Open Spotify/Chrome wheel", "wheel_pose"),
     ("open_screen_wheel", "Open screen capture wheel", "screen_wheel"),
     ("close_active_window", "Close the focused window", "close_window"),
+    # Instant clip: same as "clip that" voice command, no prompt and
+    # no save dialog — clips the configured duration (default 60 s)
+    # ending at the moment the gesture fires and auto-saves to
+    # clips_save_dir with a timestamped filename. r53: default pose
+    # moved from right_one to left_two after dictation was retired.
+    ("instant_clip", "Save instant clip (no prompt)", "left_two"),
 ]
 
 
@@ -155,7 +158,8 @@ STATIC_POSE_LABEL_MAP: dict[str, tuple[str, str]] = {
     "left_two":   ("Left",  "two"),
     "left_three": ("Left",  "three"),
     "left_four":  ("Left",  "four"),
-    "left_fist":  ("Left",  "fist"),
+    # r53: "left_fist" removed — no active binding.
+    "right_one":  ("Right", "one"),
     "right_two":  ("Right", "two"),
     "right_fist": ("Right", "fist"),
     "right_three": ("Right", "three"),

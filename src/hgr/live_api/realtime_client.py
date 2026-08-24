@@ -151,6 +151,16 @@ class RealtimeClient:
             ws = None
             try:
                 ws = websocket.create_connection(url, header=headers, timeout=10)
+                # Per-recv timeout so a server-side stall surfaces as a
+                # WebSocketTimeoutException instead of parking the reader
+                # thread on recv() forever. The handler at _read_loop
+                # already loops harmlessly on that exception, giving the
+                # manager's response-cycle watchdog a second detection
+                # path on top of its own response.done timer.
+                try:
+                    ws.sock.settimeout(30)
+                except Exception:
+                    pass
                 self._ws = ws
                 self._connected = True
                 self._logger.event("ws_connected", attempt=attempts)
@@ -388,6 +398,23 @@ class RealtimeClient:
             "session": {"type": "realtime", "tools": self._tools},
         })
 
+    def update_instructions(self, instructions: str) -> bool:
+        """Replace the session's system instructions mid-conversation.
+
+        Used by `/persona <name>` so a voice swap takes effect on the
+        very next reply instead of waiting for a new session. Like
+        update_tools, this merges into the live session — tools and
+        audio config are untouched. Safe before connect.
+        """
+        self._system_instructions = str(instructions or "")
+        if not self._connected:
+            return False
+        return self._send({
+            "type": "session.update",
+            "session": {"type": "realtime",
+                        "instructions": self._system_instructions},
+        })
+
     def send_audio_chunk(self, pcm16_bytes: bytes) -> bool:
         if not pcm16_bytes:
             return True
@@ -414,6 +441,20 @@ class RealtimeClient:
         text = (text or "").strip()
         if not text:
             return True
+        # Hard cap: notes are conversation.item.create with role=system,
+        # which permanently append to the server-side conversation and
+        # are re-tokenized on every subsequent turn. A runaway recall-
+        # draft injection (e.g. a 50K-char artifact) would silently
+        # bloat input-token cost for the rest of the session.
+        _MAX_NOTE_CHARS = 4000
+        if len(text) > _MAX_NOTE_CHARS:
+            if self._logger:
+                self._logger.event(
+                    "session_note_truncated",
+                    original_chars=len(text),
+                    max_chars=_MAX_NOTE_CHARS,
+                )
+            text = text[:_MAX_NOTE_CHARS] + " ... [truncated]"
         return self._send(
             {
                 "type": "conversation.item.create",
@@ -458,6 +499,13 @@ class RealtimeClient:
         )
 
     def request_response(self) -> bool:
+        # NOTE: prior versions sent response.audio.voice as a per-response
+        # voice re-assertion (workaround for old voices drifting mid-
+        # session — sage / coral / verse). The current Realtime API
+        # rejects that shape with [unknown_parameter] — voice is now
+        # session-scoped only (set via session.update's audio.output.voice).
+        # The current default voices (marin / cedar) don't drift, so the
+        # workaround is no longer needed.
         return self._send({"type": "response.create"})
 
     def cancel_response(self) -> bool:

@@ -35,6 +35,12 @@ class LiveViewWindow(QMainWindow):
         self.resize(1120, 780)
 
         self._build_ui()
+        # r51: frameless indigo title bar so the enlarged live view
+        # matches every other Touchless window. Must come AFTER
+        # _build_ui so the central widget exists to be wrapped.
+        # Renders identically on Win10 and Win11 (no DWM dependency).
+        from .window_chrome import install_indigo_chrome_main_window
+        install_indigo_chrome_main_window(self, "Touchless Live View")
         self.apply_theme(config)
         self.attach_to_worker(worker)
 

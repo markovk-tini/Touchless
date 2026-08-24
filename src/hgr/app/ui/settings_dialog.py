@@ -74,16 +74,19 @@ class SettingsDialog(QDialog):
 
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome (Win10+Win11) replaces the old
+        # apply_touchless_chrome (Win11 only). _body is the QWidget
+        # under the indigo bar — _build_ui parents its layout to it.
+        from .window_chrome import install_indigo_chrome
         self.setWindowTitle("Settings")
         self.setModal(False)
         self.setMinimumWidth(420)
+        self._body = install_indigo_chrome(self, "Settings")
         self.config = AppConfig(**config.__dict__)
         self._build_ui()
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(18, 18, 18, 18)
         root.setSpacing(14)
 
@@ -130,11 +133,7 @@ class SettingsDialog(QDialog):
             admin_layout.addStretch(1)
         else:
             elevate_button = QPushButton("Restart as administrator")
-            elevate_button.setToolTip(
-                "Needed to clip games at higher integrity levels and to "
-                "control elevated apps like Task Manager. Triggers a "
-                "Windows UAC prompt."
-            )
+            elevate_button.setToolTip("Needed for elevated-app clipping (UAC prompt).")
             elevate_button.clicked.connect(self._restart_as_admin)
             admin_layout.addWidget(elevate_button)
             admin_layout.addStretch(1)

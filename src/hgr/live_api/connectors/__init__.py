@@ -57,6 +57,7 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     from .volume_connector import VolumeConnector
     from .media_connector import MediaConnector
     from .youtube_connector import YouTubeConnector
+    from .youtube_data_connector import YouTubeDataConnector
     from .chrome_connector import ChromeConnector
     from .discord_connector import DiscordConnector
     from .outlook_connector import OutlookConnector
@@ -74,10 +75,16 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     from .phone_link_connector import PhoneLinkConnector
     from .ollama_connector import OllamaConnector
     from .notion_connector import NotionConnector
+    from .contacts_connector import ContactsConnector
+    from .tasks_connector import TasksConnector
+    from .forms_connector import FormsConnector
+    from .photos_connector import GooglePhotosConnector
+    from .identity_connector import IdentityConnector
 
     _add(lambda: VolumeConnector())
     _add(lambda: MediaConnector())
     _add(lambda: YouTubeConnector(executor=executor))
+    _add(lambda: YouTubeDataConnector())
     _add(lambda: ChromeConnector(executor=executor))
     _add(lambda: DiscordConnector())
     _add(lambda: OutlookConnector(executor=executor))
@@ -100,6 +107,11 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
     _add(lambda: PhoneLinkConnector(executor=executor))
     _add(lambda: SpotifyConnector(setup_only=True))
     _add(lambda: OllamaConnector())
+    _add(lambda: ContactsConnector())
+    _add(lambda: TasksConnector())
+    _add(lambda: FormsConnector())
+    _add(lambda: GooglePhotosConnector())
+    _add(lambda: IdentityConnector())
     # NotionConnector demoted to setup_only: tools() returns [] so it doesn't
     # compete with web_search for 'my X' phrases (the user doesn't write into
     # Notion as a primary second-brain). setup_self() is still reachable via
@@ -138,6 +150,12 @@ def build_connector_registry(executor: Optional[Any] = None) -> ConnectorRegistr
         "directions": "directions route navigation distance drive travel time map between places",
         "ms365": "Microsoft 365 Outlook email send read search Microsoft calendar event OneDrive upload Teams message chat Excel spreadsheet cell To Do task reminder OneNote note Contacts Office Copilot",
         "outlook_com": "Outlook desktop email inbox unread mail message read summarize via COM (works for Exchange Gmail-via-IMAP any account Outlook is connected to — zero setup, no auth)",
+        "contacts": "Google Contacts People API search add create lookup person name email phone address book",
+        "tasks": "Google Tasks to-do task list add complete delete reminder checklist",
+        "forms": "Google Forms poll survey quiz questionnaire create responses results answers",
+        "youtube_data": "YouTube my playlists subscriptions watch later channel videos list show readonly",
+        "photos": "Google Photos library upload save image picture screenshot video clip",
+        "identity": "Google account whoami profile name email birthday date of birth signed in user identity",
     }
     for c in reg._connectors:
         if not getattr(c, "description", ""):

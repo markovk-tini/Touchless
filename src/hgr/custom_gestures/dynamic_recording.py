@@ -45,15 +45,26 @@ class DynamicGestureTake:
 
     Attributes:
       timestamps:  shape (T,)   monotonic seconds since take start
-      landmarks:   shape (T, 21, 3)  normalized hand-local coords
+      landmarks:   shape (T, 21, 3)  wrist-relative + palm-scaled coords
       handedness:  "Left" / "Right" / None (None = either-hand take)
       raw_duration_seconds:  end - start time, useful for sanity
+      wrist_palm_scaled: shape (T, 3) — the ABSOLUTE wrist position per
+        frame divided by palm scale. Crucially, this is NOT wrist-
+        subtracted — it carries the whole-hand translation signal that
+        `landmarks` (wrist-relative) discards. The classifier uses this
+        as a second DTW channel so swipes match by the wrist's path and
+        stationary-wrist gestures (fist squeeze) match by fingers alone,
+        without a binary wrist-travel gate. Defaults to a zero (T, 3)
+        for back-compat with takes constructed without wrist data — the
+        classifier treats zero motion as "stationary template" and
+        weights the wrist channel to ~0.
     """
 
     timestamps: np.ndarray
     landmarks: np.ndarray
     handedness: Optional[str] = None
     raw_duration_seconds: float = 0.0
+    wrist_palm_scaled: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         if self.landmarks.ndim != 3 or self.landmarks.shape[1:] != (NUM_LANDMARKS, 3):
@@ -65,6 +76,16 @@ class DynamicGestureTake:
             raise ValueError(
                 "timestamps and landmarks must have the same first dim"
             )
+        t = self.landmarks.shape[0]
+        if self.wrist_palm_scaled is None:
+            self.wrist_palm_scaled = np.zeros((t, 3), dtype=np.float32)
+        else:
+            self.wrist_palm_scaled = np.asarray(self.wrist_palm_scaled, dtype=np.float32)
+            if self.wrist_palm_scaled.shape != (t, 3):
+                raise ValueError(
+                    f"wrist_palm_scaled must have shape ({t}, 3); got "
+                    f"{self.wrist_palm_scaled.shape}"
+                )
 
     @property
     def num_frames(self) -> int:
@@ -78,6 +99,13 @@ class DynamicGestureTake:
         the user performed the gesture.
         """
         return _resample_landmarks(self.landmarks, target_length)
+
+    def resampled_wrist(self, target_length: int = RESAMPLED_FRAME_COUNT) -> np.ndarray:
+        """Return the absolute (palm-scaled) wrist trajectory resampled
+        to `target_length` frames, shape (target_length, 3). Used by the
+        template builder to populate the wrist DTW channel.
+        """
+        return _resample_wrist(self.wrist_palm_scaled, target_length)
 
 
 def palm_scale_from_landmarks(landmarks: np.ndarray) -> float:
@@ -113,6 +141,28 @@ def normalize_frame(landmarks: np.ndarray, palm_scale: float) -> np.ndarray:
     """
     wrist = landmarks[0]
     out = (landmarks - wrist[np.newaxis, :]) / max(float(palm_scale), 1e-6)
+    return out
+
+
+def _resample_wrist(wrist: np.ndarray, target_length: int) -> np.ndarray:
+    """Linear-interpolate a (T, 3) wrist trajectory to (target_length, 3).
+    Mirror of `_resample_landmarks` for the 2-axis wrist channel."""
+    if wrist.ndim != 2 or wrist.shape[1] != 3:
+        raise ValueError(f"expected (T, 3); got shape {wrist.shape}")
+    src_count = wrist.shape[0]
+    if src_count == target_length:
+        return wrist.astype(np.float32, copy=True)
+    if src_count < 2:
+        return np.repeat(
+            wrist.astype(np.float32, copy=True)[:1] if src_count else np.zeros((1, 3), dtype=np.float32),
+            target_length,
+            axis=0,
+        )
+    src_indices = np.linspace(0.0, 1.0, src_count, dtype=np.float64)
+    dst_indices = np.linspace(0.0, 1.0, target_length, dtype=np.float64)
+    out = np.empty((target_length, 3), dtype=np.float32)
+    for ch in range(3):
+        out[:, ch] = np.interp(dst_indices, src_indices, wrist[:, ch].astype(np.float32))
     return out
 
 

@@ -81,7 +81,17 @@ class OutlookConnector(Connector):
                "default is Gmail, else the OS default mail app) for the user to "
                "review and send themselves. Does NOT send. Use when the user "
                "just wants a draft. ALWAYS pass a concise `subject` (summarize "
-               "the body if unstated).",
+               "the body if unstated). "
+               "ONLY call this tool when the utterance STARTS with a compose/"
+               "send verb (send, mail, compose, draft, write, shoot, fire off, "
+               "or 'email' used as an imperative verb followed by a recipient). "
+               "DO NOT call this tool when the word 'email' appears as CONTENT "
+               "(e.g. after 'to say', 'to write', 'set to', 'change to', "
+               "'enter', 'type', 'put', inside quotes) or when the utterance "
+               "references a spreadsheet cell (A1-style token such as C1, B12, "
+               "AA3), a Sheets / Docs / Slides / OneNote document, or otherwise "
+               "names a non-mail target. Those requests go to "
+               "sheets_update_range / gdocs_append / slides_* instead.",
                mail_params),
             fn("email_send",
                "Compose AND SEND an email without API setup: opens the pre-filled "

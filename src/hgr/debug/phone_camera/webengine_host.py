@@ -24,6 +24,7 @@ Author: Konstantin Markov
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import sys
 import threading
@@ -107,7 +108,60 @@ _HOST_HTML = """<!doctype html>
       pc = new RTCPeerConnection({ iceServers: ICE });
       pc.onicecandidate = (e) => { if (e.candidate) ws.send(JSON.stringify({ type: "ice", candidate: e.candidate })); };
       pc.ontrack = (e) => { v.srcObject = e.streams[0]; pump(); startAudio(e.streams[0]); };
+      // Inbound DataChannel from the phone for text commands.
+      // The connect page (touchless-control.com/connect) opens a
+      // channel named "commands" and sends one text frame per Send tap.
+      // We POST each message body to /command on this local server; the
+      // host's text-command callback dispatches it through the voice
+      // processor on the GUI thread.
+      //
+      // Result toast return path: after dispatch, the GUI thread calls
+      // _LocalServer.publish_command_result({ok, heard_text, ...}),
+      // which fans out to the SSE /results stream we subscribe to
+      // below. Each event is forwarded back through the SAME DataChannel
+      // so the phone's "commands" channel receives a JSON
+      // {kind:"command_result", ...} message and renders a toast.
+      pc.ondatachannel = (e) => {
+        try {
+          const ch = e.channel;
+          commandsChannel = ch;
+          ch.onmessage = (msg) => {
+            const text = (typeof msg.data === "string" ? msg.data : "").trim();
+            if (!text) return;
+            fetch("/command", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text }),
+            }).catch(() => {});
+          };
+          ch.onclose = () => { if (commandsChannel === ch) commandsChannel = null; };
+        } catch (_) {}
+      };
     }
+    // Track the OPEN inbound DataChannel so result events can be
+    // mirrored back to the phone. SSE listener below sends each
+    // "command_result" event through this channel.
+    let commandsChannel = null;
+    function subscribeResults() {
+      let es = null;
+      try { es = new EventSource("/results"); } catch (_) { return; }
+      es.onmessage = (evt) => {
+        let payload = null;
+        try { payload = JSON.parse(evt.data || ""); } catch (_) { return; }
+        if (!payload || typeof payload !== "object") return;
+        const ch = commandsChannel;
+        if (ch && ch.readyState === "open") {
+          try { ch.send(JSON.stringify(payload)); } catch (_) {}
+        }
+      };
+      // EventSource auto-reconnects on transient failures. Long-lived
+      // connection drops trigger a fresh subscribe via this handler.
+      es.onerror = () => {
+        try { es.close(); } catch (_) {}
+        setTimeout(subscribeResults, 1500);
+      };
+    }
+    subscribeResults();
     // Capture the phone's mic track as 48k mono Int16 PCM and POST it to
     // /audio (same wire format + sink the QR flow uses). Routed into voice
     // commands only when the user ticks "Use phone microphone".
@@ -192,6 +246,19 @@ class _LocalServer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._runner: Optional[web.AppRunner] = None
+        # Phone → PC text command handler. Set by the MainWindow at
+        # engine start (same callback voice commands dispatch through).
+        # The hidden QtWebEngine page (see _HOST_HTML) listens for a
+        # WebRTC DataChannel from the phone and POSTs its messages to
+        # /command on this server, which fires the callback.
+        self._on_text_command: Optional[Callable[[str], None]] = None
+        # SSE result fan-out. Each /results subscriber holds an
+        # asyncio.Queue; publish_command_result enqueues a JSON-
+        # encoded payload onto every queue via call_soon_threadsafe so
+        # the QtWebEngine page (the only subscriber) can forward it
+        # back to the phone over the open WebRTC DataChannel.
+        self._result_queues: set[asyncio.Queue] = set()
+        self._result_queues_lock = threading.Lock()
 
     def start(self) -> None:
         ready = threading.Event()
@@ -205,6 +272,12 @@ class _LocalServer:
             app.router.add_get("/", self._index)
             app.router.add_post("/frame", self._frame)
             app.router.add_post("/audio", self._audio)
+            app.router.add_post("/command", self._command)
+            # SSE: command_result events published from the GUI thread
+            # (after voice_processor.execute returns) are fanned out
+            # here so the QtWebEngine host page can forward each one
+            # back to the phone over the WebRTC "commands" DataChannel.
+            app.router.add_get("/results", self._results)
             self._runner = web.AppRunner(app)
             try:
                 loop.run_until_complete(self._runner.setup())
@@ -268,6 +341,140 @@ class _LocalServer:
                 pass
         return web.Response(status=204)
 
+    async def _command(self, request):
+        """Text command coming from the hidden QtWebEngine page after it
+        receives a DataChannel message from the phone (Connect/pairing-
+        code flow). Body is JSON {"text": "..."} or raw text. Hands the
+        string off to the host's text-command callback (same callback
+        the QR flow uses) — dispatch runs on the GUI thread through the
+        voice processor.
+
+        TODO(iris-prompt): accept a `mode` field ({"text", "mode":"iris"})
+        once Iris paid prompts are implemented; route those to the Live
+        API agent instead of the voice processor.
+        """
+        try:
+            raw = await request.read()
+        except Exception:
+            return web.Response(status=400, text="read failed")
+        import json as _json
+        text = ""
+        try:
+            payload = _json.loads(raw.decode("utf-8")) if raw else {}
+            if isinstance(payload, dict):
+                text = str(payload.get("text", "") or "").strip()
+            elif isinstance(payload, str):
+                text = payload.strip()
+        except (ValueError, UnicodeDecodeError):
+            try:
+                text = raw.decode("utf-8", errors="replace").strip()
+            except Exception:
+                text = ""
+        if not text:
+            return web.Response(status=400, text="empty command")
+        if self._on_text_command is None:
+            return web.Response(status=503, text="text commands not available")
+        try:
+            self._on_text_command(text)
+        except Exception as exc:
+            _log(f"POST /command dispatch error: {type(exc).__name__}: {exc}")
+            return web.Response(status=500, text="dispatch failed")
+        return web.json_response({"queued": True, "text": text}, status=202)
+
+    def set_text_command_callback(self, on_text_command: Optional[Callable[[str], None]]) -> None:
+        """Install the phone-text-command bridge for the Connect flow.
+        Called from MainWindow when the engine starts."""
+        self._on_text_command = on_text_command
+
+    async def _results(self, request: web.Request) -> web.StreamResponse:
+        """SSE endpoint consumed by the QtWebEngine host page. Each
+        `command_result` payload pushed via `publish_command_result`
+        becomes one SSE frame here; the page forwards it back to the
+        phone over the WebRTC DataChannel.
+
+        Only one subscriber is expected (the hidden QtWebEngine page),
+        but the implementation handles N for resilience: the page may
+        reconnect on a transient error, briefly producing two queues.
+        """
+        response = web.StreamResponse(
+            status=200, reason="OK",
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-store",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+        await response.prepare(request)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+        with self._result_queues_lock:
+            self._result_queues.add(queue)
+        try:
+            await response.write(b"event: hello\ndata: {}\n\n")
+            while True:
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    try:
+                        await response.write(b": heartbeat\n\n")
+                    except (ConnectionResetError, asyncio.CancelledError):
+                        break
+                    continue
+                if payload is None:
+                    break
+                try:
+                    await response.write(payload)
+                except (ConnectionResetError, asyncio.CancelledError):
+                    break
+        finally:
+            with self._result_queues_lock:
+                self._result_queues.discard(queue)
+        return response
+
+    def publish_command_result(self, payload: dict) -> None:
+        """Fan out a command result to every /results SSE subscriber so
+        the host page can mirror it back to the phone via DataChannel.
+        Safe to call from any thread — we marshal onto the asyncio loop
+        with call_soon_threadsafe.
+
+        `payload` shape mirrors the QR flow's SSE: {ok, heard_text,
+        control_text, info_text, kind:"command_result"}. `kind` is
+        injected here so the JS receiver can dispatch by message type.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        try:
+            body = dict(payload or {})
+            body.setdefault("kind", "command_result")
+            payload_json = json.dumps(body, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return
+        message = f"data: {payload_json}\n\n".encode("utf-8")
+
+        def _broadcast() -> None:
+            with self._result_queues_lock:
+                queues = list(self._result_queues)
+            for q in queues:
+                try:
+                    q.put_nowait(message)
+                except asyncio.QueueFull:
+                    # Subscriber is lagging — drop oldest by getting
+                    # then putting. Better than blocking the loop.
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(message)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        try:
+            loop.call_soon_threadsafe(_broadcast)
+        except RuntimeError:
+            # Loop is shutting down; drop the message.
+            pass
+
 
 class WebEnginePhoneServer:
     """Receives a phone camera via a hidden Chromium (QtWebEngine) page."""
@@ -317,6 +524,22 @@ class WebEnginePhoneServer:
 
     def set_status_callback(self, on_status: Optional[StatusCallback]) -> None:
         self._on_status = on_status
+
+    def set_text_command_callback(self, on_text_command: Optional[Callable[[str], None]]) -> None:
+        """Install the phone → PC text-command bridge. Forwarded to the
+        underlying _LocalServer; the hidden QtWebEngine page POSTs
+        DataChannel messages to its /command endpoint, which fires this
+        callback. MainWindow wires it at engine start (same callback the
+        QR PhoneCameraServer uses)."""
+        if self._server is not None:
+            self._server.set_text_command_callback(on_text_command)
+
+    def publish_command_result(self, payload: dict) -> None:
+        """Fan the result of a phone-sent text command back to the phone
+        via the SSE → DataChannel relay. Safe to call from any thread —
+        the underlying _LocalServer marshals onto its asyncio loop."""
+        if self._server is not None:
+            self._server.publish_command_result(payload)
 
     def _emit(self, event: str, data: dict) -> None:
         if self._on_status is None:

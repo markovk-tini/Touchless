@@ -45,17 +45,18 @@ class DrawingChooserDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
         self.setWindowTitle("Select a drawing")
         self.setModal(True)
         # No close/minimize chrome — Cancel button does it cleanly.
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        body = install_indigo_chrome(self, "Select a drawing")
 
         self.chosen_path: Optional[Path] = None
         self._candidates: List[Path] = list(candidates)[: len(_LETTERS)]
 
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(body)
         outer.setContentsMargins(20, 18, 20, 16)
         outer.setSpacing(12)
 

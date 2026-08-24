@@ -19,7 +19,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from .base import Connector, connector_result
+from .base import Connector, connector_result, friendly_api_error
 from ...utils.subprocess_utils import launch_external
 
 
@@ -183,7 +183,7 @@ class PhoneLinkConnector(Connector):
 
         except Exception as exc:
             return connector_result(
-                "error", error=f"{type(exc).__name__}: {exc}")
+                "error", error=friendly_api_error(exc, api_label="Phone Link"))
         return connector_result(
             "error", error=f"unknown phone_link tool: {name}",
             code="no_handler")

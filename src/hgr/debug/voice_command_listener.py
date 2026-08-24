@@ -36,6 +36,61 @@ class VoiceCommandResult:
     speech_end_ts: float | None = None
 
 
+def _live_windows_input_endpoints_via_pycaw() -> list[str]:
+    """Enumerate ACTIVE Windows audio-capture endpoints via pycaw
+    (Windows Core Audio). This bypasses PortAudio's PA_Initialize
+    device cache — sounddevice/PortAudio snapshots the device list
+    once at startup and never re-scans, so mid-session hotplug
+    (headset plugged in after Touchless launched) is invisible to
+    sd.query_devices() until process restart. pycaw's GetAllDevices
+    calls IMMDeviceEnumerator::EnumAudioEndpoints directly which
+    always returns live data.
+
+    v1.1.7 fix (round 8): the previous implementation guessed at a
+    ``.direction`` attribute that pycaw's AudioDevice does not
+    expose, and called ``int(dev.state)`` on a plain Enum which
+    raises TypeError. Both errors were swallowed by a broad
+    try/except so every device was silently dropped — the function
+    returned [] deterministically and dad's hot-plug bug was never
+    touched. Correct call: pass eCapture + ACTIVE at the COM layer
+    so no Python-side filtering is needed. Verified live to return
+    exactly the real capture endpoints Windows Sound shows.
+
+    Returns [] on any failure so callers fall back to the
+    sounddevice enumeration path.
+    """
+    try:
+        from pycaw.pycaw import AudioUtilities  # type: ignore
+        from pycaw.constants import EDataFlow, DEVICE_STATE  # type: ignore
+    except Exception:
+        return []
+    # Suppress pycaw's occasional COMError-during-property-fetch
+    # UserWarnings — the diff timer would spam stderr every 3 s
+    # otherwise. Real errors still propagate.
+    import warnings as _warnings
+    try:
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            devs = AudioUtilities.GetAllDevices(
+                data_flow=EDataFlow.eCapture.value,
+                device_state=DEVICE_STATE.ACTIVE.value,
+            )
+    except Exception:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for dev in devs or []:
+        try:
+            name = str(getattr(dev, "FriendlyName", "") or "").strip()
+        except Exception:
+            continue
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
 def list_input_microphones() -> list[str]:
     """Return readable names for available input-capable microphone devices.
 
@@ -49,16 +104,26 @@ def list_input_microphones() -> list[str]:
     Sound control panel uses, so the dropdown matches what the user
     sees there. Other platforms fall back to the previous all-API
     listing (where the duplicate-host-API problem doesn't exist).
+
+    v1.1.7 hot-plug fix: sounddevice caches the device list at
+    PA_Initialize and does NOT re-scan on subsequent query_devices()
+    calls, so a headset plugged in mid-session was invisible until
+    process restart. Now we FIRST try pycaw (Windows Core Audio)
+    which always returns live data, then union with the sounddevice
+    result. Union guarantees no regression when pycaw is missing
+    or returns a subset.
     """
+    live_windows_names = _live_windows_input_endpoints_via_pycaw()
+
     try:
         import sounddevice as sd
     except Exception:
-        return []
+        return live_windows_names
 
     try:
         devices = sd.query_devices()
     except Exception:
-        return []
+        return live_windows_names
 
     # Identify the WASAPI host-api index on Windows. On other
     # platforms we leave wasapi_index=None and the filter no-ops.
@@ -116,6 +181,20 @@ def list_input_microphones() -> list[str]:
                 continue
             seen.add(name)
             names.append(name)
+    # v1.1.7 hot-plug union: merge any pycaw-discovered live
+    # Windows endpoints that sounddevice didn't see (they might
+    # be brand-new hot-plug devices that PortAudio's PA_Initialize
+    # cache doesn't know about yet). This is the union that fixes
+    # dad's headset-not-appearing bug.
+    for live_name in live_windows_names:
+        try:
+            live_name = str(live_name or "").strip()
+        except Exception:
+            continue
+        if not live_name or live_name in seen:
+            continue
+        seen.add(live_name)
+        names.append(live_name)
     return names
 
 

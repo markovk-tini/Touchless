@@ -67,8 +67,9 @@ class SandboxWindow(QDialog):
         config=None,
     ) -> None:
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
+        self._body = install_indigo_chrome(self, "Custom gesture sandbox")
         self.setWindowTitle("Custom Gestures Sandbox")
         self.setModal(False)
         self.setMinimumSize(820, 560)
@@ -200,7 +201,7 @@ class SandboxWindow(QDialog):
             }}
             """
         )
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
 
@@ -258,12 +259,16 @@ class SandboxWindow(QDialog):
 
         cap = self._open_configured_camera()
         if cap is None:
-            QMessageBox.critical(
+            # r51: touchless_message_box (indigo chrome, Win10+Win11 parity).
+            from .window_chrome import touchless_message_box
+            touchless_message_box(
                 self,
                 "Camera unavailable",
                 "Could not open the camera. If you're using a phone "
                 "camera, make sure your phone is on the same Wi-Fi "
                 "network and the QR pairing is still active.",
+                icon=QMessageBox.Critical,
+                buttons=QMessageBox.Ok,
             )
             return
         self._cap = cap

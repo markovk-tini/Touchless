@@ -1,0 +1,1 @@
+[invocation_bus] subscriber raised: RuntimeError: kaboom

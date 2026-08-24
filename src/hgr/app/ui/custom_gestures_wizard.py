@@ -578,8 +578,9 @@ class CreateGestureWizard(QDialog):
         original_name: Optional[str] = None,
     ) -> None:
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
+        self._body = install_indigo_chrome(self, "Create custom gesture")
         self._edit_mode = bool(edit_mode)
         self.setWindowTitle("Edit Custom Gesture" if self._edit_mode else "Create Custom Gesture")
         self.setModal(True)
@@ -710,7 +711,7 @@ class CreateGestureWizard(QDialog):
             """
         )
 
-        outer = QVBoxLayout(self)
+        outer = QVBoxLayout(self._body)
         outer.setContentsMargins(20, 20, 20, 20)
         outer.setSpacing(14)
 

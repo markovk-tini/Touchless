@@ -104,7 +104,12 @@ class YouTubeController:
         if not value:
             value = self._has_recent_youtube_window()
         self._tab_cache_value = value
-        self._tab_cache_until = now + 1.0
+        # r42: raised TTL 1.0s -> 5.0s. find_chrome_youtube_windows
+        # walks EnumWindows + psutil.Process(pid).name() per YouTube-
+        # titled window. When Chrome opens or a new tab appears the
+        # cache miss falls on a hot-path frame; 5s cadence keeps that
+        # to ~1 slow frame per 5s at worst.
+        self._tab_cache_until = now + 5.0
         return value
 
     def _send_virtual_key(self, vk: int) -> bool:

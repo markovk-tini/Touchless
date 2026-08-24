@@ -136,6 +136,17 @@ class SpotifyController:
         self._active_device_cache: bool | None = None
         self._active_device_cache_until: float = 0.0
         self._active_device_cache_seconds: float = 3.0
+        # r50: TTL cache for _has_real_spotify_process. The new
+        # r50 gate in SpotifyGestureRouter._can_control_without_focus
+        # calls this once per gesture commit. Without a cache the
+        # psutil.process_iter walk (10-20 procs when Spotify is
+        # running) would spike gesture-commit latency. 1 s is short
+        # enough that a fresh open/close of Spotify becomes visible
+        # to gestures within one gesture cadence, long enough to
+        # absorb a 60 fps gesture loop into one psutil scan.
+        self._has_real_spotify_cache: bool | None = None
+        self._has_real_spotify_cache_until: float = 0.0
+        self._has_real_spotify_cache_seconds: float = 1.0
         # Stale-while-revalidate latch for is_active_device_available().
         # When the 3 s cache expires while a hand is in frame, we used
         # to fire the 50-300 ms /me/player HTTP call on the calling
@@ -152,8 +163,55 @@ class SpotifyController:
         # Spotify' toast so the user knows controls have silently
         # stopped working.
         self._needs_reauth: bool = False
+        # v1.1.7.10: one-shot latch for "actionable failure just
+        # happened" — MainWindow polls take_transient_failure() every
+        # debug frame and surfaces a themed dialog with actionable
+        # buttons (Open Spotify / Reconnect / Learn about Premium)
+        # when the category is one the user can actually fix. Distinct
+        # from _needs_reauth (which is a persistent server-side reject
+        # state) — this is a per-attempt event that's cleared as soon
+        # as the toast fires so a repeated gesture doesn't spam.
+        # Shape: {"category": str, "prefix": str, "at": float} or None.
+        self._last_transient_failure: dict | None = None
+        # Flips True the first time the user actually tries to use
+        # Spotify this session (an actionable gesture latches, or a
+        # user-initiated method funnels through ensure_ready — voice,
+        # wheel, Iris planner, phone-driver, etc.). MainWindow's
+        # reauth-toast gate reads this so a cold Touchless launch on
+        # a machine with no tokens never ambushes the user with a
+        # popup they didn't ask for. See record_command_attempt().
+        self._command_attempted_since_launch: bool = False
         self._load_credentials()
         self._load_tokens()
+        # v1.1.7.3 (dad rig 2026-08-19): proactive refresh at startup.
+        # If we loaded a refresh_token from disk, kick off a refresh
+        # RIGHT NOW so the first API call has a fresh access_token
+        # instead of eating a 401 → refresh → retry round-trip.
+        # This is the "users don't have to reconnect" experience the
+        # user asked for: as long as the refresh_token is valid,
+        # everything Just Works without the user seeing any prompt.
+        # If the refresh fails (refresh_token was server-revoked, no
+        # network, etc.), we silently fall through — the popup gate
+        # in main_window._check_spotify_at_startup will notice
+        # has_authorization=False and fire the reconnect prompt.
+        try:
+            if self._refresh_token and self._client_id:
+                try:
+                    _ok = self._refresh_access_token()
+                except Exception:
+                    _ok = False
+                try:
+                    import sys as _sys
+                    _sys.stderr.write(
+                        f"[spotify] proactive startup refresh: ok={_ok} "
+                        f"has_access={bool(self._access_token)} "
+                        f"has_refresh={bool(self._refresh_token)}\n"
+                    )
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     @property
     def available(self) -> bool:
@@ -191,6 +249,15 @@ class SpotifyController:
         if not self._available:
             self._message = "spotify unavailable on this platform"
             return False
+        # Every user-facing Spotify method (play/pause/next/prev/
+        # set_volume/play_search_request/add_current_track_to_queue/
+        # focus_or_open_window's async worker) funnels through
+        # ensure_ready, so flipping the latch here covers voice,
+        # wheel, and Iris planner paths in one shot. Deliberately
+        # NOT put inside _ensure_authenticated — that one runs from
+        # background probes (is_active_device_available refresh,
+        # get_player_state polling) that are NOT user-initiated.
+        self._command_attempted_since_launch = True
         if not self._ensure_authenticated():
             return False
 
@@ -318,6 +385,14 @@ class SpotifyController:
         # spins up. For verifying a fresh launch we want to know
         # the *interactive* client started, so we accept the match
         # only when the executable has a meaningful size (>1MB).
+        # r50: 1 s TTL cache. See __init__ for rationale.
+        _now = time.monotonic()
+        if (
+            self._has_real_spotify_cache is not None
+            and _now < self._has_real_spotify_cache_until
+        ):
+            return self._has_real_spotify_cache
+        result = False
         try:
             for proc in psutil.process_iter(["name", "exe"]):
                 name = (proc.info.get("name") or "").lower()
@@ -325,15 +400,20 @@ class SpotifyController:
                     continue
                 exe_path = proc.info.get("exe")
                 if not exe_path:
-                    return True
+                    result = True
+                    break
                 try:
                     if Path(exe_path).stat().st_size > 1024 * 1024:
-                        return True
+                        result = True
+                        break
                 except Exception:
-                    return True
+                    result = True
+                    break
         except Exception:
-            return False
-        return False
+            result = False
+        self._has_real_spotify_cache = result
+        self._has_real_spotify_cache_until = _now + self._has_real_spotify_cache_seconds
+        return result
 
     def is_running(self) -> bool:
         try:
@@ -396,7 +476,14 @@ class SpotifyController:
         return {"device_id": self._device_id}
 
     def play(self) -> bool:
-        if not self.ensure_ready(open_if_needed=True):
+        # r51: was open_if_needed=True which caused every skip/pause
+        # gesture to auto-launch PC Spotify even when the user was
+        # controlling a phone / other Web-API device. Now this method
+        # ROUTES to whatever device the Web API considers active; it
+        # NEVER launches PC Spotify on its own. Right-hand 'two',
+        # voice "open spotify", and the wheel-selected launch action
+        # still launch via their own explicit code paths.
+        if not self.ensure_ready(open_if_needed=False):
             self._message = "spotify play failed (not ready)"
             return False
         status, body = self._request_json("PUT", "/me/player/play", params=self._device_params())
@@ -416,10 +503,19 @@ class SpotifyController:
             _sys.stderr.flush()
         except Exception:
             pass
-        self._message = f"spotify play failed (status {status})"
+        # Route through _format_error_message so PREMIUM_REQUIRED /
+        # NO_ACTIVE_DEVICE / missing-scope 403s all surface a real
+        # human-readable message to the user instead of a numeric
+        # status. Pre-v1.1.7 the raw "(status 404)" text told users
+        # nothing about what to actually do.
+        self._message = self._format_error_message("spotify play failed", status, body)
         return False
 
     def pause(self) -> bool:
+        # r51: was open_if_needed=True. Reverting to False for the
+        # same reason play() reverted — user reported swipes/pause
+        # gestures auto-launching PC Spotify even with a phone-active
+        # device on the Web API. Route to the active device instead.
         if not self.ensure_ready(open_if_needed=False):
             self._message = "spotify pause failed (not ready)"
             return False
@@ -433,27 +529,31 @@ class SpotifyController:
             _sys.stderr.flush()
         except Exception:
             pass
-        self._message = f"spotify pause failed (status {status})"
+        self._message = self._format_error_message("spotify pause failed", status, body)
         return False
 
     def next_track(self) -> bool:
-        if not self.ensure_ready(open_if_needed=True):
+        # r51: was open_if_needed=True. See play() for rationale.
+        if not self.ensure_ready(open_if_needed=False):
+            self._message = "spotify next failed (not ready)"
             return False
-        status, _ = self._request_json("POST", "/me/player/next", params=self._device_params())
+        status, body = self._request_json("POST", "/me/player/next", params=self._device_params())
         if status in {200, 202, 204}:
             self._message = "spotify next track"
             return True
-        self._message = f"spotify next failed (status {status})"
+        self._message = self._format_error_message("spotify next failed", status, body)
         return False
 
     def previous_track(self) -> bool:
-        if not self.ensure_ready(open_if_needed=True):
+        # r51: was open_if_needed=True. See play() for rationale.
+        if not self.ensure_ready(open_if_needed=False):
+            self._message = "spotify previous failed (not ready)"
             return False
-        status, _ = self._request_json("POST", "/me/player/previous", params=self._device_params())
+        status, body = self._request_json("POST", "/me/player/previous", params=self._device_params())
         if status in {200, 202, 204}:
             self._message = "spotify previous track"
             return True
-        self._message = f"spotify previous failed (status {status})"
+        self._message = self._format_error_message("spotify previous failed", status, body)
         return False
 
     def toggle_repeat_track(self) -> bool:
@@ -465,30 +565,32 @@ class SpotifyController:
         params = {"state": target_mode}
         if self._device_id:
             params["device_id"] = self._device_id
-        status, _ = self._request_json("PUT", "/me/player/repeat", params=params)
+        status, body = self._request_json("PUT", "/me/player/repeat", params=params)
         # Same Spotify quirk as play/pause/next/prev: status can come
         # back as 200 (with non-JSON body) when the request lands on
         # the desktop client, even though the docs only mention 204.
         if status in {200, 202, 204}:
             self._message = f"spotify repeat {target_mode}"
             return True
-        self._message = f"spotify repeat failed (status {status})"
+        self._message = self._format_error_message("spotify repeat failed", status, body)
         return False
 
     def toggle_shuffle(self) -> bool:
         player = self.get_player_state()
-        if player is None and not self.ensure_ready(open_if_needed=True):
+        # r51: was open_if_needed=True. See play() for rationale.
+        if player is None and not self.ensure_ready(open_if_needed=False):
+            self._message = "spotify shuffle failed (not ready)"
             return False
         current_state = bool((player or {}).get("shuffle_state"))
         target_state = not current_state
         params = {"state": "true" if target_state else "false"}
         if self._device_id:
             params["device_id"] = self._device_id
-        status, _ = self._request_json("PUT", "/me/player/shuffle", params=params)
+        status, body = self._request_json("PUT", "/me/player/shuffle", params=params)
         if status in {200, 202, 204}:
             self._message = f"spotify shuffle {'on' if target_state else 'off'}"
             return True
-        self._message = f"spotify shuffle failed (status {status})"
+        self._message = self._format_error_message("spotify shuffle failed", status, body)
         return False
 
     def get_volume(self) -> int | None:
@@ -562,7 +664,7 @@ class SpotifyController:
         worker.start()
         return True
 
-    def dispatch_async(self, callable_obj, *args, **kwargs) -> None:
+    def dispatch_async(self, callable_obj, *args, on_complete=None, **kwargs) -> None:
         # Fire-and-forget runner for synchronous Spotify HTTP calls
         # (next_track, previous_track, toggle_playback, etc.). The
         # gesture worker calls these from inside its main loop;
@@ -577,11 +679,26 @@ class SpotifyController:
         # decision pay a fresh HTTP call, undoing the cache's
         # whole reason to exist. focus_or_open_window already
         # invalidates separately when it actually opens Spotify.
+        #
+        # v1.1.7 tester bug: the router used to set the "last action"
+        # label optimistically BEFORE the HTTP call returned, so a
+        # failed request (Premium user with no active device, etc.)
+        # never showed anything to the user — the wheel confirmed
+        # "spotify play/pause" as if it worked. `on_complete` is a
+        # thread-safe callback fired AFTER the request settles; the
+        # router uses it to overwrite the optimistic text with the
+        # real result. Called as on_complete(bool_result, message_str).
         def _runner():
+            result = None
             try:
-                callable_obj(*args, **kwargs)
+                result = callable_obj(*args, **kwargs)
             except Exception:
                 pass
+            if on_complete is not None:
+                try:
+                    on_complete(bool(result), str(self._message or ""))
+                except Exception:
+                    pass
 
         worker = threading.Thread(target=_runner, name="spotify-action", daemon=True)
         worker.start()
@@ -818,19 +935,24 @@ class SpotifyController:
         return True
 
     def is_active_for_wheel(self) -> bool:
-        # Wheel only engages when Spotify is genuinely available for
-        # control: either it has a visible window the user can
-        # interact with, or the Spotify Web API confirms an active
-        # device (might be playing on the user's phone). Stricter
-        # than the previous is_running() check, which considered
-        # Spotify protocol-handler / helper processes as "running"
-        # and surfaced wheel slices that did nothing useful.
+        # r51: wheel is now a PC-Spotify-UI feature, not a Web-API
+        # remote. Prior logic returned True whenever the Web API
+        # confirmed any device (phone, tablet, Bluetooth speaker) —
+        # which meant the wheel opened even with PC Spotify fully
+        # closed if any other device was on the account. User
+        # reported the wheel showing up unexpectedly. Now the gate
+        # requires an actual desktop Spotify.exe process OR a
+        # visible Spotify window on this PC. Web-API-only routing
+        # continues to work for fist/skip/swipe via the standard
+        # gesture router (see spotify_gesture_router.py).
         if self.is_window_open():
             return True
-        player = self.get_player_state()
-        if player is not None:
-            return True
-        self._message = "spotify not running"
+        try:
+            if self._has_real_spotify_process():
+                return True
+        except Exception:
+            pass
+        self._message = "spotify not running on this PC"
         return False
 
     def add_current_track_to_queue(self) -> bool:
@@ -983,23 +1105,91 @@ class SpotifyController:
 
     def _format_error_message(self, prefix: str, status: int | None, payload: Any) -> str:
         detail = ""
+        reason = ""
         if isinstance(payload, dict):
             inner = payload.get("error")
             if isinstance(inner, dict):
                 msg = inner.get("message")
                 if isinstance(msg, str) and msg:
                     detail = msg
+                # Spotify 403 responses include a `reason` code
+                # separate from the human `message`. Distinguishing
+                # PREMIUM_REQUIRED / NO_ACTIVE_DEVICE / missing scope
+                # is critical because they need very different user
+                # actions — the pre-refactor code lumped all 403s
+                # into "missing scope — re-authorize" which sent
+                # Free-tier users into an infinite reauth loop that
+                # cannot fix their actual (Premium-gated) problem.
+                r = inner.get("reason")
+                if isinstance(r, str) and r:
+                    reason = r.upper()
             elif isinstance(inner, str):
                 detail = inner
         elif isinstance(payload, str):
             detail = payload.strip()
-        if status == 403 and ("scope" in detail.lower() or not detail):
-            return f"{prefix} (403 missing scope — re-authorize Spotify in Settings)"
+        # 404 with NO_ACTIVE_DEVICE is Spotify's normal response on
+        # play/pause/next/prev/shuffle/repeat when no Connect device
+        # is currently active for the OAuth'd account. This is the
+        # single most common cause of "controls don't work" in the
+        # v1.1.7 tester bug report — dad's Premium account was fine,
+        # but the OAuth'd account had no active device visible.
+        if status == 404 and reason == "NO_ACTIVE_DEVICE":
+            self._latch_transient_failure("NO_ACTIVE_DEVICE", prefix)
+            return (
+                f"{prefix} — no active Spotify device. Open the "
+                "Spotify app on your PC or phone, sign in with the "
+                "SAME account you connected in Touchless Settings, "
+                "start playing any song, then try the gesture again."
+            )
+        if status == 403:
+            if reason == "PREMIUM_REQUIRED":
+                self._latch_transient_failure("PREMIUM_REQUIRED", prefix)
+                return (
+                    f"{prefix} — Spotify Premium is required to control "
+                    "playback via the Spotify API. Free accounts can't "
+                    "play/pause/skip/change volume remotely (this is a "
+                    "Spotify restriction, not a Touchless limit). "
+                    "Upgrade to Premium at spotify.com/premium to use "
+                    "Touchless's Spotify controls."
+                )
+            if reason == "NO_ACTIVE_DEVICE":
+                self._latch_transient_failure("NO_ACTIVE_DEVICE", prefix)
+                return (
+                    f"{prefix} — no active Spotify device. Open the "
+                    "Spotify app (desktop, phone, or web player), "
+                    "start playing any track, then try again."
+                )
+            if "scope" in detail.lower() or not detail:
+                self._latch_transient_failure("MISSING_SCOPE", prefix)
+                return f"{prefix} (403 missing scope — re-authorize Spotify in Settings)"
         if status is None:
             return f"{prefix} (network error)"
         if detail:
             return f"{prefix} ({status}: {detail})"
         return f"{prefix} ({status})"
+
+    def _latch_transient_failure(self, category: str, prefix: str) -> None:
+        """Store the last actionable failure so the UI can surface a
+        themed dialog with the right button (Open Spotify, Reconnect,
+        Learn about Premium). One-shot — read via take_transient_failure
+        and cleared there so a rapid-fire gesture doesn't spam popups
+        (per-category rate limit lives in main_window)."""
+        try:
+            self._last_transient_failure = {
+                "category": category,
+                "prefix": prefix,
+                "at": time.monotonic(),
+            }
+        except Exception:
+            self._last_transient_failure = {"category": category, "prefix": prefix, "at": 0.0}
+
+    def take_transient_failure(self) -> dict | None:
+        """MainWindow polls this per debug frame. Returns the latched
+        failure dict (category / prefix / at) or None; clears the latch
+        so subsequent polls return None until the next failure."""
+        f = self._last_transient_failure
+        self._last_transient_failure = None
+        return f
 
     def authorize_full_scopes(self, *, port: int = 5000, timeout_seconds: float = 180.0) -> bool:
         """Open Spotify's OAuth flow in the user's browser using
@@ -1259,27 +1449,42 @@ class SpotifyController:
 
     def _resolve_persistent_token_path(self) -> Path:
         """Return the per-user, update-survival path Spotify tokens
-        should be written to. Always ~/Documents/Touchless/
-        auth_token.json on Windows; the parent directory is
-        created on demand so the very-first OAuth on a fresh
-        install doesn't fail just because Documents/Touchless/
-        doesn't exist yet."""
+        should be written to.
+
+        v1.1.7.3 (dad rig 2026-08-19): unified to ~/.touchless/
+        auth_token.json so all Touchless user data lives in ONE
+        folder instead of being split across ~/.touchless/settings.json
+        AND ~/Documents/Touchless/auth_token.json. That was confusing
+        UX and made it harder to reason about what an uninstall
+        preserves. Legacy Documents/Touchless/ path is still consulted
+        on load (see _default_token_paths) so existing users keep
+        their tokens without needing to re-authorize.
+        """
         home = Path.home()
-        target = home / "Documents" / "Touchless" / "auth_token.json"
+        target = home / ".touchless" / "auth_token.json"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
         except Exception:
-            # If we can't create the per-user folder for any reason
-            # (locked-down corporate environment, etc.) fall back to
-            # the legacy install-dir path. The user might lose tokens
-            # on update but at least the OAuth flow completes.
-            return self._token_paths[0]
+            # Fall back to the legacy Documents/Touchless/ path if we
+            # can't create ~/.touchless/ for some reason.
+            try:
+                legacy = home / "Documents" / "Touchless" / "auth_token.json"
+                legacy.parent.mkdir(parents=True, exist_ok=True)
+                return legacy
+            except Exception:
+                return self._token_paths[0]
         return target
 
     def _default_token_paths(self) -> tuple[Path, ...]:
         home = Path.home()
         return (
+            # v1.1.7.3: unified location — checked first so tokens
+            # written by 1.1.7.3+ load cleanly.
+            home / ".touchless" / "auth_token.json",
             self._repo_root / "auth_token.json",
+            # Legacy Documents/Touchless/ path — preserved so users
+            # who authorized on older builds keep their tokens across
+            # the upgrade without needing to re-auth.
             home / "Documents" / "Touchless" / "auth_token.json",
             home / "Documents" / "HandGestureControl" / "HGRApp" / "auth_token.json",
             home / "Documents" / "HandAI" / "HandMeshLive" / "src" / "auth_token.json",
@@ -1574,6 +1779,50 @@ class SpotifyController:
         frame. Re-arms only on the next refresh failure."""
         self._needs_reauth = False
 
+    @property
+    def command_attempted_since_launch(self) -> bool:
+        """True once the user has actively invoked ANY user-facing
+        Spotify method this session (gesture latch, voice command,
+        wheel action, Iris planner call, etc.). MainWindow's reauth-
+        toast gate reads this so a cold launch on a machine with no
+        Spotify tokens never surprises the user with a modal until
+        they've actually tried to use Spotify."""
+        return bool(self._command_attempted_since_launch)
+
+    def record_command_attempt(self) -> None:
+        """Flip the 'user tried to use Spotify' latch. Called by the
+        gesture router when an actionable static/dynamic gesture
+        latches, and by ensure_ready() so every voice / wheel / Iris
+        planner path is covered too. Cheap: one bool write, no I/O,
+        no lock. Idempotent — once True stays True for the session."""
+        self._command_attempted_since_launch = True
+
+    def readiness_state(self) -> str:
+        """Cheap local check for the reauth-toast gate in MainWindow.
+
+        Returns one of:
+          READY         — access or refresh token loaded, no
+                          server-side rejection latched
+          NEEDS_REAUTH  — a stored refresh token was rejected by
+                          Spotify's /api/token endpoint (revoked,
+                          expired, password changed)
+          NO_TOKENS     — client_id resolved, but no auth_token.json
+                          on disk (fresh install, or user wiped
+                          ~/Documents/Touchless/ and re-installed)
+          NO_CLIENT_ID  — no client_id even from the embedded default
+                          (shouldn't happen in shipped builds)
+
+        Pure attribute reads — no HTTP, no disk, no lock. Called
+        once per debug frame from MainWindow's reauth-toast gate;
+        aggregate cost is well under a microsecond."""
+        if self._needs_reauth:
+            return "NEEDS_REAUTH"
+        if not self._client_id:
+            return "NO_CLIENT_ID"
+        if not (self._access_token or self._refresh_token):
+            return "NO_TOKENS"
+        return "READY"
+
     def _request_json(
         self,
         method: str,
@@ -1707,7 +1956,14 @@ class SpotifyController:
                 "play": bool(play),
             },
         )
-        return status == 204
+        # v1.1.7 fix: Spotify Web API's transfer-playback endpoint
+        # commonly returns 202 (accepted, still processing) as well
+        # as the documented 204. Requiring exactly 204 caused
+        # ensure_ready to falsely report "device activation failed"
+        # on a real 202 response, and the caller silently aborted.
+        # Accept 200/202/204 to match the same treatment play/pause
+        # already use for the actual playback endpoints.
+        return status in (200, 202, 204)
 
     def _search_best_playable(self, query: str, preferred_types: tuple[str, ...]) -> dict[str, Any] | None:
         if preferred_types and preferred_types[0] == "playlist":
@@ -1974,7 +2230,12 @@ class SpotifyController:
         except Exception:
             handles = []
         self._handles_cache = list(handles)
-        self._handles_cache_until = now + 1.0
+        # r42: raised TTL 1.0s -> 5.0s to match chrome/youtube
+        # controllers. Prevents the per-second cache-miss frame from
+        # blocking on psutil.process_iter + EnumWindows when the
+        # process count is inflated (e.g. Spotify's ~10-20 helper
+        # procs on launch pushing chrome_controller's scan cost up).
+        self._handles_cache_until = now + 5.0
         return handles
 
     def _wait_for_window_handles(self, timeout_seconds: float = 15.0) -> list[int]:

@@ -110,6 +110,12 @@ def _log(msg: str) -> None:
 
 
 StatusCallback = Callable[[str, dict], None]
+# Phone → PC text command (e.g. "pause spotify", "open chrome"). The
+# callback runs on the asyncio thread; the MainWindow wires it through
+# a Qt signal so dispatch happens on the GUI thread alongside voice
+# commands. Return value is ignored — the PC reports the dispatch
+# result back to the phone asynchronously via `publish_event`.
+TextCommandCallback = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -124,6 +130,10 @@ class PhoneCameraServer:
     def __init__(self, port: int = 8765, on_status: Optional[StatusCallback] = None) -> None:
         self._port = int(port)
         self._on_status = on_status
+        # Optional handler for phone → PC text commands (POST /command).
+        # Set by the MainWindow via set_text_command_callback after the
+        # voice processor is constructed at engine start.
+        self._on_text_command: Optional[TextCommandCallback] = None
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._runner: Optional[web.AppRunner] = None
@@ -216,6 +226,15 @@ class PhoneCameraServer:
     def set_status_callback(self, on_status: Optional[StatusCallback]) -> None:
         self._on_status = on_status
 
+    def set_text_command_callback(self, on_text_command: Optional[TextCommandCallback]) -> None:
+        """Install the phone-text-command bridge. The callback receives a
+        single text string from the phone's /command POST. Fired on the
+        asyncio loop thread — the wired MainWindow handler MUST be fast
+        + non-blocking (emit a Qt signal, return). Dispatch happens on
+        the GUI thread and the result is reported back to the phone via
+        `publish_event("command_result", ...)`."""
+        self._on_text_command = on_text_command
+
     def start(self) -> PhoneCameraServerInfo:
         if self.is_running:
             assert self._info is not None
@@ -301,6 +320,13 @@ class PhoneCameraServer:
         app.router.add_get("/touchless-ca.cer", self._handle_cert)
         app.router.add_post("/frame", self._handle_frame)
         app.router.add_post("/audio", self._handle_audio)
+        # POST /command — phone sends a text command (e.g. "pause spotify",
+        # "open chrome"). Server hands the string off to the host (Main-
+        # Window) via the text-command callback, which dispatches through
+        # the existing voice-command processor on the GUI thread. Result
+        # is reported back asynchronously via the SSE stream
+        # (kind="command_result") so the phone shows a confirmation toast.
+        app.router.add_post("/command", self._handle_command)
         # Server-Sent Events stream pushed FROM the PC TO the phone.
         # Used to display gesture / voice toast notifications on the
         # phone screen so the user gets live feedback that the PC
@@ -432,6 +458,54 @@ class PhoneCameraServer:
             _log(f"POST /audio first chunk from {peer} size={len(payload)} bytes")
             self._emit_status("audio_streaming", {"bytes": len(payload)})
         return web.Response(status=204, text="")
+
+    async def _handle_command(self, request: web.Request) -> web.Response:
+        """Accept a phone-side text command and hand it off to the host
+        for dispatch via the existing voice-command processor.
+
+        Expected body: JSON `{"text": "pause spotify"}` or raw text.
+        Returns 202 on accepted (queued for GUI-thread dispatch) or 503
+        when no host callback is wired (engine not running). Actual
+        dispatch result is reported back via the SSE stream
+        (event kind="command_result") so the phone can render a toast.
+
+        TODO(iris-prompt): when the user has an Iris paid plan, also
+        expose a `mode` field in the body (e.g. {"text": "...", "mode":
+        "iris"}) so the phone can send free-form prompts to the Iris
+        Live API agent instead of (or alongside) the deterministic
+        voice-command processor. Out of scope for the initial cut.
+        """
+        peer = self._peer(request)
+        try:
+            raw = await request.read()
+        except Exception as exc:
+            _log(f"POST /command from {peer} read error: {type(exc).__name__}")
+            return web.Response(status=400, text="read failed")
+        text = ""
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+            if isinstance(payload, dict):
+                text = str(payload.get("text", "") or "").strip()
+            elif isinstance(payload, str):
+                text = payload.strip()
+        except (ValueError, UnicodeDecodeError):
+            # Allow raw text/plain body as a fallback for clients that
+            # don't want to wrap a single string in JSON.
+            try:
+                text = raw.decode("utf-8", errors="replace").strip()
+            except Exception:
+                text = ""
+        if not text:
+            return web.Response(status=400, text="empty command")
+        if self._on_text_command is None:
+            return web.Response(status=503, text="text commands not available — start the engine")
+        try:
+            self._on_text_command(text)
+        except Exception as exc:
+            _log(f"POST /command dispatch error: {type(exc).__name__}: {exc}")
+            return web.Response(status=500, text="dispatch failed")
+        _log(f"POST /command from {peer} text={text!r}")
+        return web.json_response({"queued": True, "text": text}, status=202)
 
     def _emit_status(self, event: str, data: dict) -> None:
         if self._on_status is None:

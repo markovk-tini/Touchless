@@ -89,6 +89,11 @@ class _ActiveTakeBuffer:
 
     started_at: float
     landmarks: List[np.ndarray] = field(default_factory=list)
+    # Per-frame absolute wrist position divided by palm scale.
+    # NOT wrist-subtracted — carries the whole-hand translation signal
+    # that the wrist-relative `landmarks` discards. The classifier uses
+    # this as its second DTW channel.
+    wrist_palm_scaled: List[np.ndarray] = field(default_factory=list)
     timestamps: List[float] = field(default_factory=list)
     handedness: Optional[str] = None
 
@@ -267,8 +272,13 @@ class DynamicGestureRecorder:
         # wall-clock (live engine) or deterministic test timestamps.
         if not self._active.landmarks:
             self._active.started_at = ts
-        normalized = normalize_frame(landmarks.astype(np.float32), float(palm_scale))
+        raw = landmarks.astype(np.float32)
+        scale = max(float(palm_scale), 1e-6)
+        # Capture absolute wrist BEFORE normalize_frame subtracts it.
+        wrist_ps = (raw[0] / scale).astype(np.float32)
+        normalized = normalize_frame(raw, scale)
         self._active.landmarks.append(normalized.astype(np.float32))
+        self._active.wrist_palm_scaled.append(wrist_ps)
         self._active.timestamps.append(ts)
         if handedness and self._active.handedness is None:
             # First handedness reading wins so a momentary classifier
@@ -326,8 +336,10 @@ class DynamicGestureRecorder:
                 landmarks=zeros,
                 handedness=self._active.handedness,
                 raw_duration_seconds=0.0,
+                wrist_palm_scaled=np.zeros((1, 3), dtype=np.float32),
             )
         landmarks = np.stack(self._active.landmarks, axis=0)
+        wrist = np.stack(self._active.wrist_palm_scaled, axis=0) if self._active.wrist_palm_scaled else None
         timestamps = np.asarray(self._active.timestamps, dtype=np.float64)
         duration = float(timestamps[-1] - timestamps[0]) if timestamps.size > 1 else 0.0
         return DynamicGestureTake(
@@ -335,6 +347,7 @@ class DynamicGestureRecorder:
             landmarks=landmarks,
             handedness=self._active.handedness,
             raw_duration_seconds=duration,
+            wrist_palm_scaled=wrist,
         )
 
     def _transition(self, new_state: RecorderState) -> None:

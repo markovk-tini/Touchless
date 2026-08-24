@@ -41,11 +41,52 @@ class LLMPlanner:
                        or DEFAULT_MODEL)
 
     def plan(self, goal: str, memory_context: str = "") -> Optional[Plan]:
-        if not configured() or self._registry is None:
+        if self._registry is None:
+            return None
+        # Phase-3 wiring: consult the ModelRouter. When the user is
+        # over their daily cost cap (or has explicitly forced local
+        # via TOUCHLESS_FORCE_LOCAL_MODELS=1), the router returns
+        # tier='local'. The OpenAI-only planner can't run locally,
+        # so we return None and the caller falls through to the
+        # local-model path or surfaces a "budget exhausted" message.
+        chosen_provider = "openai"
+        try:
+            from ..model_router import (LatencyBudget, TaskKind,
+                                         global_router)
+            decision = global_router().route(
+                kind=TaskKind.PLANNER,
+                latency=LatencyBudget.FAST,
+                est_input_tokens=len(goal) // 3,
+            )
+            if decision.tier == "local":
+                if self._logger:
+                    self._logger.event("planner_llm_routed_to_local",
+                                       reason=decision.reason)
+                return None
+            chosen_provider = decision.provider
+            self._model = decision.model_id or self._model
+        except Exception:
+            pass  # router unavailable → keep default behavior
+        # Provider gate: only proceed when the chosen provider is
+        # actually configured. Fall through to OpenAI as the safe
+        # default when the router picked Anthropic but no key set.
+        if chosen_provider == "anthropic":
+            from .. import anthropic_client
+            if not anthropic_client.configured():
+                # No Anthropic key → fall back to OpenAI default.
+                chosen_provider = "openai"
+                self._model = DEFAULT_MODEL
+        if chosen_provider == "openai" and not configured():
             return None
         try:
             messages = self._build_messages(goal, memory_context=memory_context)
+            if chosen_provider == "anthropic":
+                return self._call_anthropic(goal, messages)
             data = self._call(messages)
+            # Phase-3 wiring: record the spend (input + output token
+            # estimates) so the cost meter actually accumulates and the
+            # cap can fire. Without this every call shows $0.
+            self._maybe_record_cost(messages, data)
             return self._parse(goal, data, self._known_tool_names())
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
@@ -57,6 +98,73 @@ class LLMPlanner:
             if self._logger:
                 self._logger.exception("planner_llm_failed", exc)
             return None
+
+    def _call_anthropic(self, goal: str,
+                        messages: List[Dict[str, Any]]
+                        ) -> Optional[Plan]:
+        """Phase-4 multi-provider: when the router picks Haiku /
+        Sonnet, call Anthropic's Messages API instead of OpenAI.
+        Mirrors the JSON-mode + parse flow of `_call` + `_parse`."""
+        from .. import anthropic_client
+        # Anthropic's API uses a top-level `system` param + only
+        # user/assistant in messages. Split the system prompt out.
+        system_blocks: Any = None
+        user_messages: List[Dict[str, Any]] = []
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content")
+            if role == "system":
+                system_blocks = content
+            else:
+                user_messages.append({
+                    "role": "user" if role == "user" else "assistant",
+                    "content": content,
+                })
+        text, usage = anthropic_client.call_messages(
+            model=self._model,
+            system=system_blocks,
+            messages=user_messages,
+            max_tokens=1024,
+            json_mode=True,
+        )
+        if text is None:
+            return None
+        try:
+            anthropic_client.record_spend(
+                self._model, usage,
+                fallback_in_chars=sum(
+                    len(str(m.get("content") or "")) for m in messages),
+                fallback_out_chars=len(text),
+            )
+        except Exception:
+            pass
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        return self._parse(goal, data, self._known_tool_names())
+
+    def _maybe_record_cost(self, messages: List[Dict[str, Any]],
+                           data: Dict[str, Any]) -> None:
+        """Record this call's token spend against the global CostMeter.
+        Falls back to a cheap estimate when the API didn't return
+        usage (some streaming paths)."""
+        try:
+            from ..cost_meter import global_meter
+            usage = data.get("usage") if isinstance(data, dict) else None
+            if isinstance(usage, dict):
+                tokens_in = int(usage.get("prompt_tokens") or 0)
+                tokens_out = int(usage.get("completion_tokens") or 0)
+            else:
+                # ~4 chars/token rough estimate.
+                tokens_in = sum(len(str(m.get("content") or ""))
+                                for m in messages) // 4
+                tokens_out = 200  # planner replies are small
+            global_meter().record(self._model,
+                                  tokens_in=tokens_in,
+                                  tokens_out=tokens_out)
+        except Exception:
+            pass
 
     # ---- prompt + tool catalog --------------------------------------------
     def _build_messages(self, goal: str,
@@ -142,6 +250,18 @@ class LLMPlanner:
             '{"id":2,"tool":"gmail_send","args":{"to":'
             '"{step:1.contacts[0].emails[0]}","subject":"Hi",'
             '"body":"Hi Dani!"},"depends_on":[1]}'
+            '],"final":"return"}\n\n'
+            "Example for 'create a sheet called Contacts and add headers "
+            "Name, Email, Phone' — sheets_create does NOT accept a headers "
+            "arg, so appending headers is ALWAYS a second step. Reference "
+            "the new sheet's id as {step:1.id} (that's what sheets_create "
+            "returns; do NOT invent a spreadsheet_id):\n"
+            '{"goal":"create sheet Contacts with headers Name, Email, Phone",'
+            '"steps":['
+            '{"id":1,"tool":"sheets_create","args":{"title":"Contacts"}},'
+            '{"id":2,"tool":"sheets_append_rows","args":{'
+            '"spreadsheet_id":"{step:1.id}",'
+            '"rows":[["Name","Email","Phone"]]},"depends_on":[1]}'
             '],"final":"return"}\n\n'
             "Example for 'create google doc called Iris Debrief and write a "
             "debrief about weather and emails' — when the next step needs "

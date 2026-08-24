@@ -168,6 +168,25 @@ if not "%SKIP_SIGNING%"=="1" (
   echo [3/6] Skipping signing of Touchless.exe ^(SKIP_SIGNING=1^)
 )
 
+REM v1.1.7.7 (dad rig 2026-08-22): sign every internal .exe under
+REM dist\Touchless\_internal too. Norton flagged whisper-server.exe as
+REM Win64:Evo-gen [Trj] on 1.1.7.6 installs — a heuristic false positive
+REM Norton's engine fires on unsigned OSS C++ binaries (whisper.cpp,
+REM llama.cpp, ffmpeg builds). Signing them with our publisher cert
+REM bypasses the heuristic. Cost: ~4 minutes for ~50 files. Idempotent
+REM — re-runs skip files that already have a valid signature.
+if not "%SKIP_SIGNING%"=="1" (
+  echo [3.5/6] Signing internal binaries...
+  call "%ROOT%\signing\sign-all-internal.bat" "%ROOT%\dist\Touchless"
+  if !errorlevel! neq 0 (
+    echo [ERROR] Signing internal binaries failed. Set SKIP_SIGNING=1 to bypass for dev builds.
+    popd
+    exit /b 1
+  )
+) else (
+  echo [3.5/6] Skipping signing of internal binaries ^(SKIP_SIGNING=1^)
+)
+
 REM Pack the dist tree into the payload zip BEFORE running ISCC, so
 REM the SHA256 we bake into the stub matches the bytes we'll upload.
 if not exist "%ROOT%\release" mkdir "%ROOT%\release"

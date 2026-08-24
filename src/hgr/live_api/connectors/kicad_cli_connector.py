@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .base import Connector, connector_result
+from .base import Connector, connector_result, friendly_api_error
 from ...utils.subprocess_utils import hidden_subprocess_kwargs
 
 
@@ -254,7 +254,7 @@ class KiCadCliConnector(Connector):
 
         except Exception as exc:
             return connector_result(
-                "error", error=f"{type(exc).__name__}: {exc}")
+                "error", error=friendly_api_error(exc, api_label="KiCad CLI"))
         return connector_result(
             "error", error=f"unknown kicad tool: {name}", code="no_handler")
 

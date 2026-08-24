@@ -81,6 +81,14 @@ hiddenimports += [
     "PySide6.QtWidgets",
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
+    # Google Picker dialog (app/ui/google_picker_dialog.py) hosts the
+    # Picker widget inside a QWebEngineView and bridges the PICKED
+    # file_id back to Python via QWebChannel. QtWebEngineWidgets is
+    # already collected by the collect_all("PySide6.QtWebEngineWidgets")
+    # block above, but the WebChannel module is separate — listing it
+    # here ensures the frozen bundle can register the pickerBridge
+    # object even if collect_all misses it on a stripped PySide6 build.
+    "PySide6.QtWebChannel",
     # ---- Iris ambient-tools deps (zero-setup for end users) ----------
     # Each is optional at runtime (graceful degrade), but we want them
     # PRESENT in the build so a shipped user gets toast / per-app volume
@@ -243,11 +251,18 @@ def _collect_whisper_runtime(roots):
     # Store-policy compliant, unlike an install-time downloader).
     # Channel is read from TOUCHLESS_BUILD_CHANNEL (set by
     # build_windows.bat: 'store' when STORE=1, else 'website').
+    # v1.1.7.6 (dad rig 2026-08-21): removed medium.en from the website
+    # allowlist. Shipping the 1.5 GB medium.en model in the installer
+    # bloated the payload from ~1.75 GB (1.1.7) to ~3.16 GB (1.1.7.5),
+    # and Windows Defender flagged the unsigned 1.5 GB binary blob during
+    # extraction — dad's install failed 3× with "failed to extract"
+    # errors. Behavior now matches the Store build: ship only small.en
+    # (~490 MB, sufficient for the default dictation flow), and let
+    # users who want higher accuracy pull medium.en at runtime via the
+    # in-app "Voice Recognition Upgrade" download. Same code path the
+    # Store build already used; no functional regression.
     _channel_for_models = os.environ.get("TOUCHLESS_BUILD_CHANNEL", "website").strip().lower()
-    if _channel_for_models == "store":
-        MODEL_ALLOWLIST = {"ggml-small.en.bin"}
-    else:
-        MODEL_ALLOWLIST = {"ggml-small.en.bin", "ggml-medium.en.bin"}
+    MODEL_ALLOWLIST = {"ggml-small.en.bin"}
     collected = []
     seen_models: set[str] = set()
     seen_binaries: set[tuple[str, str]] = set()

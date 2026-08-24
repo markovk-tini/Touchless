@@ -77,8 +77,14 @@ class PhoneConnectDialog(QDialog):
         self.setModal(False)
         self.setMinimumWidth(440)
         self.setStyleSheet(f"PhoneConnectDialog {{ background-color: {self._surface}; }}")
+        # r51: install indigo chrome (previously bare OS-default).
+        from .window_chrome import install_indigo_chrome
+        body = install_indigo_chrome(self, "Connect Phone")
+        # r51 fix: scope background to body only (see spotify_setup_wizard).
+        body.setObjectName("phoneConnectBody")
+        body.setStyleSheet(f"QWidget#phoneConnectBody {{ background: {self._surface}; }}")
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(body)
         root.setContentsMargins(28, 26, 28, 24)
         root.setSpacing(18)
 

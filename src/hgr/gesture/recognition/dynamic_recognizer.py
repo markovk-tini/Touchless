@@ -106,7 +106,17 @@ class DynamicGestureRecognizer:
             if step[0] < -step_threshold:
                 negative_x_steps += 1
 
-        pose_strength = sum(sample.pose_gate for sample in window) / len(window)
+        # r53 v2: allow index-only pose ("one" shape used while
+        # drawing) to also drive the horizontal-swipe pose strength.
+        # Prior version only counted pose_gate (which requires open
+        # hand / at least index+middle extended), so a user in
+        # drawing mode couldn't undo/clear with an index-only sweep.
+        # Take the max at each sample so an open-hand swipe still
+        # scores full strength while an index-only swipe now scores
+        # ~1.0 instead of ~0.3.
+        pose_strength = sum(
+            max(sample.pose_gate, sample.one_pose_gate) for sample in window
+        ) / len(window)
         straightness = clamp01(abs(horizontal) / max(path, 1e-6))
         horizontal_axis_gate = clamp01(((abs(horizontal) / max(vertical + 0.62 * depth, 1e-6)) - 1.35) / 0.90)
         if self.low_fps_mode:
@@ -131,12 +141,20 @@ class DynamicGestureRecognizer:
             path_floor_r = 0.34
             path_floor_l = 0.32
         else:
-            right_h_floor = 0.67
-            left_h_floor = 0.61
-            speed_floor_r = 1.35
-            speed_floor_l = 1.22
-            path_floor_r = 0.80
-            path_floor_l = 0.76
+            # r52: loosened Normal-mode swipe geometry and speed
+            # floors so an ordinary committed swipe registers on
+            # the first try. Prior values (0.67/0.61, 1.35/1.22,
+            # 0.80/0.76) required nearly a full-palm sweep at
+            # 1.2+ palm/s — casual users had to over-swipe. New
+            # floors still sit well above Low-FPS's permissive
+            # values (0.28/0.27, 0.44/0.40, 0.34/0.32) so idle
+            # hand drift still fails the horizontal gates.
+            right_h_floor = 0.50
+            left_h_floor = 0.46
+            speed_floor_r = 0.95
+            speed_floor_l = 0.85
+            path_floor_r = 0.60
+            path_floor_l = 0.58
         right_score = clamp01(
             (
                 0.32 * clamp01((horizontal - right_h_floor) / 0.26)
@@ -236,7 +254,11 @@ class DynamicGestureRecognizer:
             )
         )
         best = ranked[0] if ranked else GestureCandidate("neutral", 0.0, "dynamic")
-        score_floor = 0.34 if self.low_fps_mode else 0.59
+        # r52: Normal score_floor 0.59 → 0.48. Swipes scoring in the
+        # 0.45-0.55 band (moderate committed motion) were silently
+        # dropped to "neutral". 0.48 still sits ~14 pts above the
+        # neutral noise band.
+        score_floor = 0.34 if self.low_fps_mode else 0.48
         if best.score < score_floor:
             return "neutral", ranked, scores
 

@@ -25,11 +25,23 @@ _CHAIN_RE = re.compile(
 )
 
 # "and <verb>" — "...and send him hi", "...also create a doc"
+# CRITICAL: every continuation string here MUST be a raw string (r"...").
+# A regular Python string at the end with `\b` becomes a literal BACKSPACE
+# character (\x08), silently breaking the entire alternation — every search
+# returns None and the verb branch below has to carry the whole detection.
 _AND_VERB_RE = re.compile(
     r"\b(?:and|,)\s+(?:also\s+|then\s+)?(?:please\s+)?"
     r"(?:open|close|send|find|read|search|click|type|press|create|make|"
     r"delete|summarize|summarise|upload|download|navigate|copy|move|"
-    r"email|message|draft|compose|schedule|post|share)\b",
+    r"email|message|draft|compose|schedule|post|share|"
+    # Added after live tests C19/C20: 'and add a task' / 'and set volume'
+    # / 'and remove X' / 'and remind me'. Without these, multi-action
+    # prompts containing common command verbs slip past — Layer 0 then
+    # mis-fires on ONE embedded sub-action (e.g. picks 'set volume to 30'
+    # out of a 3-clause prompt and runs only that).
+    r"add|set|remove|remind|toggle|mute|unmute|"
+    r"translate|rephrase|generate|produce|fetch|"
+    r"play|pause|skip|launch|start)\b",
     re.IGNORECASE,
 )
 
@@ -45,6 +57,14 @@ _ACTION_VERBS = (
     # are deliberately excluded to avoid false-positive multi-action on
     # ordinary single-intent requests like 'tell me Dani's email'.
     "write", "save", "store", "append", "include", "fill", "insert", "record",
+    # Added after live tests C19 ('add a task, set volume, and tell me X')
+    # and C20 ('write a haiku and add a task'): these prompts have 2+ clearly
+    # distinct actions but the two-verb branch counted only 'write' (1 verb)
+    # because 'add' and 'set' were missing here. Same noun-form stripping
+    # below protects against false positives like 'set the table'.
+    "add", "set", "remove", "remind", "toggle", "mute", "unmute",
+    "translate", "rephrase", "generate", "produce", "fetch",
+    "play", "pause", "skip", "launch", "start",
 )
 _VERB_PATTERNS = [re.compile(r"\b" + v + r"\b", re.IGNORECASE) for v in _ACTION_VERBS]
 
@@ -99,6 +119,7 @@ RISKY_TOOLS: frozenset = frozenset({
     # Outbound communication
     "outlook_compose", "outlook_send", "ms_mail_send",
     "gmail_send", "gmail_compose",
+    "email_send",
     "teams_post", "teams_send", "teams_channel_post",
     "slack_post", "slack_send",
     "discord_send",

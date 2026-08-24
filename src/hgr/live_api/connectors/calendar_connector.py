@@ -10,11 +10,16 @@ Author: Konstantin Markov
 """
 from __future__ import annotations
 
+import concurrent.futures
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 
-from .base import Connector, connector_result
+from .base import Connector, connector_result, friendly_api_error
 from .google_client import GoogleClient
+
+_CALENDAR_CALL_TIMEOUT_SEC = 25.0
+_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="calendar")
 
 
 class CalendarConnector(Connector):
@@ -53,6 +58,17 @@ class CalendarConnector(Connector):
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return _pool.submit(self._execute_locked, name, args).result(
+                timeout=_CALENDAR_CALL_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            return connector_result(
+                "error",
+                error=f"{name} timed out after {_CALENDAR_CALL_TIMEOUT_SEC}s",
+                code="timeout",
+            )
+
+    def _execute_locked(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         svc = self._svc()
         if svc is None:
             return connector_result("error", error="Calendar not authorized", code="not_ready")
@@ -72,6 +88,12 @@ class CalendarConnector(Connector):
                 return connector_result("ok", count=len(out), events=out)
 
             if name == "calendar_create_event":
+                try:
+                    from .outlook_com_connector import _diag as _ocl_diag
+                    _ocl_diag(f"calendar_create_event (Google) PICKED "
+                              f"args={args!r}")
+                except Exception:
+                    pass
                 summary = str(args.get("summary") or "").strip()
                 start = str(args.get("start") or "").strip()
                 end = str(args.get("end") or "").strip()
@@ -84,8 +106,20 @@ class CalendarConnector(Connector):
                 if desc:
                     body["description"] = desc
                 created = svc.events().insert(calendarId="primary", body=body).execute()
+                try:
+                    _dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                    try:
+                        start_label = _dt.strftime("%a %b %-d at %-I:%M %p")
+                    except ValueError:
+                        start_label = _dt.strftime("%a %b %#d at %#I:%M %p")
+                except Exception:
+                    start_label = start
                 return connector_result("ok", created=True, id=created.get("id"),
-                                        link=created.get("htmlLink"))
+                                        link=created.get("htmlLink"),
+                                        calendar="Google Calendar",
+                                        summary=f"Added '{summary}' to your "
+                                                f"Google Calendar on "
+                                                f"{start_label}.")
         except Exception as exc:
-            return connector_result("error", error=f"{type(exc).__name__}: {exc}")
+            return connector_result("error", error=friendly_api_error(exc, api_label="Google Calendar"))
         return connector_result("error", error=f"unknown calendar tool: {name}", code="no_handler")

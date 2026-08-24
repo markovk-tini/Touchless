@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from PySide6.QtCore import QEasingCurve, QObject, QPoint, QPointF, QPropertyAnimation, QRect, QSize, Qt, QThread, QTimer, QEvent, QUrl, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPainterPath, QPen, QCursor, QPixmap, QGuiApplication, QImage
+from PySide6.QtGui import QCloseEvent, QColor, QPainter, QPainterPath, QPen, QCursor, QPixmap, QGuiApplication, QImage, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractButton,
     QApplication,
@@ -52,11 +52,12 @@ from PySide6.QtWidgets import (
 )
 
 try:
-    from PySide6.QtMultimedia import QMediaPlayer
+    from PySide6.QtMultimedia import QMediaPlayer, QMediaDevices
     from PySide6.QtMultimediaWidgets import QVideoWidget
     _HAS_QT_MEDIA = True
 except Exception:
     QMediaPlayer = None
+    QMediaDevices = None
     QVideoWidget = None
     _HAS_QT_MEDIA = False
 from ctypes import wintypes
@@ -89,7 +90,7 @@ from ..overlays.overlay import HelloOverlay, ScreenDrawOverlay, DrawingSettingsD
 from .mini_live_viewer import MiniLiveViewer
 from .live_view_window import LiveViewWindow
 from .tutorial_window import TutorialWindow
-from .window_chrome import apply_touchless_chrome
+from .window_chrome import apply_indigo_title_bar, apply_touchless_chrome, touchless_message_box
 
 
 SECTION_INSTRUCTIONS = 0
@@ -143,7 +144,7 @@ WALKTHROUGH_PAGE_HINTS = {
         "What Touchless does and the 30-second start.",
     SECTION_GENERAL:
         "Mouse, overlays, performance, and more. "
-        "Connect Spotify premium "
+        "Set up Spotify "
         "<a href='walkthrough:scroll-to-spotify' style='color: #58E3FF; text-decoration: underline;'>here</a>.",
     SECTION_GESTURES:
         "Every gesture and voice command, with a short demo for each.",
@@ -361,8 +362,14 @@ class WindowControlButton(QAbstractButton):
             else:
                 painter.drawRect(QRect(cx - 4, cy - 4, 8, 8))
         elif self.kind == "close":
-            painter.drawLine(cx - 3, cy - 3, cx + 3, cy + 3)
-            painter.drawLine(cx + 3, cy - 3, cx - 3, cy + 3)
+            # r51: bumped X extent from ±3 (6x6 span) to ±4 (8x8) so
+            # the close glyph is slightly more legible in the main
+            # window title bar. Pen width already 1.95 (vs 1.9 for
+            # min/max) so the X reads a touch thicker; combined with
+            # the wider span it now matches the visual weight of the
+            # native Windows caption glyph.
+            painter.drawLine(cx - 4, cy - 4, cx + 4, cy + 4)
+            painter.drawLine(cx + 4, cy - 4, cx - 4, cy + 4)
 
 
 class TitleBar(QFrame):
@@ -934,9 +941,21 @@ class StartTutorialDialog(QDialog):
         return self.do_not_show_checkbox.isChecked()
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 16, 20, 14)
-        root.setSpacing(8)
+        # Frameless-with-custom-indigo-bar layout. The outer
+        # QVBoxLayout(self) holds the bar (row 0) + a body_container
+        # widget with the ORIGINAL padding (row 1). Rebinding
+        # `root = body_layout` at the end lets the remainder of
+        # this method append into the body unchanged.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(apply_indigo_title_bar(self, "Touchless"))
+        body_container = QWidget(self)
+        body_layout = QVBoxLayout(body_container)
+        body_layout.setContentsMargins(20, 16, 20, 14)
+        body_layout.setSpacing(8)
+        outer.addWidget(body_container)
+        root = body_layout  # rebind: rest of method appends into body
 
         title = QLabel("Would you like to start the tutorial? (2 minuets)")
         title.setObjectName("startDialogTitle")
@@ -1150,9 +1169,18 @@ class WalkthroughStartDialog(QDialog):
         return self.do_not_show_checkbox.isChecked()
 
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 16, 20, 14)
-        root.setSpacing(8)
+        # Frameless-with-custom-indigo-bar layout. See
+        # StartTutorialDialog._build_ui for the pattern.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(apply_indigo_title_bar(self, "Touchless"))
+        body_container = QWidget(self)
+        body_layout = QVBoxLayout(body_container)
+        body_layout.setContentsMargins(20, 16, 20, 14)
+        body_layout.setSpacing(8)
+        outer.addWidget(body_container)
+        root = body_layout  # rebind: rest of method appends into body
 
         title = QLabel("Would you like to start the Touchless walk-through?")
         title.setObjectName("startDialogTitle")
@@ -1326,7 +1354,9 @@ class WalkthroughStartDialog(QDialog):
 class CameraSelectionDialog(QDialog):
     def __init__(self, config: AppConfig, cameras: list[CameraInfo], prompt_text: str, parent=None):
         super().__init__(parent)
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
+        self._body = install_indigo_chrome(self, "Choose Camera")
         self.config = config
         self.cameras = cameras
         self.selected_camera_index: Optional[int] = None
@@ -1342,7 +1372,7 @@ class CameraSelectionDialog(QDialog):
         return self.remember_checkbox.isChecked()
 
     def _build_ui(self, prompt_text: str) -> None:
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(22, 20, 22, 18)
         root.setSpacing(14)
 
@@ -2512,13 +2542,13 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
         ),
         GestureGuideCard(
             title="Left Hand Two",
-            action="Start or stop dictation (beta)",
+            action="Save an instant clip of your chosen duration",
             how_to=(
                 "How To: Face your left palm toward the monitor, extend the index and middle fingers in a V shape, and "
-                "keep the thumb, ring, and pinky closed. Hold the pose steady for about half a second to toggle dictation.\n\n"
-                "Requirements: A working microphone and a text field that has keyboard "
-                "focus — dictation types into whichever window was active when you started. Dictation runs continuously "
-                "until you perform left-hand two a second time to stop, or perform the left-hand fist to cancel."
+                "keep the thumb, ring, and pinky closed. Hold the pose steady for about half a second to save a clip.\n\n"
+                "Requirements: Clipping must be enabled in Save Locations. The clip captures the seconds leading up to "
+                "the gesture and saves silently to your clips folder — no prompt, no dialog. "
+                "You can set the duration to 30 seconds, 1, 2, or 5 minutes under Settings → General → Clip Presets."
             ),
             gesture_key="two",
             image_name="Left Two.png",
@@ -2545,17 +2575,8 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
             gesture_key="four",
             image_name="Left Hand Four.png",
         ),
-        GestureGuideCard(
-            title="Left Hand Fist",
-            action="Cancel any voice command or dictation in progress",
-            how_to=(
-                "How To: Face your left palm toward the monitor and close all five fingers into a tight, compact fist. "
-                "Hold the pose clearly so Touchless reads it as a fist rather than a partially curled hand.\n\n"
-                "Requirements: Only useful while a voice command or dictation is active. Otherwise the gesture does nothing."
-            ),
-            gesture_key="fist",
-            image_name="LeftFist.png",
-        ),
+        # r53: Left Hand Fist card removed — dictation retired, so its
+        # cancel-voice action has nothing to cancel.
         GestureGuideCard(
             title="Right Hand Two",
             action="Open or focus Spotify (requires Spotify Premium)",
@@ -4318,6 +4339,21 @@ class _ExpandCollapseButton(QAbstractButton):
             )
 
 
+class _LiveDeviceDiffBridge(QObject):
+    """Signal-emitter helper so a background thread can hand its
+    enumerated device list back to the MainWindow main thread.
+
+    v1.1.7 round-8 correctness fix: `QTimer.singleShot(0, callable)`
+    from a non-Qt thread is a silent no-op (verified by test) — the
+    prior code path never actually delivered the result, so the
+    3-second diff-timer path was still broken. Signals with the
+    default AutoConnection type queue automatically when emitted
+    cross-thread. Verified working.
+    """
+
+    result_ready = Signal(list)
+
+
 class _RefreshingCameraCombo(_DisplayOverrideCombo):
     """QComboBox that emits `popup_about_to_show` right before its
     dropdown opens, so the camera list can refresh lazily without a
@@ -4562,7 +4598,9 @@ class _MouseMonitorChoiceDialog(QDialog):
 
     def __init__(self, config: AppConfig, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
+        self._body = install_indigo_chrome(self, "Mouse Monitor")
         self._config = config
         self.setWindowTitle("Mouse Monitor")
         self.setObjectName("mouseMonitorChoiceDialog")
@@ -4571,7 +4609,7 @@ class _MouseMonitorChoiceDialog(QDialog):
         self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
 
-        layout = QVBoxLayout(self)
+        layout = QVBoxLayout(self._body)
         layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(10)
 
@@ -4835,7 +4873,9 @@ class CameraPreviewDialog(QDialog):
         external_capture=None,
     ) -> None:
         super().__init__(parent)
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
+        self._body = install_indigo_chrome(self, camera_label or "Camera Preview")
         self.config = config
         # frame_signal path: the camera isn't a local cv2 index (e.g. the
         # phone-QR source while the engine is running). Instead we
@@ -4873,7 +4913,7 @@ class CameraPreviewDialog(QDialog):
 
     def _build_ui(self) -> None:
         from PySide6.QtWidgets import QFrame
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(20, 18, 20, 16)
         root.setSpacing(12)
 
@@ -5162,7 +5202,9 @@ class TouchlessNotice(QDialog):
         cancel_label: str | None = None,
     ) -> None:
         super().__init__(parent)
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
+        self._body = install_indigo_chrome(self, title)
         self._kind = kind
         self.setWindowTitle(title)
         # Tool window: still has a close button, won't show its own
@@ -5214,7 +5256,7 @@ class TouchlessNotice(QDialog):
             "  background: rgba(255,255,255,0.14);"
             "}"
         )
-        layout = QVBoxLayout(self)
+        layout = QVBoxLayout(self._body)
         layout.setContentsMargins(SPACE_XL, SPACE_LG + 2, SPACE_XL, SPACE_LG)
         layout.setSpacing(SPACE_MD)
 
@@ -5420,6 +5462,11 @@ class TouchlessPrivacyDialog(QDialog):
             "TouchlessPrivacyDialog, QDialog#privacyDialog {"
             f"  background-color: {surface_color};"
             "  color: #E5F6FF;"
+            # Frameless windows lose the OS drop-shadow; a 1px
+            # translucent teal border matches the framing the
+            # start/walkthrough dialogs already use, keeping this
+            # dialog visually distinct from a dark parent window.
+            "  border: 1px solid rgba(29,233,182,0.30);"
             "}"
             f"QDialog {{ background-color: {surface_color}; }}"
             "QLabel { color: #E5F6FF; background: transparent; }"
@@ -5472,9 +5519,22 @@ class TouchlessPrivacyDialog(QDialog):
             "QPushButton#privacyDetailsToggle:hover { color: #29f0c1; }"
         )
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(SPACE_LG, SPACE_LG, SPACE_LG, SPACE_LG)
-        layout.setSpacing(SPACE_SM)
+        # Frameless-with-custom-indigo-bar layout. See
+        # StartTutorialDialog._build_ui for the pattern.
+        # body_container is a plain transparent QWidget — the
+        # dialog's own autoFillBackground + palette Window role +
+        # WA_StyledBackground paints the surface color behind it,
+        # so no extra QSS is needed on the body.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(apply_indigo_title_bar(self, "Touchless"))
+        body_container = QWidget(self)
+        body_layout = QVBoxLayout(body_container)
+        body_layout.setContentsMargins(SPACE_LG, SPACE_LG, SPACE_LG, SPACE_LG)
+        body_layout.setSpacing(SPACE_SM)
+        outer.addWidget(body_container)
+        layout = body_layout  # rebind: rest of method appends into body
 
         title = QLabel("Help improve Touchless?")
         title.setAlignment(Qt.AlignCenter)
@@ -5699,6 +5759,17 @@ class _CurrentSizedStack(QStackedWidget):
     collapsing shrinks it back. Panels that opt into `Ignored` vertical
     policy (Camera — manages its own internal scroll) skip the cap
     entirely so they can fill the viewport.
+
+    v1.1.7 round-19: panels can additionally OPT IN to a recursive
+    true-content-height computation by setting the widget property
+    `useAccurateHeight = True` in their builder. That path walks the
+    panel's layout tree by hand, invoking heightForWidth on any layout
+    or widget that advertises it — restoring the chain that QFrame-
+    wrapped wordwrap labels otherwise break (their host QFrame reports
+    hasHeightForWidth == False even though its inner layout would).
+    Currently only the Camera panel opts in, so Colors / Tutorial /
+    Instructions / etc. keep their existing bare-sizeHint measurement
+    verbatim and no other panel's layout math is affected.
     """
 
     def __init__(self, *args, **kwargs):
@@ -5706,9 +5777,110 @@ class _CurrentSizedStack(QStackedWidget):
         self._refresh_pending = False
         self.currentChanged.connect(lambda _i: self._schedule_refresh())
 
+    def _needs_accurate_height(self, w) -> bool:
+        """Per-panel opt-in flag. Only panels whose builder sets
+        `panel.setProperty("useAccurateHeight", True)` get the
+        recursive descent; everyone else keeps the bare-sizeHint
+        path so their existing behaviour is unchanged."""
+        if w is None:
+            return False
+        try:
+            return bool(w.property("useAccurateHeight"))
+        except Exception:
+            return False
+
+    def _true_content_height(self, w, width: int) -> int:
+        """True rendered height of `w` at `width`. Walks `w.layout()`
+        by hand so QFrame-wrapped wordwrap labels contribute their
+        wrapped height even when their host QFrame's sizePolicy
+        breaks the heightForWidth chain. Recursion depth is bounded
+        by the actual layout tree (typically 2-3 levels for a
+        settings panel)."""
+        if w is None:
+            return 0
+        try:
+            sh_h = w.sizeHint().height()
+        except Exception:
+            sh_h = 0
+        if width <= 0:
+            return sh_h
+        try:
+            if w.hasHeightForWidth():
+                hfw = w.heightForWidth(width)
+                if hfw > 0:
+                    return max(hfw, sh_h)
+        except Exception:
+            pass
+        try:
+            lay = w.layout()
+        except Exception:
+            lay = None
+        if lay is None:
+            return sh_h
+        try:
+            if lay.hasHeightForWidth():
+                hfw = lay.heightForWidth(width)
+                if hfw > 0:
+                    return max(hfw, sh_h)
+        except Exception:
+            pass
+        try:
+            m = lay.contentsMargins()
+            inner_w = max(1, width - m.left() - m.right())
+            spacing = lay.spacing()
+            if spacing < 0:
+                spacing = 0
+            total = m.top() + m.bottom()
+            counted = 0
+            for i in range(lay.count()):
+                item = lay.itemAt(i)
+                if item is None:
+                    continue
+                child_w = item.widget()
+                if child_w is not None:
+                    if child_w.isHidden():
+                        continue
+                    ch = self._true_content_height(child_w, inner_w)
+                    if ch <= 0:
+                        ch = child_w.sizeHint().height()
+                    total += max(0, ch)
+                    counted += 1
+                    continue
+                child_l = item.layout()
+                if child_l is not None:
+                    if child_l.hasHeightForWidth():
+                        hfw = child_l.heightForWidth(inner_w)
+                        if hfw > 0:
+                            total += hfw
+                            counted += 1
+                            continue
+                    sh = child_l.sizeHint()
+                    if sh.isValid():
+                        total += max(0, sh.height())
+                        counted += 1
+                    continue
+                sh = item.sizeHint()
+                if sh.isValid() and sh.height() > 0:
+                    total += sh.height()
+                    counted += 1
+            if counted > 1:
+                total += spacing * (counted - 1)
+            return max(total, sh_h)
+        except Exception:
+            return sh_h
+
     def sizeHint(self):  # type: ignore[override]
         w = self.currentWidget()
-        return w.sizeHint() if w is not None else super().sizeHint()
+        if w is None:
+            return super().sizeHint()
+        sh = w.sizeHint()
+        if not self._needs_accurate_height(w):
+            return sh
+        width = self.width() if self.width() > 0 else sh.width()
+        h = self._true_content_height(w, width)
+        if h <= 0:
+            h = sh.height()
+        return QSize(sh.width(), h)
 
     def minimumSizeHint(self):  # type: ignore[override]
         w = self.currentWidget()
@@ -5716,7 +5888,20 @@ class _CurrentSizedStack(QStackedWidget):
             return super().minimumSizeHint()
         if w.sizePolicy().verticalPolicy() == QSizePolicy.Ignored:
             return QSize(w.minimumSizeHint().width(), 0)
-        return w.sizeHint()
+        if not self._needs_accurate_height(w):
+            return w.sizeHint()
+        # For opt-in panels, minimumSizeHint MUST equal the true
+        # content height. QScrollArea(widgetResizable=True) sizes
+        # the inner widget to max(viewport, minSizeHint); if
+        # minSizeHint is smaller than the content, Qt shrinks the
+        # widget below its content and children get clipped instead
+        # of scrolled.
+        msh = w.minimumSizeHint()
+        width = self.width() if self.width() > 0 else w.sizeHint().width()
+        h = self._true_content_height(w, width)
+        if h <= 0:
+            h = w.sizeHint().height()
+        return QSize(msh.width(), h)
 
     def event(self, e):  # type: ignore[override]
         result = super().event(e)
@@ -5748,16 +5933,26 @@ class _CurrentSizedStack(QStackedWidget):
         # sizeHint() reports the single-line height for wrapped labels
         # which underestimates the rendered total. heightForWidth is
         # the only number that lines up with what the user sees.
-        h = w.sizeHint().height()
-        try:
-            lay = w.layout()
-            current_w = self.width()
-            if lay is not None and current_w > 0 and lay.hasHeightForWidth():
-                hfw = lay.heightForWidth(current_w)
-                if hfw > 0:
-                    h = max(h, hfw)
-        except Exception:
-            pass
+        current_w = self.width()
+        if self._needs_accurate_height(w):
+            # Opt-in path: recursive descent that repairs the
+            # heightForWidth chain that QFrame-wrapped wordwrap
+            # labels otherwise break.
+            h = self._true_content_height(
+                w, current_w if current_w > 0 else w.sizeHint().width()
+            )
+            if h <= 0:
+                h = w.sizeHint().height()
+        else:
+            h = w.sizeHint().height()
+            try:
+                lay = w.layout()
+                if lay is not None and current_w > 0 and lay.hasHeightForWidth():
+                    hfw = lay.heightForWidth(current_w)
+                    if hfw > 0:
+                        h = max(h, hfw)
+            except Exception:
+                pass
         if h > 0:
             self.setMaximumHeight(h)
         else:
@@ -6151,6 +6346,7 @@ class MainWindow(QMainWindow):
         self._screen_record_region: QRect | None = None
         self._screen_record_writer = None
         self._screen_record_process: subprocess.Popen | None = None
+        self._screen_record_wasapi_writer = None
         self._screen_record_path: Path | None = None
         # Bumped from 12 → 24 fps. The previous rate made clip
         # playback look like a slideshow (the user described it as
@@ -6162,6 +6358,7 @@ class MainWindow(QMainWindow):
         self._screen_record_fps = 24.0
         self._screen_record_frame_size: tuple[int, int] | None = None
         self._screen_record_backend = ""
+        self._screen_record_t_start = 0.0
         self._screen_record_timer = QTimer(self)
         self._screen_record_timer.setInterval(int(round(1000.0 / self._screen_record_fps)))
         self._screen_record_timer.timeout.connect(self._capture_screen_record_frame)
@@ -6309,6 +6506,77 @@ class MainWindow(QMainWindow):
         self.apply_theme()
         QTimer.singleShot(0, self._initial_camera_setup)
         QTimer.singleShot(0, lambda: self.refresh_microphone_inventory(update_status=True, notify=False))
+        # v1.1.7 live device detection. Subscribes to Qt's native
+        # QMediaDevices signals which fire on WM_DEVICECHANGE from
+        # Windows — near-zero cost, no polling. Camera and mic
+        # dropdowns update within ~200 ms of a USB / Bluetooth
+        # hotplug event. Debounced by singleShot to coalesce the
+        # 3-4 rapid audioInputsChanged signals a headset init
+        # sequence emits.
+        #
+        # We DO NOT auto-restart the clip cache on device change
+        # (per the adversarial critic — mid-recording restart
+        # would drop 300-800 ms of audio). Dropdown appears; user
+        # chooses to save the new device via the existing Save
+        # flow, which triggers the round-5 _restart_clip_cache_if_running.
+        self._live_device_watch_media_devices = None
+        self._live_device_watch_debounce_timer = None
+        try:
+            if QMediaDevices is not None:
+                self._live_device_watch_media_devices = QMediaDevices(self)
+                self._live_device_watch_media_devices.videoInputsChanged.connect(
+                    self._on_live_video_devices_changed
+                )
+                self._live_device_watch_media_devices.audioInputsChanged.connect(
+                    self._on_live_audio_devices_changed
+                )
+        except Exception:
+            self._live_device_watch_media_devices = None
+        # Belt-and-suspenders: some Win10 USB hubs swallow the
+        # WM_DEVICECHANGE message so audioInputsChanged never
+        # fires. A 3s low-rate diff timer catches those cases.
+        # Enumeration itself runs on a background thread (see
+        # _live_device_diff_tick) so the ~100-500 ms cost of pycaw
+        # + sounddevice queries never blocks the Qt event loop.
+        # Result is marshalled back to the main thread via a
+        # cross-thread Signal (verified working — QTimer.singleShot
+        # from a non-Qt thread was silently no-oping in the pre-fix
+        # code).
+        self._live_device_diff_bridge = _LiveDeviceDiffBridge(self)
+        self._live_device_diff_bridge.result_ready.connect(
+            self._live_device_diff_apply
+        )
+        # v1.1.7 round-9 rev-2: interval was 3 s but user reported
+        # ~1 s freezes on his older PC. Almost certainly the pycaw
+        # AudioUtilities.GetAllDevices() COM enumeration in the bg
+        # thread was STA-marshaling back to the main thread (a
+        # known comtypes behavior when COM isn't initialized in the
+        # apartment mode expected by the API). Slowing to 30 s
+        # reduces frequency of any such stall by 10x while Qt's
+        # QMediaDevices signals still catch real hot-plug events
+        # in real time. If a Windows setup swallows those signals
+        # entirely, 30 s to notice a plugged-in mic is acceptable.
+        # v1.1.7 round-17 CRITICAL FIX: create the timer but DO NOT
+        # start() it here. Dad's Win10 + BT-headset PC had ALL
+        # Windows audio devices wedged the moment Touchless opened
+        # (even without Start Engine) — the workflow adversarial
+        # critic pinned it to the timer's daemon thread churning
+        # STA↔MTA COM apartments every 30 s (each tick calls
+        # CoInitializeEx(MTA) in the worker thread while the Qt
+        # main thread stays STA and holds live IMMDeviceEnumerator
+        # references via QMediaDevices). Some Realtek/Intel Win10
+        # BT drivers spuriously mark endpoints "in use" under that
+        # STA/MTA mix, locking every app out of audio. Deferring
+        # the timer's start() to after the first Start Engine call
+        # (where the engine + audio pipeline already opens WASAPI
+        # streams anyway) eliminates the pre-engine COM churn
+        # entirely. QMediaDevices.audioInputsChanged still catches
+        # real WM_DEVICECHANGE hot-plug events at zero cost, so
+        # the 30 s poll is only a belt-and-suspenders anyway.
+        self._live_device_diff_timer = QTimer(self)
+        self._live_device_diff_timer.setInterval(30000)
+        self._live_device_diff_timer.timeout.connect(self._live_device_diff_tick)
+        # NOTE: .start() is called from start_engine, not here.
         # Auto-update check: defer 3s after launch so the app feels
         # snappy on cold start and the user has the UI in front of
         # them before any modal dialog appears. Failures (offline,
@@ -6740,6 +7008,10 @@ class MainWindow(QMainWindow):
         button_row.addStretch(1)
         body_layout.addLayout(button_row)
 
+        # r53: PerfDiagnosticsHud (top-right black box) removed per
+        # user request. Dev-side diagnostics still available via the
+        # existing FPS/latency/tracking chips in Camera settings.
+
         info_card = QFrame()
         info_card.setObjectName("card")
         self.home_status_card = info_card
@@ -6751,6 +7023,48 @@ class MainWindow(QMainWindow):
         info_layout.addWidget(info_title)
         self._home_debug_log_entries: list[str] = []
         self._home_debug_log_max_entries = 250
+
+        # Session-scoped clip-export auto-recovery state
+        # (used by _run_clip_export_ffmpeg + _ffmpeg_encoder_args).
+        #
+        # Symptom being defended against: on pre-Turing NVIDIA GPUs
+        # (GTX 9xx / 10xx era Maxwell/Pascal) NVENC's session-open
+        # succeeds but the encoder emits ZERO coded packets under
+        # some argv combos we ship. ffmpeg then aborts the mp4
+        # muxer with EINVAL = -22 = unsigned 4294967274 and stderr
+        # "Nothing was written into output file, because at least
+        # one of its streams received no packets." The startup
+        # NVENC probe uses a stripped 64x64 argv that both silicon
+        # generations pass, so capability detection alone doesn't
+        # catch it.
+        #
+        # When _run_clip_export_ffmpeg sees ffmpeg exit non-zero
+        # AND its stderr matches known HW-encoder / no-packets
+        # signatures, it flips _clip_export_encoder_demoted=True
+        # and retries the export ffmpeg with libx264 forced. The
+        # flag then persists for the rest of the session so
+        # subsequent clips skip NVENC entirely — we don't
+        # oscillate encoder choice per clip. Both flags reset
+        # only on app restart.
+        self._clip_export_encoder_demoted: bool = False
+        self._clip_export_recovery_attempts: int = 0
+
+        # Records the ACTUAL scaled resolution of frames the clip
+        # cache is writing to disk. Only differs from
+        # `_clip_cache_region` when the multi-monitor virtual desktop
+        # exceeds the HW encoder's 4096-pixel limit and the cache
+        # spawn injected `-vf scale=4096:-2` (or scale=-2:4096) to
+        # keep NVENC/AMF/QSV usable. When set, `_clip_crop_filter`
+        # rebases crop coordinates into this scaled coord space
+        # before emitting the ffmpeg crop expression. Without it,
+        # the export tried to crop e.g. 2560x1440 (primary monitor
+        # rect in ORIGINAL desktop coords) from a 4096x1392 scaled
+        # frame → ffmpeg's crop filter rejected with "Invalid too
+        # big or non positive size" and aborted the whole filter
+        # graph, muxer received 0 packets, mp4 aborted with -22
+        # ("streams received no packets"). Set at cache spawn,
+        # cleared when the cache stops.
+        self._clip_cache_scaled_region: "QRect | None" = None
 
         # status_label kept as a hidden compatibility shim — older
         # code paths still update it, but the visible device source
@@ -6809,8 +7123,21 @@ class MainWindow(QMainWindow):
         self.no_camera_hint_row.setVisible(False)
         info_layout.addWidget(self.no_camera_hint_row)
 
-        self.home_microphone_combo = _DisplayOverrideCombo()
+        # v1.1.7 fix: use _RefreshingCameraCombo (which is device-
+        # agnostic — it just emits popup_about_to_show on open) so
+        # newly-plugged mics appear the next time the user opens
+        # the dropdown. Pre-fix, mic inventory was only queried at
+        # app startup + settings-tab rebuild, so a headset plugged
+        # in mid-session was invisible without a restart. Cameras
+        # already did this — the mic dropdown was the outlier.
+        self.home_microphone_combo = _RefreshingCameraCombo()
         self.home_microphone_combo.setObjectName("homeRuntimeDeviceCombo")
+        # v1.1.7 round-8b: dispatch to background diff tick so the
+        # dropdown-open doesn't stall the UI for 100-500 ms while
+        # pycaw enumerates.
+        self.home_microphone_combo.popup_about_to_show.connect(
+            self._live_device_diff_tick
+        )
         self.home_microphone_combo.activated.connect(self._save_microphone_preference_from_home)
         self.home_microphone_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         microphone_row = QWidget()
@@ -7040,6 +7367,10 @@ class MainWindow(QMainWindow):
         self._settings_search_results = QListWidget(self)
         self._settings_search_results.setObjectName("settingsSearchResults")
         self._settings_search_results.setVisible(False)
+        # r53 v6: elide over-long labels with a trailing "..." so they
+        # never force the popup wider than its width cap. Wraps below.
+        self._settings_search_results.setTextElideMode(Qt.ElideRight)
+        self._settings_search_results.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._settings_search_results.itemActivated.connect(self._on_settings_search_result_clicked)
         self._settings_search_results.itemClicked.connect(self._on_settings_search_result_clicked)
         # Explicit color on every state — without an explicit `color`
@@ -7325,7 +7656,10 @@ class MainWindow(QMainWindow):
         content_scroll.setObjectName("settingsContentScroll")
         content_scroll.setWidgetResizable(True)
         content_scroll.setFrameShape(QFrame.NoFrame)
-        content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # v1.1.7 round-13: horizontal scroll DISABLED per user
+        # request — settings panels never scroll sideways, only up/
+        # down when content overflows.
+        content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         # Vertical scrollbar is AsNeeded — but the stack itself is now
         # a _CurrentSizedStack so its sizeHint / minimumSizeHint reflect
         # only the CURRENT panel (not the max of all panels). That means
@@ -7389,6 +7723,54 @@ class MainWindow(QMainWindow):
         # empty space below short panels.
         try:
             content_scroll.viewport().installEventFilter(self)
+        except Exception:
+            pass
+        # v1.1.7 round-25: fix scrollbar-visibility ratchet. Round-19
+        # set `vb.setVisible(vb.maximum() > 0)` on panel switch as
+        # an alternative to force-showing. But at panel-switch time
+        # the layout hasn't settled yet, so maximum() reads 0 and
+        # the vb stays hidden. Once the user clicks Show More and
+        # content actually grows past viewport (rangeChanged fires
+        # with a non-zero maximum), nothing re-evaluates visibility
+        # — the bar stays hidden even though the page is genuinely
+        # scrollable. On dad's Win10 build this made the Camera
+        # panel scrollable via wheel but with no visible bar. Wiring
+        # rangeChanged directly to setVisible makes visibility
+        # follow content: max=0 hide, max>0 show, automatically.
+        try:
+            for _sb in (
+                content_scroll.verticalScrollBar(),
+                content_scroll.horizontalScrollBar(),
+            ):
+                if _sb is None:
+                    continue
+                def _sync_bar_visible(_lo, hi, _bar=_sb):
+                    try:
+                        # Respect an OFF-list panel's AlwaysOff policy —
+                        # policy is checked live so switching TO an
+                        # off-list panel keeps the bar hidden even if
+                        # its range momentarily reads non-zero during
+                        # a mid-switch layout pass.
+                        parent_scroll = _bar.parent()
+                        if parent_scroll is not None:
+                            axis = (
+                                Qt.ScrollBarAlwaysOff
+                                if _bar is parent_scroll.verticalScrollBar()
+                                and parent_scroll.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+                                else (
+                                    Qt.ScrollBarAlwaysOff
+                                    if _bar is parent_scroll.horizontalScrollBar()
+                                    and parent_scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+                                    else None
+                                )
+                            )
+                            if axis is Qt.ScrollBarAlwaysOff:
+                                _bar.setVisible(False)
+                                return
+                    except Exception:
+                        pass
+                    _bar.setVisible(int(hi) > 0)
+                _sb.rangeChanged.connect(_sync_bar_visible)
         except Exception:
             pass
 
@@ -7463,6 +7845,32 @@ class MainWindow(QMainWindow):
                     self.settings_content_stack.currentIndex()
                 )
                 self._position_save_locations_floating_button()
+        except Exception:
+            pass
+
+        # v1.1.7 round-20: same floating-button treatment for the Camera
+        # panel's Save Changes button. Originally lived inline in the
+        # panel's header_row and scrolled off-screen whenever the panel
+        # overflowed the viewport (Camera is right at the viewport
+        # threshold at default 1020x740 window geometry). Re-parenting to
+        # the outer scroll's viewport keeps it glued to the top-right so
+        # users always see the lit "save my edits" affordance no matter
+        # how far they scroll. header_row keeps the title (the button
+        # just leaves the layout when re-parented — Qt handles that
+        # automatically).
+        try:
+            vp_btn_cam = content_scroll.viewport()
+            cam_btn = getattr(self, "save_camera_button", None)
+            if cam_btn is not None:
+                cam_btn.setParent(vp_btn_cam)
+                cam_btn.setVisible(False)
+                self.settings_content_stack.currentChanged.connect(
+                    self._update_camera_save_floating_visibility
+                )
+                self._update_camera_save_floating_visibility(
+                    self.settings_content_stack.currentIndex()
+                )
+                self._position_camera_save_floating_button()
         except Exception:
             pass
 
@@ -8041,12 +8449,98 @@ class MainWindow(QMainWindow):
                 self._general_controls.get("clip_mic_noise_reduction"),
             ),
             (
-                "General: Clipping Gesture (left-hand fist hold)",
-                "clipping gesture clip gesture left hand fist hold 0.5 seconds "
-                "trigger save buffer voice command alternative no voice cancel "
-                "priority dual purpose",
+                # r53: gesture moved from left-fist to left-two after
+                # dictation was retired. Keeping the umbrella entry.
+                "General: Clipping Gesture (left-hand two hold)",
+                "clipping gesture clip gesture left hand two v pose hold trigger "
+                "save buffer voice command alternative instant clip that",
                 SECTION_GENERAL,
                 self._general_controls.get("clip_default_duration_seconds"),
+            ),
+            # r53: recording-quality tier picker (Save Locations →
+            # Recording Quality) — high-level entry so the picker is
+            # discoverable via "quality", "clip quality", "bitrate",
+            # "fps", "high normal low", etc.
+            (
+                "General: Quality Level (Low / Normal / High)",
+                "quality level recording quality clip quality video quality tier "
+                "bitrate fps high normal low balanced smooth sharp "
+                "near lossless encode preset native resolution",
+                SECTION_GENERAL,
+                self._general_controls.get("clip_quality_tier"),
+            ),
+            (
+                "General: Quality Level Details (Show more)",
+                "quality level details show more expand hide advanced explain "
+                "what does what changes crf resolution audio bitrate",
+                SECTION_GENERAL,
+                None,
+            ),
+            # r53: additional clip duration presets (30s added in r53).
+            (
+                "General: Clip Duration Presets (30 s / 1 / 2 / 5 min)",
+                "clip duration preset 30 seconds 60 seconds 1 minute 2 minutes "
+                "5 minutes short long buffer replay length",
+                SECTION_GENERAL,
+                self._general_controls.get("clip_default_duration_seconds"),
+            ),
+            # r53: camera short-shutter / performance boost.
+            (
+                "Camera: Boost Performance for Older Cameras",
+                "boost performance older cameras cheap webcam short shutter "
+                "exposure ms driver dark image low light auto exposure hold "
+                "uvc realtek logitech c920 fps recover 30 fps 60 fps",
+                SECTION_CAMERA,
+                None,
+            ),
+            (
+                "Camera: Reapply Camera Tuning",
+                "reapply camera tuning re-run mjpg fps buffer size short "
+                "shutter refresh restart camera stuck",
+                SECTION_CAMERA,
+                None,
+            ),
+            # r53 v6: Iris + MCP + Voice picker entries removed —
+            # Iris isn't shipping yet, so hiding it from search
+            # avoids surfacing an unreleased surface.
+            # r53: Custom Gesture Sandbox.
+            (
+                "Custom Gesture: Sandbox",
+                "sandbox custom gesture test try preview practice studio "
+                "record play verify",
+                SECTION_CUSTOM_GESTURE,
+                None,
+            ),
+            # r53: Dynamic Gesture Recorder.
+            (
+                "Custom Gesture: Dynamic Recorder",
+                "dynamic gesture recorder motion sequence temporal record new "
+                "custom animation swipe wave motion",
+                SECTION_CUSTOM_GESTURE,
+                None,
+            ),
+            # r53: Discord + Spotify setup wizards.
+            (
+                "General: Discord Setup Wizard",
+                "discord setup wizard connect bot token oauth server login "
+                "link account application id",
+                SECTION_GENERAL,
+                None,
+            ),
+            (
+                "General: Spotify Setup Wizard",
+                "spotify setup wizard connect oauth login link account premium "
+                "client id secret application dashboard",
+                SECTION_GENERAL,
+                None,
+            ),
+            # r53: Phone Connect dialog (top-level entry point).
+            (
+                "Camera: Connect Phone (touchless-control.com)",
+                "connect phone iphone android qr code pairing mobile touchless "
+                "control 6 digit code webrtc lan wifi",
+                SECTION_CAMERA,
+                None,
             ),
         ]
         # Save Locations: one entry per output kind (drawings, screenshots,
@@ -8118,22 +8612,42 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QListWidgetItem
         from PySide6.QtCore import Qt as _Qt
         self._settings_search_results.clear()
+        # r53 v7: for short queries (1-2 chars) match ONLY against the
+        # LABEL's words, not the keyword cloud. The keyword cloud
+        # legitimately contains "qr" (phone pairing) and "quick"
+        # (instructions intro), so any-word-start-with-q lit up
+        # every page that mentions QR or quick-start. Users typing
+        # a single character expect to find labels beginning with
+        # that character (Quality, Save Locations, Camera, etc.),
+        # not every entry with a q-something buried in its keyword
+        # blob. Longer queries (3+ chars) keep the loose substring
+        # match against the full haystack so multi-char tokens like
+        # "clip" still find "clipping" via keyword.
+        short_query = max(len(tok) for tok in tokens) <= 2
         scored: list[tuple[int, int, dict]] = []
         for entry in self._settings_search_index:
             label = str(entry.get("label") or "").strip()
             haystack = str(entry.get("haystack") or "")
             if not label or not haystack:
                 continue
-            if not all(tok in haystack for tok in tokens):
-                continue
             label_lower = label.lower()
+            haystack_words = haystack.split()
+            if short_query:
+                # LABEL word-start match only — ignore keyword cloud.
+                label_words = label_lower.replace(":", " ").replace("(", " ").replace(")", " ").split()
+                if not all(any(w.startswith(tok) for w in label_words) for tok in tokens):
+                    continue
+            else:
+                # Loose substring match against the full haystack.
+                if not all(tok in haystack for tok in tokens):
+                    continue
             # Lower score = higher priority. The triple-tier ranking:
             #   0  label starts with the query (e.g., 's' -> 'Save…')
             #   1  any haystack word starts with the FIRST token
             #   2  pure substring match (the loosest tier)
             if label_lower.startswith(tokens[0]):
                 score = 0
-            elif any(word.startswith(tokens[0]) for word in haystack.split()):
+            elif any(word.startswith(tokens[0]) for word in haystack_words):
                 score = 1
             else:
                 score = 2
@@ -8173,23 +8687,53 @@ class MainWindow(QMainWindow):
             chrome = 14
             content_height = row_height * len(matches) + chrome
             window_height = max(400, int(self.height()))
-            # Generous height cap: up to 70 % of the window so the
-            # dropdown can show ~20 results without a scrollbar on a
-            # normal-size window. Leaves ~30 % below for the rest of
-            # the page chrome.
-            cap = max(200, int(window_height * 0.7))
+            # r53 v6: derive both caps from the sidebar geometry the
+            # search input lives in. Height cap = distance from the
+            # search input's bottom to the sidebar's bottom minus a
+            # comfortable pad so the popup stays slightly shorter
+            # than the sidebar. Width cap = sidebar width + a small
+            # amount so wide results don't extend far into the
+            # content panel; over-length labels elide with "…".
+            try:
+                search_bottom_in_window = search.mapTo(
+                    self, QPoint(0, search.height())
+                ).y()
+            except Exception:
+                search_bottom_in_window = int(window_height * 0.08)
+            sidebar_widget = search.parentWidget()
+            try:
+                if sidebar_widget is not None:
+                    sidebar_bottom_in_window = sidebar_widget.mapTo(
+                        self, QPoint(0, sidebar_widget.height())
+                    ).y()
+                else:
+                    sidebar_bottom_in_window = int(window_height) - 20
+            except Exception:
+                sidebar_bottom_in_window = int(window_height) - 20
+            # 48 px pad below the popup keeps it clearly shorter than
+            # the sidebar and leaves room for the "Back" button footer.
+            available_below = max(
+                200, int(sidebar_bottom_in_window) - int(search_bottom_in_window) - 48
+            )
+            cap = available_below
             target_height = min(content_height, cap)
-            results.setMinimumHeight(min(200, target_height))
+            results.setMinimumHeight(target_height)
             results.setMaximumHeight(target_height)
-            # Width: take the widest item, add some padding, cap at
-            # 70 % of the window width so it never crosses into the
-            # right edge controls but does overlap a healthy portion
-            # of the content panel.
+            # Width: cap = sidebar width + 30 px so results extend just
+            # slightly past the sidebar into the content panel; longer
+            # labels are elided with "..." by QListWidget's built-in
+            # ElideRight (wired at construction, see setTextElideMode).
             width_hint = results.sizeHintForColumn(0)
-            window_width = max(600, int(self.width()))
-            width_cap = max(360, int(window_width * 0.7))
-            target_width = min(max(width_hint + 32, 360), width_cap)
-            results.setFixedWidth(target_width)
+            sidebar_width = int(sidebar_widget.width()) if sidebar_widget is not None else int(search.width())
+            width_cap = max(220, sidebar_width + 30)
+            target_width = min(max(width_hint + 16, 180), width_cap)
+            results.setMinimumWidth(180)
+            results.setMaximumWidth(width_cap)
+            # r53 v5: use target_height (the freshly-computed cap-
+            # aware size), NOT results.height() (which is stale from
+            # the previous frame — the actual bug behind "popup
+            # never grows past ~160 px").
+            results.resize(target_width, target_height)
             # Position: directly below the search input, in MainWindow
             # coordinates. mapTo handles the sidebar -> MainWindow
             # translation so the dropdown lines up with the input
@@ -8216,8 +8760,42 @@ class MainWindow(QMainWindow):
         if not isinstance(entry, dict):
             return
         section_id = entry.get("section_id")
+        target_widget = entry.get("target_widget")
         if section_id is not None:
+            # r53 v4: track whether we were ALREADY on the target
+            # section. QStackedWidget.setCurrentIndex(same_index) does
+            # not emit currentChanged, so the scroll-reset hook that
+            # normally runs on panel switch never fires. Without this
+            # we saw the "clicking a result doesn't do anything"
+            # symptom whenever the user was already on that page.
+            try:
+                already_current = (
+                    self.settings_content_stack.currentIndex() == section_id
+                )
+            except Exception:
+                already_current = False
             self.show_settings_section(section_id)
+            if already_current:
+                try:
+                    self._reset_settings_scroll_to_top()
+                except Exception:
+                    pass
+            # r53 v4: when no specific target_widget was set, also
+            # zero any INNER QScrollArea on the panel (Camera has one
+            # for its own content). Otherwise the outer scroll snaps
+            # to top but the inner scroll keeps the user's last
+            # position and they land wherever they were before.
+            if target_widget is None:
+                try:
+                    from PySide6.QtWidgets import QScrollArea
+                    panel = self.settings_content_stack.widget(section_id)
+                    if panel is not None:
+                        for inner in panel.findChildren(QScrollArea):
+                            bar = inner.verticalScrollBar()
+                            if bar is not None:
+                                bar.setValue(0)
+                except Exception:
+                    pass
         section_widget = entry.get("section_widget")
         # Auto-expand the matching collapsible section. The
         # GestureGuideSection toggles by clicking its header_button;
@@ -8230,7 +8808,6 @@ class MainWindow(QMainWindow):
                     section_widget._toggle_expanded(True)
             except Exception:
                 pass
-        target_widget = entry.get("target_widget")
         if target_widget is not None:
             # Walk up until we find the ancestor QScrollArea, then
             # scroll the target into view via ensureWidgetVisible.
@@ -8477,14 +9054,20 @@ class MainWindow(QMainWindow):
         accent = str(self.config.accent_color or "#1DE9B6")
         hover_blue = _with_alpha(QColor(primary).lighter(118), 235).name(QColor.HexArgb)
         pressed_blue = _with_alpha(QColor(primary).lighter(125), 245).name(QColor.HexArgb)
+        # v1.1.7 fix: padding was 11/17 to compensate for a 1→2 px
+        # border delta that no longer exists (the global QSS now
+        # uses 2 px in every state). Matched padding to the default
+        # 12/18 so the inline sheet doesn't shrink the button
+        # when it arms. font-weight unified to 800 for the same
+        # reason (was 900 → 700 delta which nudged content width).
         return (
             f"QPushButton#settingsSaveButton {{"
             f"  background-color: {primary};"
             f"  color: {text_color};"
             f"  border: 2px solid {accent};"
             f"  border-radius: 14px;"
-            f"  padding: 11px 17px;"
-            f"  font-weight: 900;"
+            f"  padding: 12px 18px;"
+            f"  font-weight: 800;"
             f"  min-width: 110px;"
             f"}}"
             f"QPushButton#settingsSaveButton:hover {{"
@@ -8737,7 +9320,7 @@ class MainWindow(QMainWindow):
             "<b>Control Guide</b> — Every gesture and voice command, with "
             "a short demo for each. Use as a reference.<br>"
             "<b>General settings</b> — Mouse sensitivity, overlays, "
-            "performance modes, and the Connect Spotify button.",
+            "performance modes, and the Spotify setup / reconnect flow.",
             allow_html=True,
         )
         inner_layout.addWidget(more_card)
@@ -8895,7 +9478,11 @@ class MainWindow(QMainWindow):
 
         inner_layout.addWidget(self._build_general_handedness_section())
         inner_layout.addWidget(self._build_general_mouse_section())
-        inner_layout.addWidget(self._build_general_clip_section())
+        # Stash a reference to the Clip Presets card so the
+        # "clipping disabled" pill's click-navigate handler can scroll
+        # it into view when the user clicks through.
+        self._clip_presets_card = self._build_general_clip_section()
+        inner_layout.addWidget(self._clip_presets_card)
         inner_layout.addWidget(self._build_general_overlay_section())
         inner_layout.addWidget(self._build_general_system_modes_section())
         inner_layout.addWidget(self._build_general_voice_upgrade_section())
@@ -9197,7 +9784,14 @@ class MainWindow(QMainWindow):
         scroll = getattr(self, "_settings_content_scroll", None)
         if scroll is None:
             return
-        target = getattr(self, "connect_spotify_button", None)
+        # v1.1.7.11: connect_spotify_button removed — walkthrough now
+        # scrolls to the setup wizard entry (or the Premium warning
+        # frame as a fallback) so the anchor still lands on the
+        # Spotify card.
+        target = (
+            getattr(self, "_spotify_setup_button", None)
+            or getattr(self, "_spotify_premium_warning_frame", None)
+        )
         if target is None:
             return
         try:
@@ -9423,6 +10017,44 @@ class MainWindow(QMainWindow):
             self._position_save_locations_floating_button()
             button.raise_()
 
+    def _position_camera_save_floating_button(self) -> None:
+        """Anchor the sticky Camera Save Changes button to the top-right
+        of the settings content viewport. Mirrors
+        _position_general_save_floating_button so all three floating save
+        pills (General / Save Locations / Camera) line up identically
+        across pages."""
+        button = getattr(self, "save_camera_button", None)
+        if button is None:
+            return
+        vp = button.parentWidget()
+        if vp is None:
+            return
+        hint = button.sizeHint()
+        btn_w = max(140, hint.width())
+        btn_h = max(36, hint.height())
+        button.resize(btn_w, btn_h)
+        pad_right = 28
+        pad_top = 18
+        x = max(0, vp.width() - btn_w - pad_right)
+        y = pad_top
+        button.move(x, y)
+        button.raise_()
+
+    def _update_camera_save_floating_visibility(self, index: int) -> None:
+        """Show the sticky Camera Save Changes button ONLY when the
+        active settings panel is Camera."""
+        button = getattr(self, "save_camera_button", None)
+        if button is None:
+            return
+        try:
+            on_camera = (int(index) == SECTION_CAMERA)
+        except Exception:
+            on_camera = False
+        button.setVisible(on_camera)
+        if on_camera:
+            self._position_camera_save_floating_button()
+            button.raise_()
+
     def _save_general_changes(self) -> None:
         """Apply every pending change to self.config in one shot,
         persist, then run any side-effects that depend on the new
@@ -9495,15 +10127,49 @@ class MainWindow(QMainWindow):
         game detector if gaming-mode changed, sync any duplicated
         controls in other panels (Camera, Save Locations) so they
         don't show stale values, etc."""
-        # CLIP PRESETS — Audio toggles & noise reduction. Any change
-        # requires a clip-cache restart so the running ffmpeg
-        # subprocesses pick up the new audio capture flags / filter
-        # chain. _restart_clip_cache_if_running is a no-op when no
+        # CLIP PRESETS — Master enable switch. Start/stop the cache
+        # in-place so a mid-session toggle takes effect without an
+        # engine restart. Gated on the worker actually running so a
+        # toggle while the engine is stopped is a no-op (nothing to
+        # gate; start_engine will honor the new value on next start).
+        if "clip_cache_enabled" in applied_keys:
+            try:
+                worker_running = (
+                    self._worker is not None
+                    and bool(getattr(self._worker, "is_running", False))
+                )
+                enabled_now = bool(getattr(self.config, "clip_cache_enabled", True))
+                if enabled_now:
+                    # Only START if the worker is already running — matches
+                    # the historical contract (start_engine will honor the
+                    # new value on next start).
+                    if worker_running:
+                        self._start_clip_cache()
+                else:
+                    # v1.1.7 round-48: tear down UNCONDITIONALLY when the
+                    # master switch flips off. Previously we skipped the
+                    # stop when the worker wasn't running, which left the
+                    # audio bridges + watchdogs alive from a prior engine
+                    # session and let them re-arm on the next post-export
+                    # restart. `_stop_clip_cache` is safe when nothing is
+                    # running: its internal branches all short-circuit on
+                    # None-init state (`_clip_cache_backend == ""`, timer
+                    # not started, segment writer None).
+                    self._stop_clip_cache()
+            except Exception:
+                pass
+        # CLIP PRESETS — Audio toggles, noise reduction, and quality
+        # tier. Any change requires a clip-cache restart so the running
+        # ffmpeg subprocesses pick up the new audio capture flags /
+        # filter chain / tier-derived fps + segment_seconds + wrap +
+        # CQ/CRF. _restart_clip_cache_if_running is a no-op when no
         # cache is running, so it's always safe to call.
         if any(k in applied_keys for k in (
             "clip_capture_system_audio",
             "clip_capture_microphone",
             "clip_mic_noise_reduction",
+            "clip_quality_tier",
+            "clip_audio_follows_master_volume",
         )):
             try:
                 self._restart_clip_cache_if_running()
@@ -9515,7 +10181,7 @@ class MainWindow(QMainWindow):
                     and self._clip_cache_process.poll() is None
                 )
                 self._append_home_debug_log(
-                    f"[clip-audio] settings applied (cache restart "
+                    f"[clip-presets] settings applied (cache restart "
                     f"{'fired' if cache_running else 'deferred — will pick up new values on next worker start'})"
                 )
             except Exception:
@@ -9795,6 +10461,163 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel
 
         # ============================================================
+        # ENABLE CLIPPING (master switch for the buffered clip cache)
+        # ============================================================
+        # v1.1.7 — top-of-card toggle. Off = engine start skips the
+        # rolling-buffer ffmpeg subprocess entirely, so 'clip that'
+        # has nothing to save but CPU/disk stay quiet. Flipping the
+        # box mid-session lights the deferred-save Save Changes
+        # button; clicking Save starts/stops the cache in place
+        # (see _apply_general_runtime_changes).
+        enable_current = bool(getattr(self.config, "clip_cache_enabled", True))
+        enable_row = QHBoxLayout()
+        enable_row.setSpacing(10)
+        enable_checkbox = QCheckBox("Enable clipping")
+        enable_checkbox.setStyleSheet(checkbox_qss)
+        enable_checkbox.setToolTip("Master switch for buffered clip recording.")
+        enable_checkbox.setChecked(enable_current)
+        # Baseline BEFORE connecting stateChanged so the initial
+        # setChecked above doesn't fire a false pending-change and
+        # light Save Changes on panel open.
+        self._register_general_baseline("clip_cache_enabled", enable_current)
+
+        def _on_clip_cache_enabled_toggled(state: int) -> None:
+            self._on_general_control_changed("clip_cache_enabled", bool(state))
+
+        enable_checkbox.stateChanged.connect(_on_clip_cache_enabled_toggled)
+        enable_row.addWidget(enable_checkbox)
+        enable_row.addStretch(1)
+        body.addLayout(enable_row)
+        self._general_controls["clip_cache_enabled"] = enable_checkbox
+
+        # ============================================================
+        # RECORDING QUALITY TIER (Low / Normal / High)
+        # ============================================================
+        # v1.1.7 round-21: three-way picker driving cache fps, GOP
+        # segment length, and cache+export CQ/CRF via
+        # `_encoder_settings_for_tier`. Normal is byte-identical to
+        # shipping defaults. High needs a HW H.264 encoder + adequate
+        # CPU/RAM — greyed out with an inline reason via
+        # `_clip_high_quality_capable` on machines that fail
+        # detection. Wired into General's deferred-save pattern via
+        # `_register_general_baseline` + `_on_general_control_changed`,
+        # and the runtime hot-restart lives in
+        # `_apply_general_runtime_changes` under the
+        # "clip_quality_tier" branch.
+        from PySide6.QtWidgets import QRadioButton, QButtonGroup
+        tier_label_wrap = QLabel("Quality Level")
+        tier_label_wrap.setStyleSheet(
+            f"color: {text_color}; font-weight: 600; margin-top: 6px;"
+        )
+        body.addWidget(tier_label_wrap)
+        try:
+            hq_ok, hq_reason = self._clip_high_quality_capable()
+        except Exception:
+            hq_ok, hq_reason = (False, "Capability probe unavailable.")
+        current_tier = str(getattr(self.config, "clip_quality_tier", "normal") or "normal").lower()
+        if current_tier not in ("low", "normal", "high"):
+            current_tier = "normal"
+        display_tier = current_tier
+        if display_tier == "high" and not hq_ok:
+            # Persisted High but machine now fails detection — display
+            # as Normal in the UI (don't rewrite settings.json until
+            # the user actively Saves a different choice).
+            display_tier = "normal"
+        # Baseline snapshot BEFORE wiring toggled signals so the
+        # initial setChecked below doesn't fire a false pending-change.
+        self._register_general_baseline("clip_quality_tier", current_tier)
+        self._clip_quality_tier_group = QButtonGroup(card)
+        self._clip_quality_tier_buttons: dict = {}
+        accent = str(self.config.accent_color or "#1DE9B6")
+        # White-outline unchecked, green-fill checked. Keeping the
+        # outline width and radius equal on both states so the
+        # circle doesn't jump when the user toggles.
+        radio_qss = (
+            f"QRadioButton {{ color: {text_color}; spacing: 8px; }}"
+            f"QRadioButton:disabled {{ color: {text_color}; }}"
+            f"QRadioButton::indicator {{"
+            f" width: 14px; height: 14px; border-radius: 9px;"
+            f" border: 2px solid {text_color}; background: transparent;"
+            f"}}"
+            f"QRadioButton::indicator:checked {{"
+            f" background: {accent}; border: 2px solid {text_color};"
+            f"}}"
+            f"QRadioButton::indicator:disabled {{"
+            f" border: 2px solid {text_color}; background: transparent;"
+            f"}}"
+        )
+        tier_specs = [
+            ("low", "Low — smaller files, faster upload (~19 MB/min at 15 fps).", True, ""),
+            ("normal", "Normal — current default (~40 MB/min at 30 fps).", True, ""),
+            ("high", "High — 60 fps, near-lossless. Hardware encoder required (~120 MB/min).", bool(hq_ok), str(hq_reason or "")),
+        ]
+        for tier_key, tier_text, tier_enabled, tier_reason in tier_specs:
+            radio = QRadioButton(tier_text)
+            radio.setStyleSheet(radio_qss)
+            radio.setEnabled(bool(tier_enabled))
+            if not tier_enabled and tier_reason:
+                radio.setToolTip(tier_reason)
+            radio.setChecked(bool(tier_enabled) and tier_key == display_tier)
+            radio.toggled.connect(
+                lambda checked, _k=tier_key: (
+                    self._on_general_control_changed("clip_quality_tier", _k) if checked else None
+                )
+            )
+            self._clip_quality_tier_group.addButton(radio)
+            self._clip_quality_tier_buttons[tier_key] = radio
+            body.addWidget(radio)
+            if not tier_enabled and tier_reason:
+                why = QLabel(str(tier_reason))
+                why.setWordWrap(True)
+                why.setStyleSheet(
+                    f"color: {text_color}; margin-left: 22px; font-size: 12px;"
+                )
+                body.addWidget(why)
+        self._general_controls["clip_quality_tier"] = self._clip_quality_tier_group
+
+        # r52: "Show more" collapsible with the plain-English breakdown
+        # of what each tier actually changes. Users kept asking "what's
+        # the difference?" — the toggled details answer that in one
+        # place without cluttering the radio labels.
+        _quality_toggle = QPushButton("Show more ▾")
+        _quality_toggle.setCursor(Qt.PointingHandCursor)
+        _quality_toggle.setFlat(True)
+        _quality_toggle.setStyleSheet(
+            f"QPushButton {{ color: {accent}; background: transparent;"
+            f" border: none; text-align: left; padding: 4px 0; font-size: 12px;"
+            f" font-weight: 700; }}"
+            f"QPushButton:hover {{ color: {text_color}; }}"
+        )
+        _quality_details = QLabel(
+            "<b>Low</b> — 15 fps, 720p, aggressive compression. Best when disk "
+            "space or upload speed matters more than sharpness. About 19 MB/min.<br><br>"
+            "<b>Normal</b> — 30 fps at your native resolution. Balanced default: "
+            "smooth motion, small artifacts on fast movement. About 40 MB/min. "
+            "Works on any machine.<br><br>"
+            "<b>High</b> — 60 fps at your native resolution. Near-lossless quality "
+            "(you'll only see compression if you scrub frame-by-frame in an editor). "
+            "About 120 MB/min. Requires a supported hardware encoder — NVIDIA (NVENC), "
+            "Intel (QSV), or AMD (AMF). Falls back to Normal if the encoder is "
+            "unavailable mid-session."
+        )
+        _quality_details.setWordWrap(True)
+        _quality_details.setTextFormat(Qt.RichText)
+        _quality_details.setStyleSheet(
+            f"color: {text_color}; font-size: 12px; line-height: 140%;"
+            f" padding: 6px 4px 2px 4px;"
+        )
+        _quality_details.setVisible(False)
+
+        def _toggle_quality_details():
+            new_state = not _quality_details.isVisible()
+            _quality_details.setVisible(new_state)
+            _quality_toggle.setText("Hide details ▴" if new_state else "Show more ▾")
+
+        _quality_toggle.clicked.connect(_toggle_quality_details)
+        body.addWidget(_quality_toggle)
+        body.addWidget(_quality_details)
+
+        # ============================================================
         # MONITOR CHOICE
         # ============================================================
         monitor_label = QLabel("Monitor choice:")
@@ -9847,6 +10670,8 @@ class MainWindow(QMainWindow):
 
         duration_combo = QComboBox()
         duration_combo.setStyleSheet(text_qss)
+        # r53: added 30-second preset.
+        duration_combo.addItem("30 seconds", 30)
         duration_combo.addItem("1 minute", 60)
         duration_combo.addItem("2 minutes", 120)
         duration_combo.addItem("5 minutes", 300)
@@ -9857,8 +10682,8 @@ class MainWindow(QMainWindow):
         except Exception:
             initial_duration = 60
         # Snap to the nearest supported value if a stale persisted
-        # value is something else (e.g., 30 from an older build).
-        supported = [60, 120, 300]
+        # value is out of range.
+        supported = [30, 60, 120, 300]
         if initial_duration not in supported:
             initial_duration = min(supported, key=lambda v: abs(v - initial_duration))
         duration_combo.setCurrentIndex(supported.index(initial_duration))
@@ -9889,11 +10714,7 @@ class MainWindow(QMainWindow):
         sys_row.setSpacing(10)
         sys_checkbox = QCheckBox("Record system audio (game, music, app sounds)")
         sys_checkbox.setStyleSheet(checkbox_qss)
-        sys_checkbox.setToolTip(
-            "Captures whatever is playing through your default Windows "
-            "playback device via the Python WASAPI loopback bridge. No "
-            "driver install needed."
-        )
+        sys_checkbox.setToolTip("Capture Windows loopback — no driver needed.")
         sys_checkbox.setChecked(sys_current)
         self._register_general_baseline("clip_capture_system_audio", sys_current)
 
@@ -9909,6 +10730,51 @@ class MainWindow(QMainWindow):
         sys_row.addStretch(1)
         body.addLayout(sys_row)
         self._general_controls["clip_capture_system_audio"] = sys_checkbox
+
+        # ---- Sub-toggle: follow Windows master-volume slider ----
+        # Indented under the sys-audio checkbox because it only
+        # applies while sys-audio capture is on. Wired through the
+        # same deferred-save flow (_on_general_control_changed ->
+        # _apply_general_runtime_changes -> cache restart) so the
+        # floating Save Changes button lights up on toggle and the
+        # running cache picks up the new value on Save.
+        follow_current = bool(getattr(
+            self.config, "clip_audio_follows_master_volume", False
+        ))
+        follow_row = QHBoxLayout()
+        follow_row.setSpacing(10)
+        follow_row.setContentsMargins(22, 0, 0, 0)  # indent under parent
+        follow_checkbox = QCheckBox(
+            "Match clip volume to my Windows volume slider"
+        )
+        follow_checkbox.setStyleSheet(checkbox_qss)
+        follow_checkbox.setToolTip(
+            "On: clip audio follows your Windows volume slider. "
+            "Off: clip captures at full volume regardless."
+        )
+        follow_checkbox.setChecked(follow_current)
+        follow_checkbox.setEnabled(sys_current)
+        self._register_general_baseline(
+            "clip_audio_follows_master_volume", follow_current
+        )
+
+        def _on_follow_toggled(state: int) -> None:
+            # DEFERRED-SAVE: see _on_sys_toggled above.
+            self._on_general_control_changed(
+                "clip_audio_follows_master_volume", bool(state)
+            )
+
+        follow_checkbox.stateChanged.connect(_on_follow_toggled)
+        # Keep the sub-toggle enabled state in sync with the parent
+        # sys-audio checkbox -- while sys-audio is off, the follow
+        # option has nothing to modulate.
+        sys_checkbox.stateChanged.connect(
+            lambda _s, cb=follow_checkbox: cb.setEnabled(bool(_s))
+        )
+        follow_row.addWidget(follow_checkbox)
+        follow_row.addStretch(1)
+        body.addLayout(follow_row)
+        self._general_controls["clip_audio_follows_master_volume"] = follow_checkbox
 
         # Inline status line under the system-audio checkbox.
         sys_status_label = QLabel("")
@@ -9943,12 +10809,7 @@ class MainWindow(QMainWindow):
         mic_row.setSpacing(10)
         mic_checkbox = QCheckBox("Record microphone (your voice / commentary)")
         mic_checkbox.setStyleSheet(checkbox_qss)
-        mic_checkbox.setToolTip(
-            "Captures your preferred microphone (the same one used for "
-            "voice commands). Set the mic in the Voice tab. If you "
-            "enable both this and system audio, the two are mixed "
-            "together in the saved clip."
-        )
+        mic_checkbox.setToolTip("Include your mic; mixed with system audio.")
         mic_checkbox.setChecked(mic_current)
         self._register_general_baseline("clip_capture_microphone", mic_current)
 
@@ -9981,14 +10842,7 @@ class MainWindow(QMainWindow):
         ns_combo.addItem("Light — recommended for gaming (default)", "light")
         ns_combo.addItem("Strong — aggressive (may clip word tails)", "strong")
         ns_combo.setCurrentIndex(["off", "light", "strong"].index(ns_current))
-        ns_combo.setToolTip(
-            "Off: no filtering — your mic is captured verbatim, "
-            "including keyboard and mouse clicks.\n"
-            "Light: removes desk/fan rumble and silences keyboard/mouse "
-            "clicks during speaking pauses. Recommended.\n"
-            "Strong: same as Light but with a tighter noise gate. Cuts "
-            "more background noise but may chop quiet word endings."
-        )
+        ns_combo.setToolTip("Filter mic hiss and keyboard clicks.")
         ns_combo.setEnabled(mic_checkbox.isChecked())
         self._register_general_baseline("clip_mic_noise_reduction", ns_current)
 
@@ -10115,11 +10969,7 @@ class MainWindow(QMainWindow):
         row.setSpacing(10)
         checkbox = QCheckBox("Start Touchless when I sign in")
         checkbox.setStyleSheet(checkbox_qss)
-        checkbox.setToolTip(
-            "Add Touchless to the Windows startup list so it launches "
-            "automatically at sign-in. Toggling this off removes the "
-            "registry entry."
-        )
+        checkbox.setToolTip("Launch Touchless at Windows sign-in.")
         checkbox.setChecked(actual)
         checkbox.setEnabled(autostart.is_supported())
         self._register_general_baseline("auto_start_on_login", actual)
@@ -10186,12 +11036,7 @@ class MainWindow(QMainWindow):
         row.setSpacing(10)
         checkbox = QCheckBox("Install updates automatically")
         checkbox.setStyleSheet(checkbox_qss)
-        checkbox.setToolTip(
-            "When on, Touchless installs new versions automatically "
-            "in the background and restarts on the new version. "
-            "When off, you'll see a prompt with release notes before "
-            "anything downloads."
-        )
+        checkbox.setToolTip("Install updates silently in the background.")
         checkbox.setChecked(current)
         self._register_general_baseline("auto_update_enabled", current)
 
@@ -10235,10 +11080,7 @@ class MainWindow(QMainWindow):
         row.setSpacing(10)
         checkbox = QCheckBox("Show live diagnostics in the tracking pill")
         checkbox.setStyleSheet(checkbox_qss)
-        checkbox.setToolTip(
-            "Appends the recognizer's current gesture + confidence to the "
-            "home-screen tracking pill. No additional CPU cost."
-        )
+        checkbox.setToolTip("Show live gesture + confidence in tracking pill.")
         checkbox.setChecked(current)
         self._register_general_baseline("diagnostic_overlay_enabled", current)
 
@@ -10267,10 +11109,7 @@ class MainWindow(QMainWindow):
         top_checkbox = QCheckBox("Show TOP-3 recognizer scores (instead of just the stable label)")
         top_checkbox.setStyleSheet(checkbox_qss)
         top_checkbox.setToolTip(
-            "Replaces the single 'stable_label (conf)' in the tracking pill "
-            "with the recognizer's top 3 candidates each frame — e.g. "
-            "'fist 0.87 · neutral 0.08 · three 0.05'. Lets you see runner-up "
-            "poses when a gesture isn't firing. Requires the toggle above."
+            "Show top-3 candidates instead of stable label."
         )
         top_checkbox.setChecked(top_current)
         self._register_general_baseline("show_recognizer_top_scores", top_current)
@@ -10568,22 +11407,20 @@ class MainWindow(QMainWindow):
     def _build_general_spotify_section(self) -> "QFrame":
         card, body = self._make_general_section(
             "Spotify",
-            "Run the one-time setup, then click Connect Spotify.",
+            "Click Set up / reconnect Spotify to link (or re-link) your account.",
             details=(
                 "Spotify caps shared developer apps at 5 testers per "
                 "release, so every Touchless user creates their own "
-                "free Spotify Developer app once — Set up your own "
-                "Spotify app walks you through it in about a minute "
-                "(every value has a Copy button, your Spotify "
-                "password never leaves the official Spotify "
-                "website). Touchless only receives a public Client "
-                "ID; tokens stay on your machine.\n\n"
-                "Connect Spotify opens Spotify's OAuth consent "
-                "screen in your browser and saves the resulting "
-                "tokens locally. Click it again any time you need "
-                "to re-authorise — for example after changing your "
-                "Spotify password, switching accounts, or if voice "
-                "control of Spotify suddenly stops working."
+                "free Spotify Developer app once — the wizard walks "
+                "you through it in about a minute (every value has a "
+                "Copy button, your Spotify password never leaves the "
+                "official Spotify website). Touchless only receives a "
+                "public Client ID; tokens stay on your machine.\n\n"
+                "The same wizard hosts a Reconnect section for users "
+                "who are already set up — click that any time voice / "
+                "gesture control of Spotify stops working (Spotify "
+                "periodically expires sign-in tokens, especially "
+                "after a password change or a long break)."
             ),
         )
         # Premium-required warning line. Spotify gates its Web API
@@ -10643,28 +11480,25 @@ class MainWindow(QMainWindow):
         if bool(getattr(self.config, "spotify_premium_warning_dismissed", False)):
             self._spotify_premium_warning_frame.setVisible(False)
 
-        # Connect Spotify button — opens OAuth in a browser. Not
-        # gated on the deferred-save mechanism (it does its own
-        # token persistence).
-        self.connect_spotify_button = QPushButton("Connect Spotify")
-        self.connect_spotify_button.setObjectName("connectSpotifyButton")
-        self.connect_spotify_button.setCursor(Qt.PointingHandCursor)
-        self.connect_spotify_button.clicked.connect(self._on_connect_spotify_clicked)
-
-        # Wizard button — opens the in-app Spotify setup flow that
-        # lets every user supply their own client_id (lifting the
-        # 5-user cap Spotify enforces on the bundled default).
-        setup_btn = QPushButton("Set up your own Spotify app")
+        # v1.1.7.11: the standalone "Connect Spotify" button was
+        # removed here — the setup wizard now hosts both first-time
+        # setup AND a Reconnect section, and the failure fade-pill
+        # opens the wizard on click. Keeping only the wizard entry.
+        setup_btn = QPushButton("Set up / reconnect Spotify")
         setup_btn.setObjectName("spotifySetupButton")
         setup_btn.setCursor(Qt.PointingHandCursor)
         setup_btn.setStyleSheet(self._settings_panel_button_stylesheet())
         setup_btn.clicked.connect(self._open_spotify_setup_wizard)
+        # Assign to attribute so the walkthrough scroll anchor still
+        # has something to reach for (used at
+        # _scroll_general_to_spotify_section, which used to point at
+        # connect_spotify_button before this rewrite).
+        self._spotify_setup_button = setup_btn
 
         row = QHBoxLayout()
         row.setSpacing(10)
         row.addStretch(1)
         row.addWidget(setup_btn)
-        row.addWidget(self.connect_spotify_button)
         row.addStretch(1)
         body.addLayout(row)
         return card
@@ -12689,6 +13523,21 @@ class MainWindow(QMainWindow):
             "Camera",
             "",
         )
+        # v1.1.7 round-19: opt into _CurrentSizedStack's recursive
+        # true-content-height path so the stack's sizeHint /
+        # minimumSizeHint / maxHeight all reflect the real rendered
+        # height of the wordwrap labels nested inside our inner QFrame
+        # cards (whose sizePolicy otherwise breaks the heightForWidth
+        # chain). Result: outer content_scroll's AsNeeded scrollbar
+        # stays hidden when Show more is collapsed (content ≤
+        # viewport) and engages with range = content - viewport (exact
+        # overflow) when the user expands Show more. Panel keeps its
+        # default (Preferred, Maximum) sizePolicy from
+        # _make_content_panel — the earlier round-18 attempt to switch
+        # to Ignored was reverted because QScrollArea's widgetResizable
+        # min-height derivation re-introduces the wordwrap height
+        # regardless of the panel's sizePolicy.
+        panel.setProperty("useAccurateHeight", True)
         # _make_content_panel already applies the transparent-bg
         # override and tightened margins. Camera-specific tweak:
         # tighten further so the camera content fits inside the
@@ -12735,8 +13584,22 @@ class MainWindow(QMainWindow):
         # (16, 16, 16, 16) so the three-section camera content fits
         # the settings viewport at default window size without
         # triggering a vertical scrollbar. Spacing also nudged down.
-        box_layout.setContentsMargins(14, 12, 14, 12)
-        box_layout.setSpacing(6)
+        # v1.1.7 round-20: tightened further (14/10/14/10, spacing 4)
+        # so the default state fits the ~625-640 px settings viewport at
+        # the app's default 1020x740 geometry without triggering the outer
+        # scrollbar. Combined with the Save Changes button being reparented
+        # to the scroll viewport (removes ~15-20 px of header_row height
+        # from the panel column) this brings default content to ~575-585
+        # px — comfortably inside the viewport with headroom for the two
+        # expandable Show-more notes when the user opens them.
+        # r52: tightened again — the C31 short-shutter checkbox added
+        # ~40 px to the default panel height, so with round-20's margins
+        # the outer scrollbar showed on default. Bringing top/bottom
+        # margins to 6 and section spacings below to 4 recovers ~20 px
+        # while keeping enough headroom that the two Show-more notes
+        # can expand without immediately triggering the scroll.
+        box_layout.setContentsMargins(14, 6, 14, 6)
+        box_layout.setSpacing(4)
 
         # Camera-panel checkbox style: matches the unified app-wide
         # green-box-with-white-checkmark look (see
@@ -12883,7 +13746,119 @@ class MainWindow(QMainWindow):
         preview_row.addWidget(self.camera_already_mirrored_checkbox)
         preview_row.addStretch(1)
         box_layout.addLayout(preview_row)
-        box_layout.addSpacing(16)
+
+        # r51: three placebo checkboxes removed here (auto-adjust
+        # for lighting, prefer camera's native resolution, fast
+        # tracking mode). Audit found all three had docstrings /
+        # tooltips promising behavior (CLAHE + adaptive gamma, res
+        # clamp, MP frame dim) but no actual consumer wired to the
+        # config values. See OPEN_ISSUES.md for the r52 items that
+        # follow up (physical config-field deletion after one
+        # release, marketing/tutorial sweep, potential CLAHE/gamma
+        # implementation revival if a support ticket asks). The
+        # "Re-apply camera tuning" button below replaces the
+        # accidental escape hatch that the prefer-native save
+        # handler used to provide (it retuned MJPG/FPS/BUFFERSIZE
+        # + r49 short-shutter on every flip).
+        _tuning_button_row = QHBoxLayout()
+        _tuning_button_row.setContentsMargins(0, 0, 0, 0)
+        _tuning_button_row.setSpacing(10)
+        self.reapply_camera_tuning_button = QPushButton("Re-apply camera tuning")
+        self.reapply_camera_tuning_button.setCursor(Qt.PointingHandCursor)
+        self.reapply_camera_tuning_button.setToolTip(
+            "Re-apply MJPG, fps, buffer, and shutter."
+        )
+        self.reapply_camera_tuning_button.clicked.connect(
+            self._on_reapply_camera_tuning_clicked
+        )
+        _tuning_button_row.addWidget(self.reapply_camera_tuning_button)
+        _tuning_button_row.addStretch(1)
+        box_layout.addLayout(_tuning_button_row)
+        # v1.1.7 r49: Force short-shutter toggle for cheap UVC webcams.
+        # Some low-end USB webcam drivers (generic Realtek "FULL HD
+        # 1080P Webcam" and similar) hold auto-exposure open for 40-80
+        # ms per frame in indoor lighting, which caps delivered fps
+        # around 15. This toggle forces manual exposure at ~15.6 ms
+        # so the driver stops throttling. Default OFF to protect
+        # premium cameras (Kiyo Pro / Brio) whose drivers interpret
+        # the same hint as their own HDR trigger and throttle 60->25.
+        short_shutter_row = QHBoxLayout()
+        short_shutter_row.setContentsMargins(0, 0, 0, 0)
+        short_shutter_row.setSpacing(10)
+        # r53: reworded per user request — no parentheses, emphasise
+        # performance boost on older / lower-quality cameras.
+        self.camera_short_shutter_checkbox = QCheckBox(
+            "Boost performance for older cameras"
+        )
+        self.camera_short_shutter_checkbox.setObjectName("cameraMirroredCheckbox")
+        self.camera_short_shutter_checkbox.setStyleSheet(
+            checkbox_style_tpl.format(
+                name="cameraMirroredCheckbox",
+                text=self.config.text_color,
+                accent=self.config.accent_color,
+                check_path=_checkmark_image_path(),
+            )
+        )
+        self.camera_short_shutter_checkbox.setToolTip(
+            "Boost fps on older / cheaper cameras."
+        )
+        self._camera_short_shutter_baseline = bool(
+            getattr(self.config, "camera_force_short_shutter", False)
+        )
+        self.camera_short_shutter_checkbox.setChecked(
+            self._camera_short_shutter_baseline
+        )
+        self.camera_short_shutter_checkbox.toggled.connect(
+            lambda _checked: self._refresh_camera_settings_save_state()
+        )
+        short_shutter_row.addWidget(self.camera_short_shutter_checkbox)
+        short_shutter_row.addStretch(1)
+        box_layout.addLayout(short_shutter_row)
+
+        # r53 v7: match the other camera Show more's exactly — same
+        # "Show more..." / "Show less..." labels, same accent-link
+        # stylesheet, same right-aligned row layout as the QR-note
+        # and Save-Location expanders in _build_expandable_note.
+        _short_shutter_toggle = QPushButton("Show more...")
+        _short_shutter_toggle.setCursor(Qt.PointingHandCursor)
+        _short_shutter_toggle.setFlat(True)
+        _short_shutter_toggle.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        _short_shutter_toggle.setStyleSheet(self._settings_inline_link_stylesheet())
+        _short_shutter_toggle_row = QHBoxLayout()
+        _short_shutter_toggle_row.setContentsMargins(0, 0, 0, 0)
+        _short_shutter_toggle_row.setSpacing(0)
+        _short_shutter_toggle_row.addStretch(1)
+        _short_shutter_toggle_row.addWidget(
+            _short_shutter_toggle, 0, Qt.AlignRight | Qt.AlignBottom
+        )
+
+        _short_shutter_details = QLabel(
+            "Some cameras slow down in dim rooms because they hold the "
+            "shutter open longer to gather light. That can make video "
+            "stutter and lag behind your hand. Turn this on to keep the "
+            "shutter quick — the picture may look a little darker, but "
+            "movement stays smooth and gestures track more reliably. "
+            "Leave off if your camera already handles low light well. "
+            "Takes effect the next time the camera reopens."
+        )
+        _short_shutter_details.setObjectName("cameraNote")
+        _short_shutter_details.setWordWrap(True)
+        _short_shutter_details.setVisible(False)
+
+        def _toggle_short_shutter_details():
+            new_state = not _short_shutter_details.isVisible()
+            _short_shutter_details.setVisible(new_state)
+            _short_shutter_toggle.setText(
+                "Show less..." if new_state else "Show more..."
+            )
+
+        _short_shutter_toggle.clicked.connect(_toggle_short_shutter_details)
+        box_layout.addLayout(_short_shutter_toggle_row)
+        box_layout.addWidget(_short_shutter_details)
+
+        # r52: 10 -> 4 to keep the default state below the outer viewport
+        # after the C31 short-shutter row landed.
+        box_layout.addSpacing(4)
 
         # ============================================================
         # 2. PHONE CAMERA VIA QR CODE
@@ -12899,8 +13874,8 @@ class MainWindow(QMainWindow):
         box_layout.addWidget(_section_header("Connect Phone"))
 
         qr_note = self._build_expandable_note(
-            "Use your phone as the camera — Connect Phone to enter a code via touchless-control.com, or LAN via QR code.",
-            "No phone app needed. Connect Phone shows a 6-digit code to type on touchless-control.com/connect (works across networks, no certificate warning). The QR option pairs over your local Wi-Fi instead.",
+            "Use your phone as the camera.",
+            "Enter a 6-digit code at touchless-control.com/connect, or scan the QR to pair over local Wi-Fi. No phone app needed.",
         )
         # Held on self so the pair / unpair handlers can hide it when a
         # phone is connected (the instruction is redundant once paired)
@@ -12981,7 +13956,8 @@ class MainWindow(QMainWindow):
         self.phone_camera_qr_status_label.setWordWrap(True)
         self.phone_camera_qr_status_label.setVisible(bool(initial_status))
         box_layout.addWidget(self.phone_camera_qr_status_label)
-        box_layout.addSpacing(16)
+        # r52: 10 -> 4 (see matching change above).
+        box_layout.addSpacing(4)
 
         # Lite Mode / Low FPS Mode / GPU Mode were removed from the
         # Camera panel — they duplicated the toggles in
@@ -14262,7 +15238,15 @@ class MainWindow(QMainWindow):
         # Without this the panel's natural sizeHint can exceed the
         # outer viewport and a second (outer) scrollbar appears next
         # to the inner one.
-        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+        # v1.1.7 round-8: was `Preferred, Ignored`, which made the
+        # panel report height=0 to the outer stack — the outer
+        # scroll could never engage, so we had to add an inner
+        # QScrollArea, and THAT is what dad saw as a scrollbar.
+        # Match the Camera panel's default (`Preferred, Maximum`
+        # from _make_content_panel) so the panel reports its real
+        # heightForWidth and the outer settingsContentScroll
+        # engages only as safety net when content overflows.
+        pass
         title_item = layout.takeAt(0)
         title_label = title_item.widget() if title_item is not None else None
         header_row = QHBoxLayout()
@@ -14282,67 +15266,21 @@ class MainWindow(QMainWindow):
         self._set_settings_save_button_pending(self.save_microphone_button, False)
         self.clear_microphone_button = None
 
-        # Wrap the panel body in a scroll area so the mic selector +
-        # phone-mic toggle + test/gain controls don't get squeezed when
-        # the Settings column is narrow. Matches the Camera panel's
-        # pattern — accent-colored handle on a faint track.
-        scroll = QScrollArea()
-        scroll.setObjectName("micScroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # Per user request: Microphone panel should never show a
-        # scrollbar. Inner card margins are tightened below so the
-        # whole panel content fits the typical settings viewport
-        # without overflow — Local + Phone Mic stack into one card,
-        # Test Microphone stacks into the second card right below.
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setStyleSheet(
-            f"""
-            QScrollArea#micScroll, QScrollArea#micScroll > QWidget,
-            QScrollArea#micScroll QWidget#qt_scrollarea_viewport {{
-                background: transparent;
-                border: none;
-            }}
-            QScrollArea#micScroll QScrollBar:vertical {{
-                background: rgba(255,255,255,0.04);
-                width: 10px;
-                margin: 6px 3px 6px 8px;
-                border-radius: 5px;
-            }}
-            QScrollArea#micScroll QScrollBar::handle:vertical {{
-                background: {self.config.accent_color};
-                border-radius: 5px;
-                min-height: 32px;
-            }}
-            QScrollArea#micScroll QScrollBar::handle:vertical:hover {{
-                background: {self.config.accent_color};
-                border: 1px solid rgba(255,255,255,0.25);
-            }}
-            QScrollArea#micScroll QScrollBar::add-line:vertical,
-            QScrollArea#micScroll QScrollBar::sub-line:vertical {{
-                height: 0px;
-                background: transparent;
-            }}
-            QScrollArea#micScroll QScrollBar::add-page:vertical,
-            QScrollArea#micScroll QScrollBar::sub-page:vertical {{
-                background: transparent;
-            }}
-            """
-        )
-
-        scroll_container = QWidget()
-        # Qt gives a naked QWidget a white system background unless we
-        # explicitly opt out — without this the Microphone panel
-        # viewport paints white behind our innerCard frames and
-        # everything becomes unreadable against the pale text.
-        scroll_container.setAutoFillBackground(False)
-        scroll_container.setAttribute(Qt.WA_StyledBackground, False)
-        scroll_container.setStyleSheet("background: transparent;")
-        scroll_vbox = QVBoxLayout(scroll_container)
-        scroll_vbox.setContentsMargins(0, 0, 0, 0)
-        # Tight inter-card spacing so Local-Mic-card + Test-Mic-card
-        # fit in the settings viewport without forcing a scroll.
+        # v1.1.7 round-8: DELETED the inner QScrollArea wrapper.
+        # It was the ROOT CAUSE of the visible scrollbar dad saw
+        # on the Mic panel — even after round-6 removed
+        # SECTION_MICROPHONE from _SETTINGS_OUTER_SCROLL_OFF, the
+        # inner micScroll (AsNeeded) still engaged whenever content
+        # exceeded the viewport. Camera panel doesn't wrap its
+        # content in an inner scroll at all — it just adds its
+        # innerCard directly to the panel's layout, and if content
+        # overflows the outer settingsContentScroll (AsNeeded)
+        # handles it. We now do the same: alias scroll_vbox to
+        # the panel's layout so all downstream addWidget calls
+        # target the panel directly.
+        scroll_vbox = layout
+        # Tighter spacing so Local-Mic-card + Test-Mic-card fit
+        # without needing outer scroll either.
         scroll_vbox.setSpacing(6)
 
         section_style = (
@@ -14385,8 +15323,17 @@ class MainWindow(QMainWindow):
         note.setWordWrap(True)
         box_layout.addWidget(note)
 
-        self.microphone_combo = QComboBox()
+        # v1.1.7 fix: refresh mic inventory when the dropdown is
+        # opened, so a headset plugged in mid-session appears. See
+        # matching change on home_microphone_combo above.
+        self.microphone_combo = _RefreshingCameraCombo()
         self.microphone_combo.setObjectName("settingsMicrophoneCombo")
+        # v1.1.7 round-8b: dispatch to background diff tick so the
+        # dropdown-open doesn't stall the UI for 100-500 ms while
+        # pycaw enumerates.
+        self.microphone_combo.popup_about_to_show.connect(
+            self._live_device_diff_tick
+        )
         self.microphone_combo.currentIndexChanged.connect(self._on_microphone_settings_selection_changed)
         box_layout.addWidget(self.microphone_combo)
         # Auto-detected mic-class badge below the dropdown. Updates on
@@ -14613,10 +15560,8 @@ class MainWindow(QMainWindow):
 
         scroll_vbox.addWidget(test_box)
         scroll_vbox.addStretch(1)
-
-        scroll.setWidget(scroll_container)
-        self._install_scroll_wheel_forwarder(scroll)
-        layout.addWidget(scroll, 1)
+        # (v1.1.7 round-8: no more scroll.setWidget / layout.addWidget(scroll)
+        # — inner QScrollArea deleted, scroll_vbox is now `layout` itself.)
         # Reflect the persisted phone-mic source choice in the visible
         # dropdown + QR button state.
         self._refresh_phone_mic_dependent_ui()
@@ -15477,6 +16422,22 @@ class MainWindow(QMainWindow):
             f"font-size: 12px; padding-top: 8px;"
         )
         layout.addWidget(about_footer_label)
+
+        # Build round marker — bumped on every shipped build so we
+        # can distinguish which round the installed .exe corresponds
+        # to. Shipped v1.1.7 uses the same version string across
+        # rounds 24-28; this marker resolves that ambiguity.
+        try:
+            from ... import BUILD_ROUND as _touchless_build_round
+        except Exception:
+            _touchless_build_round = 29
+        build_marker_label = QLabel(f"build round {_touchless_build_round}")
+        build_marker_label.setAlignment(Qt.AlignCenter)
+        build_marker_label.setStyleSheet(
+            f"color: {self.config.text_color}; opacity: 0.4; "
+            f"font-size: 11px; padding-top: 2px; padding-bottom: 4px;"
+        )
+        layout.addWidget(build_marker_label)
 
         layout.addStretch(1)
         return panel
@@ -16509,10 +17470,18 @@ Admin elevation
     #      Colors, Tutorial, About / Privacy. The user explicitly
     #      asked these to have no scroll at all.
     _SETTINGS_OUTER_SCROLL_OFF = frozenset({
-        # Microphone keeps its own inner scroll (short content, fits).
-        SECTION_MICROPHONE,
-        # Panels whose content is short enough to always fit in a
-        # reasonable window — no scroll affordance needed at all.
+        # v1.1.7 round-19: Camera stays OUT of this set. It keeps its
+        # default (Preferred, Maximum) policy from _make_content_panel
+        # and opts in to _CurrentSizedStack's recursive true-content-
+        # height path via panel.setProperty("useAccurateHeight", True)
+        # in _build_camera_panel. That combination gives the outer
+        # AsNeeded scrollbar an EXACT overflow-range only when Show
+        # more expands past viewport height — no bar in the default
+        # collapsed state, exact-extent bar when expanded. Panels
+        # listed here are ones whose content is guaranteed to fit
+        # the viewport at every supported window size, so the outer
+        # scrollbar is disabled and its wheel is swallowed by the
+        # viewport event filter (see MainWindow.eventFilter).
         SECTION_COLORS,
         SECTION_TUTORIAL,
         # Camera, Custom Gesture, Gesture Binds, Save Locations, and
@@ -16553,11 +17522,25 @@ Admin elevation
             else:
                 scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
                 scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-                # Re-enable when leaving an off-list panel so the
-                # scroll bars can render again for panels that need them.
+                # v1.1.7 round-19: DON'T force-show the scrollbars
+                # here. Coming off an OFF-list panel we hid them via
+                # setVisible(False); force-visible(True) overrides
+                # AsNeeded's auto-hide and leaves a phantom empty bar
+                # on panels whose current content fits the viewport
+                # (Camera in its default collapsed state — the exact
+                # "scroll bar by default which is incorrect" complaint).
+                # Gate on the actual range so the bar renders ONLY
+                # when there is content to scroll to; a follow-up
+                # LayoutRequest / Resize after _refresh_max_height
+                # settles will re-evaluate and reveal the bar the
+                # moment the range actually grows.
                 try:
-                    scroll.verticalScrollBar().setVisible(True)
-                    scroll.horizontalScrollBar().setVisible(True)
+                    vb = scroll.verticalScrollBar()
+                    hb = scroll.horizontalScrollBar()
+                    if vb is not None:
+                        vb.setVisible(vb.maximum() > 0)
+                    if hb is not None:
+                        hb.setVisible(hb.maximum() > 0)
                 except Exception:
                     pass
             scroll.verticalScrollBar().setValue(0)
@@ -17167,34 +18150,42 @@ Admin elevation
            fill. Reads as inactive without being grayed-out-disabled;
            the button IS clickable but pressing it is a no-op when
            nothing's pending, so it shouldn't shout for attention. */
+        /* v1.1.7 fix: use 2 px border in EVERY state so the box
+           model geometry is constant across armed/unarmed/hover/
+           pressed/disabled. Was 1 px in resting/disabled and 2 px
+           in pending, which grew the button by 2 px vertically
+           and 2 px horizontally when it armed on a settings change.
+           That growth shoved the settings header row taller and
+           clipped panel viewports (dad's Mic-panel report). Only
+           the border COLOR changes across states now, not width. */
         QStackedWidget#settingsContentStack QPushButton#settingsSaveButton {{
             background-color: {settings_button_bg};
             color: rgba(229, 246, 255, 0.45);
-            border: 1px solid {accent_outline};
-            font-weight: 700;
+            border: 2px solid {accent_outline};
+            font-weight: 800;
         }}
         QStackedWidget#settingsContentStack QPushButton#settingsSaveButton[hgrHover="true"],
         QStackedWidget#settingsContentStack QPushButton#settingsSaveButton:hover {{
             background-color: {button_hover_color};
             color: rgba(229, 246, 255, 0.70);
-            border: 1px solid {accent_outline_strong};
+            border: 2px solid {accent_outline_strong};
         }}
         QStackedWidget#settingsContentStack QPushButton#settingsSaveButton[hgrPressed="true"],
         QStackedWidget#settingsContentStack QPushButton#settingsSaveButton:pressed {{
             background-color: {panel_active_bg};
             color: {self.config.text_color};
-            border: 1px solid {accent_outline_strong};
+            border: 2px solid {accent_outline_strong};
         }}
-        /* Save Changes pending state — "lit up" look:
-           full-strength accent border at 2 px so the cyan rim
-           reads clearly, full text colour + bolder weight, solid
-           primary-blue fill. The whole button changes colour, not
-           just the border. */
+        /* Save Changes pending state — "lit up" look. Same 2 px
+           border as resting; only the border COLOR flips to the
+           accent so the whole button reads as active. Font-weight
+           was 900 pre-fix, causing a subpixel content-width nudge;
+           unified to 800 across states. */
         QStackedWidget#settingsContentStack QPushButton#settingsSaveButton[pendingSave="true"] {{
             background-color: {self.config.primary_color};
             color: {self.config.text_color};
             border: 2px solid {self.config.accent_color};
-            font-weight: 900;
+            font-weight: 800;
         }}
         QStackedWidget#settingsContentStack QPushButton#settingsSaveButton[pendingSave="true"][hgrHover="true"],
         QStackedWidget#settingsContentStack QPushButton#settingsSaveButton[pendingSave="true"]:hover {{
@@ -17205,7 +18196,7 @@ Admin elevation
         QStackedWidget#settingsContentStack QPushButton#settingsSaveButton:disabled {{
             color: {soft_text};
             background-color: rgba(127, 127, 127, 0.10);
-            border: 1px solid rgba(127, 127, 127, 0.18);
+            border: 2px solid rgba(127, 127, 127, 0.18);
         }}
         /* Inner-panel action buttons (Camera Preview / Low FPS /
            Lite Mode / GPU Mode / Mic Test / Save Locations Browse /
@@ -18950,7 +19941,25 @@ Admin elevation
                 want_mirrored = not bool(mirrored_cb.isChecked())
                 if want_mirrored != bool(self._camera_mirrored_baseline):
                     pending = True
+        # r51: auto-adjust + prefer-native pending-save checks
+        # removed (checkboxes deleted). Fast-tracking never had a
+        # pending-save entry.
+        # v1.1.7 r49: Force short-shutter checkbox — deferred save.
+        if not pending:
+            ss_cb = getattr(self, "camera_short_shutter_checkbox", None)
+            if ss_cb is not None and hasattr(self, "_camera_short_shutter_baseline"):
+                if bool(ss_cb.isChecked()) != bool(self._camera_short_shutter_baseline):
+                    pending = True
         self._set_settings_save_button_pending(button, pending)
+        # v1.1.7 round-20: button is now a viewport-anchored floater
+        # (reparented after content_scroll wraps the stack). Re-position
+        # after each pending-state flip so width changes from font/state
+        # don't leave the button in the wrong spot — mirrors the same
+        # tail call in _update_general_save_state.
+        try:
+            self._position_camera_save_floating_button()
+        except Exception:
+            pass
 
     def _on_camera_settings_selection_changed(self, _index: int) -> None:
         self._refresh_camera_settings_save_state()
@@ -19037,7 +20046,18 @@ Admin elevation
             new_line = f"[{stamp}] {value} (×{n})"
             entries[-1] = new_line
             if isinstance(widget, QPlainTextEdit):
-                self._sync_home_debug_log_widget()
+                # v1.1.7 round-30 stall fix: held-repeat gestures
+                # (volume-up held → command_detected ~30x/s) hit this
+                # branch on every tick and each call full-rewrites a
+                # ~250-block QPlainTextEdit via setPlainText. Coalesce
+                # to at most 4/s so a held gesture can't wedge the
+                # main-thread paint scheduler. Distinct-message appends
+                # (below) land in-place via cursor.insertText and stay
+                # unrate-limited — they're rare compared to the
+                # per-tick same-message collapse.
+                if not getattr(self, "_home_debug_log_sync_pending", False):
+                    self._home_debug_log_sync_pending = True
+                    QTimer.singleShot(250, self._flush_home_debug_log_sync)
             return
 
         # New distinct message — append fresh.
@@ -19077,6 +20097,18 @@ Admin elevation
         widget.setPlainText("\n".join(reversed(entries)))
         if should_follow:
             scrollbar.setValue(0)
+
+    def _flush_home_debug_log_sync(self) -> None:
+        # v1.1.7 round-30 companion to the collapse-branch coalescer:
+        # clears the pending flag BEFORE repainting so a same-tick burst
+        # arriving during setPlainText schedules the NEXT paint instead
+        # of dropping the update entirely. The distinct-message append
+        # branch reads the widget's live cursor state so the pending
+        # coalesced repaint won't overwrite a fresh in-place insert —
+        # setPlainText re-renders from self._home_debug_log_entries which
+        # the append branch already updated.
+        self._home_debug_log_sync_pending = False
+        self._sync_home_debug_log_widget()
 
     def _set_home_camera_display_text(self, text: str, *, enabled: bool = True) -> None:
         self._set_home_device_combo_text("home_camera_combo", text, enabled=enabled)
@@ -19473,14 +20505,69 @@ Admin elevation
         # saved), the combo-save path is a no-op but we still need
         # to persist the overlay flags — _save_live_view_overlay_changes
         # handles both cases.
+        #
+        # IMPORTANT: snapshot `combo_changed` BEFORE the combo-save
+        # call. _save_camera_preference_from_combo writes
+        # self.config.preferred_camera_index, which makes any later
+        # `combo.currentData() == _saved_camera_settings_combo_value()`
+        # trivially True and used to fire a stacked "Settings Saved"
+        # toast right on top of "Camera Saved". The two toasts must
+        # be mutually exclusive.
         overlay_changed = self._save_live_view_overlay_changes()
-        self._save_camera_preference_from_combo(self.camera_combo, show_notice=not overlay_changed or self.camera_combo.currentData() != self._saved_camera_settings_combo_value())
-        if overlay_changed and self.camera_combo.currentData() == self._saved_camera_settings_combo_value():
-            # Combo-save shows its own confirmation toast; when only
-            # the overlay toggles changed, surface a small note so
-            # the user sees Save Changes was acknowledged.
+        combo_changed = (
+            self.camera_combo.currentData()
+            != self._saved_camera_settings_combo_value()
+        )
+        self._save_camera_preference_from_combo(self.camera_combo, show_notice=combo_changed)
+        if overlay_changed and not combo_changed:
+            # Only the overlay toggles changed — combo-save was a
+            # no-op and didn't show its "Camera Saved" toast, so
+            # surface a small note here to acknowledge Save Changes.
             TouchlessNotice.show_info(self, "Settings Saved", "Live view overlays updated.")
         self._refresh_camera_settings_save_state()
+
+    def _on_reapply_camera_tuning_clicked(self) -> None:
+        """r51: 'Re-apply camera tuning' button in Settings > Camera.
+        Explicit replacement for the accidental escape hatch that
+        the removed 'Prefer camera's native resolution' checkbox
+        used to provide via its save handler. Re-runs the default
+        capture tuning (MJPG format, requested fps, buffer size,
+        and force-short-shutter arm/reset if enabled) against the
+        live worker cap.
+        """
+        worker = getattr(self, "_worker", None)
+        worker_cap = getattr(worker, "_cap", None) if worker is not None else None
+        if worker is None or worker_cap is None:
+            TouchlessNotice.show_info(
+                self,
+                "Camera Not Running",
+                "Start the engine first — the camera has to be running for "
+                "'Re-apply camera tuning' to do anything.",
+            )
+            return
+        try:
+            worker._apply_default_capture_tuning((None, worker_cap))
+        except Exception as _e:
+            try:
+                sys.stderr.write(
+                    f"[r51-reapply-tuning] exception: "
+                    f"{type(_e).__name__}: {_e}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            TouchlessNotice.show_info(
+                self,
+                "Re-apply Failed",
+                "Something went wrong re-applying camera tuning — check the "
+                "debug log for details.",
+            )
+            return
+        TouchlessNotice.show_info(
+            self,
+            "Camera Tuning Re-applied",
+            "The camera was re-tuned. If it was stuck, this should un-stick it.",
+        )
 
     def _save_live_view_overlay_changes(self) -> bool:
         """Apply the three Live View Overlay checkboxes to config,
@@ -19515,6 +20602,66 @@ Admin elevation
                 changed = True
             self.config.camera_source_is_mirrored = want_mirrored
             self._camera_mirrored_baseline = want_mirrored
+        # r51: auto-adjust / prefer-native / fast-tracking save
+        # handlers removed (audit found no consumer wired to their
+        # config values). The 'Re-apply camera tuning' button in
+        # Settings > Camera is the explicit escape hatch that
+        # prefer-native's save handler used to double as by accident.
+        # v1.1.7 r49: Force short-shutter checkbox — same deferred-save
+        # pattern. Unlike fast_tracking (which is read every frame in
+        # _dim_frame_for_mp), this hint is applied at capture-open
+        # time in _apply_default_capture_tuning. Both ON->OFF and
+        # OFF->ON require the camera to next reopen for the change
+        # to take full effect: OFF->ON needs the driver to latch the
+        # new manual-exposure value, and ON->OFF has no code path
+        # today that restores CAP_PROP_AUTO_EXPOSURE back to auto
+        # (the apply block only writes values when apply_hint=True).
+        # The checkbox tooltip already warns the user that a camera
+        # reopen is required.
+        ss_cb = getattr(self, "camera_short_shutter_checkbox", None)
+        short_shutter_changed = False
+        if ss_cb is not None and hasattr(self, "_camera_short_shutter_baseline"):
+            want_ss = bool(ss_cb.isChecked())
+            if want_ss != bool(self._camera_short_shutter_baseline):
+                changed = True
+                short_shutter_changed = True
+            self.config.camera_force_short_shutter = want_ss
+            # r53: mark the FSS choice as user-authoritative so the
+            # r50 classifier never overrides it (was silently flipping
+            # user-off back to on for Realtek/generic UVC display names).
+            self.config.camera_force_short_shutter_user_chose = True
+            self._camera_short_shutter_baseline = want_ss
+        if short_shutter_changed:
+            worker = getattr(self, "_worker", None)
+            worker_cap = getattr(worker, "_cap", None) if worker is not None else None
+            # r49 diag Q3 anchor: log the wall-time of the toggle-save
+            # so subsequent [perf-monitor] fps samples can be bisected
+            # against the flip. Also records whether the live retune
+            # path was eligible -- worker/cap absence (Settings opened
+            # before Start pressed) now self-diagnoses instead of
+            # looking identical to a working retune.
+            try:
+                sys.stderr.write(
+                    f"[r49-short-shutter] UI toggle saved: "
+                    f"want={self.config.camera_force_short_shutter} "
+                    f"worker_present={worker is not None} "
+                    f"live_cap_present={worker_cap is not None}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            if worker is not None and worker_cap is not None:
+                try:
+                    worker._apply_default_capture_tuning((None, worker_cap))
+                except Exception as _e:
+                    try:
+                        sys.stderr.write(
+                            f"[r49-short-shutter] live retune exception: "
+                            f"{type(_e).__name__}: {_e}\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
         if changed:
             # Persist off the UI thread so the click handler returns
             # instantly (config in-memory is already up to date).
@@ -19549,6 +20696,154 @@ Admin elevation
         self._refresh_camera_combo_selection(None)
         self._refresh_camera_labels()
         self.last_action_label.setText("Last action: cleared saved camera")
+
+    def _on_live_audio_devices_changed(self) -> None:
+        """Fired by QMediaDevices.audioInputsChanged on WM_DEVICECHANGE.
+        Debounced with a 300 ms singleShot to coalesce the 3-4 rapid
+        signals a headset init sequence emits into a single refresh.
+
+        v1.1.7 round-8b LAG FIX: was routing straight to
+        refresh_microphone_inventory() which calls
+        list_input_microphones() → pycaw COM enumeration
+        (~100-500 ms). Since QMediaDevices signals fire on the main
+        thread, that was blocking the Qt event loop every time
+        Windows saw an audio device change — which happens quite
+        often on some Win10 setups (session state polls, endpoint
+        wakes, headset renegotiation). Now dispatches to
+        _live_device_diff_tick which offloads to a background
+        thread and marshals the result back via the signal bridge.
+        Zero main-thread cost regardless of enumeration duration.
+        """
+        try:
+            timer = getattr(self, "_live_device_watch_debounce_timer", None)
+            if timer is not None and timer.isActive():
+                return
+            debounce = QTimer(self)
+            debounce.setSingleShot(True)
+            debounce.setInterval(300)
+            debounce.timeout.connect(self._live_device_diff_tick)
+            debounce.start()
+            self._live_device_watch_debounce_timer = debounce
+        except Exception:
+            pass
+
+    def _on_live_video_devices_changed(self) -> None:
+        """Fired by QMediaDevices.videoInputsChanged on WM_DEVICECHANGE.
+        Kicks the existing async camera refresh path (no polling cost)."""
+        try:
+            self._kick_off_async_camera_refresh()
+        except Exception:
+            pass
+
+    def _live_device_diff_tick(self) -> None:
+        """Belt-and-suspenders 3s poll for hotplug events that Qt's
+        signal missed (some Win10 USB hubs swallow WM_DEVICECHANGE).
+
+        v1.1.7 round-8 fix: enumeration is now run on a BACKGROUND
+        THREAD. Previously it ran synchronously on the Qt main
+        thread and blocked the event loop for 100-500 ms every 3 s
+        on older Win10 PCs (pycaw's COM enumeration + sounddevice
+        query stacked); dad reported "app is lagging even though
+        the FPS number looks fine" — that periodic hitch was
+        invisible in the 0.5 s FPS-window display but visible as
+        stutter. Offloading eliminates the main-thread stall
+        entirely. The diff comparison and UI rebuild happen back on
+        the main thread via QTimer.singleShot marshalling.
+        """
+        # Skip re-entry: if a prior tick's worker is still running,
+        # don't queue another one (drop this tick — next 3 s tick
+        # will pick it up).
+        if getattr(self, "_live_device_diff_in_progress", False):
+            return
+        self._live_device_diff_in_progress = True
+
+        def _worker():
+            # v1.1.7 round-9 rev-2: initialize COM on this bg thread
+            # BEFORE calling pycaw. comtypes internally calls
+            # CoInitializeEx when needed, but if we let it default,
+            # it can pick STA — which then marshals the underlying
+            # IMMDeviceEnumerator calls back to the process's main
+            # STA thread. Result: main thread stalls for the full
+            # duration of the enumeration (500-1000 ms on older PCs
+            # with many audio endpoints). Explicit MTA init here
+            # keeps the enumeration on THIS thread. Safe if pycaw
+            # is missing — the wrapping try suppresses any error.
+            try:
+                import ctypes as _ctypes_com
+                _ctypes_com.oledll.ole32.CoInitializeEx(None, 0x0)  # MTA
+            except Exception:
+                pass
+            new_list: list[str] = []
+            try:
+                new_list = list_input_microphones()
+            except Exception:
+                new_list = []
+            try:
+                _ctypes_com.oledll.ole32.CoUninitialize()
+            except Exception:
+                pass
+            try:
+                # Cross-thread signal emit — automatically queues on
+                # the main thread's event loop. Verified correct
+                # (unlike QTimer.singleShot from a bg thread which
+                # is a silent no-op).
+                self._live_device_diff_bridge.result_ready.emit(new_list)
+            except Exception:
+                # If emit fails somehow, release the guard so we
+                # don't deadlock the next tick.
+                self._live_device_diff_in_progress = False
+
+        try:
+            threading.Thread(
+                target=_worker,
+                name="touchless-mic-diff-tick",
+                daemon=True,
+            ).start()
+        except Exception:
+            # Threading unavailable — release guard, this tick is
+            # a no-op.
+            self._live_device_diff_in_progress = False
+
+    def _live_device_diff_apply(self, new_list: list[str]) -> None:
+        """Runs on the MAIN thread. Applies the diff computed by
+        the background _live_device_diff_tick worker."""
+        try:
+            try:
+                old_names = {str(m).strip() for m in (self._discovered_microphones or [])}
+            except Exception:
+                old_names = set()
+            try:
+                new_names = {str(m).strip() for m in (new_list or [])}
+            except Exception:
+                new_names = old_names
+            if new_names != old_names:
+                self._discovered_microphones = new_list
+                try:
+                    self._rebuild_microphone_combo()
+                    self._refresh_microphone_labels()
+                except Exception:
+                    pass
+                # DO NOT auto-restart the clip cache here. The round-25
+                # attempt to mirror manual save had two blockers:
+                # (1) _restart_clip_cache_if_running() → _start_clip_
+                # cache_ffmpeg() unconditionally calls
+                # _cleanup_ffmpeg_clip_cache_files(), which unlinks
+                # every segment_*.mkv on disk — any background hotplug
+                # (BT pair, USB webcam add, dock connect) would
+                # silently wipe the entire rolling clip buffer
+                # mid-session. (2) No _clip_export_thread.is_alive() or
+                # _audio_endpoint_swap_in_progress guard, unlike every
+                # peer path (see 27930-27932, 28200-28202), so a
+                # hotplug during a clip export would race the export's
+                # file I/O against unlink/respawn on the same
+                # session_id. Mid-session mic swaps are architected to
+                # go through the in-place _audio_endpoint_watchdog
+                # (~L27803+), which calls writer.swap_device() and
+                # preserves the ring buffer. The user's explicit Save
+                # flow remains the only path that triggers a full
+                # cache restart.
+        finally:
+            self._live_device_diff_in_progress = False
 
     def refresh_microphone_inventory(self, update_status: bool = True, notify: bool = False) -> list[str]:
         self._discovered_microphones = list_input_microphones()
@@ -19759,6 +21054,23 @@ Admin elevation
                 self.tutorial_window._voice_listener.set_input_device_name(selected_name)
             except Exception:
                 pass
+        # v1.1.7 fix: restart the clip cache's mic ffmpeg bridge so
+        # it captures from the newly-selected device. The voice
+        # listener re-resolves its device on every utterance, but
+        # the clip cache's ffmpeg subprocess was spawned at engine
+        # start bound to the OLD device — no config-key match in
+        # _restart_clip_cache_if_running's watch list meant the
+        # cache stayed bound until an engine restart. Dad's exact
+        # scenario: he switched to headset, restarted the app so
+        # it was picked, but clips still had no mic audio because
+        # the initial cache spawn's mic index was resolved before
+        # his preference was saved. Now: any successful mic-pref
+        # save also kicks the clip cache to re-spawn its bridge
+        # against the fresh preferred device.
+        try:
+            self._restart_clip_cache_if_running()
+        except Exception:
+            pass
         if hasattr(self, "use_phone_mic_checkbox"):
             self.use_phone_mic_checkbox.blockSignals(True)
             self.use_phone_mic_checkbox.setChecked(bool(getattr(self.config, "phone_camera_qr_use_mic", False)))
@@ -19851,6 +21163,13 @@ Admin elevation
                 self.tutorial_window._voice_listener.set_input_device_name(None)
             except Exception:
                 pass
+        # v1.1.7 fix: rebind the clip cache's mic bridge to the
+        # (now cleared → default) device, matching the same fix on
+        # _save_microphone_preference_from_combo above.
+        try:
+            self._restart_clip_cache_if_running()
+        except Exception:
+            pass
         self.last_action_label.setText("Last action: cleared saved microphone")
 
     def _on_connect_spotify_clicked(self) -> None:
@@ -19923,6 +21242,56 @@ Admin elevation
             label = "spotify_connect_failed"
         if hasattr(self, "last_action_label"):
             self.last_action_label.setText(f"Last action: {short}")
+        # v1.1.7 round-16: surface OAuth failures via a REAL dialog
+        # instead of the tiny bottom-of-Settings label the user was
+        # never going to notice. Dad reported "clicked Connect
+        # Spotify — nothing happened, no popup". Almost always the
+        # OAuth flow silently failed (invalid_redirect_uri because
+        # the user's own dev app is missing the loopback callback
+        # URLs, user_not_listed because they revoked the 25-user
+        # allowlist entry, or 180 s timeout because they closed the
+        # browser tab). Surface the failure so at least dad knows
+        # WHY nothing changed and can act on the actual reason.
+        if not ok:
+            try:
+                explanation = message or "The Spotify authorisation window closed before finishing."
+                touchless_message_box(
+                    self,
+                    "Spotify — connect failed",
+                    (
+                        f"{explanation}\n\n"
+                        "Common causes:\n"
+                        "  • Your Spotify Developer app is missing "
+                        "'http://127.0.0.1:5000/callback' (through "
+                        "5004) in its Redirect URIs list — add all "
+                        "five in the Spotify Developer Dashboard and "
+                        "try again.\n"
+                        "  • The developer app is in Development Mode "
+                        "and your Spotify account isn't on the "
+                        "25-user allowlist.\n"
+                        "  • The browser tab was closed before you "
+                        "clicked Agree.\n\n"
+                        "Open the Spotify setup wizard again after "
+                        "fixing whichever of these applies to you."
+                    ),
+                    icon=QMessageBox.Warning,
+                    buttons=QMessageBox.Ok,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                touchless_message_box(
+                    self,
+                    "Spotify — connected",
+                    "Spotify is connected. Gesture-controlled play, "
+                    "pause, skip, volume, and shuffle should now work "
+                    "whenever the Touchless engine is running.",
+                    icon=QMessageBox.Information,
+                    buttons=QMessageBox.Ok,
+                )
+            except Exception:
+                pass
         # Append to the detailed Recent Actions log so the user can
         # see what happened even if the last_action_label has
         # already been overwritten by a subsequent action. Goes
@@ -20002,81 +21371,209 @@ Admin elevation
         except Exception:
             pass
 
-    def _maybe_show_spotify_reauth_toast(self) -> None:
-        """One-shot 'reconnect Spotify' toast. Fires when EITHER:
-          1. controller.needs_reauth — refresh token rejected by
-             Spotify's auth server (revoked / expired / password-
-             changed); OR
-          2. user has a configured custom client_id (= ran the setup
-             wizard) BUT has_authorization is False (= no tokens).
-             Catches 'user did setup, never connected, then tried a
-             Spotify gesture'.
+    def _show_spotify_action_pill(self, reason: str) -> None:
+        """v1.1.7.11: top-right fade toast surfacing every Spotify
+        failure. Uses SpotifyConnectPromptOverlay (sibling of the
+        LowFpsSuggestionOverlay pattern) — same top-right anchor,
+        same translucent-navy body with light-blue border, same fade
+        animation, same X-close button.
 
-        Latches `_spotify_reauth_prompted_this_session` after the
-        first show so we don't respawn the dialog on every debug
-        frame when the user closes it without authorising. Cleared
-        when the user actually authorises (has_authorization flips
-        True) so a later token expiry can re-fire it."""
+        Body is the caller's `reason` string (already tailored to the
+        detected category). We wrap it in a short rich-text sentence
+        ending in `... here` where "here" is a clickable link. On
+        click the setup wizard opens; on close-X or auto-dismiss the
+        pill fades out without action.
+
+        Session-suppress: if the user checks "Don't show me again this
+        session" and dismisses, `_spotify_prompt_suppressed_session`
+        gets latched True and every subsequent call to this method
+        early-returns until process restart. Reset only on process
+        restart (per user spec: "this session").
+        """
+        # Session suppress latch — user opted out for this run.
+        if bool(getattr(self, "_spotify_prompt_suppressed_session", False)):
+            return
+        overlay = getattr(self, "_spotify_prompt_overlay", None)
+        if overlay is None:
+            try:
+                from ...debug.spotify_connect_prompt_overlay import (
+                    SpotifyConnectPromptOverlay,
+                )
+                overlay = SpotifyConnectPromptOverlay(parent=None)
+                overlay.linkClicked.connect(self._open_spotify_setup_wizard_from_pill)
+                overlay.dismissed.connect(self._on_spotify_prompt_dismissed)
+                self._spotify_prompt_overlay = overlay
+            except Exception:
+                return
+        try:
+            body = str(reason or "").strip()
+            if not body:
+                body = (
+                    "Reconnect to Spotify to keep controlling music "
+                    "with Touchless"
+                )
+            # v1.1.7.11 rebuild: inline anchor style — QSS `QLabel a`
+            # selectors do not reliably reach anchors inside a
+            # rich-text QLabel (they get the browser-default blue). An
+            # inline style survives Qt's HTML renderer without needing
+            # setDefaultStyleSheet on a QTextDocument.
+            html = (
+                f"{body} — click "
+                "<a href='#connect' style='color: #1DE9B6; "
+                "font-weight: 700; text-decoration: underline;'>here</a>."
+            )
+            overlay.show_prompt(html)
+        except Exception:
+            pass
+
+    def _on_spotify_prompt_dismissed(self, suppress_session: bool) -> None:
+        """Wired from SpotifyConnectPromptOverlay.dismissed. When the
+        user ticks the "don't show me again this session" checkbox
+        before dismissing, latch a session-scoped suppression flag so
+        _show_spotify_action_pill early-returns for the rest of this
+        process lifetime. No persistence — restart clears the latch."""
+        if bool(suppress_session):
+            self._spotify_prompt_suppressed_session = True
+
+    def _open_spotify_setup_wizard_from_pill(self) -> None:
+        """Link click-target from the SpotifyConnectPromptOverlay. The
+        pill fades itself synchronously after emitting linkClicked, so
+        opening the wizard (which uses .exec()) here is safe — no
+        blocking of the pill's fade path."""
+        try:
+            self._open_spotify_setup_wizard()
+        except Exception:
+            pass
+
+    def _maybe_show_spotify_reauth_toast(self) -> None:
+        """'Connect / Reconnect Spotify' toast, state-driven.
+
+        Root problem this fixes: dad uninstalled Touchless and wiped
+        ~/Documents/Touchless/, which nuked auth_token.json. The old
+        gate was `needs_reauth OR (has_user_client_id AND
+        unauthorized)` — neither branch fired for him because
+        (a) with tokens deleted there's no refresh token to reject,
+        so needs_reauth stays False, and (b) config.spotify_client_id
+        lives in ~/.touchless/settings.json (separate dir) so a user
+        who never ran the wizard has an empty value there. Result:
+        gestures silently no-op'd, no popup, no diagnostic.
+
+        New gate:
+          state (from controller.readiness_state) != READY
+          AND (command_attempted_since_launch OR test_force)
+
+        The command-attempted latch is flipped by the gesture router
+        when an actionable static/dynamic gesture LATCHES, and by
+        SpotifyController.ensure_ready() so voice / wheel / Iris
+        planner paths trip it too. That means a cold launch with a
+        wiped Documents folder stays silent until the user actually
+        tries to use Spotify — at which point they get the popup
+        with copy tailored to what's actually broken.
+
+        Copy:
+          NEEDS_REAUTH → 'Reconnect Spotify' (session expired /
+                         Spotify revoked us / password changed)
+          NO_TOKENS    → 'Connect Spotify'   (fresh install, or user
+                         wiped Documents/Touchless/ — dad's case)
+
+        Guards:
+          • _spotify_reauth_toast_in_flight — no double-modal while
+            the previous one is still up (kept from prior impl).
+          • _spotify_reauth_prompted_this_session — one show per
+            session (kept from prior impl); cleared when
+            has_authorization flips True so a later token expiry
+            can re-fire.
+          • _next_spotify_reauth_prompt_allowed_at — after the first
+            dismissal, allow ONE more retry 30 s later so an
+            accidental Esc doesn't strand the user. After the
+            second show the latch is permanent for the session.
+
+        TOUCHLESS_TEST_SPOTIFY_PROMPT=1 forces every gate open —
+        matches the same env var the first-active prompt honours so
+        both paths can be exercised from source without touching
+        on-disk state.
+        """
+        # v1.1.7.11: routed through the fade-pill helper. Every
+        # session-latch / 30 s re-arm / in-flight guard from the
+        # 1.1.7.10 modal version is intentionally REMOVED — the pill
+        # cancels a prior instance cleanly and fires on every failed
+        # attempt (per user spec). Only gates left: (a) skip when the
+        # controller is already READY (no problem to surface),
+        # (b) skip until the user has actually attempted Spotify at
+        # least once (avoids ambushing cold launches).
+        import os as _os
         worker = getattr(self, "_worker", None)
         controller = getattr(worker, "spotify_controller", None) if worker is not None else None
         if controller is None:
             return
-        has_auth = bool(getattr(controller, "has_authorization", False))
-        # Reset the per-session latch once the user is authorised
-        # again — that way a future token rejection can re-prompt.
-        if has_auth:
-            self._spotify_reauth_prompted_this_session = False
-        needs_reauth = bool(getattr(controller, "needs_reauth", False))
-        has_user_client_id = bool(getattr(self.config, "spotify_client_id", "") or "")
-        unauthorized = not has_auth
-        # Show if Spotify revoked us, OR if user finished setup-wizard
-        # but never authorised (and isn't authorised now).
-        should_show = needs_reauth or (has_user_client_id and unauthorized)
-        if not should_show:
+        state_fn = getattr(controller, "readiness_state", None)
+        if callable(state_fn):
+            try:
+                state = str(state_fn() or "")
+            except Exception:
+                state = "READY" if bool(getattr(controller, "has_authorization", False)) else "NO_TOKENS"
+        else:
+            if bool(getattr(controller, "needs_reauth", False)):
+                state = "NEEDS_REAUTH"
+            elif not bool(getattr(controller, "has_authorization", False)):
+                state = "NO_TOKENS"
+            else:
+                state = "READY"
+        if state == "READY":
             return
-        if getattr(self, "_spotify_reauth_toast_in_flight", False):
+        test_force = bool(_os.environ.get("TOUCHLESS_TEST_SPOTIFY_PROMPT"))
+        attempted = bool(getattr(controller, "command_attempted_since_launch", False))
+        if not (attempted or test_force):
             return
-        # Session-scoped latch — only prompt once per app run. Without
-        # this the popup would re-fire on every debug frame after the
-        # user closes it (which would be horrible UX).
-        if getattr(self, "_spotify_reauth_prompted_this_session", False):
-            return
-        self._spotify_reauth_prompted_this_session = True
-        self._spotify_reauth_toast_in_flight = True
         try:
             controller.clear_reauth_flag()
         except Exception:
             pass
 
-        def _show() -> None:
-            try:
-                message = (
-                    "Your Spotify session has expired and needs to "
-                    "reconnect.\n\n"
-                    "Heads up: Spotify controls require reconnecting "
-                    "every once in a while — Spotify periodically "
-                    "expires its sign-in tokens, especially after a "
-                    "password change or a long break. Click Reconnect "
-                    "to sign back in; it takes about 5 seconds and "
-                    "happens in your browser."
-                )
-                dlg = TouchlessNotice(
-                    self,
-                    "Reconnect Spotify",
-                    message,
-                    kind="warn",
-                )
-                dlg.exec()
-                # If the user clicked through, route them to the
-                # existing PKCE auth flow (same one the first-active
-                # prompt uses).
-                self._begin_spotify_authorization_flow()
-            except Exception:
-                pass
-            finally:
-                self._spotify_reauth_toast_in_flight = False
+        # v1.1.7.11 rebuild: single general message per user spec —
+        # "For simplicity lets stick with the general message option
+        # Set up or reconnect spotify ...". Detection categories still
+        # exist inside the controller for logging, but the user-facing
+        # pill always shows the same text so dad doesn't get a
+        # "Reconnect" message when the real problem is "no setup yet".
+        self._show_spotify_action_pill(
+            "Set up or reconnect Spotify to control your music with Touchless"
+        )
 
-        QTimer.singleShot(0, _show)
+    def _maybe_show_spotify_transient_failure_toast(self) -> None:
+        """v1.1.7.11: reads the controller's one-shot failure latch and
+        pipes into the same fade pill as the reauth path. No rate
+        limit — pill cancels prior instance cleanly, so rapid failures
+        show fresh pills without stacking.
+
+        Category → reason text mapping:
+          NO_ACTIVE_DEVICE — user needs Spotify open + playing
+          PREMIUM_REQUIRED — Free account can't control remotely
+          MISSING_SCOPE    — stale token, reconnect fixes it
+          <other>          — generic "may need setup/reconnect"
+
+        All four categories route the pill click into the setup
+        wizard (which now also hosts a Reconnect section for
+        already-set-up users) — same click_action for every case per
+        user spec: "one general pop up" with tailored reason text.
+        """
+        worker = getattr(self, "_worker", None)
+        controller = getattr(worker, "spotify_controller", None) if worker is not None else None
+        if controller is None:
+            return
+        take_fn = getattr(controller, "take_transient_failure", None)
+        if not callable(take_fn):
+            return
+        try:
+            failure = take_fn()
+        except Exception:
+            failure = None
+        if not failure:
+            return
+        # v1.1.7.11 rebuild: single general message everywhere.
+        self._show_spotify_action_pill(
+            "Set up or reconnect Spotify to control your music with Touchless"
+        )
 
     def _begin_spotify_authorization_flow(self) -> None:
         """Run the PKCE authorize-full-scopes flow on a worker
@@ -20132,8 +21629,6 @@ Admin elevation
                 except Exception:
                     pass
             return
-        if not test_force and bool(getattr(self.config, "spotify_first_active_prompt_shown", False)):
-            return
         # Connect-Spotify is an authorization prompt, NOT a transient
         # text pop-up — it's required for the feature to work and the
         # user can't dismiss it via gesture. Intentionally bypasses
@@ -20158,6 +21653,10 @@ Admin elevation
                 return
         try:
             is_auth = bool(getattr(controller, "has_authorization", False))
+            # v1.1.7.3: check auth state BEFORE latch, so a user whose
+            # tokens went missing gets the popup even if the latch was
+            # previously set. See _check_spotify_at_startup for full
+            # rationale (dad rig 2026-08-19).
             if is_auth and not test_force:
                 # Already authorised in a prior run — silently
                 # latch the flag so we don't poll on every frame.
@@ -20167,6 +21666,16 @@ Admin elevation
                 except Exception:
                     pass
                 return
+            # Not authorized — check the latch. If it was set from a
+            # prior successful auth but tokens are now gone, clear it
+            # so this popup fires.
+            _latched = bool(getattr(self.config, "spotify_first_active_prompt_shown", False))
+            if _latched and not test_force:
+                self.config.spotify_first_active_prompt_shown = False
+                try:
+                    save_config(self.config)
+                except Exception:
+                    pass
             if test_force:
                 try:
                     print(
@@ -20230,13 +21739,14 @@ Admin elevation
 
         latched = bool(getattr(self.config, "spotify_first_active_prompt_shown", False))
         _log(f"startup check — spotify_first_active_prompt_shown={latched}")
-        if latched and not test_force:
-            _log(
-                "skipped: latch flag is True (user already saw the prompt or "
-                "is already connected). Run `python reset_spotify_test_state.py` "
-                "to clear it."
-            )
-            return
+        # v1.1.7.3 (dad rig 2026-08-19): check has_authorization BEFORE
+        # the latch gate. Previous behavior was: if latch was ever set,
+        # skip the popup forever — even if the user's tokens had
+        # meanwhile disappeared (Documents/Touchless/ deleted, install
+        # migration, refresh_token revoked by Spotify). Result: dad had
+        # to figure out why Spotify controls didn't work with no
+        # feedback from the app. Now: if tokens are missing, the popup
+        # fires regardless of latch state.
         try:
             from ..integration.noop_engine import SpotifyController as _SpotifyController
             controller = _SpotifyController()
@@ -20244,16 +21754,31 @@ Admin elevation
             _log(f"controller built — has_authorization={already_authorized}")
             if already_authorized and not test_force:
                 _log(
-                    "skipped: tokens already on disk. Run "
-                    "`python reset_spotify_test_state.py` to delete them and test "
-                    "the fresh-install flow."
+                    "skipped: tokens already on disk. Auto-refresh will handle "
+                    "expiring access tokens; user does NOT need to reconnect."
                 )
-                self.config.spotify_first_active_prompt_shown = True
+                # Latch the flag so any per-frame path also skips.
+                if not latched:
+                    self.config.spotify_first_active_prompt_shown = True
+                    try:
+                        save_config(self.config)
+                    except Exception:
+                        pass
+                return
+            # Tokens are missing / broken. Auto-clear the latch so the
+            # popup fires — otherwise a user who ran the flow once but
+            # lost their tokens (uninstall, manual folder cleanup,
+            # Spotify revoked refresh_token) gets silent-failure UX.
+            if latched and not test_force:
+                _log(
+                    "auth missing but latch was True — clearing latch so the "
+                    "popup can fire and the user can reconnect."
+                )
+                self.config.spotify_first_active_prompt_shown = False
                 try:
                     save_config(self.config)
                 except Exception:
                     pass
-                return
             running = controller._has_real_spotify_process()
             _log(f"spotify process detected — _has_real_spotify_process={running}")
             if not running:
@@ -20291,8 +21816,8 @@ Admin elevation
         finally:
             # Latch the flag regardless of choice — the user has
             # answered, we never ask again. They can still connect
-            # later via the Connect Spotify button at the bottom of
-            # the Instructions panel.
+            # later via Settings → General → Spotify → Set up /
+            # reconnect Spotify (opens the wizard's Reconnect flow).
             self.config.spotify_first_active_prompt_shown = True
             try:
                 save_config(self.config)
@@ -20472,8 +21997,8 @@ Admin elevation
         layout.setSpacing(8)
         label = QLabel(
             "If you would like to connect Touchless to Spotify at some "
-            "point, find the connect to Spotify button at the bottom of "
-            "Instructions page."
+            "point, open Settings → General → Spotify → Set up / "
+            "reconnect Spotify."
         )
         label.setWordWrap(True)
         label.setMaximumWidth(560)
@@ -20555,6 +22080,17 @@ Admin elevation
             pill.setVisible(False)
 
     def start_engine(self, checked: bool = False, skip_tutorial_prompt: bool = False) -> None:
+            # v1.1.7 round-17: kick off the 30 s device-diff poll
+            # HERE, not in __init__. Deferring until engine start
+            # eliminates the pre-engine STA↔MTA COM apartment churn
+            # that was wedging Win10 BT drivers. Idempotent: QTimer
+            # ignores start() when already active.
+            try:
+                _diff_timer = getattr(self, "_live_device_diff_timer", None)
+                if _diff_timer is not None and not _diff_timer.isActive():
+                    _diff_timer.start()
+            except Exception:
+                pass
             # Diagnostic trace — written to stderr (same stream as
             # MediaPipe's TFLite/INFO lines) so it lines up with the
             # other engine-init noise the user pastes from terminal.
@@ -21003,7 +22539,11 @@ Admin elevation
                 QApplication.processEvents()
             except Exception:
                 pass
-            self._start_clip_cache()
+            # v1.1.7: gated on the master clip-cache switch. Default
+            # True preserves historical behavior; False skips spawning
+            # the rolling-buffer ffmpeg subprocess entirely.
+            if bool(getattr(self.config, "clip_cache_enabled", True)):
+                self._start_clip_cache()
             try:
                 QApplication.processEvents()
             except Exception:
@@ -21610,6 +23150,65 @@ Admin elevation
         text = str(message or "").strip()
         if not text:
             return
+        # r50: classifier auto-apply first-fire pill. Worker emits
+        # '[r50-classifier-pill] <message> camera=<display_name>' when
+        # the classifier picked 'generic' for a camera it has never
+        # shown the pill for. Intercept here, pop a 4 s ProcessingOverlay
+        # toast, and persist the camera name into
+        # config.short_shutter_pill_shown_for_cameras so the toast fires
+        # once per camera name, ever. Falls through to the debug log
+        # append so the raw line is still visible for support.
+        if text.startswith("[r50-classifier-pill]"):
+            try:
+                # Parse camera=<name> tail; body of the pill is a fixed
+                # string that we render verbatim so the log-line format
+                # can drift without changing the user-facing pill.
+                camera_display = ""
+                camera_tag = " camera="
+                _idx = text.find(camera_tag)
+                if _idx >= 0:
+                    camera_display = text[_idx + len(camera_tag):].strip()
+                label = (
+                    "Your camera is set up for smooth tracking. "
+                    "Change this in Settings → Camera."
+                )
+                overlay = getattr(self, "processing_overlay", None)
+                if overlay is not None:
+                    try:
+                        overlay.show_processing(label)
+                    except Exception:
+                        pass
+                    try:
+                        QTimer.singleShot(4000, overlay.complete_and_hide)
+                    except Exception:
+                        try:
+                            QTimer.singleShot(4000, overlay.hide_processing)
+                        except Exception:
+                            pass
+                # Persist off the UI thread so the click handler returns
+                # instantly and Settings-save race is impossible.
+                if camera_display:
+                    try:
+                        key = camera_display.lower().strip()
+                        current = list(
+                            getattr(
+                                self.config,
+                                "short_shutter_pill_shown_for_cameras",
+                                [],
+                            )
+                        )
+                        keys = {str(x).lower().strip() for x in current}
+                        if key and key not in keys:
+                            current.append(camera_display)
+                            self.config.short_shutter_pill_shown_for_cameras = current
+                            threading.Thread(
+                                target=save_config, args=(self.config,),
+                                daemon=True, name="hgr-save-classifier-pill",
+                            ).start()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         self._append_home_debug_log(text)
 
     def _on_command_detected(self, command: str) -> None:
@@ -23191,8 +24790,144 @@ Admin elevation
         except Exception:
             pass
         return capabilities
+    def _encoder_settings_for_tier(self, tier: str) -> dict:
+        """Tier → per-tier cache/export knobs. Called from
+        `_start_clip_cache_ffmpeg` (to derive fps / segment / wrap /
+        timer / scale filter) and from `_ffmpeg_encoder_args` (to
+        pick CQ/CRF + libx264/NVENC preset). Unknown tier falls back
+        to `normal`.
+
+        NORMAL is byte-identical to the shipping v1.1.7 defaults —
+        the previously-hardcoded `veryfast` / `slow` / `p4` / `p7`
+        preset values in `_ffmpeg_encoder_args` are moved into the
+        dict as-is so existing installed-base users see bit-exact
+        same ffmpeg args as before this refactor.
+
+        LOW and HIGH are widened on THREE axes so the picker has a
+        visible effect (which the shipping 2-3 CRF spread lacked):
+          axis 1 — CRF/CQ:   Low 30/26  Normal 20/17  High 17/15
+          axis 2 — preset:   Low ultrafast/veryfast (p1/p2)
+                             Normal veryfast/slow (p4/p7) — unchanged
+                             High medium/slow (p6/p7)
+          axis 3 — scale:    Low scale=-2:720; Normal/High native.
+            The Low-only scale keeps existing 1440p/4K users on
+            Normal from silently losing resolution, and only Low
+            wants the CPU savings from a smaller frame anyway.
+        `_start_clip_cache_ffmpeg` further clamps Low's scale so it
+        never produces a width > 4096 on wide multi-monitor rigs
+        (which would break NVENC/AMF/QSV's 4096 input cap).
+
+        `screen_record_fps` is intentionally NOT tiered here —
+        standalone screen recording is a separate feature and keeps
+        its own fixed 24 fps (documented in the tier card UI note).
+        """
+        t = str(tier or "").lower().strip()
+        if t == "low":
+            return {
+                "fps": 15.0, "segment_seconds": 10.0,
+                "scale_filter": "scale=-2:720",
+                "cache_libx264_preset": "ultrafast",
+                "cache_nvenc_preset_modern": "p1",
+                "cache_nvenc_preset_legacy": "fast",
+                "export_libx264_preset": "veryfast",
+                "export_nvenc_preset_modern": "p2",
+                "export_nvenc_preset_legacy": "fast",
+                "cache_cq_nvenc": "30", "cache_qp_amf_i": "28",
+                "cache_qp_amf_p": "30", "cache_gq_qsv": "30",
+                "cache_crf_libx264": "30",
+                "export_cq_nvenc": "26", "export_qp_amf_i": "24",
+                "export_qp_amf_p": "26", "export_gq_qsv": "26",
+                "export_crf_libx264": "26",
+            }
+        if t == "high":
+            # r52: widened the Normal↔High gap so the picker's effect
+            # is obvious. Previously High was only ~3 CRF points and
+            # +10 fps over Normal — users on 1080p 20fps monitors
+            # couldn't tell the two apart. Now:
+            #   fps        60 (was 30) — the biggest user-visible bump
+            #   cache CRF  14 (was 17) — near-visually-lossless source
+            #   export CRF 13 (was 15) — visually-lossless output
+            #   preset     medium/p7 (unchanged) — quality/speed floor
+            # fps=60 may exceed the source's captured frame rate;
+            # ffmpeg duplicates frames to hit the target — cheap, and
+            # keeps timing stable when re-cut in a video editor.
+            return {
+                "fps": 60.0, "segment_seconds": 5.0,
+                "scale_filter": None,
+                "cache_libx264_preset": "medium",
+                "cache_nvenc_preset_modern": "p7",
+                "cache_nvenc_preset_legacy": "slow",
+                "export_libx264_preset": "slow",
+                "export_nvenc_preset_modern": "p7",
+                "export_nvenc_preset_legacy": "slow",
+                "cache_cq_nvenc": "14", "cache_qp_amf_i": "12",
+                "cache_qp_amf_p": "14", "cache_gq_qsv": "14",
+                "cache_crf_libx264": "14",
+                "export_cq_nvenc": "13", "export_qp_amf_i": "12",
+                "export_qp_amf_p": "13", "export_gq_qsv": "13",
+                "export_crf_libx264": "13",
+            }
+        # normal / default — SHIPPING VALUES, byte-identical. New
+        # preset/scale keys mirror what `_ffmpeg_encoder_args`
+        # previously hard-coded, so the resulting ffmpeg CLI is
+        # unchanged for Normal-tier users.
+        return {
+            "fps": 20.0, "segment_seconds": 10.0,
+            "scale_filter": None,
+            "cache_libx264_preset": "veryfast",
+            "cache_nvenc_preset_modern": "p4",
+            "cache_nvenc_preset_legacy": "medium",
+            "export_libx264_preset": "slow",
+            "export_nvenc_preset_modern": "p7",
+            "export_nvenc_preset_legacy": "slow",
+            "cache_cq_nvenc": "21", "cache_qp_amf_i": "19",
+            "cache_qp_amf_p": "21", "cache_gq_qsv": "21",
+            "cache_crf_libx264": "20",
+            "export_cq_nvenc": "17", "export_qp_amf_i": "16",
+            "export_qp_amf_p": "17", "export_gq_qsv": "17",
+            "export_crf_libx264": "17",
+        }
+
+    def _resolved_clip_tier(self, *, for_purpose: str) -> str:
+        """Resolve the ACTIVE tier for a given call site, taking the
+        session-level encoder-demote flag into account. `for_purpose`
+        is one of {'cache', 'export'}. Returns 'normal' whenever High
+        is requested but the runtime encoder situation can't support
+        it — this is the safety net for the mid-session HW-encoder
+        failure path where the settings-panel grey-out couldn't
+        anticipate the demote.
+        """
+        try:
+            requested = str(getattr(self.config, "clip_quality_tier", "normal") or "normal").lower().strip()
+        except Exception:
+            requested = "normal"
+        if requested not in ("low", "normal", "high"):
+            requested = "normal"
+        if requested != "high":
+            return requested
+        # High requested — verify HW encoder is still selectable.
+        try:
+            pref = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
+        except Exception:
+            pref = "libx264"
+        if pref not in ("h264_nvenc", "h264_qsv", "h264_amf"):
+            return "normal"
+        if for_purpose == "export" and getattr(self, "_clip_export_encoder_demoted", False):
+            return "normal"
+        return "high"
+
     def _ffmpeg_encoder_args(self, *, purpose: str, fps: float, segment_seconds: float | None = None) -> list[str]:
         encoder = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
+        # Auto-recovery: after a prior clip export failed with a HW-
+        # encoder / no-packets signature this session, force libx264
+        # for every subsequent export. Cache-side encoding is NOT
+        # affected — the cache has its own libx264 fallback at
+        # _check_clip_cache_segment_arrival (~26343-26389) that fires
+        # only if the cache spawn itself misbehaves; this hook only
+        # covers the EXPORT subprocess. See __init__ for the flag's
+        # lifecycle.
+        if purpose == "clip_export" and getattr(self, "_clip_export_encoder_demoted", False):
+            encoder = "libx264"
         gop = max(1, int(round(float(fps) * float(segment_seconds if segment_seconds is not None else 2.0))))
         # NVENC preset selection: modern (p1-p7) only if the startup
         # probe verified the GPU accepts them. Maxwell (GTX 9xx) and
@@ -23214,23 +24949,47 @@ Admin elevation
         # one-shot per clip so cost is irrelevant. Env override
         # HGR_CLIP_EXPORT_HQ=0 reverts to the real-time args below
         # (= pre-Turing-NVENC escape hatch / emergency revert).
+        # Tier resolution. Priority: envvar=0 escape hatch still
+        # wins (as documented for HGR_CLIP_EXPORT_HQ / _CACHE_HQ,
+        # falls through to the real-time path below). Otherwise
+        # active tier drives CQ/CRF; unknown or demoted High
+        # collapses to Normal via `_resolved_clip_tier`.
+        _tier_for = "export" if purpose == "clip_export" else "cache"
+        _tier = self._resolved_clip_tier(for_purpose=_tier_for)
+        _ts = self._encoder_settings_for_tier(_tier)
         if (purpose == "clip_export"
                 and _enc_os.environ.get("HGR_CLIP_EXPORT_HQ", "1") != "0"):
+            # Preset now flows from the tier dict so Low actually gets
+            # `veryfast` (was silently `slow` regardless of tier) and
+            # High can escalate. Fallbacks match the pre-refactor
+            # hard-coded values, so a corrupt/partial tier dict still
+            # produces the previous shipping ffmpeg args. QSV keeps
+            # `veryslow` since QSV's preset ladder is narrow and this
+            # is already close to lossless for one-shot exports.
+            _lx_preset = _ts.get("export_libx264_preset", "slow")
+            _nv_preset = (
+                _ts.get("export_nvenc_preset_modern", "p7")
+                if _nvenc_modern
+                else _ts.get("export_nvenc_preset_legacy", "slow")
+            )
             try:
                 import sys as _hq_sys
                 _hq_sys.stderr.write(
-                    f"[clip-export] HQ encoder branch active: {encoder}\n"
+                    f"[clip-export] tier={_tier} encoder={encoder} "
+                    f"libx264_preset={_lx_preset} nvenc_preset={_nv_preset} "
+                    f"crf={_ts.get('export_crf_libx264')} "
+                    f"cq={_ts.get('export_cq_nvenc')}\n"
                 )
                 _hq_sys.stderr.flush()
             except Exception:
                 pass
             if encoder == "h264_nvenc":
-                return ["-c:v", "h264_nvenc", "-preset", _nvenc_p7, "-rc", "vbr", "-cq:v", "17", "-b:v", "0", "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_nvenc", "-preset", _nv_preset, "-rc", "vbr", "-cq:v", _ts["export_cq_nvenc"], "-b:v", "0", "-pix_fmt", "yuv420p"]
             if encoder == "h264_amf":
-                return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "16", "-qp_p", "17", "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", _ts["export_qp_amf_i"], "-qp_p", _ts["export_qp_amf_p"], "-pix_fmt", "yuv420p"]
             if encoder == "h264_qsv":
-                return ["-c:v", "h264_qsv", "-preset", "veryslow", "-global_quality", "17", "-look_ahead", "1", "-pix_fmt", "nv12"]
-            return ["-c:v", "libx264", "-preset", "slow", "-crf", "17", "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_qsv", "-preset", "veryslow", "-global_quality", _ts["export_gq_qsv"], "-look_ahead", "1", "-pix_fmt", "nv12"]
+            return ["-c:v", "libx264", "-preset", _lx_preset, "-crf", _ts["export_crf_libx264"], "-pix_fmt", "yuv420p"]
         # CACHE HIGH-QUALITY BRANCH (purpose=='clip'). Bump CRF/CQ
         # for a better source the export reads from — export's slow
         # preset can preserve detail but not recreate it if cache
@@ -23243,13 +25002,38 @@ Admin elevation
         # segment_wrap bounded ring, total cache disk is still bounded.
         if (purpose == "clip"
                 and _enc_os.environ.get("HGR_CLIP_CACHE_HQ", "1") != "0"):
+            # Mirror the export branch — preset now tier-driven. Low
+            # uses ultrafast (cheapest CPU + gentlest ring-buffer disk),
+            # Normal keeps veryfast (byte-identical to shipping), High
+            # escalates to medium/p6. High is only reached when
+            # preferred_encoder is a HW encoder (config gate +
+            # `_resolved_clip_tier` demote), so libx264-medium is
+            # never the real-time cache path — it's only the export
+            # path or a fallback.
+            _lx_preset = _ts.get("cache_libx264_preset", "veryfast")
+            _nv_preset = (
+                _ts.get("cache_nvenc_preset_modern", "p4")
+                if _nvenc_modern
+                else _ts.get("cache_nvenc_preset_legacy", "medium")
+            )
+            try:
+                import sys as _cq_sys
+                _cq_sys.stderr.write(
+                    f"[clip-cache-enc] tier={_tier} encoder={encoder} "
+                    f"libx264_preset={_lx_preset} nvenc_preset={_nv_preset} "
+                    f"crf={_ts.get('cache_crf_libx264')} "
+                    f"cq={_ts.get('cache_cq_nvenc')}\n"
+                )
+                _cq_sys.stderr.flush()
+            except Exception:
+                pass
             if encoder == "h264_nvenc":
-                return ["-c:v", "h264_nvenc", "-preset", _nvenc_p4, "-cq:v", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_nvenc", "-preset", _nv_preset, "-cq:v", _ts["cache_cq_nvenc"], "-g", str(gop), "-pix_fmt", "yuv420p"]
             if encoder == "h264_amf":
-                return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "19", "-qp_p", "21", "-g", str(gop), "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", _ts["cache_qp_amf_i"], "-qp_p", _ts["cache_qp_amf_p"], "-g", str(gop), "-pix_fmt", "yuv420p"]
             if encoder == "h264_qsv":
-                return ["-c:v", "h264_qsv", "-global_quality", "21", "-look_ahead", "0", "-g", str(gop), "-pix_fmt", "nv12"]
-            return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-g", str(gop), "-pix_fmt", "yuv420p"]
+                return ["-c:v", "h264_qsv", "-global_quality", _ts["cache_gq_qsv"], "-look_ahead", "0", "-g", str(gop), "-pix_fmt", "nv12"]
+            return ["-c:v", "libx264", "-preset", _lx_preset, "-crf", _ts["cache_crf_libx264"], "-g", str(gop), "-pix_fmt", "yuv420p"]
         # Real-time path (record + cache-HQ-disabled fallback) —
         # UNCHANGED from original shipping values. Preserves cache
         # fps, GOP cadence, and segment timing.
@@ -23289,7 +25073,18 @@ Admin elevation
             "-video_size", f"{int(target.width())}x{int(target.height())}",
             "-i", "desktop",
         ]
-    def _start_ffmpeg_process(self, command: list[str]) -> subprocess.Popen | None:
+    def _start_ffmpeg_process(
+        self,
+        command: list[str],
+        *,
+        extra_creation_flags: int = 0,
+    ) -> subprocess.Popen | None:
+        """Spawn ffmpeg. `extra_creation_flags` is OR'd into the
+        Windows creationflags — screen recording passes
+        subprocess.CREATE_NEW_PROCESS_GROUP so we can send it
+        CTRL_BREAK_EVENT for a graceful mp4-finalizing stop; every
+        other caller passes 0 (unchanged behaviour).
+        """
         if not command:
             return None
         # stderr=PIPE (was DEVNULL) so a fast-failing ffmpeg
@@ -23308,7 +25103,10 @@ Admin elevation
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    | int(extra_creation_flags or 0)
+                ),
             )
         except Exception as exc:
             try:
@@ -23735,28 +25533,48 @@ Admin elevation
         target_region = QRect(target_region.normalized())
         if capture_region == target_region:
             return ""
+        # If the cache injected `-vf scale=4096:-2` (multi-monitor
+        # virtual desktop > 4096 wide + HW encoder path) then the
+        # on-disk MKV segments are SMALLER than capture_region.
+        # Rebase the crop coords by the same scale factor so the
+        # crop rectangle stays inside the frame's actual bounds.
+        # Without this rebase the crop filter rejects with "Invalid
+        # too big or non positive size for width or height" and the
+        # export aborts before any encoder gets a packet — the mp4
+        # muxer then errors with -22 = "streams received no packets"
+        # (dad's rig: 4240x1440 desktop, 2560x1440 target monitor,
+        # scaled cache is 4096x1392, crop=2560x1440 rejected).
+        scaled = getattr(self, "_clip_cache_scaled_region", None)
+        cap_w_src = max(1, int(capture_region.width()))
+        cap_h_src = max(1, int(capture_region.height()))
+        if scaled is not None and (int(scaled.width()) != cap_w_src
+                                    or int(scaled.height()) != cap_h_src):
+            scale_x = float(int(scaled.width())) / float(cap_w_src)
+            scale_y = float(int(scaled.height())) / float(cap_h_src)
+            frame_w = max(2, int(scaled.width()))
+            frame_h = max(2, int(scaled.height()))
+        else:
+            scale_x = 1.0
+            scale_y = 1.0
+            frame_w = max(2, cap_w_src)
+            frame_h = max(2, cap_h_src)
         relative = QRect(target_region)
         relative.translate(-capture_region.x(), -capture_region.y())
-        x = max(0, int(relative.x()))
-        y = max(0, int(relative.y()))
-        w = max(2, int(target_region.width()))
-        h = max(2, int(target_region.height()))
-        # Clamp w/h so the crop rectangle stays inside the capture
-        # frame. Multi-monitor layouts with monitors at negative
-        # coordinates (e.g. left monitor at x=-1920) plus DPI scaling
-        # can produce a target_region that extends past the captured
-        # frame's right or bottom edge by a few pixels. ffmpeg's
-        # crop filter rejects out-of-bounds rectangles with
-        # "Invalid too big or non positive size for width '...' or
-        # height '...'" and returns non-zero, killing the export.
-        # Clamping here turns those edge cases into a valid crop that
-        # captures up to the frame boundary.
-        cap_w = max(2, int(capture_region.width()))
-        cap_h = max(2, int(capture_region.height()))
-        if x + w > cap_w:
-            w = max(2, cap_w - x)
-        if y + h > cap_h:
-            h = max(2, cap_h - y)
+        x = max(0, int(round(relative.x() * scale_x)))
+        y = max(0, int(round(relative.y() * scale_y)))
+        w = max(2, int(round(target_region.width() * scale_x)))
+        h = max(2, int(round(target_region.height() * scale_y)))
+        # Clamp w/h so the crop rectangle stays inside the (possibly
+        # scaled) frame. Multi-monitor layouts with monitors at
+        # negative coordinates plus DPI scaling can also produce a
+        # target_region that extends past the captured frame's right
+        # or bottom edge by a few pixels; clamping turns those edge
+        # cases into a valid crop that captures up to the frame
+        # boundary.
+        if x + w > frame_w:
+            w = max(2, frame_w - x)
+        if y + h > frame_h:
+            h = max(2, frame_h - y)
         # Even dimensions — libx264 + yuv420p require it. An odd
         # width or height ffmpeg-errors with "width not divisible by 2".
         if w % 2 != 0:
@@ -24229,9 +26047,20 @@ Admin elevation
                 return primary
     def _clip_cache_output_path(self) -> Path:
         return self._clip_cache_dir() / f"clip_cache_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}.avi"
-    def _clip_output_specs(self, duration_seconds: int) -> list[tuple[Path, str]]:
+    def _clip_output_specs(
+        self,
+        duration_seconds: int,
+        *,
+        output_kind: str = "clips",
+    ) -> list[tuple[Path, str]]:
+        """Return path candidates for a clip-style export.
+        `output_kind` gates the save-locations category so screen
+        recordings (which reuse this whole export path) can be
+        routed to Videos/screen_recordings instead of Clips.
+        Default preserves the existing clip semantics.
+        """
         label = f"{int(duration_seconds)}s"
-        base = self._next_output_path("clips", ".mp4", extra_label=label)
+        base = self._next_output_path(output_kind, ".mp4", extra_label=label)
         stem = base.stem
         target_dir = base.parent
         return [
@@ -25390,6 +27219,9 @@ Admin elevation
                     is_loopback=True,
                     label="WasapiSysLoopback",
                     close_stdin_on_exit=loopback_owns_stdin,
+                    apply_master_scalar=bool(getattr(
+                        cfg, "clip_audio_follows_master_volume", False
+                    )),
                 )
                 if writer.start():
                     self._wasapi_writer = writer
@@ -25694,6 +27526,14 @@ Admin elevation
                 pass
 
         cfg = self.config
+        # v1.1.7 round-48 defense-in-depth: the master clip-cache
+        # switch also gates the two audio bridges + their encoders +
+        # both watchdogs + the pycaw bg thread. Belt for any future
+        # caller that skips _start_clip_cache_ffmpeg but still reaches
+        # this method directly.
+        if not bool(getattr(cfg, "clip_cache_enabled", True)):
+            _log("master clip_cache_enabled=False; skipping audio bridges + watchdogs")
+            return False
         want_system = bool(getattr(cfg, "clip_capture_system_audio", False))
         want_mic = bool(getattr(cfg, "clip_capture_microphone", False))
         if not (want_system or want_mic):
@@ -25710,6 +27550,28 @@ Admin elevation
         mic_name = ""
         listener_index: int | None = None
 
+        # v1.1.7 round-11: skip the sys-loopback bridge when the
+        # current default output is a Bluetooth device AND the
+        # avoid-bluetooth flag is on (default True). Opening a
+        # shared-mode WASAPI loopback on a BT A2DP endpoint forces
+        # a HFP profile renegotiation on many BT drivers, which
+        # silences the endpoint for 5-15 s (dad's dropout on his
+        # BT headphones every Touchless launch). Advanced users
+        # can flip clip_audio_avoid_bluetooth off to restore the
+        # capture at their own risk.
+        avoid_bt = bool(getattr(cfg, "clip_audio_avoid_bluetooth", True))
+        if want_system and avoid_bt:
+            try:
+                from hgr.app.ui.wasapi_loopback import is_default_output_bluetooth
+                if is_default_output_bluetooth():
+                    _log(
+                        "default output is Bluetooth — sys-loopback SKIPPED "
+                        "so BT audio isn't dropped by profile renegotiation. "
+                        "Disable clip_audio_avoid_bluetooth in config to override."
+                    )
+                    want_system = False
+            except Exception:
+                pass
         if want_system:
             sys_pcm_format = self._probe_wasapi_loopback_format()
             if sys_pcm_format is not None:
@@ -25721,31 +27583,95 @@ Admin elevation
                     "found — check Windows default playback device"
                 )
 
-        if want_mic:
-            mic_name = str(getattr(cfg, "preferred_microphone_name", "") or "").strip()
+        if want_mic and avoid_bt:
+            # v1.1.7 round-16: skip mic bridge if the selected mic
+            # (or system default input) is a Bluetooth endpoint.
+            # Opening a shared-mode WASAPI capture on a BT mic
+            # forces A2DP→HFP profile renegotiation on many BT
+            # drivers, which silences BOTH input and output on the
+            # headset (dad's report — all audio disappeared with
+            # Touchless open). Detect by friendly-name match and
+            # skip the mic bridge entirely — the clip loses its
+            # mic track, but the BT audio survives.
             try:
-                if (self._worker is not None
-                        and getattr(self._worker, "voice_listener", None) is not None):
-                    if not mic_name:
-                        listener_mic = self._worker.voice_listener.input_device_name()
-                        if listener_mic:
-                            mic_name = str(listener_mic).strip()
+                import sounddevice as _sd_check
+                _preferred_mic = str(getattr(cfg, "preferred_microphone_name", "") or "").strip()
+                _check_name = _preferred_mic
+                if not _check_name:
                     try:
-                        listener_index = self._worker.voice_listener.input_device_index()
+                        _default_in = _sd_check.default.device
+                        if isinstance(_default_in, (tuple, list)) and _default_in:
+                            _idx = _default_in[0]
+                            if isinstance(_idx, int) and _idx >= 0:
+                                _check_name = str(_sd_check.query_devices(_idx).get("name", "") or "").strip()
                     except Exception:
-                        listener_index = None
-                    if listener_index is None:
-                        try:
-                            import sounddevice as _sd
-                            default_pair = _sd.default.device
-                            if isinstance(default_pair, (tuple, list)) and default_pair:
-                                cand = default_pair[0]
-                                if isinstance(cand, int) and cand >= 0:
-                                    listener_index = int(cand)
-                        except Exception:
-                            pass
+                        pass
+                if _check_name:
+                    from hgr.app.ui.wasapi_loopback import is_input_name_bluetooth
+                    if is_input_name_bluetooth(_check_name):
+                        _log(
+                            f"selected mic '{_check_name}' looks like a "
+                            "Bluetooth endpoint — mic bridge SKIPPED so "
+                            "BT audio isn't dropped by profile "
+                            "renegotiation. Disable clip_audio_avoid_bluetooth "
+                            "in config to override."
+                        )
+                        want_mic = False
             except Exception:
                 pass
+
+        if want_mic:
+            mic_name = str(getattr(cfg, "preferred_microphone_name", "") or "").strip()
+            # v1.1.7 mic-in-clips fix: DO NOT trust the voice
+            # listener's cached sounddevice index. That index was
+            # resolved ONCE at listener startup and never re-checked;
+            # if devices have shifted since (hot-plug, USB re-enumer-
+            # ation, WASAPI default swap after speakers→headset), it
+            # can now point at the WRONG device — silently capturing
+            # nothing while the mic test still works because it
+            # re-resolves live. Instead, run sd.query_devices() LIVE
+            # here and match preferred_microphone_name by exact name.
+            # Only borrow the listener's *name* (not index) as a
+            # fallback hint when no preferred name is set.
+            try:
+                if (self._worker is not None
+                        and getattr(self._worker, "voice_listener", None) is not None
+                        and not mic_name):
+                    listener_mic = self._worker.voice_listener.input_device_name()
+                    if listener_mic:
+                        mic_name = str(listener_mic).strip()
+            except Exception:
+                pass
+            live_index: int | None = None
+            if mic_name:
+                try:
+                    import sounddevice as _sd_live
+                    for _i, _dev in enumerate(_sd_live.query_devices()):
+                        try:
+                            _dev_name = str(_dev.get("name", "")).strip()
+                            _max_in = int(_dev.get("max_input_channels", 0) or 0)
+                        except Exception:
+                            continue
+                        if _max_in > 0 and _dev_name == mic_name:
+                            live_index = int(_i)
+                            break
+                except Exception:
+                    pass
+            # Fall back to the system default input device only if
+            # nothing named matched — matches previous behavior when
+            # the preferred mic is missing entirely, so users without
+            # a saved preference still get their default input.
+            if live_index is None:
+                try:
+                    import sounddevice as _sd_default
+                    default_pair = _sd_default.default.device
+                    if isinstance(default_pair, (tuple, list)) and default_pair:
+                        cand = default_pair[0]
+                        if isinstance(cand, int) and cand >= 0:
+                            live_index = int(cand)
+                except Exception:
+                    pass
+            listener_index = live_index
             try:
                 from hgr.app.ui.wasapi_loopback import probe_input_device_format
                 mic_pcm_format = probe_input_device_format(
@@ -25757,7 +27683,14 @@ Admin elevation
                 if mic_pcm_format is not None:
                     _log(
                         f"mic probe -> idx={mic_pcm_format[0]} "
-                        f"rate={mic_pcm_format[1]} ch={mic_pcm_format[2]}"
+                        f"rate={mic_pcm_format[1]} ch={mic_pcm_format[2]} "
+                        f"(name='{mic_name}')"
+                    )
+                else:
+                    _log(
+                        f"mic probe returned None — preferred mic "
+                        f"'{mic_name}' may not be present. Clips will "
+                        "have no mic audio until it's plugged back in."
                     )
             except Exception as exc:
                 _log(f"mic probe failed: {exc}")
@@ -25834,6 +27767,9 @@ Admin elevation
                         is_loopback=True,
                         label="WasapiSysLoopbackV2",
                         close_stdin_on_exit=True,
+                        apply_master_scalar=bool(getattr(
+                            cfg, "clip_audio_follows_master_volume", False
+                        )),
                     )
                     if sys_writer.start():
                         self._wasapi_writer = sys_writer
@@ -26039,6 +27975,64 @@ Admin elevation
             self._clip_cache_audio_mic_started_at = 0.0
         self._clip_cache_v2_active = False
 
+    def _clip_high_quality_capable(self) -> tuple[bool, str]:
+        """Return (capable, reason) for whether this machine can
+        sustain the High recording-quality tier (1080p / 30 fps HW-
+        encoded screen capture without starving the gesture pipeline).
+
+        Signals — all wrapped in try/except so a hostile probe never
+        crashes the settings panel:
+          1. HW H.264 encoder is currently the preferred encoder
+             (rejects libx264, catches session-demote state — see
+             `_ffmpeg_capabilities` mutations at the cache-recovery
+             site + the export-demote flag).
+          2. Export path hasn't been session-demoted to libx264.
+          3. CPU has >=4 logical threads. `os.cpu_count() or 0` guards
+             a None return.
+          4. System RAM >= 7.5 GiB (8 GB retail systems typically
+             report ~7.6-7.9 GiB after firmware reserve).
+
+        NOT cached across calls: the probes are all cheap (dict
+        lookups + os/psutil sysinfo), and the settings panel calls
+        this at most once per open. Avoiding a cache also avoids
+        the stale-state hazard when `preferred_encoder` gets mutated
+        mid-session.
+        """
+        # Signal 1: HW encoder present.
+        try:
+            pref = str(self._ffmpeg_capabilities.get("preferred_encoder", "libx264") or "libx264")
+        except Exception:
+            return (False, "Encoder probe unavailable - try Normal.")
+        if pref not in ("h264_nvenc", "h264_qsv", "h264_amf"):
+            return (False, "Requires a hardware H.264 encoder (NVENC, QSV, or AMF). Your system uses the software encoder.")
+        # Signal 2: export-side demote flag.
+        try:
+            if getattr(self, "_clip_export_encoder_demoted", False):
+                return (False, "Hardware encoder failed earlier in this session. Restart Touchless to re-enable High.")
+        except Exception:
+            return (False, "Encoder state probe failed - try Normal.")
+        # Signal 3: CPU logical threads.
+        try:
+            import os as _cpu_os
+            threads = int((_cpu_os.cpu_count() or 0))
+        except Exception:
+            threads = 0
+        if threads < 4:
+            return (False, f"CPU reports {threads} logical threads - 4+ recommended for High.")
+        # Signal 4: system RAM.
+        try:
+            import psutil as _hq_psu
+            total_bytes = int(_hq_psu.virtual_memory().total)
+            if total_bytes < int(7.5 * (2 ** 30)):
+                gib = total_bytes / (2 ** 30)
+                return (False, f"System reports {gib:.1f} GB RAM - 8 GB or more recommended for High.")
+        except Exception:
+            # psutil unavailable - don't deny High for a probe
+            # failure alone; HW encoder + CPU thread bar already
+            # filtered out the low-end machines this signal targets.
+            pass
+        return (True, "ok")
+
     def _restart_clip_cache_if_running(self) -> None:
         """Stop+restart the clip cache so a recent settings change
         (audio toggle, mic name, noise preset, region change) takes
@@ -26053,12 +28047,72 @@ Admin elevation
         self._start_clip_cache_ffmpeg()
 
     def _start_clip_cache_ffmpeg(self) -> bool:
+        # v1.1.7 round-48 master gate. Every existing caller that
+        # bypassed the master switch — auto-recovery restart (~L28182),
+        # post-export re-arm (~L31711 / L34468), _restart_clip_cache_
+        # if_running — funnels through this method. Guarding here means
+        # `clip_cache_enabled = False` deterministically prevents ALL
+        # downstream subsystems (video ffmpeg, audio-v2 bridges,
+        # endpoint watchdog, liveness watchdog, pycaw bg thread) from
+        # ever spawning. Fixes the failure mode where dad flipped the
+        # switch off but the audio bridges kept respawning after every
+        # clip export.
+        if not bool(getattr(self.config, "clip_cache_enabled", True)):
+            return False
         if self._clip_cache_process is not None and self._clip_cache_process.poll() is None:
             self._clip_cache_backend = "ffmpeg"
             return True
         region = self._normalized_record_region(self._screens_union_geometry())
         if region.isNull() or region.width() <= 1 or region.height() <= 1 or not self._ffmpeg_ready():
             return False
+        # ---- Tier-aware cache settings (round-21) ----
+        # Resolve tier BEFORE any encoder_args / wrap_count math
+        # runs. `_resolved_clip_tier` auto-drops High → Normal when
+        # the preferred encoder is libx264 (no HW encoder available
+        # or session-demoted), which is the safety net the settings-
+        # panel grey-out can't cover for mid-session encoder failure.
+        # We RE-DERIVE fps + segment_seconds + wrap_count + timer
+        # interval TOGETHER — the ring buffer size math
+        # (wrap_count = ceil(max_seconds / segment_seconds) + 1) was
+        # baked at __init__ against the Normal 10 s segment; if we
+        # shrink to 5 s at High tier without recomputing wrap_count
+        # the ring silently halves to ~155 s and violates the 305 s
+        # clip_max_buffer_seconds guarantee. The QTimer interval
+        # (drives the MJPG-writer fallback path) is updated too so
+        # Low tier's fps halves even when ffmpeg is unavailable and
+        # the OpenCV writer is taking over.
+        try:
+            import math as _tier_math
+            _tier = self._resolved_clip_tier(for_purpose="cache")
+            _ts = self._encoder_settings_for_tier(_tier)
+            self._clip_cache_fps = float(_ts["fps"])
+            self._clip_cache_segment_seconds = float(_ts["segment_seconds"])
+            self._clip_cache_wrap_count = max(
+                3,
+                int(_tier_math.ceil(
+                    float(self._clip_cache_max_seconds) / float(self._clip_cache_segment_seconds)
+                )) + 1,
+            )
+            try:
+                self._clip_cache_timer.setInterval(int(round(1000.0 / self._clip_cache_fps)))
+            except Exception:
+                pass
+            try:
+                import sys as _tier_sys
+                _tier_sys.stderr.write(
+                    f"[clip-cache] tier={_tier} fps={self._clip_cache_fps} "
+                    f"segment_s={self._clip_cache_segment_seconds} "
+                    f"wrap={self._clip_cache_wrap_count}\n"
+                )
+                _tier_sys.stderr.flush()
+            except Exception:
+                pass
+        except Exception:
+            # Any failure in the tier resolver — fall through with
+            # whatever fps/segment/wrap were already on self (i.e.
+            # the __init__ Normal defaults). Never let tier resolution
+            # itself kill the cache spawn.
+            pass
         self._cleanup_ffmpeg_clip_cache_files()
         self._clip_cache_region = QRect(region)
         self._clip_cache_list_path = self._ffmpeg_clip_list_path()
@@ -26110,25 +28164,82 @@ Admin elevation
             tag in encoder_args
             for tag in ("h264_nvenc", "h264_amf", "h264_qsv")
         )
-        if oversize and using_hw_encoder:
-            # scale=4096:-2 forces width to 4096 and computes height
-            # divisible by 2 (yuv420p requirement) while preserving
-            # aspect. If height is the limiting axis, swap to scale=-2:4096.
-            if region.width() >= region.height():
-                scale_filter_args = ["-vf", "scale=4096:-2"]
+        # Parse tier's optional scale filter (only Low currently ships
+        # one — a `scale=-2:720`). Normal/High return None. Anything
+        # other than `scale=-2:H` falls through to None (defensive
+        # against future tier-dict schema changes) — the HW-cap path
+        # below still fires when the region exceeds 4096.
+        _tier_target_h: int | None = None
+        _tier_now: str = "normal"
+        try:
+            _tier_now = self._resolved_clip_tier(for_purpose="cache")
+            _tsf = self._encoder_settings_for_tier(_tier_now).get("scale_filter")
+            if isinstance(_tsf, str) and _tsf.startswith("scale=-2:"):
+                try:
+                    _tier_target_h = int(_tsf[len("scale=-2:"):])
+                except Exception:
+                    _tier_target_h = None
+        except Exception:
+            _tier_target_h = None
+        # Only apply tier scale when it would ACTUALLY shrink the frame
+        # (never upscale — wastes bits without gaining detail).
+        tier_applies = _tier_target_h is not None and region.height() > _tier_target_h
+        need_hw_cap = oversize and using_hw_encoder
+        if tier_applies or need_hw_cap:
+            # CHAIN both constraints. Without this, a Low-tier user on
+            # a 3x1440p desktop (7680x1440) would get `scale=-2:720`
+            # producing 3840x720 (safe), but a Low-tier user on
+            # 4x1080p (7680x1080, height already ≤ 720? no, 1080 > 720
+            # → tier applies) would produce 5120x720 which exceeds
+            # NVENC/AMF/QSV's 4096-width silicon cap — silent cache
+            # crash. We compute max_h + max_w that satisfy BOTH the
+            # tier target AND the 4096 HW cap, then try height-driven
+            # scale=-2:H; if the resulting width is still too wide,
+            # fall to width-driven scale=W:-2. Exactly one of the two
+            # filter shapes always suffices.
+            _max_h = _tier_target_h if tier_applies else region.height()
+            if need_hw_cap:
+                _max_h = min(_max_h, 4096)
+            _max_w = 4096 if need_hw_cap else region.width()
+            # ffmpeg's `-2` uses av_rescale (round half-up) then snaps
+            # to nearest even via `& ~1`. Python `int(round(...))`
+            # matches for all realistic aspect ratios; the snap-to-even
+            # step is what stops the crop rebase from overshooting the
+            # frame boundary. `_clip_crop_filter` at L25187 additionally
+            # clamps `w = frame_w - x` on overshoot, so any residual
+            # 1px drift becomes a harmless crop shrink.
+            _w_from_h = int(round(_max_h * region.width() / region.height()))
+            _w_from_h -= _w_from_h & 1
+            if _w_from_h <= _max_w:
+                scale_filter_args = ["-vf", f"scale=-2:{int(_max_h)}"]
+                scaled_w, scaled_h = max(2, _w_from_h), int(_max_h)
             else:
-                scale_filter_args = ["-vf", "scale=-2:4096"]
+                _h_from_w = int(round(_max_w * region.height() / region.width()))
+                _h_from_w -= _h_from_w & 1
+                scale_filter_args = ["-vf", f"scale={int(_max_w)}:-2"]
+                scaled_w, scaled_h = int(_max_w), max(2, _h_from_w)
+            self._clip_cache_scaled_region = QRect(0, 0, scaled_w, scaled_h)
             try:
                 import sys as _enc_sys
+                _reason_bits = []
+                if tier_applies:
+                    _reason_bits.append(f"tier={_tier_now}({_tier_target_h}p)")
+                if need_hw_cap:
+                    _reason_bits.append("hw-cap>4096")
                 _enc_sys.stderr.write(
-                    f"[clip-cache] capture region {region.width()}x{region.height()} "
-                    "exceeds 4096x4096 hardware encoder limit — auto-scaling "
-                    f"input to fit ({scale_filter_args[1]}). Keeps NVENC/AMF/QSV "
-                    "active instead of slamming CPU with libx264.\n"
+                    f"[clip-cache] capture region {region.width()}x{region.height()} — "
+                    f"scaling ({', '.join(_reason_bits) or 'none'}): "
+                    f"{scale_filter_args[1]} -> {scaled_w}x{scaled_h}\n"
                 )
                 _enc_sys.stderr.flush()
             except Exception:
                 pass
+        else:
+            # No scale filter injected: on-disk frames match the
+            # unscaled capture region. Explicitly clear the flag so
+            # _clip_crop_filter's rebase math falls through to the
+            # identity case.
+            self._clip_cache_scaled_region = None
         # Video-only command. Audio capture runs in a SEPARATE ffmpeg
         # subprocess (see _start_clip_cache_audio) so a stalled audio
         # source can never backpressure the video pipeline and produce
@@ -26362,6 +28473,25 @@ Admin elevation
                 # next selection picks the next-best (eventually libx264).
                 self._ffmpeg_capabilities["encoders"].discard(current_pref)
                 self._ffmpeg_capabilities["preferred_encoder"] = "libx264"
+                # Round-21: the settings panel's High-tier grey-out
+                # is driven by `_clip_high_quality_capable`, which reads
+                # `preferred_encoder`. Now that we've just downgraded to
+                # libx264 mid-session, the panel state is stale. Also
+                # force the active clip tier down to Normal so the next
+                # cache respawn (below) picks Normal fps/segment/CQ —
+                # a libx264 encoder at High-tier 30 fps 1080p slow-
+                # preset would crush a mid-tier CPU and starve the
+                # gesture pipeline (the very failure High grey-out was
+                # supposed to prevent).
+                try:
+                    if str(getattr(self.config, "clip_quality_tier", "normal") or "normal").lower() == "high":
+                        self.config.clip_quality_tier = "normal"
+                        try:
+                            save_config(self.config)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 # Tear down the dead cache + restart with the new
                 # encoder. delete_files=False keeps any audio segments
                 # already buffered (which CAN be valid even when video
@@ -26440,14 +28570,26 @@ Admin elevation
     # Kill switch: env var HGR_CLIP_DEVICE_WATCHDOG=0 disables.
 
     def _audio_endpoint_fingerprint(self) -> tuple:
-        """Snapshot of (sys_idx, sys_name, mic_idx, mic_name)."""
+        """Snapshot of (sys_idx, sys_name, mic_idx, mic_name, mic_pinned_missing).
+
+        Fifth slot (v1.1.7 mic-hotplug-watchdog-fingerprint):
+        `mic_pinned_missing` is True iff the user has pinned a
+        `preferred_microphone_name` in config AND no live
+        `sd.query_devices()` input entry currently matches that
+        name — making "pinned mic unplugged" distinguishable
+        from "user has no preference" and from "user changed
+        preferred mic". Consumers that only care about the
+        (sys/mic) identity keep slicing [0]..[3] and stay
+        source-compatible; the tick's diff code guards the
+        5th slot with `len(prev) >= 5`.
+        """
         try:
             from hgr.app.ui.wasapi_loopback import (
                 probe_default_loopback_identity,
                 probe_input_device_identity,
             )
         except Exception:
-            return (None, "", None, "")
+            return (None, "", None, "", False)
         sys_pair = None
         try:
             sys_pair = probe_default_loopback_identity()
@@ -26456,22 +28598,45 @@ Admin elevation
         sys_idx = sys_pair[0] if sys_pair else None
         sys_name = sys_pair[1] if sys_pair else ""
         mic_name_hint = ""
-        listener_idx: int | None = None
         try:
             mic_name_hint = str(
                 getattr(self.config, "preferred_microphone_name", "") or ""
             ).strip()
         except Exception:
             mic_name_hint = ""
-        try:
-            if (self._worker is not None
-                    and getattr(self._worker, "voice_listener", None) is not None):
-                try:
-                    listener_idx = self._worker.voice_listener.input_device_index()
-                except Exception:
-                    listener_idx = None
-        except Exception:
-            listener_idx = None
+        # v1.1.7 fix: DO NOT trust the voice listener's cached
+        # sounddevice index for the fingerprint. That index was
+        # resolved ONCE at listener startup; on a hot-plug or USB
+        # re-enumeration since, it points at the WRONG device. If
+        # probe_input_device_identity accepted the stale index
+        # verbatim (pre-fix), the fingerprint would say "mic
+        # unchanged" even after the physical mic swapped — so the
+        # watchdog would never fire the swap. Now: resolve the
+        # preferred mic BY NAME via sd.query_devices() live, then
+        # probe from that fresh index. The identity probe itself
+        # was also fixed (~L1781) to name-validate any passed
+        # index as belt-and-braces.
+        listener_idx: int | None = None
+        pinned_present = False
+        if mic_name_hint:
+            try:
+                import sounddevice as _sd_wd
+                for _i, _dev in enumerate(_sd_wd.query_devices()):
+                    try:
+                        _dev_name = str(_dev.get("name", "")).strip()
+                        _max_in = int(_dev.get("max_input_channels", 0) or 0)
+                    except Exception:
+                        continue
+                    if _max_in > 0 and _dev_name == mic_name_hint:
+                        listener_idx = int(_i)
+                        pinned_present = True
+                        break
+            except Exception:
+                # If we can't enumerate, be conservative and do NOT
+                # claim the pinned mic is missing — assume present
+                # so we don't spuriously flip the 5th slot.
+                pinned_present = True
+        mic_pinned_missing = bool(mic_name_hint) and not pinned_present
         mic_pair = None
         try:
             mic_pair = probe_input_device_identity(
@@ -26482,7 +28647,63 @@ Admin elevation
             mic_pair = None
         mic_idx = mic_pair[0] if mic_pair else None
         mic_name = mic_pair[1] if mic_pair else ""
-        return (sys_idx, sys_name, mic_idx, mic_name)
+        return (sys_idx, sys_name, mic_idx, mic_name, mic_pinned_missing)
+
+    def _audio_endpoint_bg_worker(self) -> None:
+        """Background thread that runs _audio_endpoint_fingerprint()
+        at a ~1 s cadence and publishes each result into
+        self._audio_endpoint_bg_last plus a monotonically-increasing
+        self._audio_endpoint_bg_seq counter.
+
+        perf(v1.1.7): the fingerprint call walks pycaw (CoInitializeEx
+        + AudioUtilities.GetSpeakers + MMDeviceEnumerator) and
+        sounddevice.query_devices() -- 150-800 ms per call on real
+        hardware. When it ran inside the 700 ms QTimer tick it stalled
+        the Qt event loop and queued fps_label paints / live-viewer
+        frames behind every enumeration burst. Off-thread publishing
+        collapses main-thread work per tick to a couple of getattr
+        calls; see _tick_audio_endpoint_watchdog for the reader side.
+
+        Skips the probe when _clip_cache_has_audio is False so we
+        don't enumerate audio devices while no clip session is
+        buffering (matches the tick's own guard). CoInitializeEx with
+        COINIT_MULTITHREADED (0x0) so pycaw's AudioUtilities.
+        GetSpeakers() works off the main thread. Exceptions inside
+        the probe are swallowed -- a failed probe just leaves the
+        cached tuple where it was and the debouncer holds its state.
+        """
+        try:
+            import ctypes as _ct
+            try:
+                _ct.windll.ole32.CoInitializeEx(None, 0x0)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        stop_ev = getattr(self, "_audio_endpoint_bg_stop", None)
+        try:
+            while stop_ev is not None and not stop_ev.is_set():
+                try:
+                    if bool(getattr(self, "_clip_cache_has_audio", False)):
+                        fp = self._audio_endpoint_fingerprint()
+                        self._audio_endpoint_bg_last = fp
+                        self._audio_endpoint_bg_seq = int(
+                            getattr(self, "_audio_endpoint_bg_seq", 0)
+                        ) + 1
+                except Exception:
+                    # Never let a probe failure kill the bg thread --
+                    # tick will read the last-good tuple and hold.
+                    pass
+                stop_ev.wait(1.0)
+        finally:
+            try:
+                import ctypes as _ct
+                try:
+                    _ct.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     def _start_audio_endpoint_watchdog(self) -> None:
         import os as _os
@@ -26495,8 +28716,47 @@ Admin elevation
                     return
             except Exception:
                 pass
-        self._audio_endpoint_last_fingerprint = self._audio_endpoint_fingerprint()
+        # Seed the "last committed" fingerprint synchronously so the
+        # first tick has a real prev to diff against -- same one-time
+        # ~150-800 ms cost as the pre-fix version at this line, so
+        # no startup-latency regression. From here on the bg thread
+        # owns republishing.
+        seed = self._audio_endpoint_fingerprint()
+        self._audio_endpoint_last_fingerprint = seed
+        # perf(v1.1.7): spawn the daemon "audio-endpoint bg" thread
+        # that runs the fingerprint at ~1 s cadence and publishes
+        # into _audio_endpoint_bg_last with a monotonic
+        # _audio_endpoint_bg_seq. The 700 ms QTimer tick reads that
+        # cache only -- main-thread work per tick collapses from
+        # 150-800 ms of COM/PortAudio enumeration to a couple of
+        # getattr calls. Tuple shape is UNCHANGED (same 5-slot layout)
+        # so downstream consumers (5th-slot pinned-mic-missing
+        # semantics, _swap_audio_endpoints_in_place callers) don't
+        # move. See _audio_endpoint_bg_worker.
+        import threading as _threading
+        self._audio_endpoint_bg_last = seed
+        self._audio_endpoint_bg_seq = 0
+        self._audio_endpoint_bg_last_seen_seq = 0
+        self._audio_endpoint_bg_stop = _threading.Event()
+        bg = _threading.Thread(
+            target=self._audio_endpoint_bg_worker,
+            name="audio-endpoint bg",
+            daemon=True,
+        )
+        bg.start()
+        self._audio_endpoint_bg_thread = bg
+        # Kept for backwards-safety even though the N-consecutive-
+        # stable-ticks logic below does not read it. Some diagnostic
+        # / test tooling still references the attribute.
         self._audio_endpoint_change_pending_since = 0.0
+        # v1.1.7 stabilization: require the SAME new fingerprint to
+        # hold across N consecutive ticks (default 2, env-overridable
+        # via HGR_CLIP_ENDPOINT_STABLE_TICKS, clamped 1..5) before
+        # committing an in-place device swap. Absorbs the 100 ms – 2 s
+        # MMDevice-promotion window where the fingerprint can drift
+        # through half-promoted states.
+        self._audio_endpoint_stable_candidate = None
+        self._audio_endpoint_stable_count = 0
         self._audio_endpoint_last_swap_at = 0.0
         self._audio_endpoint_swap_in_progress = False
         timer = QTimer(self)
@@ -26506,6 +28766,26 @@ Admin elevation
         self._audio_endpoint_watchdog_timer = timer
 
     def _stop_audio_endpoint_watchdog(self) -> None:
+        # Signal the bg fingerprint thread FIRST so it stops
+        # republishing during teardown, then join with a bounded
+        # timeout so a PortAudio call that's still in flight can't
+        # hold up the Qt window-close path. If the join times out
+        # the thread is daemon=True so process exit will still cut
+        # it -- worst case we leave one 150-800 ms probe running
+        # in the background.
+        stop_ev = getattr(self, "_audio_endpoint_bg_stop", None)
+        if stop_ev is not None:
+            try:
+                stop_ev.set()
+            except Exception:
+                pass
+        bg = getattr(self, "_audio_endpoint_bg_thread", None)
+        if bg is not None:
+            try:
+                bg.join(timeout=1.5)
+            except Exception:
+                pass
+        self._audio_endpoint_bg_thread = None
         timer = getattr(self, "_audio_endpoint_watchdog_timer", None)
         if timer is None:
             return
@@ -26546,7 +28826,27 @@ Admin elevation
             last_swap_at = float(getattr(self, "_audio_endpoint_last_swap_at", 0.0))
             if (now - last_swap_at) < 5.0:
                 return
-            current = self._audio_endpoint_fingerprint()
+            # perf(v1.1.7): the fingerprint now runs on the bg thread
+            # (_audio_endpoint_bg_worker); we read the cached tuple
+            # instead of calling probe_default_loopback_identity /
+            # probe_input_device_identity / sd.query_devices() on the
+            # Qt main thread. The sequence-number gate ensures each
+            # fresh sample is consumed exactly once -- so the
+            # N-consecutive-stable-ticks debouncer below sees only
+            # NEW observations, matching the pre-fix semantics where
+            # every tick's call produced a fresh sample. Same 5-tuple
+            # shape as before, so the sys_only / mic_only / pinned-
+            # missing diff logic downstream is untouched.
+            bg_seq = int(getattr(self, "_audio_endpoint_bg_seq", 0))
+            last_seen_seq = int(
+                getattr(self, "_audio_endpoint_bg_last_seen_seq", 0)
+            )
+            if bg_seq == last_seen_seq:
+                return
+            self._audio_endpoint_bg_last_seen_seq = bg_seq
+            current = getattr(self, "_audio_endpoint_bg_last", None)
+            if current is None:
+                return
             prev = getattr(self, "_audio_endpoint_last_fingerprint", None)
             # Diagnostic heartbeat — every 30s log the current poll
             # result so it's visible when the probe is or isn't
@@ -26566,25 +28866,47 @@ Admin elevation
                 self._audio_endpoint_last_fingerprint = current
                 return
             if current != prev:
-                pending_since = float(
-                    getattr(self, "_audio_endpoint_change_pending_since", 0.0)
-                )
-                if pending_since == 0.0:
-                    self._audio_endpoint_change_pending_since = now
+                # v1.1.7 mic-hotplug stabilization: require N
+                # consecutive identical polls of `current` before
+                # committing. If a candidate drifts (A -> B -> C)
+                # mid-stabilization we re-arm on the newest value
+                # instead of committing the transient. Env override:
+                # HGR_CLIP_ENDPOINT_STABLE_TICKS (default 2, clamped 1..5).
+                candidate = getattr(self, "_audio_endpoint_stable_candidate", None)
+                if candidate != current:
+                    self._audio_endpoint_stable_candidate = current
+                    self._audio_endpoint_stable_count = 1
                     return
-                if (now - pending_since) < 0.7:
+                stable_count = int(getattr(self, "_audio_endpoint_stable_count", 0)) + 1
+                self._audio_endpoint_stable_count = stable_count
+                import os as _os_stab
+                try:
+                    required = int(_os_stab.environ.get("HGR_CLIP_ENDPOINT_STABLE_TICKS", "2"))
+                except Exception:
+                    required = 2
+                required = max(1, min(5, required))
+                if stable_count < required:
                     return
+                # Stabilized — commit swap.
+                self._audio_endpoint_stable_count = 0
+                self._audio_endpoint_stable_candidate = None
                 self._audio_endpoint_change_pending_since = 0.0
                 self._audio_endpoint_last_fingerprint = current
                 self._audio_endpoint_last_swap_at = now
                 self._audio_endpoint_swap_in_progress = True
                 # Diff prev vs current. Fingerprint shape is
-                # (sys_idx, sys_name, mic_idx, mic_name). If only the
-                # sys halves changed we pass sys_only=True so the mic
-                # bridge isn't disturbed (and vice versa). Conservative
-                # default if shapes don't match: swap both (legacy).
+                # (sys_idx, sys_name, mic_idx, mic_name, mic_pinned_missing).
+                # If only the sys halves changed we pass sys_only=True so
+                # the mic bridge isn't disturbed (and vice versa). A
+                # transition INTO or OUT of pinned-missing counts as a
+                # mic-side change so the mic bridge re-resolves against
+                # the current system default. Conservative default if
+                # shapes don't match: swap both (legacy).
                 sys_only = False
                 mic_only = False
+                mic_pinned_missing_change = False
+                entered_pinned_missing = False
+                curr_pinned_missing = False
                 try:
                     if (isinstance(prev, tuple) and isinstance(current, tuple)
                             and len(prev) >= 4 and len(current) >= 4):
@@ -26594,6 +28916,13 @@ Admin elevation
                         mic_changed = (
                             prev[2] != current[2] or prev[3] != current[3]
                         )
+                        prev_missing = bool(prev[4]) if len(prev) >= 5 else False
+                        curr_missing = bool(current[4]) if len(current) >= 5 else False
+                        curr_pinned_missing = curr_missing
+                        if prev_missing != curr_missing:
+                            mic_pinned_missing_change = True
+                            entered_pinned_missing = curr_missing
+                            mic_changed = True
                         if sys_changed and not mic_changed:
                             sys_only = True
                         elif mic_changed and not sys_changed:
@@ -26607,17 +28936,40 @@ Admin elevation
                         side = "sys-only"
                     elif mic_only:
                         side = "mic-only"
+                    extra = ""
+                    if mic_pinned_missing_change:
+                        extra = (
+                            " [pinned-mic -> MISSING]"
+                            if entered_pinned_missing
+                            else " [pinned-mic -> RECONNECTED]"
+                        )
                     _sys.stderr.write(
-                        f"[clip-audio] endpoint changed ({side}) "
+                        f"[clip-audio] endpoint changed ({side}){extra} "
                         f"prev={prev!r} -> now={current!r} — "
                         f"swap_device (NO ffmpeg restart)\n"
                     )
                     _sys.stderr.flush()
                 except Exception:
                     pass
+                if mic_pinned_missing_change:
+                    try:
+                        from PySide6.QtCore import QTimer as _QT_ns
+                        _ns_msg = (
+                            "Preferred microphone unplugged — using system default"
+                            if entered_pinned_missing
+                            else "Preferred microphone reconnected"
+                        )
+                        _QT_ns.singleShot(
+                            0,
+                            lambda m=_ns_msg: self._notify_mic_status(m),
+                        )
+                    except Exception:
+                        pass
                 try:
                     self._swap_audio_endpoints_in_place(
-                        sys_only=sys_only, mic_only=mic_only,
+                        sys_only=sys_only,
+                        mic_only=mic_only,
+                        mic_pinned_missing=curr_pinned_missing,
                     )
                 except Exception as exc:
                     try:
@@ -26632,6 +28984,10 @@ Admin elevation
                 finally:
                     self._audio_endpoint_swap_in_progress = False
             else:
+                # Fingerprint matches last-committed — clear any
+                # in-flight stabilization state.
+                self._audio_endpoint_stable_count = 0
+                self._audio_endpoint_stable_candidate = None
                 self._audio_endpoint_change_pending_since = 0.0
                 self._audio_endpoint_last_fingerprint = current
         except Exception:
@@ -26644,6 +29000,7 @@ Admin elevation
         *,
         sys_only: bool = False,
         mic_only: bool = False,
+        mic_pinned_missing: bool = False,
     ) -> None:
         """Swap the underlying PortAudio devices on the sys and mic
         bridges. NEVER touches ffmpeg, NEVER re-stamps
@@ -26662,6 +29019,16 @@ Admin elevation
         clip and break ~10 s of mic audio. Watchdog now passes the
         side that actually changed; liveness watchdog passes the
         silent bridge.
+
+        v1.1.7 mic-hotplug-watchdog-fingerprint:
+        `mic_pinned_missing=True` tells the mic branch that the
+        user's pinned preferred microphone is currently unplugged.
+        In that case the mic branch skips preferred-name resolution
+        entirely and lets probe_input_device_format resolve the
+        current system default input — which is a safe no-op via
+        writer.swap_device when the writer is already on that
+        default. FM4 auto-liveness watchdog callers keep the safe
+        `False` default, unchanged.
         """
         # SYS bridge swap.
         sys_writer = getattr(self, "_wasapi_writer", None)
@@ -26699,26 +29066,34 @@ Admin elevation
             except Exception:
                 probe_input_device_format = None
             if probe_input_device_format is not None:
-                # Same resolution priority as the original spawn.
+                # Same resolution priority as the original spawn —
+                # UNLESS the pinned preferred mic is currently
+                # missing (v1.1.7 mic-hotplug-watchdog-fingerprint):
+                # in that case skip the preferred-name resolution
+                # and the stale listener index, let probe_input_
+                # device_format resolve the current system default
+                # input. writer.swap_device is a safe no-op when
+                # the writer is already on that default.
                 mic_name = ""
                 listener_index: int | None = None
-                try:
-                    mic_name = str(
-                        getattr(self.config, "preferred_microphone_name", "") or ""
-                    ).strip()
-                except Exception:
-                    mic_name = ""
-                try:
-                    if (self._worker is not None
-                            and getattr(self._worker, "voice_listener", None) is not None):
-                        try:
-                            listener_index = (
-                                self._worker.voice_listener.input_device_index()
-                            )
-                        except Exception:
-                            listener_index = None
-                except Exception:
-                    listener_index = None
+                if not mic_pinned_missing:
+                    try:
+                        mic_name = str(
+                            getattr(self.config, "preferred_microphone_name", "") or ""
+                        ).strip()
+                    except Exception:
+                        mic_name = ""
+                    try:
+                        if (self._worker is not None
+                                and getattr(self._worker, "voice_listener", None) is not None):
+                            try:
+                                listener_index = (
+                                    self._worker.voice_listener.input_device_index()
+                                )
+                            except Exception:
+                                listener_index = None
+                    except Exception:
+                        listener_index = None
                 try:
                     fmt = probe_input_device_format(
                         mic_name or None,
@@ -26750,6 +29125,36 @@ Admin elevation
                             _sys.stderr.flush()
                         except Exception:
                             pass
+
+    def _notify_mic_status(self, message: str) -> None:
+        """Best-effort one-shot mic-status notification.
+
+        Called from the endpoint watchdog when a transition INTO or
+        OUT of pinned-missing is stabilized. Always logs the message
+        to stderr; additionally attempts (best-effort) to surface it
+        on an attached status bar / mic-status label if either is
+        wired up. Guaranteed never to raise into the caller.
+        """
+        try:
+            import sys as _sys_ns_stderr
+            _sys_ns_stderr.stderr.write(f"[clip-audio] mic-status: {message}\n")
+            _sys_ns_stderr.stderr.flush()
+        except Exception:
+            pass
+        # Optional: mic-status label attached by the settings UI.
+        try:
+            _label = getattr(self, "_mic_status_label", None)
+            if _label is not None:
+                _label.setText(str(message))
+        except Exception:
+            pass
+        # Optional: main-window status bar.
+        try:
+            _sb = self.statusBar() if hasattr(self, "statusBar") else None
+            if _sb is not None:
+                _sb.showMessage(str(message), 5000)
+        except Exception:
+            pass
 
     # ===== End audio-endpoint watchdog =============================
 
@@ -26861,6 +29266,44 @@ Admin elevation
             mic_writer = getattr(self, "_wasapi_mic_writer", None)
             if mic_writer is not None:
                 mic_last = float(getattr(mic_writer, "last_real_data_at", 0.0) or 0.0)
+                # v1.1.7 fix: if the bridge has NEVER produced real
+                # data (mic_last == 0), the old branch short-
+                # circuited and the auto-repair never fired. Dad's
+                # scenario: initial cache spawn used a wrong device
+                # index → bridge is "running" but silent forever.
+                # Track when we first noticed a live-but-silent
+                # bridge; if 15+ s pass without any real data,
+                # treat the same as a stalled bridge.
+                if mic_last <= 0:
+                    first_seen = float(getattr(self, "_audio_liveness_mic_first_silent_at", 0.0) or 0.0)
+                    if first_seen <= 0:
+                        self._audio_liveness_mic_first_silent_at = now
+                        first_seen = now
+                    since_first_seen = now - first_seen
+                    if (auto_repair_enabled
+                            and since_first_seen >= 15.0
+                            and (now - float(self._audio_liveness_mic_repaired_at)) >= 30.0):
+                        try:
+                            import sys as _sys_ns
+                            _sys_ns.stderr.write(
+                                f"[clip-audio] MIC auto-repair: NEVER produced "
+                                f"data in {since_first_seen:.0f}s -> swap_device "
+                                "(likely wrong device picked at spawn)\n"
+                            )
+                            _sys_ns.stderr.flush()
+                        except Exception:
+                            pass
+                        self._audio_liveness_mic_repaired_at = now
+                        self._audio_liveness_mic_first_silent_at = 0.0
+                        try:
+                            self._swap_audio_endpoints_in_place(mic_only=True)
+                        except Exception:
+                            pass
+                else:
+                    # Bridge started producing data — clear the
+                    # never-produced timer so future silence
+                    # falls through to the standard silence path.
+                    self._audio_liveness_mic_first_silent_at = 0.0
                 if mic_last > 0:
                     silent_for = now - mic_last
                     if silent_for >= 15.0:
@@ -26947,6 +29390,7 @@ Admin elevation
     def _run_clip_export_ffmpeg(
         self, duration_seconds: int, target_region: QRect,
         *, end_ts: float | None = None,
+        output_kind: str = "clips",
     ) -> tuple[bool, Path | None, float]:
         """Thread-safe variant of _export_recent_clip_ffmpeg that
         does NOT touch any QWidget or worker state — used from the
@@ -26965,6 +29409,12 @@ Admin elevation
         was_active = (
             self._clip_cache_backend == "ffmpeg" and self._clip_cache_process is not None
         )
+        # Reset per-clip retry counter so each fresh clip gets its own
+        # 2-retry budget. The session-scoped demote flag persists
+        # (once flipped stays flipped this session) — we don't
+        # re-try NVENC after it failed once — but each clip should be
+        # able to consume its own retries independently.
+        self._clip_export_recovery_attempts = 0
         # Snapshot BEFORE we stop the cache — `_stop_clip_cache_ffmpeg`
         # unconditionally resets `_clip_cache_has_audio` to False
         # (and clears `_clip_cache_audio_process`), so checking the
@@ -27152,7 +29602,9 @@ Admin elevation
                     pass
             except Exception:
                 pass
-            output_path = self._clip_output_specs(duration_seconds)[0][0]
+            output_path = self._clip_output_specs(
+                duration_seconds, output_kind=output_kind
+            )[0][0]
             capture_region = (
                 QRect(self._clip_cache_region)
                 if self._clip_cache_region is not None
@@ -28703,6 +31155,88 @@ Admin elevation
                 stderr=subprocess.PIPE,
                 creationflags=export_creationflags,
             )
+            # --- Auto-recovery for HW-encoder / no-packets failures ---
+            # Symptom: ffmpeg exit 4294967274 (= -22 = EINVAL) with
+            # stderr "Nothing was written into output file, because at
+            # least one of its streams received no packets." Fires
+            # deterministically on pre-Turing NVIDIA (GTX 9xx / 10xx
+            # Maxwell/Pascal) NVENC where the session opens but the
+            # encoder emits zero coded packets on some argv combos.
+            # Also covers Intel QSV / AMD AMF init-succeeds-encode-
+            # fails variants and Defender-ASR-sandboxed-subprocess
+            # variants (subprocess launches but produces no output).
+            # Retry the export ONCE with libx264 forced by flipping
+            # the session-scoped demote flag; if that STILL fails
+            # AND we included audio, retry once more video-only per
+            # the project's graceful-degrade policy. Session-local
+            # counter caps at 2 retries per clip.
+            def _stderr_suggests_hw_encoder_fault(text: bytes | None) -> bool:
+                if not text:
+                    return False
+                needles = (
+                    b"received no packets",
+                    b"Nothing was written into output file",
+                    b"InitializeEncoder failed",
+                    b"No capable devices",
+                    b"OpenEncodeSessionEx",
+                    b"NvEnc",
+                    b"nvenc",
+                    b"h264_amf",
+                    b"h264_qsv",
+                )
+                return any(n in text for n in needles)
+            attempts = getattr(self, "_clip_export_recovery_attempts", 0)
+            if (
+                completed.returncode != 0
+                and attempts < 2
+                and _stderr_suggests_hw_encoder_fault(completed.stderr)
+            ):
+                self._clip_export_recovery_attempts = attempts + 1
+                self._clip_export_encoder_demoted = True
+                # 1st retry: libx264 + keep audio.
+                # 2nd retry: libx264 + drop audio (covers the "audio
+                # stream received no packets" variant).
+                retry_has_audio = has_audio if attempts == 0 else False
+                try:
+                    import sys as _rec_sys
+                    stderr_tail = (completed.stderr or b"")[-400:]
+                    _rec_sys.stderr.write(
+                        f"[clip-export] auto-recovery retry #{attempts + 1}: "
+                        f"encoder=libx264 has_audio={retry_has_audio} "
+                        f"orig_rc={completed.returncode} "
+                        f"stderr_tail={stderr_tail!r}\n"
+                    )
+                    _rec_sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    self._append_home_debug_log(
+                        f"[clip-export] auto-recovery retry #{attempts + 1}: "
+                        f"encoder=libx264 has_audio={retry_has_audio}"
+                    )
+                except Exception:
+                    pass
+                retry_command = [
+                    self._ffmpeg_path,
+                    "-hide_banner", "-loglevel", "error", "-y",
+                    *inputs,
+                    "-filter_complex", filter_complex,
+                    "-map", "[vout]",
+                    *(["-map", "[aout]"] if retry_has_audio else ["-an"]),
+                    *self._ffmpeg_encoder_args(
+                        purpose="clip_export", fps=self._clip_cache_fps
+                    ),
+                    *(["-c:a", "aac", "-b:a", "192k"] if retry_has_audio else []),
+                    str(output_path),
+                ]
+                completed = subprocess.run(
+                    retry_command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    creationflags=export_creationflags,
+                )
+                command = retry_command
+                has_audio = retry_has_audio
             # When audio was wired in but the export still succeeded,
             # surface ffmpeg's stderr to the Detailed Log anyway —
             # ffmpeg sometimes succeeds with WARNINGS about audio
@@ -29743,6 +32277,109 @@ Admin elevation
         not started, or the very first frame after Start)."""
         return self._buffered_clip_seconds() > 0.0
 
+    def _navigate_to_clip_presets(self) -> None:
+        """Open Settings → General and scroll the Clip Presets card
+        into view. Wired to the `clipping disabled` pill's click-
+        action so users can enable clipping in one motion.
+
+        Also raises + activates the main window so the user
+        actually SEES the navigation happen (e.g. when the app is
+        minimized to taskbar or lost focus behind a game).
+        """
+        # v1.1.7: bring the window to the foreground so the user
+        # sees the click-through resolve. showNormal() undoes any
+        # minimize state; raise_() brings it above sibling windows;
+        # activateWindow() gives it focus.
+        try:
+            if self.isMinimized():
+                self.showNormal()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        try:
+            self.show_settings_page(SECTION_GENERAL)
+        except Exception:
+            return
+        card = getattr(self, "_clip_presets_card", None)
+        if card is None:
+            return
+        # Ensure the scroll area brings the card into view. Defer
+        # one event tick so the settings page has laid out before
+        # we ask it to scroll.
+        def _scroll():
+            try:
+                # Walk up from the card to find its enclosing QScrollArea
+                # (the general settings scroll pane) and ask it to reveal.
+                from PySide6.QtWidgets import QScrollArea
+                parent = card.parentWidget()
+                while parent is not None:
+                    if isinstance(parent, QScrollArea):
+                        parent.ensureWidgetVisible(card, 0, 0)
+                        return
+                    parent = parent.parentWidget()
+            except Exception:
+                pass
+        try:
+            QTimer.singleShot(0, _scroll)
+        except Exception:
+            _scroll()
+
+    def _show_clip_disabled_pill(self) -> None:
+        """Bottom-of-screen pill telling the user clipping is off
+        and offering a click-through into the setting that
+        re-enables it. Fires from every clip-attempt path when
+        `config.clip_cache_enabled == False`.
+        """
+        try:
+            self.last_action_label.setText("Last action: clipping is disabled")
+        except Exception:
+            pass
+        # v1.1.7: rich HTML content so "Clip Presets" is highlighted
+        # in the accent teal + underlined, matching the app's link
+        # affordance. The whole pill is still clickable — the styled
+        # phrase just signals to the user that clicking navigates
+        # into that specific setting. Wrap the whole message in a
+        # white-coloured span because QTextDocument's default text
+        # colour is black; without the outer wrapper the non-link
+        # portion rendered against the dark pill background as an
+        # unreadable dark grey.
+        accent = str(getattr(self.config, "accent_color", "#1DE9B6") or "#1DE9B6")
+        html = (
+            "<span style=\"color:#E8F6FF;\">"
+            "Clipping is disabled. Click here to open "
+            f"<span style=\"color:{accent}; text-decoration: underline;\">"
+            "Clip Presets</span>."
+            "</span>"
+        )
+        try:
+            self.saved_location_overlay.show_saved(
+                html,
+                total_ms=6000,
+                fade_ms=600,
+                click_action=self._navigate_to_clip_presets,
+                # stack_offset=0 puts the pill LOWER than the default
+                # (which sits above the standard status pill row) so
+                # it lands below where a "Clipping last N" pill would
+                # normally show up.
+                stack_offset=0,
+                rich_text=True,
+            )
+        except Exception:
+            # Overlay unavailable (very early startup or teardown) —
+            # fall back to a modal so users always get the answer to
+            # "why did clipping do nothing?".
+            try:
+                QMessageBox.information(
+                    self, "Clipping is disabled",
+                    "Clipping is turned off. To enable it, go to "
+                    "Settings → General → Clip Presets and check "
+                    "'Enable clipping'."
+                )
+            except Exception:
+                pass
+
     def _export_clip_async(
         self,
         duration_seconds: int,
@@ -29750,6 +32387,9 @@ Admin elevation
         *,
         auto_save: bool = False,
         end_ts: float | None = None,
+        output_kind: str = "clips",
+        pill_label: str | None = None,
+        save_prompt_kind: str | None = None,
     ) -> None:
         # Off-main-thread clip export. The ffmpeg subprocess for a
         # 60 s concat + crop + trim + encode takes 3-8 s; running
@@ -29768,6 +32408,15 @@ Admin elevation
         #      starting voice capture — must be main-thread).
         if self._clip_export_thread is not None and self._clip_export_thread.is_alive():
             self.last_action_label.setText("Last action: clip already exporting")
+            return
+        # v1.1.7: if the user has turned Clip Presets → Enable clipping
+        # OFF, the rolling cache is not running and there's nothing to
+        # export. Safety net — the engine-side gates in noop_engine
+        # should short-circuit BEFORE this path, but if something ever
+        # bypasses them (direct API, unit test, race), we still show
+        # the same friendly pill.
+        if not bool(getattr(self.config, "clip_cache_enabled", True)):
+            self._show_clip_disabled_pill()
             return
         # Required diagnostic per scout fix: when the caller supplied a
         # speech_end anchor (voice "clip that" path), log the skew
@@ -29861,21 +32510,25 @@ Admin elevation
         )
         try:
             self.processing_overlay.show_processing(
-                f"Processing {effective_seconds:.0f}s clip"
+                pill_label
+                or f"Processing {effective_seconds:.0f}s clip"
             )
         except Exception:
             pass
 
         # Reset shared result slot for this run. Worker thread
-        # writes here; GUI callback reads. `auto_save` is set
-        # main-thread BEFORE the worker starts so the completion
-        # handler can read it without the worker ever touching it.
+        # writes here; GUI callback reads. `auto_save` and
+        # `save_prompt_kind` are set main-thread BEFORE the worker
+        # starts so the completion handler can read them without the
+        # worker ever touching them.
         self._clip_export_result = {
             "success": False,
             "output_path": None,
             "actual_seconds": 0.0,
             "error": None,
             "auto_save": bool(auto_save),
+            "output_kind": str(output_kind),
+            "save_prompt_kind": str(save_prompt_kind or output_kind),
         }
 
         # Connect the cross-thread bridge signal exactly once. We
@@ -29891,8 +32544,14 @@ Admin elevation
                 if self._ffmpeg_ready() and self._clip_cache_backend == "ffmpeg":
                     success, output_path, actual_seconds = self._run_clip_export_ffmpeg(
                         duration_seconds, target, end_ts=end_ts,
+                        output_kind=output_kind,
                     )
                 else:
+                    # OpenCV fallback path doesn't support output_kind
+                    # yet — it always uses the "clips" category. That's
+                    # fine because the OpenCV path only fires when
+                    # ffmpeg is unavailable, which is rare and where
+                    # screen-recordings routing is a secondary concern.
                     success, output_path, actual_seconds = self._run_clip_export_opencv(
                         duration_seconds, target, end_ts=end_ts,
                     )
@@ -29902,6 +32561,8 @@ Admin elevation
                     "actual_seconds": float(actual_seconds or 0.0),
                     "error": None,
                     "auto_save": bool(auto_save),
+                    "output_kind": str(output_kind),
+                    "save_prompt_kind": str(save_prompt_kind or output_kind),
                 }
             except Exception as exc:
                 self._clip_export_result = {
@@ -29910,6 +32571,8 @@ Admin elevation
                     "actual_seconds": 0.0,
                     "error": f"{type(exc).__name__}: {exc!s}",
                     "auto_save": bool(auto_save),
+                    "output_kind": str(output_kind),
+                    "save_prompt_kind": str(save_prompt_kind or output_kind),
                 }
             # Bounce to the GUI thread via Qt signal — works from
             # any thread, doesn't require a local event loop.
@@ -29955,15 +32618,22 @@ Admin elevation
                 pass
 
     def _on_clip_export_finished_main_thread_inner(self) -> None:
-        try:
-            self.processing_overlay.hide_processing()
-        except Exception:
-            pass
         result = dict(getattr(self, "_clip_export_result", {}) or {})
         success = bool(result.get("success", False))
         output_path = result.get("output_path")
         actual_seconds = float(result.get("actual_seconds", 0.0) or 0.0)
         error = result.get("error")
+        # r53: use complete_and_hide() on success so the bar visibly
+        # eases to 100% before the pill disappears. hide_processing()
+        # was killing the overlay at ~20-30% fill regardless of the
+        # animation state. Failure path keeps the hard hide.
+        try:
+            if success and not error:
+                self.processing_overlay.complete_and_hide()
+            else:
+                self.processing_overlay.hide_processing()
+        except Exception:
+            pass
         # Failure paths used to only update last_action_label, which
         # users on multi-monitor systems missed entirely — the symptom
         # they reported was "monitor picker closes, nothing happens,
@@ -30038,13 +32708,19 @@ Admin elevation
                 pass
             return
         auto_save = bool(result.get("auto_save", False))
+        # `save_prompt_kind` lets the screen-record entry point ("clip
+        # cache mode recording") route to Videos/screen_recordings
+        # while clip semantics stay on Videos/clips. Defaults to
+        # "clips" when the field is absent (older code paths, retries).
+        save_prompt_kind = str(result.get("save_prompt_kind") or "clips")
+        noun = "recording" if save_prompt_kind == "screen_recordings" else "clip"
         if auto_save:
             # Voice-trigger fast path: clip already lives in the
             # default clips folder; don't open the "where to save"
             # voice prompt — the user said "clip that" and expects
             # the action to be one-and-done.
             self.last_action_label.setText(
-                f"Last action: saved {actual_seconds:.1f}s clip to {output_path}"
+                f"Last action: saved {actual_seconds:.1f}s {noun} to {output_path}"
             )
             # v2 MVP commit 2: non-blocking save confirmation toast
             # via the existing SavedLocationOverlay (bottom-center
@@ -30058,10 +32734,13 @@ Admin elevation
                 )
             except Exception:
                 show_toast = True
-            if show_toast:
+            # r53: also honour the Settings > General > Overlay > "Text
+            # pop-ups" master flag. Users who turn text pop-ups off
+            # expect the clip's "saved to..." toast to stay quiet too.
+            if show_toast and self._should_show_text_popups():
                 try:
                     self.saved_location_overlay.show_saved(
-                        f"Clip saved: {Path(output_path).name}",
+                        f"{noun.capitalize()} saved: {Path(output_path).name}",
                         total_ms=4000,
                         fade_ms=600,
                         click_target=Path(output_path),
@@ -30070,26 +32749,54 @@ Admin elevation
                     pass
             return
         self.last_action_label.setText(
-            f"Last action: saved {actual_seconds:.1f}s clip to {output_path}"
+            f"Last action: saved {actual_seconds:.1f}s {noun} to {output_path}"
         )
         # Save-location voice prompt — must run on GUI thread
         # because it starts voice capture (sounddevice + QObject).
         try:
-            self._queue_post_action_save_prompt("clips", Path(output_path))
+            self._queue_post_action_save_prompt(
+                save_prompt_kind, Path(output_path)
+            )
         except Exception:
             pass
     def _start_screen_recording_ffmpeg(self, region: QRect) -> bool:
-        if not self._ffmpeg_ready():
-            try:
-                QMessageBox.warning(
-                    self, "Screen recording — ffmpeg unavailable",
-                    "Screen recording needs ffmpeg, which Touchless couldn't "
-                    "find or use on this machine. The bundled installer should "
-                    "include it; if it's gone, the install may be corrupted."
-                )
-            except Exception:
-                pass
-            return False
+        """DEPRECATED — v1.1.7 redesign.
+
+        Screen recording no longer spawns its own gdigrab/ffmpeg
+        subprocess. Two gdigrab processes (this one + the clip cache)
+        starved each other for GDI/DWM resources and produced choppy
+        output, and the live-mux mkv path was fragile at stop-time.
+        The recording pipeline now piggybacks on the always-running
+        clip cache: start = stamp T_start; stop = invoke the working
+        clip export path with duration = T_stop - T_start.
+
+        This method is kept as a stub returning False so the parent
+        `_start_screen_recording` falls through to the cache-mode
+        implementation below. Older external callers that expected
+        an ffmpeg-based recording just get a no-op.
+        """
+        return False
+
+    def _start_screen_recording(self, region: QRect) -> None:
+        """Arm a screen-recording session — cache-slice mode.
+
+        v1.1.7 REDESIGN: no ffmpeg spawn, no WASAPI writer, no
+        matroska output, no ffprobe verify, no CTRL_BREAK stop. All
+        we do here is:
+          1. Verify the clip cache is running and has non-zero
+             footage (warm-up guard: refuses if buffer is empty).
+          2. Stamp T_start = time.time() and stash the region.
+          3. Set the recording flag, arm the worker's
+             utility-recording state so the stop-gesture branch
+             activates, show the recording indicator.
+
+        On stop (see `_stop_screen_recording`), duration is computed
+        from T_stop - T_start and `_export_clip_async` is called
+        with output_kind="screen_recordings" so the mp4 lands in
+        Videos/screen_recordings/. Audio (sys + mic) is picked up by
+        the shipped clip-export audio path — same infrastructure
+        that produces working clips for existing users.
+        """
         region = self._normalized_record_region(region)
         if region.isNull() or region.width() <= 1 or region.height() <= 1:
             try:
@@ -30100,279 +32807,197 @@ Admin elevation
                 )
             except Exception:
                 pass
-            return False
-        output_path = self._record_output_specs()[0][0]
-        command = [
-            self._ffmpeg_path,
-            "-hide_banner", "-loglevel", "error", "-y",
-            *self._ffmpeg_capture_input_args(region, fps=self._screen_record_fps, prefer_low_overhead=True),
-            "-an",
-            *self._ffmpeg_encoder_args(purpose="record", fps=self._screen_record_fps),
-            str(output_path),
-        ]
-        # Reset the stashed startup error before launch so this
-        # attempt's diagnostic doesn't get confused with a previous
-        # failure left behind.
-        self._last_ffmpeg_startup_error = None
-        process = self._start_ffmpeg_process(command)
-        if process is None:
-            # Surface whatever _start_ffmpeg_process captured. Without
-            # this popup, the user sees no feedback at all — recording
-            # gesture fires, no on-screen recording indicator appears,
-            # nothing in the log. The diagnostic captured by
-            # _start_ffmpeg_process via stderr=PIPE makes the failure
-            # actionable.
-            detail = getattr(self, "_last_ffmpeg_startup_error", None) or ""
-            detail_block = f"\n\nffmpeg said: {detail}\n" if detail else ""
+            self._set_worker_utility_recording_active(False)
+            return
+        # Screen recording is structurally impossible with the clip
+        # cache disabled — there's no rolling buffer to slice from.
+        if not bool(getattr(self.config, "clip_cache_enabled", True)):
             try:
-                QMessageBox.warning(
-                    self, "Screen recording — couldn't start",
-                    "Touchless tried to start a screen recording but ffmpeg "
-                    "exited immediately. This is usually a screen-capture "
-                    "device mismatch (gdigrab / dshow), a region out of "
-                    "bounds for the current monitor layout, or a save-folder "
-                    "permission problem."
-                    + detail_block
-                    + "\nTip: launch Touchless.exe from a Command Prompt and "
-                    "try again — full ffmpeg output goes to the console."
+                self._show_clip_disabled_pill()
+            except Exception:
+                try:
+                    QMessageBox.information(
+                        self, "Screen recording — clipping disabled",
+                        "Screen recording uses the same buffer as the "
+                        "clipping feature. Enable clipping in Settings → "
+                        "General → Clip Presets, then try again."
+                    )
+                except Exception:
+                    pass
+            self.last_action_label.setText(
+                "Last action: screen recording needs clipping enabled"
+            )
+            self._set_worker_utility_recording_active(False)
+            return
+        # Cache must be running (engine is on and cache is up).
+        if self._clip_cache_backend != "ffmpeg":
+            self.last_action_label.setText(
+                "Last action: screen recording needs the engine running"
+            )
+            try:
+                QMessageBox.information(
+                    self, "Screen recording — engine not running",
+                    "Click Start on the home page first — the clip cache "
+                    "must be running so we have footage to save."
                 )
             except Exception:
                 pass
-            return False
-        self._screen_record_process = process
-        self._screen_record_backend = "ffmpeg"
-        self._screen_record_region = QRect(region)
-        self._screen_record_path = output_path
-        self._screen_record_frame_size = (region.width(), region.height())
-        self._screen_recording_active = True
-        self._set_worker_utility_recording_active(True)
-        self.recording_overlay.show_indicator()
-        self.last_action_label.setText(f"Last action: screen recording started {output_path}")
-        return True
-
-        def _record_output_specs(self) -> list[tuple[Path, str]]:
-            videos_dir = Path.home() / "Videos"
-            target_dir = videos_dir if videos_dir.exists() else Path.home()
-            target_dir.mkdir(parents=True, exist_ok=True)
-            stamp = time.strftime('%Y%m%d_%H%M%S')
-            return [
-                (target_dir / f"hgr_record_{stamp}.mp4", 'mp4v'),
-                (target_dir / f"hgr_record_{stamp}.avi", 'XVID'),
-                (target_dir / f"hgr_record_{stamp}_mjpg.avi", 'MJPG'),
-            ]
-
-        def _normalized_record_region(self, region: QRect | None) -> QRect:
-            target = QRect(self._screens_union_geometry() if region is None or region.isNull() else region.normalized())
-            if target.width() % 2 != 0:
-                target.setWidth(max(2, target.width() - 1))
-            if target.height() % 2 != 0:
-                target.setHeight(max(2, target.height() - 1))
-            return target
-
-        def _grab_global_region_bgr_frame(self, region: QRect) -> np.ndarray | None:
-            target = QRect(region.normalized())
-            if target.isNull() or target.width() <= 0 or target.height() <= 0:
-                return None
-            if not sys.platform.startswith("win"):
-                return self._pixmap_to_bgr_frame(self._grab_global_region_pixmap(target))
-            try:
-                user32 = ctypes.windll.user32
-                gdi32 = ctypes.windll.gdi32
-            except Exception:
-                return self._pixmap_to_bgr_frame(self._grab_global_region_pixmap(target))
-
-            SRCCOPY = 0x00CC0020
-            DIB_RGB_COLORS = 0
-            BI_RGB = 0
-
-            class BITMAPINFOHEADER(ctypes.Structure):
-                _fields_ = [
-                    ("biSize", wintypes.DWORD),
-                    ("biWidth", ctypes.c_long),
-                    ("biHeight", ctypes.c_long),
-                    ("biPlanes", wintypes.WORD),
-                    ("biBitCount", wintypes.WORD),
-                    ("biCompression", wintypes.DWORD),
-                    ("biSizeImage", wintypes.DWORD),
-                    ("biXPelsPerMeter", ctypes.c_long),
-                    ("biYPelsPerMeter", ctypes.c_long),
-                    ("biClrUsed", wintypes.DWORD),
-                    ("biClrImportant", wintypes.DWORD),
-                ]
-
-            class BITMAPINFO(ctypes.Structure):
-                _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
-
-            width = int(target.width())
-            height = int(target.height())
-            hdc_screen = user32.GetDC(0)
-            if not hdc_screen:
-                return self._pixmap_to_bgr_frame(self._grab_global_region_pixmap(target))
-            hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
-            if not hdc_mem:
-                user32.ReleaseDC(0, hdc_screen)
-                return self._pixmap_to_bgr_frame(self._grab_global_region_pixmap(target))
-            hbm = gdi32.CreateCompatibleBitmap(hdc_screen, width, height)
-            if not hbm:
-                gdi32.DeleteDC(hdc_mem)
-                user32.ReleaseDC(0, hdc_screen)
-                return self._pixmap_to_bgr_frame(self._grab_global_region_pixmap(target))
-            old_obj = gdi32.SelectObject(hdc_mem, hbm)
-            try:
-                if not gdi32.BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, int(target.x()), int(target.y()), SRCCOPY):
-                    return self._pixmap_to_bgr_frame(self._grab_global_region_pixmap(target))
-                bmi = BITMAPINFO()
-                bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-                bmi.bmiHeader.biWidth = width
-                bmi.bmiHeader.biHeight = -height
-                bmi.bmiHeader.biPlanes = 1
-                bmi.bmiHeader.biBitCount = 32
-                bmi.bmiHeader.biCompression = BI_RGB
-                buf = (ctypes.c_ubyte * (width * height * 4))()
-                rows = gdi32.GetDIBits(hdc_mem, hbm, 0, height, ctypes.byref(buf), ctypes.byref(bmi), DIB_RGB_COLORS)
-                if rows != height:
-                    return self._pixmap_to_bgr_frame(self._grab_global_region_pixmap(target))
-                arr = np.ctypeslib.as_array(buf).reshape((height, width, 4)).copy()
-                return cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
-            finally:
-                if old_obj:
-                    gdi32.SelectObject(hdc_mem, old_obj)
-                gdi32.DeleteObject(hbm)
-                gdi32.DeleteDC(hdc_mem)
-                user32.ReleaseDC(0, hdc_screen)
-
-        def _pixmap_to_bgr_frame(self, pixmap: QPixmap) -> np.ndarray | None:
-            if pixmap.isNull():
-                return None
-            image = pixmap.toImage().convertToFormat(QImage.Format_RGBA8888)
-            width = image.width()
-            height = image.height()
-            if width <= 0 or height <= 0:
-                return None
-            ptr = image.bits()
-            size = int(image.sizeInBytes())
-            try:
-                arr = np.frombuffer(ptr, dtype=np.uint8, count=size).copy().reshape((height, width, 4))
-            except Exception:
-                try:
-                    raw = ptr.tobytes()
-                except Exception:
-                    try:
-                        raw = bytes(ptr[:size])
-                    except Exception:
-                        return None
-                arr = np.frombuffer(raw, dtype=np.uint8).reshape((height, width, 4))
-            return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-
-        def _start_screen_record_countdown(self, region: QRect | None = None) -> bool:
-            if self._screen_recording_active or self._capture_region_selection_mode is not None or self._utility_countdown_active:
-                return False
-            chosen_region = QRect(region) if region is not None and not region.isNull() else self._choose_full_capture_region("record")
-            if chosen_region is None or chosen_region.isNull():
-                return True
-            target_region = self._normalized_record_region(chosen_region)
-            if target_region.isNull() or target_region.width() <= 1 or target_region.height() <= 1:
-                return False
-            return self._start_countdown_overlay(3, lambda region=QRect(target_region): self._start_screen_recording(region), label_prefix="screen record")
-    def _start_screen_recording(self, region: QRect) -> None:
-        region = self._normalized_record_region(region)
-        if self._start_screen_recording_ffmpeg(region):
-            return
-        writer = None
-        path = None
-        for candidate_path, codec_name in self._record_output_specs():
-            fourcc = cv2.VideoWriter_fourcc(*codec_name)
-            candidate_writer = cv2.VideoWriter(str(candidate_path), fourcc, float(self._screen_record_fps), (region.width(), region.height()))
-            if candidate_writer.isOpened():
-                writer = candidate_writer
-                path = candidate_path
-                break
-            try:
-                candidate_writer.release()
-            except Exception:
-                pass
-        if writer is None or path is None:
-            self.last_action_label.setText("Last action: could not start screen recording")
             self._set_worker_utility_recording_active(False)
             return
-        self._screen_record_backend = "opencv"
-        self._screen_record_writer = writer
-        self._screen_record_process = None
+        # Warm-up guard: cache must have at least one CLOSED segment
+        # so `_run_clip_export_ffmpeg` has something to concat from.
+        # If we're within the first ~10 s of cache start, refuse
+        # with a friendly message rather than starting a doomed
+        # recording that would export a zero-frame file.
+        buffered = self._buffered_clip_seconds()
+        seg_seconds = int(round(float(self._clip_cache_segment_seconds)))
+        if buffered <= 0.0:
+            self.last_action_label.setText(
+                f"Last action: cache warming up — wait {seg_seconds}s and try again"
+            )
+            try:
+                QMessageBox.information(
+                    self, "Screen recording — cache warming up",
+                    f"The rolling clip cache needs to record at least "
+                    f"{seg_seconds} seconds before a screen recording "
+                    "can be saved from it. Wait a few seconds and try "
+                    "again."
+                )
+            except Exception:
+                pass
+            self._set_worker_utility_recording_active(False)
+            return
+        # Passed all guards. Arm the recording session.
+        self._screen_record_t_start = time.time()
         self._screen_record_region = QRect(region)
-        self._screen_record_path = path
+        self._screen_record_backend = "cache_slice"
+        self._screen_record_process = None
+        self._screen_record_writer = None
+        self._screen_record_path = None
         self._screen_record_frame_size = (region.width(), region.height())
         self._screen_recording_active = True
         self._set_worker_utility_recording_active(True)
         self.recording_overlay.show_indicator()
-        self._capture_screen_record_frame()
-        self._screen_record_timer.start()
-        self.last_action_label.setText(f"Last action: screen recording started {path}")
+        self.last_action_label.setText("Last action: screen recording started")
 
-        def _capture_screen_record_frame(self) -> None:
-            if self._screen_record_backend == "ffmpeg":
-                return
-            if not self._screen_recording_active or self._screen_record_writer is None or self._screen_record_region is None:
-                return
-            frame = self._grab_global_region_bgr_frame(self._screen_record_region)
-            if frame is None and self._screen_record_region is not None:
-                overlay_was_visible = self.recording_overlay.isVisible()
-                if overlay_was_visible:
-                    self.recording_overlay.hide_indicator()
-                try:
-                    frame = self._pixmap_to_bgr_frame(self._grab_global_region_pixmap(self._screen_record_region))
-                finally:
-                    if overlay_was_visible and self._screen_recording_active:
-                        self.recording_overlay.show_indicator()
-            if frame is None:
-                return
-            if self._screen_record_frame_size is not None:
-                expected_w, expected_h = self._screen_record_frame_size
-                if frame.shape[1] != expected_w or frame.shape[0] != expected_h:
-                    frame = cv2.resize(frame, (expected_w, expected_h), interpolation=cv2.INTER_AREA)
-            self._screen_record_writer.write(frame)
     def _stop_screen_recording(self) -> bool:
+        """Stop a screen-recording session and fire the export.
+
+        Snapshots T_start + region, clears session state, then
+        invokes `_export_clip_async` with:
+          duration_seconds = max(1, round(T_stop - T_start))
+          end_ts = T_stop
+          output_kind = "screen_recordings"
+          pill_label = "Processing Ns recording"
+
+        Concurrency handling: if a clip export is currently running
+        (`_clip_export_thread` alive), the export slot is busy. We
+        restore the recording state so the user can retry `stop`
+        once the current export completes, and surface a friendly
+        message. Silent data loss (dropping a 5-minute recording
+        because a 2-second clip was mid-export) is not acceptable.
+        """
         if not self._screen_recording_active:
             return False
-        self._screen_record_timer.stop()
-        self.recording_overlay.hide_indicator()
-        # Show the processing pill during ffmpeg / cv2 finalize.
-        # ffmpeg finalize can take 0.5-2 s as it writes the trailer
-        # and flushes; without the pill the UI looks unresponsive
-        # in that window.
+        # Defensive: stop the OpenCV-fallback timer if it was
+        # somehow armed. The v1.1.7 redesign never starts it, but
+        # the timer allocation lives in __init__ so calling .stop()
+        # is safe either way.
         try:
-            self.processing_overlay.show_processing("Processing recording")
+            self._screen_record_timer.stop()
         except Exception:
             pass
-        writer = self._screen_record_writer
-        process = self._screen_record_process
-        path = self._screen_record_path
-        backend = self._screen_record_backend
+        # Snapshot state BEFORE clearing so we can restore on the
+        # "export slot busy" retry path.
+        t_start = float(getattr(self, "_screen_record_t_start", 0.0) or 0.0)
+        region_snapshot = self._screen_record_region
+        # Clear recording state.
+        self._screen_record_t_start = 0.0
+        self._screen_record_region = None
+        self._screen_record_backend = ""
         self._screen_record_writer = None
         self._screen_record_process = None
-        self._screen_record_region = None
-        self._screen_record_frame_size = None
         self._screen_record_path = None
-        self._screen_record_backend = ""
+        self._screen_record_frame_size = None
         self._screen_recording_active = False
         self._set_worker_utility_recording_active(False)
-        try:
-            if backend == "ffmpeg" and process is not None:
-                self._stop_ffmpeg_process(process)
-            elif writer is not None:
-                writer.release()
-        finally:
+        self.recording_overlay.hide_indicator()
+        # Compute the recording window.
+        if t_start <= 0.0 or region_snapshot is None:
+            self.last_action_label.setText("Last action: screen recording stopped")
+            return True
+        t_stop = time.time()
+        wall_duration = max(0.0, t_stop - t_start)
+        # Concurrency guard: if a clip export is in-flight, restore
+        # state and ask the user to try stopping again in a moment.
+        if (
+            self._clip_export_thread is not None
+            and self._clip_export_thread.is_alive()
+        ):
+            self._screen_record_t_start = t_start
+            self._screen_record_region = QRect(region_snapshot)
+            self._screen_record_backend = "cache_slice"
+            self._screen_recording_active = True
+            self._set_worker_utility_recording_active(True)
+            self.recording_overlay.show_indicator()
+            self.last_action_label.setText(
+                "Last action: clip export busy — try stop again in a moment"
+            )
             try:
-                self.processing_overlay.hide_processing()
+                QMessageBox.information(
+                    self, "Screen recording — export in progress",
+                    "A clip is currently exporting. Try stopping the "
+                    "recording again once the current export finishes "
+                    "(usually within a few seconds)."
+                )
             except Exception:
                 pass
-            if path is not None and path.exists() and path.stat().st_size > 1024:
-                self.last_action_label.setText(f"Last action: saved screen recording to {path}")
-                self._queue_post_action_save_prompt("screen_recordings", path)
-            elif path is not None:
-                self.last_action_label.setText("Last action: screen recording failed to save")
-            else:
-                self.last_action_label.setText("Last action: screen recording stopped")
+            return True
+        # Cap the duration by the ring buffer retention so we never
+        # request more than the cache actually holds. The export
+        # path will do its own cap too, but this makes the pill
+        # text accurate and lets us warn the user about truncation.
+        duration_int = int(max(1, round(wall_duration)))
+        ring_cap = int(
+            getattr(self, "_clip_cache_max_seconds", 305) or 305
+        )
+        truncated = duration_int > ring_cap
+        if truncated:
+            duration_int = ring_cap
+            self._append_home_debug_log(
+                f"[screen-record] recording {wall_duration:.1f}s > cache "
+                f"retention {ring_cap}s — saving last {ring_cap}s only"
+            )
+        # Fire the export. `_export_clip_async` shows the processing
+        # pill, runs the concat + trim + encode off the GUI thread,
+        # and calls `_on_clip_export_finished_main_thread` with the
+        # save-prompt category set to "screen_recordings" so the mp4
+        # lands in Videos/screen_recordings/ instead of Videos/clips/.
+        try:
+            self._export_clip_async(
+                duration_int,
+                QRect(region_snapshot),
+                auto_save=False,
+                end_ts=t_stop,
+                output_kind="screen_recordings",
+                pill_label=(
+                    f"Processing {duration_int}s recording"
+                    + (" (truncated)" if truncated else "")
+                ),
+                save_prompt_kind="screen_recordings",
+            )
+        except Exception as exc:
+            self.last_action_label.setText(
+                f"Last action: recording export failed — {type(exc).__name__}"
+            )
+            try:
+                self._append_home_debug_log(
+                    f"[screen-record] export dispatch error: {exc!r}"
+                )
+            except Exception:
+                pass
         return True
+
 
         def _on_worker_debug_frame(self, frame, info) -> None:
             if not isinstance(info, dict):
@@ -30430,6 +33055,9 @@ Admin elevation
                     utility_handled = self._export_recent_clip(30)
                 elif utility_request_action == "clip_1m":
                     utility_handled = self._export_recent_clip(60)
+                elif utility_request_action == "clip_disabled_notice":
+                    self._show_clip_disabled_pill()
+                    utility_handled = True
                 if utility_handled:
                     self._last_utility_request_token = utility_request_token
                     if self._worker is not None and hasattr(self._worker, "acknowledge_utility_request"):
@@ -30729,6 +33357,11 @@ Admin elevation
         # toast so the user knows controls have stopped working,
         # then clear the flag so we don't spam.
         self._maybe_show_spotify_reauth_toast()
+        # v1.1.7.10: actionable dialog for transient failures the user
+        # can fix (Spotify closed → Open; Free account → Learn about
+        # Premium; missing scope → Reconnect). Rate-limited to one
+        # popup per category per 60 s inside the toast method itself.
+        self._maybe_show_spotify_transient_failure_toast()
         drawing_target = str(info.get("drawing_render_target", self._drawing_render_target) or self._drawing_render_target)
         self._set_drawing_render_target(drawing_target)
         request_token = int(info.get("drawing_request_token", 0) or 0)
@@ -30888,8 +33521,10 @@ Admin elevation
                 except Exception:
                     _gesture_duration = 60
                 # Snap to supported set so a stale persisted value
-                # doesn't propagate. Supported = 60 / 120 / 300.
-                _supported = (60, 120, 300)
+                # doesn't propagate. r53: 30 s preset added; 30 was
+                # previously being silently snapped up to 60 here,
+                # so a user asking for a 30 s clip got a 60 s file.
+                _supported = (30, 60, 120, 300)
                 if _gesture_duration not in _supported:
                     _gesture_duration = min(
                         _supported, key=lambda v: abs(v - _gesture_duration)
@@ -30918,6 +33553,9 @@ Admin elevation
                         self._worker._pending_clip_voice_end_ts = None
                 except Exception:
                     pass
+            elif utility_request_action == "clip_disabled_notice":
+                self._show_clip_disabled_pill()
+                utility_handled = True
             if utility_handled:
                 self._last_utility_request_token = utility_request_token
                 if self._worker is not None and hasattr(self._worker, "acknowledge_utility_request"):
@@ -31113,18 +33751,22 @@ Admin elevation
         # Tutorial, About) or panels with their own internal scroll
         # (Camera / Mic / Custom Gestures / Gesture Binds / Save
         # Locations), the user could still wheel-scroll the outer
-        # area into empty space below the content. Consume the wheel
-        # event here when the active panel is in the no-scroll set.
+        # area into empty space below the content.
+        #
+        # v1.1.7 round-17: swapped the section-membership test for a
+        # live scrollbar-policy check. When Camera's "Show more…"
+        # expander flips the policy to AsNeeded (round-15), the
+        # wheel should follow — but the old membership test still
+        # said "Camera is in the no-scroll set" and swallowed the
+        # event, leaving the visible scrollbar unresponsive to
+        # mouse wheel. Deriving from the same source of truth the
+        # user sees on screen fixes that: AlwaysOff → block wheel,
+        # AsNeeded → allow wheel.
         if event.type() == QEvent.Wheel:
             scroll = getattr(self, "_settings_content_scroll", None)
-            stack = getattr(self, "settings_content_stack", None)
-            if (
-                scroll is not None
-                and stack is not None
-                and obj is scroll.viewport()
-            ):
+            if scroll is not None and obj is scroll.viewport():
                 try:
-                    if stack.currentIndex() in self._SETTINGS_OUTER_SCROLL_OFF:
+                    if scroll.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff:
                         event.accept()
                         return True
                 except Exception:
@@ -31145,6 +33787,11 @@ Admin elevation
                 # resize/show event so it stays glued to top-right.
                 try:
                     self._position_save_locations_floating_button()
+                except Exception:
+                    pass
+                # Camera floating Save button — same story, same viewport.
+                try:
+                    self._position_camera_save_floating_button()
                 except Exception:
                     pass
         # Walk-through overlay: re-anchor the pill + Next button
@@ -31381,6 +34028,20 @@ Admin elevation
                 client.shutdown(timeout=2.0)
         except Exception:
             pass
+        # v1.1.7 round-48: surface the resolved debug-log path on exit
+        # so users who can't find touchless_debug.log (OneDrive redirect,
+        # CFA-protected Documents, etc.) always know exactly where it
+        # landed. Modal is safe here: stop_engine() ran above so there
+        # is no live camera / gesture pipeline to freeze, and `self` is
+        # still a valid parent because super().closeEvent runs BELOW
+        # this block. Gated on config.show_log_path_on_exit (default
+        # True) with a persistent 'Don't show again' checkbox so power
+        # users can silence it forever with one click. Reads the
+        # resolved path via the `hgr` package (populated by run_app on
+        # startup) — NOT via `import run_app`, which would fail in the
+        # frozen build where run_app.py is loaded as __main__.
+        # r53: debug-log-location exit popup removed per user request.
+        # Log path still resolvable via %LOCALAPPDATA%\Touchless\logs.
         super().closeEvent(event)
 
     def _init_telemetry(self) -> None:
@@ -32755,18 +35416,22 @@ def _stop_screen_recording(self) -> bool:
         # Tutorial, About) or panels with their own internal scroll
         # (Camera / Mic / Custom Gestures / Gesture Binds / Save
         # Locations), the user could still wheel-scroll the outer
-        # area into empty space below the content. Consume the wheel
-        # event here when the active panel is in the no-scroll set.
+        # area into empty space below the content.
+        #
+        # v1.1.7 round-17: swapped the section-membership test for a
+        # live scrollbar-policy check. When Camera's "Show more…"
+        # expander flips the policy to AsNeeded (round-15), the
+        # wheel should follow — but the old membership test still
+        # said "Camera is in the no-scroll set" and swallowed the
+        # event, leaving the visible scrollbar unresponsive to
+        # mouse wheel. Deriving from the same source of truth the
+        # user sees on screen fixes that: AlwaysOff → block wheel,
+        # AsNeeded → allow wheel.
         if event.type() == QEvent.Wheel:
             scroll = getattr(self, "_settings_content_scroll", None)
-            stack = getattr(self, "settings_content_stack", None)
-            if (
-                scroll is not None
-                and stack is not None
-                and obj is scroll.viewport()
-            ):
+            if scroll is not None and obj is scroll.viewport():
                 try:
-                    if stack.currentIndex() in self._SETTINGS_OUTER_SCROLL_OFF:
+                    if scroll.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff:
                         event.accept()
                         return True
                 except Exception:
@@ -32787,6 +35452,11 @@ def _stop_screen_recording(self) -> bool:
                 # resize/show event so it stays glued to top-right.
                 try:
                     self._position_save_locations_floating_button()
+                except Exception:
+                    pass
+                # Camera floating Save button — same story, same viewport.
+                try:
+                    self._position_camera_save_floating_button()
                 except Exception:
                     pass
         # Walk-through overlay: re-anchor the pill + Next button
