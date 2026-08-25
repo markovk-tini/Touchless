@@ -116,9 +116,27 @@ Current focus. Historical issues (from prior sessions, not yet all verified on c
 
 Planned-work / polish backlog has moved to [`Touchless to-do.md`](Touchless%20to-do.md). This section is reserved for architectural-level roadmap notes that don't fit the to-do format.
 
-### 4.0 Dynamic custom gestures (in progress — paused 2026-05-13)
+### 4.0 Dynamic custom gestures (RECALL FIX LANDED — v1.1.8.1, 2026-08-24)
 
-Motion-based custom gestures (DTW over per-frame hand landmarks). The first end-to-end loop works in the live engine — recording → save → live-fire — but accuracy is mediocre and several UX/visual polish items are still open. Pausing here to revisit later.
+Motion-based custom gestures (DTW over per-frame hand landmarks). End-to-end loop was wired 2026-05-13 but recall was low ("just rarely detects the dynamic gesture that i just recorded"). The 2026-08-24 diff addresses the root causes ranked by the audit workflow — see the block below.
+
+**2026-08-24 recall fix (v1.1.8.1):**
+- **Segment timeout** — [dynamic_classifier.py](src/hgr/custom_gestures/dynamic_classifier.py) `_MAX_SEGMENT_SECONDS = 2.5`. Fixes the #1 root cause: at 15-25 fps in dim rooms, motion energy stays above LOW during small hand jitter after a gesture, so the segment never closes and no match is ever attempted. Timeout force-closes and matches.
+- **Timeout quality gate** — before a timeout-close fires DTW, requires accumulated wrist path ≥ 0.5 palm units OR max-finger displacement ≥ 0.3. Prevents random hand fidgeting during a 2.5 s window from firing the closest template.
+- **Settle debounce** — motion must sit ≤ LOW for 3 consecutive frames before closing on settle. Prevents mid-gesture pauses (double-taps, swipe-pause-swipe) from closing prematurely.
+- **fps-invariant min-segment floor** — replaces the `_MIN_SEGMENT_FRAMES = 8` constant with per-second math (0.20 s → 3-4 frames @ 15 fps, 12 frames @ 60 fps). Fast 250-350 ms flicks now pass the floor on dim-room rigs.
+- **Wrist channel = displacement, not absolute** — [dynamic_classifier.py](src/hgr/custom_gestures/dynamic_classifier.py) `build_template_from_takes` subtracts wrist[0]; live `_close_and_match` does the same. A swipe recorded at the left edge of frame now matches the same swipe performed at the right edge. Legacy templates get migrated on registry load and persisted back at `wrist_schema=2`.
+- **Per-template auto-threshold** — pairwise DTW between takes at build time → threshold clamped `[0.22, 0.30]`. Tight-recording users get a tight gate; sloppy-recording users get a loose gate. Legacy templates get the same value computed on-the-fly at runtime load.
+- **Top-1 vs top-2 margin gate** — with multiple registered gestures, winner must beat runner-up by ≥ 0.04 palm units. Prevents ambiguous-motion firing the "closest wrong" gesture.
+
+**What was NOT changed (backward compat):**
+- `_DEFAULT_MATCH_THRESHOLD` stays at 0.18 (fallback only; new/legacy templates get the 0.22-0.30 auto-threshold).
+- Handedness gate stays decisive-drop (skeptic 1 blocker).
+- HGR_DYNAMIC_FPS_INVARIANT stays default-OFF (per-second gates deferred; skeptic 1 blocker).
+- Landmarks_raw path deferred — requires cross-file coordination + recorder-vs-live worker-signal plumbing (skeptic 1 concern).
+- No forced re-record UI. Existing templates work with in-memory migration.
+
+**Historical context (2026-05-13 investigation):**
 
 **What's wired and working:**
 - Wizard ([custom_gestures_wizard.py](src/hgr/app/ui/custom_gestures_wizard.py)) Static / Dynamic toggle. Custom-painted widget with a true diagonal seam and a darken-edge gradient on the inactive half. Dynamic-only Duration-per-take radio block (1.5 s / 3 s / Until stopped) with custom white-outline + green-dot radios. Action picker auto-grows the dialog and scrolls the keyboard into view; thin green scrollbar.

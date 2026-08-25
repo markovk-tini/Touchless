@@ -26,8 +26,10 @@ import numpy as np
 from .action import fire_once
 from .dynamic_classifier import (
     _DEFAULT_MATCH_THRESHOLD,
+    _DTW_BAND,
     DynamicGestureClassifier,
     DynamicGestureTemplate,
+    _dtw_distance,
 )
 from .dynamic_recording import normalize_frame
 from .registry import GestureRegistry, registry_path
@@ -281,12 +283,40 @@ class DynamicGestureRuntime:
                 strength = 0.0
             if not wrist:
                 strength = 0.0
+            # v1.1.8.1: prefer the per-template match_threshold saved
+            # in the registry. Legacy records (no field) get an on-the-
+            # fly auto-threshold from pairwise DTW between takes, then
+            # cached on the DynamicGestureTemplate for this session.
+            saved_threshold = getattr(gesture, "match_threshold", None)
+            template_threshold: Optional[float]
+            if saved_threshold is not None:
+                template_threshold = float(saved_threshold)
+            elif len(valid) >= 2:
+                try:
+                    pair_dists: list = []
+                    for i in range(len(valid)):
+                        fa = valid[i].reshape(valid[i].shape[0], -1)
+                        for j in range(i + 1, len(valid)):
+                            fb = valid[j].reshape(valid[j].shape[0], -1)
+                            if fa.shape[1] != fb.shape[1]:
+                                continue
+                            pair_dists.append(_dtw_distance(fa, fb, band=_DTW_BAND))
+                    if pair_dists:
+                        med = float(np.median(pair_dists))
+                        template_threshold = float(np.clip(med * 1.8 + 0.05, 0.22, 0.30))
+                    else:
+                        template_threshold = None
+                except Exception:
+                    template_threshold = None
+            else:
+                template_threshold = None
             return DynamicGestureTemplate(
                 name=str(gesture.name),
                 key_point_indices=indices,
                 sample_trajectories=valid,
                 wrist_trajectories=wrist,
                 wrist_motion_strength=strength,
+                match_threshold=template_threshold,
             )
         except Exception:
             return None

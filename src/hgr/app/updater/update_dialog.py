@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -49,6 +50,16 @@ class UpdateDialog(QDialog):
         # r51: replaced apply_touchless_chrome (Win11-only DWM) with
         # install_indigo_chrome (frameless indigo bar, works on Win10 too).
         body = install_indigo_chrome(self, "Touchless Update Available")
+        # v1.1.8.1 dialog-visibility fix. install_indigo_chrome sets
+        # Qt.FramelessWindowHint which on Windows causes the compositor
+        # to freeze the dialog behind its parent — .show() succeeds,
+        # .raise_() reports success, but the pixels never surface on
+        # screen. Force it to the front with WindowStaysOnTopHint AND
+        # a queued raise+activate on the next event-loop tick (Qt
+        # processes .show() and .raise_() in the wrong order for
+        # frameless windows). Users on 1.1.7 have a permanently
+        # invisible update dialog for exactly this reason.
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         # r51 fix: scope background to body only (see spotify_setup_wizard).
         body.setObjectName("updateDialogBody")
         body.setStyleSheet("QWidget#updateDialogBody { background: #0B3D91; }")
@@ -271,6 +282,37 @@ class UpdateDialog(QDialog):
         if self.download_button.isEnabled():
             self.dismissed.emit()
         super().closeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802 — Qt API name
+        """v1.1.8.1 visibility fix. Frameless dialogs on Windows can
+        end up outside the compositor's z-order at .show() time. Two
+        remedies applied here:
+          1) Queue a raise+activate on the next event-loop tick so it
+             happens AFTER Qt has finished processing the show.
+          2) Recenter on the parent (or the primary screen) in case
+             the dialog opened at an off-screen coordinate.
+        """
+        super().showEvent(event)
+        QTimer.singleShot(0, self._force_to_front)
+
+    def _force_to_front(self) -> None:
+        try:
+            parent = self.parent()
+            rect = self.frameGeometry()
+            if parent is not None and hasattr(parent, "isVisible") and parent.isVisible():
+                rect.moveCenter(parent.frameGeometry().center())
+            else:
+                screen = QGuiApplication.primaryScreen()
+                if screen is not None:
+                    rect.moveCenter(screen.availableGeometry().center())
+            self.move(rect.topLeft())
+        except Exception:
+            pass
+        try:
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Updater hooks

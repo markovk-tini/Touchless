@@ -677,6 +677,14 @@ class DynamicGestureRecorderWindow(QDialog):
                 # (strength ≈ 0 → finger-only matching, no false reject).
                 wrist_trajectories=artifacts.template.wrist_trajectories,
                 wrist_motion_strength=artifacts.template.wrist_motion_strength,
+                # v1.1.8.1: the template's per-gesture match_threshold
+                # (derived from intra-take pairwise DTW) rides along
+                # so the runtime doesn't have to re-derive it on every
+                # startup. wrist_schema=2 marks displacement semantics
+                # (the recorder's build_template_from_takes stored
+                # displacement, not absolute position).
+                match_threshold=artifacts.template.match_threshold,
+                wrist_schema=2,
                 action=self._action,
                 description=self._description,
                 handedness=handedness,

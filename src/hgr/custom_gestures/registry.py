@@ -336,6 +336,17 @@ class CustomGesture:
     # the user re-records with the same mode by default. One of:
     # "fixed_short" / "fixed_long" / "until_stopped".
     duration_mode: str = ""
+    # v1.1.8.1 dynamic-only. Per-template DTW match threshold derived
+    # from intra-take pairwise distance at build time. None → runtime
+    # falls back to the classifier's global _DEFAULT_MATCH_THRESHOLD
+    # (which is what every legacy schema=1 record uses).
+    match_threshold: Optional[float] = None
+    # v1.1.8.1 dynamic-only. Schema version for the wrist channel.
+    # 1 = absolute palm-scaled position (legacy). 2 = displacement
+    # from the take's first frame (new semantics; matches live
+    # classifier post-fix). Registry.load() migrates 1 → 2 in-memory
+    # and persists on next save so users don't have to re-record.
+    wrist_schema: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -362,6 +373,12 @@ class CustomGesture:
             out["wrist_motion_strength"] = float(self.wrist_motion_strength)
         if self.duration_mode:
             out["duration_mode"] = self.duration_mode
+        # v1.1.8.1 — emit only when present so legacy static JSON stays
+        # byte-for-byte identical to before.
+        if self.match_threshold is not None:
+            out["match_threshold"] = float(self.match_threshold)
+        if self.wrist_schema and self.wrist_schema != 1:
+            out["wrist_schema"] = int(self.wrist_schema)
         return out
 
     @classmethod
@@ -396,6 +413,16 @@ class CustomGesture:
         except (TypeError, ValueError):
             wrist_motion_strength = 0.0
         duration_mode = str(data.get("duration_mode", "") or "")
+        # v1.1.8.1 — new dynamic-only fields.
+        try:
+            raw_mt = data.get("match_threshold")
+            match_threshold = float(raw_mt) if raw_mt is not None else None
+        except (TypeError, ValueError):
+            match_threshold = None
+        try:
+            wrist_schema = int(data.get("wrist_schema", 1) or 1)
+        except (TypeError, ValueError):
+            wrist_schema = 1
         return cls(
             name=str(data["name"]),
             description=str(data.get("description", "")),
@@ -410,6 +437,8 @@ class CustomGesture:
             wrist_trajectories=wrist_trajectories,
             wrist_motion_strength=wrist_motion_strength,
             duration_mode=duration_mode,
+            match_threshold=match_threshold,
+            wrist_schema=wrist_schema,
         )
 
 
@@ -446,12 +475,65 @@ class GestureRegistry:
                 # Corrupt file — start fresh rather than crashing the caller.
                 # A future version can back up the broken file here.
                 return
+            migrated_any = False
             for entry in raw.get("gestures", []):
                 try:
                     gesture = CustomGesture.from_dict(entry)
                 except Exception:
                     continue
+                # v1.1.8.1: migrate legacy wrist_schema=1 (absolute
+                # palm-scaled position) to schema=2 (displacement from
+                # first frame). Fixes the correctness bug where a
+                # swipe recorded at one in-frame position couldn't
+                # match the same swipe performed elsewhere. Idempotent
+                # via the schema flag: schema>=2 skips.
+                if (
+                    gesture.kind == "dynamic"
+                    and gesture.wrist_trajectories
+                    and gesture.wrist_schema < 2
+                ):
+                    try:
+                        migrated_wrist: List[List[List[float]]] = []
+                        for take in gesture.wrist_trajectories:
+                            if not take:
+                                migrated_wrist.append(take)
+                                continue
+                            first = take[0]
+                            new_take = []
+                            for row in take:
+                                new_take.append(
+                                    [
+                                        float(row[k]) - float(first[k])
+                                        for k in range(len(row))
+                                    ]
+                                )
+                            migrated_wrist.append(new_take)
+                        # Frozen dataclass — swap in a new instance with
+                        # the migrated field. Same object identity
+                        # replaced in the dict below.
+                        object.__setattr__(gesture, "wrist_trajectories", migrated_wrist)
+                        object.__setattr__(gesture, "wrist_schema", 2)
+                        migrated_any = True
+                    except Exception:
+                        # Bad migration → leave the record alone.
+                        pass
                 self._gestures[gesture.name] = gesture
+            if migrated_any:
+                # Persist the migration immediately so a later process
+                # doesn't re-migrate. Guard against write failures —
+                # in-memory migration is enough for THIS process even
+                # if the disk write can't happen.
+                try:
+                    self._path.parent.mkdir(parents=True, exist_ok=True)
+                    payload = {
+                        "schema_version": self._SCHEMA_VERSION,
+                        "gestures": [g.to_dict() for g in self._gestures.values()],
+                    }
+                    tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+                    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                    tmp.replace(self._path)
+                except Exception:
+                    pass
 
     def save(self) -> None:
         with self._lock:
@@ -517,6 +599,8 @@ class GestureRegistry:
         duration_mode: str = "",
         wrist_trajectories=None,  # parallel iterable of (T, 3) per take
         wrist_motion_strength: float = 0.0,
+        match_threshold: Optional[float] = None,
+        wrist_schema: int = 2,  # v1.1.8.1 default: displacement semantics
     ) -> CustomGesture:
         """Register a dynamic gesture. `sample_trajectories` is an
         iterable of arrays/lists with shape (resampled_length,
@@ -577,6 +661,10 @@ class GestureRegistry:
                 wrist_trajectories=serialized_wrist,
                 wrist_motion_strength=float(wrist_motion_strength or 0.0),
                 duration_mode=str(duration_mode or ""),
+                match_threshold=(
+                    float(match_threshold) if match_threshold is not None else None
+                ),
+                wrist_schema=int(wrist_schema),
             )
             self._gestures[name] = gesture
         return gesture

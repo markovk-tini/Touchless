@@ -118,6 +118,44 @@ _WRIST_MOTION_REFERENCE_PALM_UNITS = 1.5
 # but fingers still keep 30% weight.
 _WRIST_WEIGHT_MAX = 0.7
 
+# ─────────────────────────────────────────────────────────────────────────
+# v1.1.8.1 (dynamic-gesture recall fix). Addresses OPEN_ISSUES §4.0's
+# top failure mode: at 15-25 fps in dim rooms the motion energy stays
+# above _MOTION_GATE_LOW during small hand jitter after a gesture, so
+# the segment never closes and no match is ever attempted. The fix is
+# three cooperating additions:
+#   (a) Hard segment timeout — force-close and match after this many
+#       real-time seconds regardless of motion level. Kills the
+#       "hand never settled → nothing ever runs" failure.
+#   (b) Settle debounce — require the motion to sit below LOW for N
+#       consecutive frames before closing on settle. Prevents mid-
+#       gesture pauses (double-taps, swipe-pause-swipe) from closing
+#       the segment prematurely.
+#   (c) Timeout quality gate — before a timeout-close fires DTW,
+#       require enough accumulated wrist path OR max-finger
+#       displacement. Without this, any 2.5s window of unrelated hand
+#       fidgeting would DTW against every template and match the
+#       closest one (skeptic-precision blocker in the audit workflow).
+_MAX_SEGMENT_SECONDS = 2.5           # hard timeout
+_SETTLE_DEBOUNCE_FRAMES = 3          # consecutive frames below LOW
+_MIN_SEGMENT_SECONDS = 0.20          # 200 ms wall-clock floor
+_MIN_SEGMENT_FRAMES_FLOOR = 4        # never below this many frames
+_TIMEOUT_MIN_WRIST_PATH = 0.5        # palm units of accumulated wrist
+_TIMEOUT_MIN_FINGER_DISP = 0.3       # palm units of max-landmark disp
+
+# False-positive safeguard: when more than one template passes its
+# threshold, only fire if the top-1 beats the top-2 by this much.
+# Avoids "many similar templates all fire on any moderate motion".
+_TOP2_MARGIN = 0.04
+
+# FPS estimator bounds. Median of trailing dt values, clamped so a
+# process stall / hitch can't yank the estimator to 3 fps (which
+# would then let ~1-frame gestures pass _min_segment_frames).
+_FPS_EST_MIN = 10.0
+_FPS_EST_MAX = 60.0
+_FPS_EST_WARMUP = 30.0               # assumed fps until we have samples
+_FPS_EST_WINDOW = 10                 # median of trailing N dt values
+
 
 @dataclass(frozen=True)
 class DynamicGestureTemplate:
@@ -199,14 +237,34 @@ class DynamicGestureClassifier:
         # Each entry: (timestamp, normalized_landmarks, wrist_palm_scaled_or_None).
         # The wrist-position third element is optional so the existing
         # 2-arg `update(...)` callers continue to work.
+        # v1.1.8.1: deque sized to hold enough history for MAX_SEGMENT_SECONDS
+        # at 60 fps + headroom, so a timeout close still has the entire
+        # segment (skeptic-fps blocker in audit workflow).
+        _target_window = max(
+            int(window_frames),
+            int(_MAX_SEGMENT_SECONDS * _FPS_EST_MAX + 30),
+        )
         self._frames: Deque[Tuple[float, np.ndarray, Optional[np.ndarray]]] = deque(
-            maxlen=int(window_frames)
+            maxlen=_target_window
         )
         # Motion-gate state machine.
         self._in_progress = False
         self._segment_start_idx: Optional[int] = None
+        # v1.1.8.1: timestamp of when the current segment opened, so
+        # the hard timeout branch can compare wall-clock elapsed.
+        self._segment_start_ts: Optional[float] = None
+        # v1.1.8.1: number of consecutive frames below the LOW gate.
+        # Reset on any frame at or above LOW; segment closes on
+        # settle when this reaches _SETTLE_DEBOUNCE_FRAMES.
+        self._below_low_streak: int = 0
+        # v1.1.8.1: rolling dt buffer for the FPS estimator. Fed each
+        # update(); used by _estimated_fps() for the min-segment floor
+        # and the per-frame-vs-per-second gate branch.
+        self._recent_dts: Deque[float] = deque(maxlen=_FPS_EST_WINDOW)
+        self._last_ts: Optional[float] = None
         # Bookkeeping for tests / diagnostics.
         self._last_segment_motion = 0.0
+        self._last_close_reason: str = ""  # "settle" | "timeout" | ""
 
     @property
     def in_progress(self) -> bool:
@@ -219,6 +277,39 @@ class DynamicGestureClassifier:
         self._frames.clear()
         self._in_progress = False
         self._segment_start_idx = None
+        self._segment_start_ts = None
+        self._below_low_streak = 0
+        self._recent_dts.clear()
+        self._last_ts = None
+
+    def _estimated_fps(self) -> float:
+        """v1.1.8.1: median of trailing dt values → fps, clamped to a
+        [10, 60] band. Warm-starts at 30 fps until we have >= 3
+        samples so early frames don't yank the estimator."""
+        if len(self._recent_dts) < 3:
+            return _FPS_EST_WARMUP
+        med_dt = float(np.median(np.asarray(self._recent_dts, dtype=np.float32)))
+        if med_dt <= 1e-6:
+            return _FPS_EST_WARMUP
+        fps = 1.0 / med_dt
+        return float(max(_FPS_EST_MIN, min(_FPS_EST_MAX, fps)))
+
+    def _current_min_segment_frames(self) -> int:
+        """v1.1.8.1: fps-invariant floor. At 15 fps this returns 4
+        (was 8 constant → users on dim-room rigs lost fast
+        250-350 ms flicks); at 60 fps it returns 12. Honors the
+        constructor override — takes the max so a caller who
+        explicitly passed a larger floor stays constrained."""
+        fps = self._estimated_fps()
+        floored = int(round(fps * _MIN_SEGMENT_SECONDS))
+        computed = max(_MIN_SEGMENT_FRAMES_FLOOR, floored)
+        override = int(getattr(self, "_min_segment_frames", 0) or 0)
+        # If the caller passed the default (8), we ignore it because it
+        # was a bad constant; if they passed anything else, honor as
+        # a floor.
+        if override and override != _MIN_SEGMENT_FRAMES:
+            return max(computed, override)
+        return computed
 
     def update(
         self,
@@ -249,8 +340,15 @@ class DynamicGestureClassifier:
         wrist_entry: Optional[np.ndarray] = None
         if wrist_palm_scaled is not None:
             wrist_entry = np.asarray(wrist_palm_scaled, dtype=np.float32).reshape(-1)
+        ts = float(timestamp)
+        # v1.1.8.1: feed the fps estimator with the frame-to-frame dt.
+        if self._last_ts is not None:
+            dt = ts - float(self._last_ts)
+            if dt > 1e-6:
+                self._recent_dts.append(dt)
+        self._last_ts = ts
         self._frames.append(
-            (float(timestamp), landmarks_normalized.astype(np.float32), wrist_entry)
+            (ts, landmarks_normalized.astype(np.float32), wrist_entry)
         )
 
         # Compute motion energy over the trailing window.
@@ -264,12 +362,24 @@ class DynamicGestureClassifier:
                 # frame the gate happened to trip on).
                 lookback = min(_MOTION_WINDOW_FRAMES, len(self._frames))
                 self._segment_start_idx = len(self._frames) - lookback
+                self._segment_start_ts = ts
+                self._below_low_streak = 0
             return None
 
-        # Currently in progress — wait for motion to settle.
+        # Currently in progress.
+        # v1.1.8.1: track a debounce streak below LOW, and check the
+        # hard timeout every frame. Priority: settle debounce first
+        # (natural gesture end); timeout only fires when the hand
+        # never actually settled.
         if motion <= self._motion_gate_low:
-            # Close the segment and try to match.
-            return self._close_and_match(timestamp)
+            self._below_low_streak += 1
+        else:
+            self._below_low_streak = 0
+        if self._below_low_streak >= _SETTLE_DEBOUNCE_FRAMES:
+            return self._close_and_match(ts, reason="settle")
+        segment_start_ts = self._segment_start_ts or ts
+        if (ts - segment_start_ts) >= _MAX_SEGMENT_SECONDS:
+            return self._close_and_match(ts, reason="timeout")
         return None
 
     # ---- internal ----
@@ -341,15 +451,25 @@ class DynamicGestureClassifier:
         except Exception:
             return None
 
-    def _close_and_match(self, timestamp: float) -> Optional[Match]:
+    def _close_and_match(
+        self,
+        timestamp: float,
+        *,
+        reason: str = "settle",
+    ) -> Optional[Match]:
         if self._segment_start_idx is None:
             self._in_progress = False
+            self._segment_start_ts = None
+            self._below_low_streak = 0
             return None
         all_frames = list(self._frames)
         segment = all_frames[self._segment_start_idx:]
         self._in_progress = False
         self._segment_start_idx = None
-        if len(segment) < self._min_segment_frames:
+        self._segment_start_ts = None
+        self._below_low_streak = 0
+        self._last_close_reason = reason
+        if len(segment) < self._current_min_segment_frames():
             return None
 
         landmarks_stack = np.stack([lm for _, lm, _ in segment], axis=0).astype(np.float32)
@@ -359,21 +479,50 @@ class DynamicGestureClassifier:
         # every template that carries a wrist channel). None when the
         # caller didn't pass wrist data — older 2-arg update() shape,
         # in which case we silently fall back to finger-only matching.
+        # v1.1.8.1: template wrist trajectories are displacement-from-
+        # first-frame (schema=2). Match the live segment's semantics
+        # by subtracting the segment's first wrist entry too.
         seg_wrist_resampled = self._segment_wrist_resampled(segment)
+        if seg_wrist_resampled is not None:
+            seg_wrist_resampled = seg_wrist_resampled - seg_wrist_resampled[0:1]
 
-        best: Optional[Match] = None
+        # v1.1.8.1: TIMEOUT quality gate. When the segment force-closes
+        # because MAX_SEGMENT_SECONDS elapsed (not because the hand
+        # actually settled), require that SOMETHING meaningful happened
+        # during the window before running DTW. Otherwise 2.5 s of
+        # ambient hand fidgeting (talking, adjusting glasses) would
+        # DTW against every template and fire the closest — a
+        # categorical new false-positive source flagged by the audit.
+        if reason == "timeout":
+            wrist_path = 0.0
+            if seg_wrist_resampled is not None and seg_wrist_resampled.shape[0] >= 2:
+                diffs = np.diff(seg_wrist_resampled, axis=0)
+                wrist_path = float(np.linalg.norm(diffs, axis=1).sum())
+            # Max landmark displacement across the segment. Wrist-
+            # relative so it captures finger motion (fist squeeze,
+            # finger wiggle) that the wrist channel misses.
+            first = landmarks_stack[0]
+            per_frame_max = np.linalg.norm(
+                landmarks_stack - first[np.newaxis, :, :], axis=-1
+            ).max()
+            if (
+                wrist_path < _TIMEOUT_MIN_WRIST_PATH
+                and float(per_frame_max) < _TIMEOUT_MIN_FINGER_DISP
+            ):
+                # Not enough coherent motion; skip DTW entirely.
+                return None
+
+        # Score every (template, sample) pair. Collect the best distance
+        # per template so the top-1 vs top-2 margin gate below sees
+        # inter-template competition, not inter-sample noise.
+        template_best: List[Tuple[float, DynamicGestureTemplate, int]] = []
         for template in self._templates:
             if not template.sample_trajectories:
                 continue
             try:
                 key_indices = template.key_point_indices
-                # Extract the segment's key-point trajectory only.
                 segment_kp = landmarks_stack[:, key_indices, :]
-                # Resample to the canonical length so DTW comparison
-                # is bounded.
                 resampled = _resample_landmarks(segment_kp, RESAMPLED_FRAME_COUNT)
-                # Flatten the per-frame key-point xyz into one feature
-                # vector per frame so DTW operates on (frames × F).
                 seg_features = resampled.reshape(RESAMPLED_FRAME_COUNT, -1)
             except Exception:
                 continue
@@ -382,10 +531,6 @@ class DynamicGestureClassifier:
                 if template.match_threshold is not None
                 else self._match_threshold
             )
-            # Weight for the wrist channel. Falls to 0 (finger-only)
-            # whenever the template carries no wrist data (e.g. legacy
-            # records loaded from registry without wrist_trajectories)
-            # OR the live caller didn't supply wrist positions.
             template_wrist = template.wrist_trajectories or []
             wrist_weight = 0.0
             if (
@@ -396,13 +541,14 @@ class DynamicGestureClassifier:
                 wrist_weight = float(template.wrist_motion_strength)
             wrist_weight = max(0.0, min(_WRIST_WEIGHT_MAX, wrist_weight))
             finger_weight = 1.0 - wrist_weight
+            best_dist_for_template: Optional[float] = None
+            best_sample_idx = 0
             for sample_idx, sample in enumerate(template.sample_trajectories):
                 try:
                     sample_features = sample.reshape(sample.shape[0], -1)
                 except Exception:
                     continue
                 if sample_features.shape[1] != seg_features.shape[1]:
-                    # Schema mismatch (different key-point count).
                     continue
                 finger_dist = _dtw_distance(seg_features, sample_features, band=self._dtw_band)
                 if wrist_weight > 0.0 and sample_idx < len(template_wrist):
@@ -413,19 +559,38 @@ class DynamicGestureClassifier:
                             band=self._dtw_band,
                         )
                     except Exception:
-                        wrist_dist = finger_dist  # neutral on failure
+                        wrist_dist = finger_dist
                 else:
                     wrist_dist = 0.0
                 distance = finger_weight * finger_dist + wrist_weight * wrist_dist
-                if distance < threshold and (best is None or distance < best.distance):
-                    best = Match(
-                        gesture_name=template.name,
-                        distance=float(distance),
-                        matched_sample_index=int(sample_idx),
-                        segment_frame_count=int(len(segment)),
-                        timestamp=float(timestamp),
-                    )
-        return best
+                if best_dist_for_template is None or distance < best_dist_for_template:
+                    best_dist_for_template = float(distance)
+                    best_sample_idx = int(sample_idx)
+            if best_dist_for_template is not None and best_dist_for_template < threshold:
+                template_best.append(
+                    (best_dist_for_template, template, best_sample_idx)
+                )
+
+        if not template_best:
+            return None
+        # Sort ascending so [0] is the closest template.
+        template_best.sort(key=lambda item: item[0])
+        winner_dist, winner_tpl, winner_sample = template_best[0]
+        # v1.1.8.1: top-1 vs top-2 confidence gap. With multiple
+        # registered gestures, insist that the winner is meaningfully
+        # closer than the runner-up. Single-template deployments skip
+        # this check.
+        if len(template_best) >= 2:
+            runner_up_dist = template_best[1][0]
+            if (runner_up_dist - winner_dist) < _TOP2_MARGIN:
+                return None
+        return Match(
+            gesture_name=winner_tpl.name,
+            distance=float(winner_dist),
+            matched_sample_index=int(winner_sample),
+            segment_frame_count=int(len(segment)),
+            timestamp=float(timestamp),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -503,21 +668,59 @@ def build_template_from_takes(
         # takes that include whole-hand translation.
         normalized = resampled - resampled[:, 0:1, :]
         sample_trajectories.append(normalized[:, indices, :].astype(np.float32))
-        # Absolute (palm-scaled) wrist channel — carries whole-hand
-        # translation that the wrist-relative `normalized` discards.
+        # v1.1.8.1: wrist channel now stored as DISPLACEMENT from the
+        # take's first frame (schema=2). Previously stored absolute
+        # (palm-scaled) position, which made a swipe recorded at the
+        # left edge fail to match the same swipe performed at the
+        # right edge purely because of in-frame offset. The live path
+        # applies the same subtraction so the semantics match.
         try:
             wrist_resampled = take.resampled_wrist(resampled_length)
         except Exception:
             wrist_resampled = np.zeros((resampled_length, 3), dtype=np.float32)
-        wrist_trajectories.append(wrist_resampled.astype(np.float32))
+        wrist_resampled = wrist_resampled.astype(np.float32)
+        # Displacement-from-first-frame — path length is invariant, so
+        # wrist_motion_strength computed below is unchanged.
+        wrist_resampled = wrist_resampled - wrist_resampled[0:1]
+        wrist_trajectories.append(wrist_resampled)
     strength = _wrist_motion_strength_from_trajectories(wrist_trajectories)
+
+    # v1.1.8.1: PER-TEMPLATE AUTO-THRESHOLD. Compute pairwise DTW
+    # between every pair of takes; the template's threshold is
+    # 1.8 * median + 0.05, clamped to [0.22, 0.30]. Users who record
+    # tight consistent takes get a tight gate (fewer false positives);
+    # users whose takes vary more get a looser gate (better recall on
+    # their own gestures). Floor 0.22 preserves the pre-fix effective
+    # tightness for very-consistent recorders; ceiling 0.30 caps how
+    # loose we let a sloppy template become. Skipped when caller
+    # already supplied match_threshold explicitly.
+    auto_threshold: Optional[float] = None
+    if match_threshold is None and len(sample_trajectories) >= 2:
+        try:
+            pair_dists: List[float] = []
+            for i in range(len(sample_trajectories)):
+                fa = sample_trajectories[i].reshape(sample_trajectories[i].shape[0], -1)
+                for j in range(i + 1, len(sample_trajectories)):
+                    fb = sample_trajectories[j].reshape(sample_trajectories[j].shape[0], -1)
+                    if fa.shape[1] != fb.shape[1]:
+                        continue
+                    pair_dists.append(_dtw_distance(fa, fb, band=_DTW_BAND))
+            if pair_dists:
+                med = float(np.median(pair_dists))
+                auto_threshold = float(np.clip(med * 1.8 + 0.05, 0.22, 0.30))
+        except Exception:
+            auto_threshold = None
+
+    effective_threshold = (
+        match_threshold if match_threshold is not None else auto_threshold
+    )
     return DynamicGestureTemplate(
         name=str(name),
         key_point_indices=indices,
         sample_trajectories=sample_trajectories,
         wrist_trajectories=wrist_trajectories,
         wrist_motion_strength=float(strength),
-        match_threshold=match_threshold,
+        match_threshold=effective_threshold,
     )
 
 

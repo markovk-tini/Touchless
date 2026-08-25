@@ -6817,6 +6817,21 @@ class MainWindow(QMainWindow):
         self._update_dialog.show()
         self._update_dialog.raise_()
         self._update_dialog.activateWindow()
+        # v1.1.8.1 dialog-visibility safety net. Even with the
+        # WindowStaysOnTopHint fix in update_dialog.py, we double up
+        # with a tray balloon so users on any future frameless-window
+        # regression still see the notification. The tray messageClicked
+        # signal re-fires the show/raise/activate sequence.
+        try:
+            tray = getattr(self, "_tray_icon", None)
+            if tray is not None and hasattr(tray, "showMessage"):
+                tray.showMessage(
+                    "Touchless update available",
+                    f"Touchless {info.version} is ready to install. Click to open the installer.",
+                    msecs=8000,
+                )
+        except Exception:
+            pass
 
     def _show_auto_update_toast(self, version: str) -> None:
         """Surface a non-blocking notification when the auto-update flow

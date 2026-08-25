@@ -752,7 +752,16 @@ class AppConfig:
     # no Inno dialog) — full-installer and Store-fallback paths still
     # surface the dialog because they take noticeably longer and the
     # user deserves to know the app is about to disappear for ~30 sec.
-    auto_update_enabled: bool = False
+    # v1.1.8.1: flipped default False -> True. The 1.1.7 dialog was
+    # invisible on frameless-window Windows compositions (fixed in
+    # update_dialog.py this release), and even with the fix in place
+    # users benefit from silent app-zip updates that just relaunch
+    # into the new version. The auto path only fires for the small
+    # app-zip kind (no UAC, no full-installer dialog, no user
+    # interaction required); full-installer / store-fallback paths
+    # still surface the dialog. Users can opt back out via
+    # Settings > General > "Install updates automatically".
+    auto_update_enabled: bool = True
     # Rate-limiter sentinel for the auto-update path. Written before the
     # download starts, cleared on successful apply (in _on_installer_ready)
     # or on failure (in _on_auto_update_failed). If a launch starts and
