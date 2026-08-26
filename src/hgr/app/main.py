@@ -61,6 +61,13 @@ def main() -> int:
             heal_install_location()
         except Exception:
             pass
+        # Auto-start half of the same re-home: if login-launch is enabled but
+        # its Run-key command points at the pre-move location, repoint it.
+        try:
+            from ..utils import autostart
+            autostart.heal()
+        except Exception:
+            pass
 
     # Install the taskbar Jump List. Only attempts in frozen builds
     # where sys.executable is Touchless.exe (each task re-launches
