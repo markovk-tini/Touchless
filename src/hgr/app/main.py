@@ -49,6 +49,19 @@ def main() -> int:
     app.setApplicationDisplayName(APP_NAME)
     app.setApplicationName(APP_NAME)
 
+    # Keep Windows' record of where Touchless is installed in sync with where
+    # it's actually running from. If the user moved the install folder (e.g. to
+    # another drive), this rewrites the stale registry path so the installer /
+    # Microsoft Store update path targets the real location instead of the old
+    # one. Frozen + Windows only; no-op when already correct. Runs early so a
+    # move is healed before any update check fires.
+    if getattr(sys, "frozen", False):
+        try:
+            from .updater.install_location import heal_install_location
+            heal_install_location()
+        except Exception:
+            pass
+
     # Install the taskbar Jump List. Only attempts in frozen builds
     # where sys.executable is Touchless.exe (each task re-launches
     # the exe with a flag). Source runs use python.exe whose path

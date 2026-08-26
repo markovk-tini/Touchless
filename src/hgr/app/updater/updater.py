@@ -328,6 +328,16 @@ class Updater(QObject):
         #                thinks it needs to (it doesn't, we don't
         #                touch system DLLs)
         params = "/SILENT /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS /NORESTART"
+        # Pin the install to the ACTUAL running location. Without this, Inno
+        # uses the directory it remembers in the registry (UsePreviousAppDir)
+        # or DefaultDirName — so a user who moved the app to another drive
+        # would get 1.x.y reinstalled to the OLD path while their moved copy
+        # stayed on the old version. /DIR overrides both. (heal_install_location
+        # keeps the registry correct too, so the Store's own Update button —
+        # which we can't pass /DIR to — also targets the right place.)
+        install_dir = self._resolve_install_dir()
+        if install_dir is not None:
+            params += f' /DIR="{install_dir}"'
         try:
             ret = ctypes.windll.shell32.ShellExecuteW(
                 None, "open", installer_path, params, None, 1
