@@ -347,6 +347,16 @@ class CustomGesture:
     # classifier post-fix). Registry.load() migrates 1 → 2 in-memory
     # and persists on next save so users don't have to re-record.
     wrist_schema: int = 1
+    # v1.1.8.2 SPRING architecture. Per-take (32, F) feature matrices
+    # used by the streaming classifier for peak-time firing. Empty for
+    # legacy templates (they fall back to segment-DTW automatically).
+    # F = 3 * (num_key_points + 6). Stored as nested lists in JSON.
+    sample_features: List[List[List[float]]] = field(default_factory=list)
+    # v1.1.8.2 (post-audit round 2) INTENT SIGNATURE — see the
+    # DynamicGestureTemplate docstring in dynamic_classifier.py.
+    intent_direction: Optional[List[float]] = None
+    intent_magnitude: float = 0.0
+    intent_window_seconds: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -379,6 +389,17 @@ class CustomGesture:
             out["match_threshold"] = float(self.match_threshold)
         if self.wrist_schema and self.wrist_schema != 1:
             out["wrist_schema"] = int(self.wrist_schema)
+        # v1.1.8.2: sample_features (SPRING). Only emit if populated so
+        # legacy static / dynamic JSON stays byte-for-byte identical.
+        if self.sample_features:
+            out["sample_features"] = self.sample_features
+        # v1.1.8.2 (post-audit round 2) intent-signature persistence.
+        if self.intent_direction is not None:
+            out["intent_direction"] = list(self.intent_direction)
+        if self.intent_magnitude:
+            out["intent_magnitude"] = float(self.intent_magnitude)
+        if self.intent_window_seconds:
+            out["intent_window_seconds"] = float(self.intent_window_seconds)
         return out
 
     @classmethod
@@ -423,6 +444,28 @@ class CustomGesture:
             wrist_schema = int(data.get("wrist_schema", 1) or 1)
         except (TypeError, ValueError):
             wrist_schema = 1
+        # v1.1.8.2 SPRING features (per-take (32, F) matrices). Empty
+        # for legacy records — those fall back to segment-DTW.
+        raw_features = data.get("sample_features") or []
+        sample_features_ = list(raw_features)
+        # v1.1.8.2 (post-audit round 2) intent-signature load.
+        raw_int_dir = data.get("intent_direction")
+        try:
+            intent_direction_ = (
+                [float(x) for x in raw_int_dir] if raw_int_dir else None
+            )
+        except (TypeError, ValueError):
+            intent_direction_ = None
+        try:
+            intent_magnitude_ = float(data.get("intent_magnitude", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            intent_magnitude_ = 0.0
+        try:
+            intent_window_seconds_ = float(
+                data.get("intent_window_seconds", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            intent_window_seconds_ = 0.0
         return cls(
             name=str(data["name"]),
             description=str(data.get("description", "")),
@@ -439,6 +482,10 @@ class CustomGesture:
             duration_mode=duration_mode,
             match_threshold=match_threshold,
             wrist_schema=wrist_schema,
+            sample_features=sample_features_,
+            intent_direction=intent_direction_,
+            intent_magnitude=intent_magnitude_,
+            intent_window_seconds=intent_window_seconds_,
         )
 
 
@@ -601,6 +648,10 @@ class GestureRegistry:
         wrist_motion_strength: float = 0.0,
         match_threshold: Optional[float] = None,
         wrist_schema: int = 2,  # v1.1.8.1 default: displacement semantics
+        sample_features=None,   # v1.1.8.2 SPRING features
+        intent_direction=None,  # v1.1.8.2 post-audit r2 INTENT SIGNATURE
+        intent_magnitude: float = 0.0,
+        intent_window_seconds: float = 0.0,
     ) -> CustomGesture:
         """Register a dynamic gesture. `sample_trajectories` is an
         iterable of arrays/lists with shape (resampled_length,
@@ -642,6 +693,15 @@ class GestureRegistry:
                 serialized_wrist.append(w.tolist())
             else:
                 serialized_wrist.append([[float(v) for v in coord] for coord in w])
+        # v1.1.8.2 SPRING sample_features: list of (32, F) matrices.
+        serialized_features: List[List[List[float]]] = []
+        for feat in (sample_features or []):
+            if hasattr(feat, "tolist"):
+                serialized_features.append(feat.tolist())
+            else:
+                serialized_features.append(
+                    [[float(v) for v in row] for row in feat]
+                )
         with self._lock:
             if name in self._gestures and not overwrite:
                 raise ValueError(
@@ -665,6 +725,13 @@ class GestureRegistry:
                     float(match_threshold) if match_threshold is not None else None
                 ),
                 wrist_schema=int(wrist_schema),
+                sample_features=serialized_features,
+                intent_direction=(
+                    [float(x) for x in intent_direction]
+                    if intent_direction is not None else None
+                ),
+                intent_magnitude=float(intent_magnitude or 0.0),
+                intent_window_seconds=float(intent_window_seconds or 0.0),
             )
             self._gestures[name] = gesture
         return gesture

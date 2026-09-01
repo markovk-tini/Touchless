@@ -829,7 +829,13 @@ class CreateGestureWizard(QDialog):
         # Timing
         timing_row = QHBoxLayout()
         timing_row.setSpacing(14)
-        timing_box1 = QVBoxLayout()
+        # v1.1.8.2: hold-to-activate wrapped in a QWidget so
+        # _on_gesture_type_changed can hide it as a unit on the Dynamic
+        # tab. Dynamic gestures fire on motion match, not on a hold — a
+        # hold slider is meaningless there and was confusing users.
+        self._hold_block = QWidget()
+        timing_box1 = QVBoxLayout(self._hold_block)
+        timing_box1.setContentsMargins(0, 0, 0, 0)
         timing_box1.addWidget(QLabel("Hold to activate (seconds)"))
         self.hold_spin = QDoubleSpinBox()
         self.hold_spin.setRange(0.2, 5.0)
@@ -837,7 +843,7 @@ class CreateGestureWizard(QDialog):
         self.hold_spin.setDecimals(1)
         self.hold_spin.setValue(1.0)
         timing_box1.addWidget(self.hold_spin)
-        timing_row.addLayout(timing_box1)
+        timing_row.addWidget(self._hold_block)
 
         timing_box2 = QVBoxLayout()
         timing_box2.addWidget(QLabel("Cooldown after fire (seconds)"))
@@ -982,6 +988,14 @@ class CreateGestureWizard(QDialog):
             pass
         try:
             self._duration_block.setVisible(value == "dynamic")
+        except Exception:
+            pass
+        # v1.1.8.2: hide "Hold to activate" on Dynamic. Dynamic gestures
+        # fire on motion match — no hold semantics — so showing the hold
+        # spinbox there was misleading. Cooldown still applies (post-fire
+        # debounce), so leave that column visible.
+        try:
+            self._hold_block.setVisible(value != "dynamic")
         except Exception:
             pass
 
@@ -1309,14 +1323,19 @@ class CreateGestureWizard(QDialog):
             self._error(str(exc))
             return
 
+        # v1.1.8.2: dynamic gestures fire on motion match — no hold
+        # semantics — so force hold_seconds = 0 regardless of what the
+        # (now-hidden) hold spinbox holds. Keeps saved payloads honest
+        # for anything that reads hold_s at run-time.
+        _is_dynamic = (self.gesture_type() == "dynamic")
         self.result_payload = WizardResult(
             name=name,
             description=self.desc_edit.text().strip(),
-            hold_seconds=float(self.hold_spin.value()),
+            hold_seconds=(0.0 if _is_dynamic else float(self.hold_spin.value())),
             cooldown_seconds=float(self.cooldown_spin.value()),
             action=action,
             duration_mode=(
-                self.duration_mode() if self.gesture_type() == "dynamic" else ""
+                self.duration_mode() if _is_dynamic else ""
             ),
         )
         self.accept()
@@ -1332,9 +1351,13 @@ class CreateGestureWizard(QDialog):
         # the live runner reads per-gesture timing back at run-time.
         # action.cooldown_seconds() already reads cooldown_s; the runner
         # reads hold_s.
+        # v1.1.8.2: dynamic gestures fire instantly on motion match; no
+        # hold semantics apply. Persist hold_s = 0 for dynamics so
+        # runtime timing readers don't accidentally apply a stale hold.
+        _is_dynamic = (self.gesture_type() == "dynamic")
         timing_payload = {
             "cooldown_s": float(self.cooldown_spin.value()),
-            "hold_s": float(self.hold_spin.value()),
+            "hold_s": 0.0 if _is_dynamic else float(self.hold_spin.value()),
         }
         if kind == "keystroke":
             return Action(kind=kind, payload={"key": value, **timing_payload})

@@ -685,6 +685,16 @@ class DynamicGestureRecorderWindow(QDialog):
                 # displacement, not absolute position).
                 match_threshold=artifacts.template.match_threshold,
                 wrist_schema=2,
+                # v1.1.8.2: SPRING streaming features so the new
+                # template fires at motion peak instead of settle.
+                sample_features=artifacts.template.sample_features,
+                # v1.1.8.2 (post-audit r2) intent signature — "the
+                # essential motion" (direction + magnitude across all
+                # keypoints). Fires reliably when SPRING's exact-shape
+                # matching is too strict.
+                intent_direction=artifacts.template.intent_direction,
+                intent_magnitude=artifacts.template.intent_magnitude,
+                intent_window_seconds=artifacts.template.intent_window_seconds,
                 action=self._action,
                 description=self._description,
                 handedness=handedness,

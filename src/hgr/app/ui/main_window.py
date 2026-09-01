@@ -6700,10 +6700,20 @@ class MainWindow(QMainWindow):
         # withdrawn).
         manual = bool(getattr(self, "_in_manual_update_check", False))
         try:
-            from ..updater.release_checker import _parse_version_tuple
+            # Hardening: use the SAME PEP 440 comparator the release
+            # checker used to decide whether to fire. The legacy
+            # digit-tuple parser (_parse_version_tuple) silently
+            # swallows legitimate finals after a pre-release Later
+            # click — e.g. dismissed '1.1.9rc1' vs incoming '1.1.9'
+            # digit-tuple compares as (1,1,9) <= (1,1,9,1), TRUE,
+            # and the popup is silently returned before it renders.
+            # _is_newer via packaging.Version handles rc/beta/dev/post
+            # ordering correctly and falls back to the legacy parser
+            # only when both strings are non-PEP 440.
+            from ..updater.release_checker import _is_newer
             dismissed = str(getattr(self.config, "last_dismissed_update_version", "") or "").strip()
             if dismissed and not manual:
-                if _parse_version_tuple(info.version) <= _parse_version_tuple(dismissed):
+                if not _is_newer(info.version, dismissed):
                     return
             if manual and dismissed:
                 # Withdraw the dismissal so the auto-check path also
@@ -6718,6 +6728,27 @@ class MainWindow(QMainWindow):
             pass
 
         from ..updater.update_dialog import UpdateDialog
+
+        # Hardening: if the main window is minimized (or tray-hidden),
+        # restore it BEFORE constructing the dialog so:
+        #   (a) Qt's owner-hidden semantics don't neuter activateWindow
+        #       and don't hide the owned popup along with the parent
+        #       on a subsequent tray-hide;
+        #   (b) the dialog's parent has a real screen rectangle for the
+        #       showEvent recentering math (a minimized window on
+        #       Windows reports geometry near (-32000,-32000));
+        #   (c) the taskbar has a visible Touchless entry, so the user
+        #       has an owner window to click even if the popup gets
+        #       occluded by another app.
+        try:
+            if hasattr(self, "isMinimized") and self.isMinimized():
+                self.showNormal()
+            elif hasattr(self, "isHidden") and self.isHidden():
+                self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
 
         # Store update with no self-applicable installer URL (rare fallback):
         # an unpackaged app can't trigger a Store install itself, so just open
@@ -6739,6 +6770,21 @@ class MainWindow(QMainWindow):
             self._update_dialog.show()
             self._update_dialog.raise_()
             self._update_dialog.activateWindow()
+            # Hardening: mirror the regular-path tray balloon so Store
+            # users on any future frameless-dialog visibility regression
+            # still see a notification. Previously this branch returned
+            # before the tray-fallback block, so Store users were the
+            # one cohort with zero backup signal.
+            try:
+                tray = getattr(self, "_tray_icon", None)
+                if tray is not None and hasattr(tray, "showMessage"):
+                    tray.showMessage(
+                        "Touchless update available",
+                        f"Touchless {info.version} is ready to install from the Store.",
+                        msecs=8000,
+                    )
+            except Exception:
+                pass
             return
 
         from ..updater import Updater

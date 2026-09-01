@@ -26,10 +26,8 @@ import numpy as np
 from .action import fire_once
 from .dynamic_classifier import (
     _DEFAULT_MATCH_THRESHOLD,
-    _DTW_BAND,
     DynamicGestureClassifier,
     DynamicGestureTemplate,
-    _dtw_distance,
 )
 from .dynamic_recording import normalize_frame
 from .registry import GestureRegistry, registry_path
@@ -287,29 +285,34 @@ class DynamicGestureRuntime:
             # in the registry. Legacy records (no field) get an on-the-
             # fly auto-threshold from pairwise DTW between takes, then
             # cached on the DynamicGestureTemplate for this session.
+            # v1.1.8.2: the on-the-fly DTW pairwise threshold was
+            # removed. Templates now persist match_threshold at build
+            # time (SPRING-native pairwise self-scoring). Legacy
+            # templates without a saved threshold fall through with
+            # `None`, which lets the classifier apply its own default
+            # (they still won't fire because they also lack
+            # sample_features — see the WARN log in __init__).
             saved_threshold = getattr(gesture, "match_threshold", None)
-            template_threshold: Optional[float]
-            if saved_threshold is not None:
-                template_threshold = float(saved_threshold)
-            elif len(valid) >= 2:
+            template_threshold: Optional[float] = (
+                float(saved_threshold) if saved_threshold is not None else None
+            )
+            # v1.1.8.2 SPRING features. Legacy templates (schema < 3)
+            # have empty sample_features and fall back to segment-DTW.
+            raw_features = getattr(gesture, "sample_features", None) or []
+            sample_features_list: List[np.ndarray] = []
+            for feat in raw_features:
                 try:
-                    pair_dists: list = []
-                    for i in range(len(valid)):
-                        fa = valid[i].reshape(valid[i].shape[0], -1)
-                        for j in range(i + 1, len(valid)):
-                            fb = valid[j].reshape(valid[j].shape[0], -1)
-                            if fa.shape[1] != fb.shape[1]:
-                                continue
-                            pair_dists.append(_dtw_distance(fa, fb, band=_DTW_BAND))
-                    if pair_dists:
-                        med = float(np.median(pair_dists))
-                        template_threshold = float(np.clip(med * 1.8 + 0.05, 0.22, 0.30))
-                    else:
-                        template_threshold = None
+                    arr = np.asarray(feat, dtype=np.float32)
+                    if arr.ndim == 2 and arr.shape[0] > 0:
+                        sample_features_list.append(arr)
                 except Exception:
-                    template_threshold = None
-            else:
-                template_threshold = None
+                    continue
+            # v1.1.8.2 (post-audit r2) intent-signature fields.
+            intent_direction = getattr(gesture, "intent_direction", None)
+            intent_magnitude = float(getattr(gesture, "intent_magnitude", 0.0) or 0.0)
+            intent_window_seconds = float(
+                getattr(gesture, "intent_window_seconds", 0.0) or 0.0
+            )
             return DynamicGestureTemplate(
                 name=str(gesture.name),
                 key_point_indices=indices,
@@ -317,6 +320,12 @@ class DynamicGestureRuntime:
                 wrist_trajectories=wrist,
                 wrist_motion_strength=strength,
                 match_threshold=template_threshold,
+                sample_features=sample_features_list,
+                intent_direction=(
+                    list(intent_direction) if intent_direction else None
+                ),
+                intent_magnitude=intent_magnitude,
+                intent_window_seconds=intent_window_seconds,
             )
         except Exception:
             return None

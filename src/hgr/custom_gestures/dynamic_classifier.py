@@ -34,6 +34,8 @@ from .dynamic_recording import (
     RESAMPLED_FRAME_COUNT,
     _resample_landmarks,
     _resample_wrist,
+    build_dynamic_features,
+    dynamic_feature_dim,
 )
 
 
@@ -86,9 +88,10 @@ _NOMINAL_FRAME_DT = 1.0 / 30.0
 # 0.267 s. Only consulted when the env flag is ON.
 _MIN_SEGMENT_DURATION_S = 0.25
 
-# Minimum number of "in progress" frames before we accept a segment.
-# Filters out tiny twitches that briefly cross the high gate.
-_MIN_SEGMENT_FRAMES = 8
+# v1.1.8.2: `_MIN_SEGMENT_FRAMES` deleted along with the segment
+# machine. SPRING has no segment concept. The constructor still
+# accepts a `min_segment_frames` kwarg for backward-compat with any
+# external caller but it is IGNORED.
 
 # DTW band radius (Sakoe-Chiba). 8 frames of slack on a 32-frame
 # template handles speed variations up to ±25% from the recorded
@@ -115,37 +118,17 @@ _WRIST_MOTION_REFERENCE_PALM_UNITS = 1.5
 # at least 1 - MAX influence on the combined distance. Stops a big
 # swipe template from matching ANY fast hand path regardless of
 # finger pose. 0.7 = wrist dominates (70%) for big-motion templates
-# but fingers still keep 30% weight.
+# but fingers still keep 30% weight. v1.1.8.2: audit dropped to
+# 0.6, reverted after 0/15 field test — the wrist balance is not
+# the current bottleneck. Await diagnostic-log evidence before
+# tweaking this constant again.
 _WRIST_WEIGHT_MAX = 0.7
 
-# ─────────────────────────────────────────────────────────────────────────
-# v1.1.8.1 (dynamic-gesture recall fix). Addresses OPEN_ISSUES §4.0's
-# top failure mode: at 15-25 fps in dim rooms the motion energy stays
-# above _MOTION_GATE_LOW during small hand jitter after a gesture, so
-# the segment never closes and no match is ever attempted. The fix is
-# three cooperating additions:
-#   (a) Hard segment timeout — force-close and match after this many
-#       real-time seconds regardless of motion level. Kills the
-#       "hand never settled → nothing ever runs" failure.
-#   (b) Settle debounce — require the motion to sit below LOW for N
-#       consecutive frames before closing on settle. Prevents mid-
-#       gesture pauses (double-taps, swipe-pause-swipe) from closing
-#       the segment prematurely.
-#   (c) Timeout quality gate — before a timeout-close fires DTW,
-#       require enough accumulated wrist path OR max-finger
-#       displacement. Without this, any 2.5s window of unrelated hand
-#       fidgeting would DTW against every template and match the
-#       closest one (skeptic-precision blocker in the audit workflow).
-_MAX_SEGMENT_SECONDS = 2.5           # hard timeout
-_SETTLE_DEBOUNCE_FRAMES = 3          # consecutive frames below LOW
-_MIN_SEGMENT_SECONDS = 0.20          # 200 ms wall-clock floor
-_MIN_SEGMENT_FRAMES_FLOOR = 4        # never below this many frames
-_TIMEOUT_MIN_WRIST_PATH = 0.5        # palm units of accumulated wrist
-_TIMEOUT_MIN_FINGER_DISP = 0.3       # palm units of max-landmark disp
-
-# False-positive safeguard: when more than one template passes its
-# threshold, only fire if the top-1 beats the top-2 by this much.
-# Avoids "many similar templates all fire on any moderate motion".
+# v1.1.8.2: the segment-based tunables (_MAX_SEGMENT_SECONDS,
+# _SETTLE_DEBOUNCE_FRAMES, _MIN_SEGMENT_*, _TIMEOUT_MIN_*) were
+# DELETED. The classifier is now SPRING streaming — no segment concept
+# at all. `_TOP2_MARGIN` still gates simultaneous multi-template
+# candidates within a single frame.
 _TOP2_MARGIN = 0.04
 
 # FPS estimator bounds. Median of trailing dt values, clamped so a
@@ -155,6 +138,13 @@ _FPS_EST_MIN = 10.0
 _FPS_EST_MAX = 60.0
 _FPS_EST_WARMUP = 30.0               # assumed fps until we have samples
 _FPS_EST_WINDOW = 10                 # median of trailing N dt values
+
+# v1.1.8.2: `_SEGMENT_LOOKBACK_FRAMES` removed. SPRING sees the entire
+# stream naturally; no segment stitching. Motion-energy is still
+# tracked as an IDLE-SKIP pre-filter (below).
+_IDLE_SKIP_FRAMES = 5                # consecutive idle frames before we
+                                     # skip the DP update. Reset on any
+                                     # frame at or above LOW/3.
 
 
 @dataclass(frozen=True)
@@ -187,6 +177,32 @@ class DynamicGestureTemplate:
     wrist_motion_strength: float = 0.0
     # Optional per-gesture threshold. None → use classifier default.
     match_threshold: Optional[float] = None
+    # v1.1.8.2 SPRING architecture. One (32, F) matrix per take. When
+    # None or empty, the runtime falls back to legacy segment-DTW for
+    # THIS template (schema_version < 3). Present for freshly-recorded
+    # templates. Fed into per-template SpringMatcher for streaming
+    # peak-time firing instead of settle-triggered batch DTW.
+    sample_features: List[np.ndarray] = field(default_factory=list)
+    # v1.1.8.2 (post-audit round 2) INTENT SIGNATURE. Captures "the
+    # essential motion" of the recorded gesture in a form that matches
+    # the user's mental model: for wave-up, the signature is "all
+    # keypoints moved up by ~X palm-units on average, with a direction
+    # unit vector pointing UP." Live matching computes the same signal
+    # over a sliding window and fires when direction cosine-similarity
+    # + magnitude both cross thresholds. Independent from SPRING —
+    # runs in parallel; either can fire.
+    #
+    # Shape:
+    #   direction: (3,)  — unit vector, mean displacement direction
+    #                       across all keypoints, all takes
+    #   magnitude: float — median total displacement (palm units) across
+    #                       takes; a live match needs to hit at least
+    #                       0.60 of this magnitude
+    #   window_seconds: float — how long the sliding window is, based
+    #                       on the recorded take duration
+    intent_direction: Optional[List[float]] = None
+    intent_magnitude: float = 0.0
+    intent_window_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -200,6 +216,198 @@ class Match:
     timestamp: float
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# v1.1.8.2 SPRING (Sakurai et al. VLDB 2007) — streaming subsequence
+# DTW. Instead of waiting for a segment to close on settle then running
+# batch DTW, feed live features one at a time and emit a per-frame cost.
+# The cost curve dips to a local minimum at the frame where the stream
+# best matches the template, then rises. Fire on the rise (motion peak),
+# not on settle.
+#
+# Firing rule wraps SpringMatcher externally: (a) cost fell below the
+# template's threshold at some frame, (b) has now RISEN for 2 frames
+# past its low point (confirms it wasn't a fluke), (c) motion-into-pose
+# — cost was above 2× threshold at some point within the last N frames
+# (blocks fire on a statically-held hand shape resembling the template),
+# (d) top-1 vs top-2 margin across templates.
+
+_SPRING_COOLDOWN_SECONDS = 0.5
+_SPRING_MOTION_INTO_POSE_FRAMES = 24  # ~800 ms at 30 fps
+# v1.1.8.2 (post-audit): DELTA-based motion-into-pose gate. Replaces the
+# absolute `cost >= 2 * threshold` ratio because SPRING's per-row L2
+# cost is star-padding-capped and rarely reaches 2x threshold on real
+# hand data — the previous formulation rejected every candidate.
+# `descent = recent_max - min_cost` measures a real cost drop
+# (i.e. an actual motion-into-pose event). `min_abs` is a floor on
+# `recent_max` so pure-jitter oscillations that dip 0.3 below their own
+# noise floor without crossing this level can't fire.
+_SPRING_MOTION_INTO_POSE_DELTA = 0.30    # recent_max - min_cost required
+_SPRING_MOTION_INTO_POSE_MIN_ABS = 1.20  # AND recent_max floor
+_SPRING_RISE_FRAMES = 2                  # confirm cost has risen 2 frames
+
+# v1.1.8.2 (post-audit round 2) INTENT SIGNATURE thresholds. Fire when
+# the live sliding-window displacement matches the template's
+# direction well enough AND its magnitude reaches enough of the
+# recorded amount. These are FRIENDLY defaults chosen to match the
+# user's mental model of "did the hand basically move the right way?"
+_INTENT_DIRECTION_COS_MIN = 0.75   # ~40° of tolerance
+_INTENT_MAGNITUDE_MIN_FRAC = 0.60  # 60% of the recorded magnitude
+# Motion-coherence gate — direction of the window's first half must
+# agree with direction of the window's second half. Real waves are
+# coherent (~0.9-0.99 cosine); random walks average 0.0-0.3. Blocks
+# the classic false-positive from ambient hand jitter.
+_INTENT_COHERENCE_MIN = 0.60
+_INTENT_COOLDOWN_SECONDS = 0.6
+
+
+# v1.1.8.2 (post-audit) STEP 6: diagnostic logging helpers behind
+# HGR_DYNAMIC_DEBUG=1. Emit one line per non-idle frame + one line per
+# candidate rejection so a bad shipping build can be grepped from user
+# logs without needing to reproduce.
+
+def _dbg_enabled() -> bool:
+    try:
+        import os as _os_dbg
+        return _os_dbg.environ.get("HGR_DYNAMIC_DEBUG") == "1"
+    except Exception:
+        return False
+
+
+def _dbg_log(msg: str) -> None:
+    try:
+        import logging as _lg
+        _lg.getLogger("hgr.dynamic").warning("[DYN] %s", msg)
+    except Exception:
+        pass
+
+
+class SpringMatcher:
+    """Streaming subsequence DTW.
+
+    template_features: (m, F) matrix. Fed one frame at a time via
+    step(feature) → (cur_norm, cur_start, is_rising_after_min,
+                       min_cost_so_far, min_start, min_at_t).
+
+    * cur_norm — length-normalized cost cost[m,t] / (t - start + m)
+      at the current step. Same units as legacy DTW threshold.
+    * cur_start — stream frame index at which the current best
+      alignment began.
+    * is_rising_after_min — True after the cost has been rising for
+      `_SPRING_RISE_FRAMES` consecutive steps past its low point (fire
+      signal candidate).
+    * min_cost_so_far — the local minimum value the cost dipped to
+      before the current rise.
+    * min_start — start frame at that minimum.
+    * min_at_t — stream frame index of the local minimum.
+
+    Complexity: O(m) per step (all-column DP, unbanded — m=32 is
+    small enough that band pruning gains ~zero and adds bugs).
+    """
+
+    __slots__ = (
+        "_m", "_F", "_template", "_cost", "_start", "_t",
+        "_prev_norm", "_last_norm",
+        "_running_min", "_running_min_start", "_running_min_t",
+        "_rising_count",
+    )
+
+    def __init__(self, template_features: np.ndarray) -> None:
+        tpl = np.asarray(template_features, dtype=np.float32)
+        if tpl.ndim != 2:
+            raise ValueError(f"template must be 2D (m, F); got {tpl.shape}")
+        self._m = int(tpl.shape[0])
+        self._F = int(tpl.shape[1])
+        self._template = tpl
+        # cost[i] = cumulative cost at template row i (0..m) for current
+        # column. Row 0 is star-padded (any stream frame can start a
+        # match with 0 accumulated cost).
+        self._cost = np.full(self._m + 1, np.inf, dtype=np.float32)
+        self._cost[0] = 0.0
+        self._start = np.zeros(self._m + 1, dtype=np.int32)
+        self._t = 0
+        self._prev_norm = float("inf")
+        self._last_norm = float("inf")
+        self._running_min = float("inf")
+        self._running_min_start = 0
+        self._running_min_t = -1
+        self._rising_count = 0
+
+    def step(self, feature: np.ndarray) -> Tuple[float, int, bool, float, int, int]:
+        """One frame in, one match candidate out. See class docstring
+        for return-tuple semantics.
+        """
+        prev_cost = self._cost.copy()
+        prev_start = self._start.copy()
+        # Star padding: new match can start at THIS frame.
+        self._cost[0] = 0.0
+        self._start[0] = self._t
+        # Vectorized local cost against every template row.
+        diff = self._template - feature[np.newaxis, :]
+        local = np.linalg.norm(diff, axis=1).astype(np.float32)  # (m,)
+        # Dynamic programming column update.
+        for i in range(1, self._m + 1):
+            # Predecessors: (i-1, t-1), (i, t-1), (i-1, t)
+            c_diag = prev_cost[i - 1]
+            s_diag = prev_start[i - 1]
+            c_up = prev_cost[i]
+            s_up = prev_start[i]
+            c_left = self._cost[i - 1]
+            s_left = self._start[i - 1]
+            # Pick min predecessor.
+            if c_diag <= c_up and c_diag <= c_left:
+                p_c, p_s = c_diag, s_diag
+            elif c_up <= c_left:
+                p_c, p_s = c_up, s_up
+            else:
+                p_c, p_s = c_left, s_left
+            self._cost[i] = local[i - 1] + p_c
+            self._start[i] = p_s
+        # Emit current match cost. v1.1.8.2: normalize by template
+        # length only, so `cur_norm` is the MEAN per-row local L2
+        # distance. Same magnitude as the raw feature values, which
+        # makes threshold values interpretable ("features differ by
+        # 0.3 per row on average = definitely not a match").
+        raw = float(self._cost[self._m])
+        start = int(self._start[self._m])
+        cur_norm = raw / float(max(1, self._m))
+        # Track running minimum + rise streak.
+        if cur_norm < self._running_min:
+            self._running_min = cur_norm
+            self._running_min_start = start
+            self._running_min_t = self._t
+            self._rising_count = 0
+        elif cur_norm > self._last_norm:
+            self._rising_count += 1
+        else:
+            self._rising_count = 0
+        is_rising_after_min = self._rising_count >= _SPRING_RISE_FRAMES
+        self._prev_norm = self._last_norm
+        self._last_norm = cur_norm
+        self._t += 1
+        return (
+            cur_norm, start, is_rising_after_min,
+            self._running_min, self._running_min_start, self._running_min_t,
+        )
+
+    def clear_running_min(self) -> None:
+        """Reset the running-min tracker — call after a fire (or after
+        a rejected candidate) so the next dip is measured fresh."""
+        self._running_min = float("inf")
+        self._running_min_start = 0
+        self._running_min_t = -1
+        self._rising_count = 0
+        self._prev_norm = float("inf")
+        self._last_norm = float("inf")
+
+    def reset(self) -> None:
+        """Full reset. Called on hand loss."""
+        self._cost.fill(np.inf)
+        self._cost[0] = 0.0
+        self._start.fill(0)
+        self._t = 0
+        self.clear_running_min()
+
+
 class DynamicGestureClassifier:
     def __init__(
         self,
@@ -209,7 +417,7 @@ class DynamicGestureClassifier:
         window_frames: int = _WINDOW_FRAMES,
         motion_gate_low: float = _MOTION_GATE_LOW,
         motion_gate_high: float = _MOTION_GATE_HIGH,
-        min_segment_frames: int = _MIN_SEGMENT_FRAMES,
+        min_segment_frames: int = 8,  # v1.1.8.2: IGNORED — SPRING has no segment concept
         dtw_band: int = _DTW_BAND,
     ) -> None:
         self._templates: List[DynamicGestureTemplate] = list(templates)
@@ -232,53 +440,136 @@ class DynamicGestureClassifier:
         else:
             self._motion_gate_low = float(motion_gate_low)
             self._motion_gate_high = float(motion_gate_high)
-        self._min_segment_frames = int(min_segment_frames)
+        # v1.1.8.2: min_segment_frames constructor arg is accepted but
+        # ignored. SPRING evaluates every frame; no segments.
+        _ = int(min_segment_frames)
         self._dtw_band = int(dtw_band)
         # Each entry: (timestamp, normalized_landmarks, wrist_palm_scaled_or_None).
         # The wrist-position third element is optional so the existing
         # 2-arg `update(...)` callers continue to work.
-        # v1.1.8.1: deque sized to hold enough history for MAX_SEGMENT_SECONDS
-        # at 60 fps + headroom, so a timeout close still has the entire
-        # segment (skeptic-fps blocker in audit workflow).
-        _target_window = max(
-            int(window_frames),
-            int(_MAX_SEGMENT_SECONDS * _FPS_EST_MAX + 30),
-        )
+        # v1.1.8.2: sliding-window deque for idle-skip pre-filter only.
+        # SPRING doesn't need lookback stitching (no segment concept).
         self._frames: Deque[Tuple[float, np.ndarray, Optional[np.ndarray]]] = deque(
-            maxlen=_target_window
+            maxlen=int(window_frames)
         )
-        # Motion-gate state machine.
-        self._in_progress = False
-        self._segment_start_idx: Optional[int] = None
-        # v1.1.8.1: timestamp of when the current segment opened, so
-        # the hard timeout branch can compare wall-clock elapsed.
-        self._segment_start_ts: Optional[float] = None
-        # v1.1.8.1: number of consecutive frames below the LOW gate.
-        # Reset on any frame at or above LOW; segment closes on
-        # settle when this reaches _SETTLE_DEBOUNCE_FRAMES.
-        self._below_low_streak: int = 0
-        # v1.1.8.1: rolling dt buffer for the FPS estimator. Fed each
-        # update(); used by _estimated_fps() for the min-segment floor
-        # and the per-frame-vs-per-second gate branch.
         self._recent_dts: Deque[float] = deque(maxlen=_FPS_EST_WINDOW)
         self._last_ts: Optional[float] = None
-        # Bookkeeping for tests / diagnostics.
-        self._last_segment_motion = 0.0
-        self._last_close_reason: str = ""  # "settle" | "timeout" | ""
+        # v1.1.8.2 idle-skip counter: consecutive idle-frames seen. When
+        # >= _IDLE_SKIP_FRAMES, we short-circuit the SPRING DP entirely
+        # (no matmul, no column update) — saves ~90% of CPU when the
+        # user's hand is at rest. Reset on any non-idle frame.
+        self._idle_streak: int = 0
+
+        # v1.1.8.2 SPRING architecture. Every template with
+        # sample_features gets one SpringMatcher per take. Templates
+        # without features (legacy schema<3) get an empty row; they
+        # will not fire — a one-time WARN log tells the user to
+        # re-record. HGR_DYNAMIC_LEGACY=1 disables SPRING entirely.
+        try:
+            import os as _os_sp
+            self._spring_disabled = _os_sp.environ.get(
+                "HGR_DYNAMIC_LEGACY", ""
+            ).strip() in ("1", "true", "TRUE")
+        except Exception:
+            self._spring_disabled = False
+        self._spring_matchers: List[List["SpringMatcher"]] = []
+        legacy_names: List[str] = []
+        for tpl in self._templates:
+            row: List[SpringMatcher] = []
+            if not self._spring_disabled:
+                for feat in (tpl.sample_features or []):
+                    try:
+                        row.append(SpringMatcher(np.asarray(feat, dtype=np.float32)))
+                    except Exception:
+                        continue
+            self._spring_matchers.append(row)
+            if not row and not self._spring_disabled:
+                legacy_names.append(str(tpl.name))
+        # v1.1.8.2 one-time WARN for pre-SPRING templates. They CAN
+        # still fire via the intent-signature path if the recorder
+        # saved the direction/magnitude; only skip the WARN when the
+        # template has intent data.
+        legacy_no_intent = [
+            n for n, tpl in zip(legacy_names, self._templates)
+            if tpl.intent_direction is None or tpl.intent_magnitude <= 1e-4
+        ]
+        if legacy_no_intent and not self._spring_disabled:
+            try:
+                import logging as _lg
+                _lg.getLogger("hgr.dynamic").warning(
+                    "%d dynamic gesture(s) have neither SPRING features nor "
+                    "an intent signature and will not fire: %s. Please "
+                    "re-record via Custom Gestures wizard.",
+                    len(legacy_no_intent), ", ".join(legacy_no_intent[:5]),
+                )
+            except Exception:
+                pass
+        # v1.1.8.2 (post-audit r2) init-time diagnostic. HGR_DYNAMIC_DEBUG=1
+        # now prints exactly which matcher paths each template has —
+        # answers "why isn't anything firing" without needing to inspect
+        # the registry JSON.
+        if _dbg_enabled():
+            for tpl, row in zip(self._templates, self._spring_matchers):
+                has_spring = len(row) > 0
+                has_intent = (
+                    tpl.intent_direction is not None
+                    and tpl.intent_magnitude > 1e-4
+                )
+                _dbg_log(
+                    f"init tpl={tpl.name!r} spring_takes={len(row)} "
+                    f"intent={'YES' if has_intent else 'NO'} "
+                    f"intent_mag={tpl.intent_magnitude:.3f} "
+                    f"intent_window={tpl.intent_window_seconds:.2f}s "
+                    f"intent_frame=WRIST_ABSOLUTE_PALM_SCALED "
+                    f"threshold={tpl.match_threshold}"
+                )
+            if not any(
+                (tpl.intent_direction is not None and tpl.intent_magnitude > 1e-4)
+                for tpl in self._templates
+            ):
+                _dbg_log(
+                    "WARN: no template has intent-signature data. "
+                    "Templates recorded before v1.1.8.2 (post-audit r2) "
+                    "must be re-recorded to enable intent matching."
+                )
+        # Cooldown: after any SPRING fire, blank all matchers for this
+        # many seconds so a returning-to-rest motion doesn't re-fire.
+        self._spring_cooldown_until: float = 0.0
+        # Motion-into-pose tracking: rolling deque of the last N
+        # (t_norm) values PER matcher, so we can enforce "cost was above
+        # 2x threshold at some point within the last 800 ms" before we
+        # allow a fire. Indexed [template_idx][sample_idx] -> deque.
+        self._spring_recent_norms: List[List[Deque[float]]] = [
+            [
+                deque(maxlen=_SPRING_MOTION_INTO_POSE_FRAMES)
+                for _ in row
+            ]
+            for row in self._spring_matchers
+        ]
 
     @property
     def in_progress(self) -> bool:
-        """True while motion is above the high gate. Useful for UI."""
-        return self._in_progress
+        """v1.1.8.2: SPRING has no discrete segment state. Kept for
+        backward compat with any UI polling this property — always
+        False now."""
+        return False
 
     def reset(self) -> None:
-        """Drop the sliding window. Call when entering a state where
-        recent motion is irrelevant (e.g. mode switch, dialog open)."""
+        """Drop the sliding window + reset every SpringMatcher. Call
+        when entering a state where recent motion is irrelevant
+        (mode switch, dialog open, hand lost)."""
         self._frames.clear()
-        self._in_progress = False
-        self._segment_start_idx = None
-        self._segment_start_ts = None
-        self._below_low_streak = 0
+        self._idle_streak = 0
+        for row in getattr(self, "_spring_matchers", []):
+            for matcher in row:
+                try:
+                    matcher.reset()
+                except Exception:
+                    pass
+        for row in getattr(self, "_spring_recent_norms", []):
+            for buf in row:
+                buf.clear()
+        self._spring_cooldown_until = 0.0
         self._recent_dts.clear()
         self._last_ts = None
 
@@ -293,23 +584,6 @@ class DynamicGestureClassifier:
             return _FPS_EST_WARMUP
         fps = 1.0 / med_dt
         return float(max(_FPS_EST_MIN, min(_FPS_EST_MAX, fps)))
-
-    def _current_min_segment_frames(self) -> int:
-        """v1.1.8.1: fps-invariant floor. At 15 fps this returns 4
-        (was 8 constant → users on dim-room rigs lost fast
-        250-350 ms flicks); at 60 fps it returns 12. Honors the
-        constructor override — takes the max so a caller who
-        explicitly passed a larger floor stays constrained."""
-        fps = self._estimated_fps()
-        floored = int(round(fps * _MIN_SEGMENT_SECONDS))
-        computed = max(_MIN_SEGMENT_FRAMES_FLOOR, floored)
-        override = int(getattr(self, "_min_segment_frames", 0) or 0)
-        # If the caller passed the default (8), we ignore it because it
-        # was a bad constant; if they passed anything else, honor as
-        # a floor.
-        if override and override != _MIN_SEGMENT_FRAMES:
-            return max(computed, override)
-        return computed
 
     def update(
         self,
@@ -351,36 +625,35 @@ class DynamicGestureClassifier:
             (ts, landmarks_normalized.astype(np.float32), wrist_entry)
         )
 
-        # Compute motion energy over the trailing window.
+        # v1.1.8.2: single streaming SPRING path. No segment machine.
+        # Idle-skip pre-filter (motion energy < LOW/3 for
+        # _IDLE_SKIP_FRAMES consecutive frames) short-circuits the DP
+        # to save CPU while the hand is at rest.
         motion = self._recent_motion_energy()
-
-        if not self._in_progress:
-            if motion >= self._motion_gate_high:
-                self._in_progress = True
-                # Start the segment a few frames BACK so the captured
-                # motion includes the user's lead-in (not just the
-                # frame the gate happened to trip on).
-                lookback = min(_MOTION_WINDOW_FRAMES, len(self._frames))
-                self._segment_start_idx = len(self._frames) - lookback
-                self._segment_start_ts = ts
-                self._below_low_streak = 0
-            return None
-
-        # Currently in progress.
-        # v1.1.8.1: track a debounce streak below LOW, and check the
-        # hard timeout every frame. Priority: settle debounce first
-        # (natural gesture end); timeout only fires when the hand
-        # never actually settled.
-        if motion <= self._motion_gate_low:
-            self._below_low_streak += 1
+        idle_threshold = self._motion_gate_low / 3.0
+        if motion < idle_threshold:
+            self._idle_streak += 1
         else:
-            self._below_low_streak = 0
-        if self._below_low_streak >= _SETTLE_DEBOUNCE_FRAMES:
-            return self._close_and_match(ts, reason="settle")
-        segment_start_ts = self._segment_start_ts or ts
-        if (ts - segment_start_ts) >= _MAX_SEGMENT_SECONDS:
-            return self._close_and_match(ts, reason="timeout")
-        return None
+            self._idle_streak = 0
+        if _dbg_enabled():
+            cooldown_left = max(0.0, self._spring_cooldown_until - ts)
+            _dbg_log(
+                f"tick t={ts:.3f} fps~={self._estimated_fps():.1f} "
+                f"motion_e={motion:.4f} idle_streak={self._idle_streak} "
+                f"n_tpl={len(self._templates)} cooldown_remaining={cooldown_left:.3f}"
+            )
+        if self._idle_streak >= _IDLE_SKIP_FRAMES:
+            return None
+        # v1.1.8.2 (post-audit round 2): INTENT SIGNATURE runs FIRST.
+        # This matches the user's mental model — "did the hand move in
+        # roughly the direction and magnitude the template captured?"
+        # Fires reliably even when SPRING's exact-shape matching is
+        # too strict. SPRING remains a fallback for cases where the
+        # intent signal is weaker.
+        intent_match = self._intent_frame_update(ts, landmarks_normalized, wrist_entry)
+        if intent_match is not None:
+            return intent_match
+        return self._spring_frame_update(ts, landmarks_normalized, wrist_entry)
 
     # ---- internal ----
 
@@ -434,167 +707,343 @@ class DynamicGestureClassifier:
                 total += step
         return total / max(1, (len(window) - 1))
 
-    def _segment_wrist_resampled(
-        self,
-        segment: List[Tuple[float, np.ndarray, Optional[np.ndarray]]],
-    ) -> Optional[np.ndarray]:
-        """Resample the segment's absolute wrist trajectory to the
-        canonical length. Returns None when the caller didn't supply
-        wrist data (older 2-arg `update()` callers).
-        """
-        wrists = [w for _, _, w in segment if w is not None]
-        if len(wrists) < 2:
-            return None
-        stacked = np.stack(wrists, axis=0).astype(np.float32)
-        try:
-            return _resample_wrist(stacked, RESAMPLED_FRAME_COUNT)
-        except Exception:
-            return None
+    # v1.1.8.2: `_segment_wrist_resampled` was DELETED — no segment
+    # concept exists in the SPRING architecture. Wrist velocities are
+    # per-frame features consumed directly by build_dynamic_features.
 
-    def _close_and_match(
+    # ---- Intent-signature streaming path (v1.1.8.2 post-audit r2) ----
+
+    def _intent_frame_update(
         self,
         timestamp: float,
-        *,
-        reason: str = "settle",
+        landmarks_normalized: np.ndarray,
+        wrist_palm_scaled: Optional[np.ndarray],
     ) -> Optional[Match]:
-        if self._segment_start_idx is None:
-            self._in_progress = False
-            self._segment_start_ts = None
-            self._below_low_streak = 0
+        """Intent-signature matcher. For each template with an intent
+        direction stored, compute the sliding-window WRIST displacement
+        (absolute wrist position, palm-scaled — same frame the templates
+        were built in) from the earliest frame in-window to this frame.
+        Fire when direction cosine-similarity + magnitude fraction both
+        cross thresholds.
+
+        v1.1.8.2.1: switched from wrist-RELATIVE fingertip displacement
+        to the ABSOLUTE wrist trajectory. Under the old form a wave-up
+        (whole hand translates up) had wrist pinned at (0,0,0) every
+        frame, so end - start collapsed to sub-palm-unit finger jitter
+        and never fired. Now the raw wrist path IS the intent signal.
+        Coordinate frame: WRIST_ABSOLUTE_PALM_SCALED (image axes).
+        """
+        if self._spring_disabled:  # HGR_DYNAMIC_LEGACY also disables intent
             return None
-        all_frames = list(self._frames)
-        segment = all_frames[self._segment_start_idx:]
-        self._in_progress = False
-        self._segment_start_idx = None
-        self._segment_start_ts = None
-        self._below_low_streak = 0
-        self._last_close_reason = reason
-        if len(segment) < self._current_min_segment_frames():
+        if not self._templates or len(self._frames) < 3:
             return None
-
-        landmarks_stack = np.stack([lm for _, lm, _ in segment], axis=0).astype(np.float32)
-        self._last_segment_motion = float(landmarks_stack.std())
-
-        # Resample the segment's wrist trajectory once (used across
-        # every template that carries a wrist channel). None when the
-        # caller didn't pass wrist data — older 2-arg update() shape,
-        # in which case we silently fall back to finger-only matching.
-        # v1.1.8.1: template wrist trajectories are displacement-from-
-        # first-frame (schema=2). Match the live segment's semantics
-        # by subtracting the segment's first wrist entry too.
-        seg_wrist_resampled = self._segment_wrist_resampled(segment)
-        if seg_wrist_resampled is not None:
-            seg_wrist_resampled = seg_wrist_resampled - seg_wrist_resampled[0:1]
-
-        # v1.1.8.1: TIMEOUT quality gate. When the segment force-closes
-        # because MAX_SEGMENT_SECONDS elapsed (not because the hand
-        # actually settled), require that SOMETHING meaningful happened
-        # during the window before running DTW. Otherwise 2.5 s of
-        # ambient hand fidgeting (talking, adjusting glasses) would
-        # DTW against every template and fire the closest — a
-        # categorical new false-positive source flagged by the audit.
-        if reason == "timeout":
-            wrist_path = 0.0
-            if seg_wrist_resampled is not None and seg_wrist_resampled.shape[0] >= 2:
-                diffs = np.diff(seg_wrist_resampled, axis=0)
-                wrist_path = float(np.linalg.norm(diffs, axis=1).sum())
-            # Max landmark displacement across the segment. Wrist-
-            # relative so it captures finger motion (fist squeeze,
-            # finger wiggle) that the wrist channel misses.
-            first = landmarks_stack[0]
-            per_frame_max = np.linalg.norm(
-                landmarks_stack - first[np.newaxis, :, :], axis=-1
-            ).max()
-            if (
-                wrist_path < _TIMEOUT_MIN_WRIST_PATH
-                and float(per_frame_max) < _TIMEOUT_MIN_FINGER_DISP
-            ):
-                # Not enough coherent motion; skip DTW entirely.
-                return None
-
-        # Score every (template, sample) pair. Collect the best distance
-        # per template so the top-1 vs top-2 margin gate below sees
-        # inter-template competition, not inter-sample noise.
-        template_best: List[Tuple[float, DynamicGestureTemplate, int]] = []
-        for template in self._templates:
-            if not template.sample_trajectories:
+        # Cooldown reuses SPRING's — one fire per gesture regardless of
+        # which path caught it.
+        if timestamp < self._spring_cooldown_until:
+            return None
+        # Wrist channel required — matches the record-time coord frame.
+        if wrist_palm_scaled is None:
+            return None
+        end_wrist = np.asarray(wrist_palm_scaled, dtype=np.float32).reshape(-1)
+        if end_wrist.shape[0] != 3:
+            return None
+        # Debug tick.
+        _dbg = _dbg_enabled()
+        best_fire: Optional[Tuple[float, str, int, float, float, float]] = None
+        # tuple: (score = cos * (mag / template_mag), name, tpl_idx, cos, mag_frac, distance)
+        for tpl_idx, tpl in enumerate(self._templates):
+            if tpl.intent_direction is None or tpl.intent_magnitude <= 1e-4:
                 continue
-            try:
-                key_indices = template.key_point_indices
-                segment_kp = landmarks_stack[:, key_indices, :]
-                resampled = _resample_landmarks(segment_kp, RESAMPLED_FRAME_COUNT)
-                seg_features = resampled.reshape(RESAMPLED_FRAME_COUNT, -1)
-            except Exception:
+            key_indices = list(tpl.key_point_indices)
+            if not key_indices:
                 continue
-            threshold = (
-                template.match_threshold
-                if template.match_threshold is not None
-                else self._match_threshold
-            )
-            template_wrist = template.wrist_trajectories or []
-            wrist_weight = 0.0
-            if (
-                seg_wrist_resampled is not None
-                and len(template_wrist) == len(template.sample_trajectories)
-                and template.wrist_motion_strength > 0.0
-            ):
-                wrist_weight = float(template.wrist_motion_strength)
-            wrist_weight = max(0.0, min(_WRIST_WEIGHT_MAX, wrist_weight))
-            finger_weight = 1.0 - wrist_weight
-            best_dist_for_template: Optional[float] = None
-            best_sample_idx = 0
-            for sample_idx, sample in enumerate(template.sample_trajectories):
-                try:
-                    sample_features = sample.reshape(sample.shape[0], -1)
-                except Exception:
-                    continue
-                if sample_features.shape[1] != seg_features.shape[1]:
-                    continue
-                finger_dist = _dtw_distance(seg_features, sample_features, band=self._dtw_band)
-                if wrist_weight > 0.0 and sample_idx < len(template_wrist):
-                    wrist_sample = template_wrist[sample_idx]
-                    try:
-                        wrist_dist = _dtw_distance(
-                            seg_wrist_resampled, wrist_sample.astype(np.float32),
-                            band=self._dtw_band,
-                        )
-                    except Exception:
-                        wrist_dist = finger_dist
-                else:
-                    wrist_dist = 0.0
-                distance = finger_weight * finger_dist + wrist_weight * wrist_dist
-                if best_dist_for_template is None or distance < best_dist_for_template:
-                    best_dist_for_template = float(distance)
-                    best_sample_idx = int(sample_idx)
-            if best_dist_for_template is not None and best_dist_for_template < threshold:
-                template_best.append(
-                    (best_dist_for_template, template, best_sample_idx)
+            tpl_dir = np.asarray(tpl.intent_direction, dtype=np.float32)
+            tpl_mag = float(tpl.intent_magnitude)
+            window = float(tpl.intent_window_seconds) or 1.0
+            # Find the frame closest to (now - window) in the buffer.
+            target_ts = timestamp - window
+            frames = list(self._frames)
+            start_idx = 0
+            for i in range(len(frames) - 1, -1, -1):
+                if frames[i][0] <= target_ts:
+                    start_idx = i
+                    break
+            if start_idx == len(frames) - 1:
+                continue  # need at least a window's worth of frames
+            start_wrist_raw = frames[start_idx][2]
+            if start_wrist_raw is None:
+                # No wrist channel in the window's start frame — cannot
+                # compare against the wrist-absolute template.
+                continue
+            start_wrist = np.asarray(start_wrist_raw, dtype=np.float32).reshape(-1)
+            if start_wrist.shape[0] != 3:
+                continue
+            live_disp = end_wrist - start_wrist  # (3,)
+            live_mag = float(np.linalg.norm(live_disp))
+            # Motion-coherence gate: split the window in half, compare
+            # first-half wrist direction to second-half wrist direction.
+            # Real waves go one way; random jitter averages to nothing
+            # coherent. Fail-closed matches the pre-existing design:
+            # if we cannot compute coherence, we do NOT gate — same as
+            # when only two frames span the window in the old code.
+            mid_idx = (start_idx + len(frames) - 1) // 2
+            if mid_idx > start_idx and mid_idx < len(frames) - 1:
+                mid_wrist_raw = frames[mid_idx][2]
+                if mid_wrist_raw is not None:
+                    mid_wrist = np.asarray(mid_wrist_raw, dtype=np.float32).reshape(-1)
+                    if mid_wrist.shape[0] == 3:
+                        d1 = mid_wrist - start_wrist
+                        d2 = end_wrist - mid_wrist
+                        n1 = float(np.linalg.norm(d1))
+                        n2 = float(np.linalg.norm(d2))
+                        if n1 > 1e-4 and n2 > 1e-4:
+                            coherence = float(np.dot(d1 / n1, d2 / n2))
+                            if coherence < _INTENT_COHERENCE_MIN:
+                                if _dbg:
+                                    _dbg_log(
+                                        f"intent-skip incoherent tpl={tpl.name} "
+                                        f"coherence={coherence:.3f} "
+                                        f"need>={_INTENT_COHERENCE_MIN}"
+                                    )
+                                continue
+            if live_mag < 1e-4:
+                if _dbg:
+                    _dbg_log(
+                        f"intent-skip zero-mag tpl={tpl.name} "
+                        f"window={window:.2f}s frames={len(frames) - start_idx}"
+                    )
+                continue
+            live_dir = live_disp / live_mag
+            cos_sim = float(np.dot(live_dir, tpl_dir))
+            mag_frac = live_mag / max(tpl_mag, 1e-6)
+            if _dbg:
+                _dbg_log(
+                    f"intent tpl={tpl.name} cos={cos_sim:.3f} "
+                    f"mag_frac={mag_frac:.3f} live_mag={live_mag:.3f} "
+                    f"tpl_mag={tpl_mag:.3f} need_cos>={_INTENT_DIRECTION_COS_MIN} "
+                    f"need_mag_frac>={_INTENT_MAGNITUDE_MIN_FRAC}"
                 )
-
-        if not template_best:
+            if cos_sim < _INTENT_DIRECTION_COS_MIN:
+                continue
+            if mag_frac < _INTENT_MAGNITUDE_MIN_FRAC:
+                continue
+            # Score by direction confidence × magnitude fraction — higher
+            # is better. Cap mag_frac at 1.5 so an accidental huge motion
+            # doesn't win over a well-matched normal one.
+            score = cos_sim * min(mag_frac, 1.5)
+            distance = 1.0 - cos_sim  # for ordering with SPRING semantics
+            if best_fire is None or score > best_fire[0]:
+                best_fire = (
+                    float(score), str(tpl.name), int(tpl_idx),
+                    float(cos_sim), float(mag_frac), float(distance),
+                )
+        if best_fire is None:
             return None
-        # Sort ascending so [0] is the closest template.
-        template_best.sort(key=lambda item: item[0])
-        winner_dist, winner_tpl, winner_sample = template_best[0]
-        # v1.1.8.1: top-1 vs top-2 confidence gap. With multiple
-        # registered gestures, insist that the winner is meaningfully
-        # closer than the runner-up. Single-template deployments skip
-        # this check.
-        if len(template_best) >= 2:
-            runner_up_dist = template_best[1][0]
-            if (runner_up_dist - winner_dist) < _TOP2_MARGIN:
-                return None
+        # Fire!
+        self._spring_cooldown_until = timestamp + _INTENT_COOLDOWN_SECONDS
+        # Also clear SPRING running-mins so it doesn't fire right after.
+        for row in self._spring_matchers:
+            for m in row:
+                m.clear_running_min()
+        for row in self._spring_recent_norms:
+            for buf in row:
+                buf.clear()
+        if _dbg:
+            _dbg_log(
+                f"FIRE-INTENT tpl={best_fire[1]} cos={best_fire[3]:.3f} "
+                f"mag_frac={best_fire[4]:.3f} score={best_fire[0]:.3f}"
+            )
         return Match(
-            gesture_name=winner_tpl.name,
-            distance=float(winner_dist),
-            matched_sample_index=int(winner_sample),
-            segment_frame_count=int(len(segment)),
+            gesture_name=best_fire[1],
+            distance=best_fire[5],
+            matched_sample_index=0,
+            segment_frame_count=0,
             timestamp=float(timestamp),
         )
 
+    # ---- SPRING streaming path ----
+
+    def _spring_frame_update(
+        self,
+        timestamp: float,
+        landmarks_normalized: np.ndarray,
+        wrist_entry: Optional[np.ndarray],
+    ) -> Optional[Match]:
+        """v1.1.8.2 streaming SPRING driver. Called every frame.
+        Feeds each template's SpringMatchers, then applies the firing
+        rule: cost dipped below threshold + has risen 2 frames past
+        the low + motion-into-pose was seen recently + top-1/top-2
+        margin. Returns Match at motion peak, or None."""
+        if self._spring_disabled or not self._spring_matchers:
+            return None
+        # Cooldown: skip until _spring_cooldown_until (blocks re-fire on
+        # returning-to-rest motion after a legit fire).
+        if timestamp < self._spring_cooldown_until:
+            return None
+        # Need at least 2 frames to compute velocity. Bootstrap silently.
+        if len(self._frames) < 2:
+            return None
+        # Build the single-frame feature vector for THIS frame using the
+        # same builder templates use. Reuse the trailing wrist entry to
+        # compute a live velocity. Callers that don't supply wrist data
+        # get zero-velocity wrist features — finger channel still works.
+        prev_ts = float(self._frames[-2][0])
+        prev_wrist_raw = self._frames[-2][2]
+        prev_wrist_np = (
+            np.asarray(prev_wrist_raw, dtype=np.float32).reshape(3)
+            if prev_wrist_raw is not None else np.zeros(3, dtype=np.float32)
+        )
+        curr_wrist_np = (
+            np.asarray(wrist_entry, dtype=np.float32).reshape(3)
+            if wrist_entry is not None else prev_wrist_np
+        )
+        _lm2 = np.stack([
+            self._frames[-2][1].astype(np.float32),
+            landmarks_normalized.astype(np.float32),
+        ], axis=0)
+        _wr2 = np.stack([prev_wrist_np, curr_wrist_np], axis=0)
+        _ts2 = np.array([prev_ts, timestamp], dtype=np.float64)
+
+        # v1.1.8.2 (post-audit) STEP 2: per-TEMPLATE candidate
+        # aggregation (samples of the same gesture are NOT competitors
+        # for the top-1/top-2 margin) + delta-based motion-into-pose
+        # gate that measures a real cost descent (`recent_max -
+        # min_cost`) rather than an unreachable absolute cost level.
+        best_fire: Optional[Tuple[float, str, int, int]] = None
+        second_best_norm: float = float("inf")
+        _dbg = _dbg_enabled()
+        for tpl_idx, tpl in enumerate(self._templates):
+            matchers = self._spring_matchers[tpl_idx]
+            if not matchers:
+                continue
+            key_indices = list(tpl.key_point_indices)
+            if not key_indices:
+                continue
+            try:
+                feats2 = build_dynamic_features(_lm2, _wr2, _ts2, key_indices)
+            except Exception:
+                continue
+            if feats2.shape[0] < 2:
+                continue
+            live_feat = feats2[1]
+            threshold = (
+                tpl.match_threshold
+                if tpl.match_threshold is not None
+                else self._match_threshold
+            )
+            # Per-template best across its N samples (aggregation by
+            # min, NOT competition — 3 clustered samples of the same
+            # gesture were killing the top-1/top-2 gate).
+            tpl_best: Optional[Tuple[float, int]] = None
+            for sample_idx, matcher in enumerate(matchers):
+                if matcher._F != live_feat.shape[0]:
+                    continue
+                try:
+                    cur_norm, cur_start, is_rising, min_cost, min_start, min_at_t = (
+                        matcher.step(live_feat)
+                    )
+                except Exception:
+                    continue
+                buf = self._spring_recent_norms[tpl_idx][sample_idx]
+                buf.append(float(cur_norm))
+                # Gate (a): rising streak ≥ _SPRING_RISE_FRAMES (encoded in is_rising)
+                if not is_rising:
+                    if _dbg:
+                        _dbg_log(
+                            f"skip is_rising=False tpl={tpl.name} s={sample_idx} "
+                            f"cur={cur_norm:.3f} min={min_cost:.3f} thr={threshold:.3f}"
+                        )
+                    continue
+                # Gate (b): running min below template threshold
+                if min_cost >= threshold:
+                    if _dbg:
+                        _dbg_log(
+                            f"skip min>=thr tpl={tpl.name} s={sample_idx} "
+                            f"min={min_cost:.3f} thr={threshold:.3f}"
+                        )
+                    continue
+                # Gate (c): delta-based motion-into-pose. `recent_max -
+                # min_cost` proves a real descent; `recent_max >=
+                # min_abs` floor blocks pure-jitter micro-descents.
+                recent_max = max(buf) if buf else float(cur_norm)
+                descent = recent_max - float(min_cost)
+                if (
+                    descent < _SPRING_MOTION_INTO_POSE_DELTA
+                    or recent_max < _SPRING_MOTION_INTO_POSE_MIN_ABS
+                ):
+                    if _dbg:
+                        _dbg_log(
+                            f"skip no-descent tpl={tpl.name} s={sample_idx} "
+                            f"recent_max={recent_max:.3f} min={min_cost:.3f} "
+                            f"descent={descent:.3f} "
+                            f"need_delta>={_SPRING_MOTION_INTO_POSE_DELTA} "
+                            f"need_abs>={_SPRING_MOTION_INTO_POSE_MIN_ABS}"
+                        )
+                    continue
+                # Passing candidate → aggregate per-template.
+                if tpl_best is None or min_cost < tpl_best[0]:
+                    tpl_best = (float(min_cost), int(sample_idx))
+            if tpl_best is None:
+                continue
+            # Global best/second across TEMPLATES only.
+            entry = (tpl_best[0], str(tpl.name), tpl_idx, tpl_best[1])
+            if best_fire is None or entry[0] < best_fire[0]:
+                if best_fire is not None:
+                    second_best_norm = min(second_best_norm, best_fire[0])
+                best_fire = entry
+            elif entry[0] < second_best_norm:
+                second_best_norm = entry[0]
+
+        if best_fire is None:
+            return None
+        # Top-1 vs top-2 margin — only meaningful when we have >= 2
+        # DIFFERENT competing templates. Same-gesture sibling samples
+        # were aggregated above, so this only fires on real ambiguity.
+        if (
+            second_best_norm != float("inf")
+            and (second_best_norm - best_fire[0]) < _TOP2_MARGIN
+        ):
+            if _dbg:
+                _dbg_log(
+                    f"skip top2 winner={best_fire[1]} winner_cost={best_fire[0]:.3f} "
+                    f"runner_up={second_best_norm:.3f} margin={second_best_norm - best_fire[0]:.3f}"
+                )
+            return None
+        if _dbg:
+            _dbg_log(
+                f"FIRE tpl={best_fire[1]} sample={best_fire[3]} min_cost={best_fire[0]:.3f} "
+                f"ts={timestamp:.3f} runner_up={second_best_norm if second_best_norm != float('inf') else -1:.3f}"
+            )
+
+        # Fire! Blank all matchers for the cooldown window so returning-
+        # to-rest motion doesn't retrigger.
+        self._spring_cooldown_until = timestamp + _SPRING_COOLDOWN_SECONDS
+        for row in self._spring_matchers:
+            for m in row:
+                m.clear_running_min()
+        # Also drain the recent-norm buffers so the next candidate's
+        # motion-into-pose gate re-arms cleanly.
+        for row in self._spring_recent_norms:
+            for buf in row:
+                buf.clear()
+        min_cost, name, tpl_idx, sample_idx = best_fire
+        return Match(
+            gesture_name=name,
+            distance=float(min_cost),
+            matched_sample_index=int(sample_idx),
+            segment_frame_count=0,  # SPRING has no discrete segment
+            timestamp=float(timestamp),
+        )
+
+    # v1.1.8.2: `_close_and_match` was DELETED. All of the segment-DTW
+    # close-time matching, timeout quality gate, and per-template
+    # scoring lives in the streaming SPRING path above.
+
 
 # ---------------------------------------------------------------------------
-# DTW
+# DTW (kept as a utility — still consumed by tests + registered-legacy
+# runtime threshold computation. Not called from the classifier itself
+# after the v1.1.8.2 SPRING rewrite.)
 
 def _dtw_distance(a: np.ndarray, b: np.ndarray, *, band: int = _DTW_BAND) -> float:
     """Sakoe-Chiba-banded DTW returning a length-normalized cost.
@@ -658,7 +1107,15 @@ def build_template_from_takes(
     """
     sample_trajectories: List[np.ndarray] = []
     wrist_trajectories: List[np.ndarray] = []
+    sample_features: List[np.ndarray] = []
     indices = list(int(i) for i in key_point_indices)
+    # v1.1.8.2: motion-onset trim was DISABLED here after synthetic
+    # tests showed it distorted the template shape enough that live
+    # takes no longer aligned (trim removed ~20% of the take, then
+    # resampling to 32 frames warped the remaining motion by the
+    # inverse ratio). Kept the trim_to_motion helper available on
+    # DynamicGestureTake for the recorder to invoke manually on
+    # cleanly-recorded real-hand takes if it wants tighter alignment.
     for take in takes:
         resampled = take.resampled(resampled_length)  # (L, 21, 3)
         # Subtract per-frame wrist so the stored template lives in
@@ -683,37 +1140,145 @@ def build_template_from_takes(
         # wrist_motion_strength computed below is unchanged.
         wrist_resampled = wrist_resampled - wrist_resampled[0:1]
         wrist_trajectories.append(wrist_resampled)
+        # v1.1.8.2: build SPRING features from the resampled take. Use
+        # the take's own timestamps (resampled to match) so velocity dt
+        # is real — a template built with dt=1/30 fixed would drift on
+        # any take that was recorded at other fps.
+        try:
+            ts_resampled = take.resampled_timestamps(resampled_length)
+            # v1.1.8.2 (post-audit) STEP 5: pass `normalized` (wrist-
+            # subtracted landmarks), not `resampled`, so template
+            # features match the LIVE feature builder — which sees
+            # normalize_frame's output. For recorder-produced takes
+            # this is a no-op (already wrist-subtracted). For synthetic
+            # / dev-tool takes that carry whole-hand translation this
+            # was inflating template position + fingertip-velocity
+            # channels by orders of magnitude and made the synthetic
+            # regression test blind to real recall problems.
+            feats = build_dynamic_features(
+                normalized, wrist_resampled, ts_resampled, indices,
+            )
+            # v1.1.8.2 (post-audit) STEP 4: backfill row-0 velocity with
+            # row-1 values so the template's first frame doesn't have a
+            # hard-zero velocity block. Live features always come from a
+            # 2-frame window so their velocity is REAL — hard-zero on
+            # template row 0 was producing a spurious ~0.05-0.30 cost
+            # penalty on any warp path touching row 0.
+            if feats.shape[0] >= 2:
+                # Only the velocity columns need patching. Position
+                # columns are frame-0 already correct.
+                key_count = len(indices)
+                pos_end = 3 * key_count
+                feats[0, pos_end:] = feats[1, pos_end:]
+            sample_features.append(feats.astype(np.float32))
+        except Exception:
+            sample_features.append(np.zeros((resampled_length, 1), dtype=np.float32))
     strength = _wrist_motion_strength_from_trajectories(wrist_trajectories)
 
-    # v1.1.8.1: PER-TEMPLATE AUTO-THRESHOLD. Compute pairwise DTW
-    # between every pair of takes; the template's threshold is
-    # 1.8 * median + 0.05, clamped to [0.22, 0.30]. Users who record
-    # tight consistent takes get a tight gate (fewer false positives);
-    # users whose takes vary more get a looser gate (better recall on
-    # their own gestures). Floor 0.22 preserves the pre-fix effective
-    # tightness for very-consistent recorders; ceiling 0.30 caps how
-    # loose we let a sloppy template become. Skipped when caller
-    # already supplied match_threshold explicitly.
-    auto_threshold: Optional[float] = None
-    if match_threshold is None and len(sample_trajectories) >= 2:
-        try:
-            pair_dists: List[float] = []
-            for i in range(len(sample_trajectories)):
-                fa = sample_trajectories[i].reshape(sample_trajectories[i].shape[0], -1)
-                for j in range(i + 1, len(sample_trajectories)):
-                    fb = sample_trajectories[j].reshape(sample_trajectories[j].shape[0], -1)
-                    if fa.shape[1] != fb.shape[1]:
-                        continue
-                    pair_dists.append(_dtw_distance(fa, fb, band=_DTW_BAND))
-            if pair_dists:
-                med = float(np.median(pair_dists))
-                auto_threshold = float(np.clip(med * 1.8 + 0.05, 0.22, 0.30))
-        except Exception:
-            auto_threshold = None
+    # v1.1.8.2.1 (post-audit round 3) — compute INTENT SIGNATURE from
+    # the ABSOLUTE wrist trajectory (palm-scaled, raw image axes).
+    # The previous round 2 version derived the signature from wrist-
+    # RELATIVE key-point displacement, but on real recorded takes the
+    # wrist landmark is already at (0, 0, 0) every frame (recorder
+    # normalizes), so start→end deltas collapsed to sub-palm-unit
+    # finger jitter — direction was random, magnitude near zero, and
+    # wave-up recall was ~0.
+    #
+    # Coordinate frame: WRIST_ABSOLUTE_PALM_SCALED (image axes:
+    # +X image-right, +Y image-down, +Z depth), divided by palm scale.
+    # Per-take displacement = wrist_palm_scaled[-1] - wrist_palm_scaled[0].
+    # Template signature: average direction unit vector + median
+    # magnitude + median window duration.
+    intent_direction: Optional[List[float]] = None
+    intent_magnitude: float = 0.0
+    intent_window_seconds: float = 0.0
+    try:
+        disp_vecs: List[np.ndarray] = []
+        magnitudes: List[float] = []
+        durations: List[float] = []
+        for take in takes:
+            wrist_traj = getattr(take, "wrist_palm_scaled", None)
+            if wrist_traj is None:
+                continue
+            wrist_traj = np.asarray(wrist_traj, dtype=np.float32)
+            if (
+                wrist_traj.ndim != 2
+                or wrist_traj.shape[0] < 2
+                or wrist_traj.shape[1] != 3
+            ):
+                continue
+            disp = wrist_traj[-1] - wrist_traj[0]  # (3,)
+            mag = float(np.linalg.norm(disp))
+            if mag < 1e-4:
+                continue
+            direction = disp / mag
+            disp_vecs.append(direction)
+            magnitudes.append(mag)
+            try:
+                durations.append(float(take.timestamps[-1] - take.timestamps[0]))
+            except Exception:
+                pass
+        if disp_vecs:
+            # Average direction (renormalized).
+            stacked = np.stack(disp_vecs, axis=0)  # (N, 3)
+            mean_dir = stacked.mean(axis=0)
+            n = float(np.linalg.norm(mean_dir))
+            if n > 1e-6:
+                intent_direction = (mean_dir / n).tolist()
+                intent_magnitude = float(np.median(magnitudes))
+                intent_window_seconds = float(np.median(durations)) if durations else 1.0
+                # Clamp window between 0.4 and 2.0 seconds
+                intent_window_seconds = max(0.4, min(2.0, intent_window_seconds))
+    except Exception:
+        pass
 
-    effective_threshold = (
-        match_threshold if match_threshold is not None else auto_threshold
-    )
+    # v1.1.8.2: DTW-based pairwise auto-threshold DELETED. SPRING-native
+    # pairwise self-scoring below produces the threshold in the same
+    # feature/cost space live matching will use.
+    effective_threshold = match_threshold
+
+    # v1.1.8.2 SPRING-native auto-threshold. Run SpringMatcher(take_i)
+    # over take_j as the stream and record its minimum cost. The
+    # pairwise minimum captures how well the takes SPRING-align against
+    # each other in the same feature space live matching will use.
+    # Formula: 1.4 * median(pairwise_min) + 0.05, clamped [0.18, 0.28].
+    # Tighter than the legacy DTW threshold because SPRING's local min
+    # is sharper than the batch-DTW average.
+    if effective_threshold is None and len(sample_features) >= 2:
+        try:
+            spring_mins: List[float] = []
+            for i in range(len(sample_features)):
+                for j in range(len(sample_features)):
+                    if i == j:
+                        continue
+                    matcher = SpringMatcher(sample_features[i])
+                    stream = sample_features[j]
+                    best = float("inf")
+                    for row in stream:
+                        cur, _s, _r, mn, _ms, _mt = matcher.step(row)
+                        if mn < best:
+                            best = mn
+                    if best != float("inf"):
+                        spring_mins.append(best)
+            if spring_mins:
+                med = float(np.median(spring_mins))
+                # v1.1.8.2 (post-audit): tightened. Formula
+                # 1.35 * median + 0.15 (was 1.5 * median + 0.3),
+                # clamp [0.6, 2.0] (was [0.5, 2.5]). On simulated real-
+                # hand data with jitter, median_pairwise runs ~1.13 →
+                # threshold 1.53 (was 2.0 clamped). This puts the
+                # threshold BELOW the achievable running_min ceiling so
+                # the min < threshold gate can actually be crossed.
+                effective_threshold = float(np.clip(med * 1.35 + 0.15, 0.6, 2.0))
+                if _dbg_enabled():
+                    _dbg_log(
+                        f"threshold_auto tpl={name} median_pairwise={med:.3f} "
+                        f"threshold={effective_threshold:.3f} "
+                        f"n_takes={len(sample_features)} n_pairwise={len(spring_mins)}"
+                    )
+        except Exception:
+            pass
+
     return DynamicGestureTemplate(
         name=str(name),
         key_point_indices=indices,
@@ -721,6 +1286,10 @@ def build_template_from_takes(
         wrist_trajectories=wrist_trajectories,
         wrist_motion_strength=float(strength),
         match_threshold=effective_threshold,
+        sample_features=sample_features,
+        intent_direction=intent_direction,
+        intent_magnitude=intent_magnitude,
+        intent_window_seconds=intent_window_seconds,
     )
 
 

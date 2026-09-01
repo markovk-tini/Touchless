@@ -63,6 +63,14 @@ class UpdateDialog(QDialog):
         # r51 fix: scope background to body only (see spotify_setup_wizard).
         body.setObjectName("updateDialogBody")
         body.setStyleSheet("QWidget#updateDialogBody { background: #0B3D91; }")
+        # Hardening: stash the indigo-chrome body widget so _build_ui can
+        # parent its QVBoxLayout to it. Previous revision referenced a
+        # bare `body` name inside _build_ui which raised NameError and
+        # prevented the dialog from constructing at all — meaning every
+        # z-order / topmost fix downstream was moot because the dialog
+        # never existed to be raised. (Adversarial finding: pre-existing
+        # bug that defeated every other fix.)
+        self._body = body
         self._info = info
         self._showing_changelog = False
         self.setWindowTitle("Touchless Update Available")
@@ -127,7 +135,7 @@ class UpdateDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(body)
+        layout = QVBoxLayout(self._body)
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(10)
 
@@ -299,12 +307,46 @@ class UpdateDialog(QDialog):
         try:
             parent = self.parent()
             rect = self.frameGeometry()
-            if parent is not None and hasattr(parent, "isVisible") and parent.isVisible():
-                rect.moveCenter(parent.frameGeometry().center())
-            else:
+            # Hardening: prefer the parent's center ONLY when it's on a
+            # real, currently-live screen. A minimized main window on
+            # Windows reports geometry at ~(-32000,-32000), and a
+            # secondary monitor that was unplugged since app-start still
+            # has a valid virtual coordinate that no display can show.
+            # Both cases used to leave the dialog off-screen and
+            # unreachable. Fall through to primaryScreen center on any
+            # such condition.
+            target_screen = None
+            parent_ok = False
+            if parent is not None:
+                try:
+                    if (
+                        hasattr(parent, "isVisible") and parent.isVisible()
+                        and not (hasattr(parent, "isMinimized") and parent.isMinimized())
+                    ):
+                        parent_rect = parent.frameGeometry()
+                        parent_center = parent_rect.center()
+                        target_screen = QGuiApplication.screenAt(parent_center)
+                        if target_screen is not None:
+                            rect.moveCenter(parent_center)
+                            parent_ok = True
+                except Exception:
+                    parent_ok = False
+            if not parent_ok:
                 screen = QGuiApplication.primaryScreen()
                 if screen is not None:
+                    target_screen = screen
                     rect.moveCenter(screen.availableGeometry().center())
+            # Clamp the final rect back inside the chosen screen's
+            # availableGeometry so a large dialog on a small monitor
+            # can't overflow past the taskbar / screen edge.
+            if target_screen is not None:
+                try:
+                    avail = target_screen.availableGeometry()
+                    x = max(avail.left(), min(rect.left(), avail.right() - rect.width()))
+                    y = max(avail.top(), min(rect.top(), avail.bottom() - rect.height()))
+                    rect.moveTo(x, y)
+                except Exception:
+                    pass
             self.move(rect.topLeft())
         except Exception:
             pass

@@ -66,7 +66,21 @@ the Cloudflare URL.
    - Do **not** attach the full `Touchless_Installer.exe` to the
      GitHub release — it's too big and lives on Cloudflare.
 
-6. **Validate the release before publishing**:
+6. **Verify the update popup appears in the installed app**:
+   - Install the PREVIOUS shipped version (N-1) on a clean VM or
+     spare machine and launch it.
+   - Point its release_checker at the new version (draft release
+     with markers is the least invasive way — see the smoke-test
+     section below for the other options).
+   - Confirm within 15 seconds that the update dialog surfaces,
+     sits above the main window, renders the target version string
+     and download-size text correctly, and that "Download Update"
+     is clickable.
+   - Full procedure and stop-ship criteria are in "Update-popup
+     smoke test (REQUIRED before every release)" below. If any
+     check fails, HALT the release.
+
+7. **Validate the release before publishing**:
    ```
    python tools/validate_release.py v1.0.6
    ```
@@ -77,7 +91,49 @@ the Cloudflare URL.
    - The installer marker is present and the Cloudflare URL is
      reachable.
 
-7. **Publish**.
+8. **Publish**.
+
+## Update-popup smoke test (REQUIRED before every release)
+
+Before pushing the release tag, verify the update popup will reach
+existing users on the previous shipped version.
+
+**Why this exists.** In 1.1.7 the chrome refactor made the update
+popup invisible on Windows (z-order behind main window). The bug
+rode through 1.1.8 undetected because there was no in-house test
+for "does the popup actually appear when a previous version checks
+for updates." 1.1.8.1 fixed it, and this checklist step exists so
+we can't repeat the mistake.
+
+**Steps:**
+
+1. On a clean VM or spare machine, install the PREVIOUS shipped
+   version (e.g. installer for version N-1 that's currently on
+   GitHub Releases).
+2. Point that install's release_checker at a mock manifest that
+   names the version you're about to ship. Either:
+   - Push a draft release to GitHub with the new tag +
+     `full-installer-url` marker, OR
+   - Temporarily monkey-patch `RELEASE_CHECK_URL` to a
+     locally-served JSON, OR
+   - Simplest: use `Update.check_for_updates_now()` from the debug
+     menu once a real preview release exists.
+3. Launch the previous-version app.
+4. Confirm within 15 seconds:
+   - The `UpdateDialog` is visibly on-screen (not hidden behind
+     the main window).
+   - It sits above the main window even if the main window has
+     focus.
+   - The "Download Update" button is clickable.
+   - If dismissed with "Later" and re-launched, the dialog
+     re-appears next launch (assuming no dismissal was persisted).
+   - Tray icon shows a balloon at least once as a fallback.
+5. If any check fails, HALT the release. This is a stop-ship gap.
+
+**If auto-update is enabled** on the previous version and the new
+version's kind is app-zip, the check is that the silent path
+completes and the user sees a tray notification ("Touchless
+updated to X.Y.Z"). Verify that path too.
 
 ## What if I don't change ML deps for a release?
 
