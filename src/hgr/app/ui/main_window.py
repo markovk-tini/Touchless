@@ -6256,6 +6256,7 @@ class MainWindow(QMainWindow):
             self._tray_icon.resume_requested.connect(self._on_tray_resume)
             self._tray_icon.settings_requested.connect(self._on_tray_settings)
             self._tray_icon.quit_requested.connect(self._on_tray_quit)
+            self._tray_icon.message_clicked.connect(self._on_tray_message_clicked)
             # Mirror the tray's state icon onto the window icon so the
             # TASKBAR entry (much more visible than the hidden-tray
             # popout) shows the same colour cue. Also set it once
@@ -6866,8 +6867,8 @@ class MainWindow(QMainWindow):
         # v1.1.8.1 dialog-visibility safety net. Even with the
         # WindowStaysOnTopHint fix in update_dialog.py, we double up
         # with a tray balloon so users on any future frameless-window
-        # regression still see the notification. The tray messageClicked
-        # signal re-fires the show/raise/activate sequence.
+        # regression still see the notification. Clicking the balloon
+        # re-fires show/raise/activate via _on_tray_message_clicked.
         try:
             tray = getattr(self, "_tray_icon", None)
             if tray is not None and hasattr(tray, "showMessage"):
@@ -6876,6 +6877,32 @@ class MainWindow(QMainWindow):
                     f"Touchless {info.version} is ready to install. Click to open the installer.",
                     msecs=8000,
                 )
+        except Exception:
+            pass
+
+    def _on_tray_message_clicked(self) -> None:
+        """Balloon click: bring the update dialog (or main window) forward.
+
+        The 1.1.7 / 1.1.8 invisible-popup bug left users with no on-screen
+        dialog. The balloon is the fallback; clicking it must surface
+        something even if the frameless dialog is still behind the parent.
+        """
+        try:
+            if hasattr(self, "isMinimized") and self.isMinimized():
+                self.showNormal()
+            elif hasattr(self, "isHidden") and self.isHidden():
+                self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        dlg = getattr(self, "_update_dialog", None)
+        if dlg is None:
+            return
+        try:
+            dlg.show()
+            dlg.raise_()
+            dlg.activateWindow()
         except Exception:
             pass
 
@@ -12975,7 +13002,20 @@ class MainWindow(QMainWindow):
                     name=result.name,
                     description=result.description,
                     action=result.action,
-                    duration_mode=result.duration_mode or "fixed_short",
+                    duration_mode=result.duration_mode or "until_stopped",
+                    parent=self,
+                    config=self.config,
+                )
+            elif gesture_type == "pose_sequence":
+                from .pose_sequence_recorder_window import (
+                    PoseSequenceRecorderWindow,
+                )
+                recorder = PoseSequenceRecorderWindow(
+                    worker=worker,
+                    accent_color=accent,
+                    name=result.name,
+                    description=result.description,
+                    action=result.action,
                     parent=self,
                     config=self.config,
                 )
@@ -13303,17 +13343,19 @@ class MainWindow(QMainWindow):
             initial_cooldown=initial_cooldown,
             initial_action_kind=action_kind if action_kind != "noop" else None,
             initial_action_value=initial_value,
+            initial_gesture_type=str(getattr(existing, "kind", "static") or "static"),
+            initial_duration_mode=str(getattr(existing, "duration_mode", "") or ""),
             original_name=existing.name,
         )
         if wizard.exec() != QDialog.DialogCode.Accepted or wizard.result_payload is None:
             return
         result = wizard.result_payload
 
-        # Save back in place — keep the existing recorded samples,
-        # handedness, AND the user-picked thumbnail image. Editing
-        # only changes metadata + action. If the user changed the
-        # name, remove the old entry AND rename the thumbnail file
-        # so the new entry's image_filename still resolves on disk.
+        # Save back in place — keep the existing recorded samples /
+        # trajectories / sequence steps, handedness, AND the user-picked
+        # thumbnail image. Editing only changes metadata + action. If
+        # the user changed the name, rename the thumbnail file so the
+        # new entry's image_filename still resolves on disk.
         previous_image_filename = str(getattr(existing, "image_filename", "") or "")
         new_image_filename = previous_image_filename
         if result.name != existing.name and previous_image_filename:
@@ -13338,17 +13380,18 @@ class MainWindow(QMainWindow):
                 # the image still resolves under the prior name even
                 # if the new entry's display name differs.
                 new_image_filename = previous_image_filename
-        if result.name != existing.name:
-            registry.remove(existing.name)
         try:
-            registry.add(
+            registry.replace_metadata(
+                existing.name,
                 name=result.name,
-                samples=existing.samples,
                 action=result.action,
                 description=result.description,
-                overwrite=True,
-                handedness=existing.handedness,  # preserve recorded hand
-                image_filename=new_image_filename,  # preserve the picked image
+                image_filename=new_image_filename,
+                duration_mode=(
+                    result.duration_mode
+                    if str(getattr(existing, "kind", "") or "") == "dynamic"
+                    else None
+                ),
             )
         except ValueError as exc:
             QMessageBox.critical(self, "Edit failed", str(exc))

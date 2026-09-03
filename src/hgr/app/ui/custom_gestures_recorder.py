@@ -65,7 +65,27 @@ from hgr.custom_gestures.registry import (
 )
 
 from .custom_gestures_chrome import apply_touchless_titlebar
+from .custom_gestures_recording_help import (
+    ExpandableHelpPanel,
+    RecordingConsistencyTip,
+)
 
+
+_STATIC_SUMMARY = (
+    "Use <b>Static</b> for a single held hand shape (thumbs-up, OK, open palm, "
+    "etc.). Hold the pose while Touchless samples many frames, then save."
+)
+_STATIC_DETAILS = (
+    "<p style='margin:0 0 6px 0;'><b>Good for:</b> one pose that triggers an "
+    "action after a short hold.</p>"
+    "<p style='margin:0 0 6px 0;'><b>Don’t use for:</b> motion paths (use "
+    "<b>Dynamic</b>) or several poses in order (use <b>Sequence</b>).</p>"
+    "<p style='margin:0 0 6px 0;'><b>How to record:</b> hold the pose, press "
+    "Begin / Space, keep fingertips visible, and let the hand drift slightly "
+    "so the classifier learns your real range.</p>"
+    "<p style='margin:0;'><b>Limits:</b> one hand; avoid heavy finger "
+    "occlusion; hold-to-activate / cooldown are set in the wizard.</p>"
+)
 
 _TARGET_SAMPLES = 100
 _CAPTURE_INTERVAL_FRAMES = 3
@@ -166,6 +186,12 @@ class RecordingWindow(QDialog):
         if not self._camera_connect_attempted:
             self._camera_connect_attempted = True
             QTimer.singleShot(0, self._deferred_connect)
+        # Tip overlay on the live view — once per open.
+        if not getattr(self, "_consistency_tip_shown", False):
+            self._consistency_tip_shown = True
+            tip = getattr(self, "_consistency_tip", None)
+            if tip is not None:
+                QTimer.singleShot(0, lambda: tip.attach(self._video_label))
 
     def _deferred_connect(self) -> None:
         self._video_label.setText("Connecting to camera...")
@@ -213,13 +239,17 @@ class RecordingWindow(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
 
-        self._instructions = QLabel(
-            "Hold your gesture in front of the camera, then click "
-            "<b>Begin Recording</b> or press <b>Spacebar</b>. Let your "
-            "hand drift naturally during the ~10-second capture so the "
-            "classifier learns your real range."
+        self._help = ExpandableHelpPanel(
+            summary_html=(
+                f"{_STATIC_SUMMARY} Click <b>Begin Recording</b> or press "
+                f"<b>Spacebar</b>."
+            ),
+            details_html=_STATIC_DETAILS,
         )
-        self._instructions.setWordWrap(True)
+        root.addWidget(self._help)
+
+        self._instructions = QLabel("")
+        self._instructions.hide()
         root.addWidget(self._instructions)
 
         self._video_label = QLabel("Waiting for camera frames...")
@@ -252,6 +282,9 @@ class RecordingWindow(QDialog):
             "}"
         )
         self._complete_overlay.hide()
+
+        self._consistency_tip = RecordingConsistencyTip(self._video_label)
+        # Shown once the dialog is on screen (showEvent) so geometry is known.
 
         self._progress_label = QLabel(
             f"Samples captured: 0 / {_TARGET_SAMPLES}"

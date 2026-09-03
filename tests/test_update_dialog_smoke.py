@@ -16,6 +16,16 @@ This test does the minimum needed to detect that class of bug:
   4. Assert the version comparator we depend on ranks releases the
      way we assume (dismissed 1.1.9rc1 does NOT swallow 1.1.9 final;
      1.1.8.1 > 1.1.8).
+  5. Assert the 1.1.7 z-order flags (FramelessWindowHint AND
+     WindowStaysOnTopHint) survive construction, including when the
+     dialog is parented to a shown window.
+  6. Assert the tray-balloon fallback is actually callable
+     (`TouchlessTrayIcon.showMessage`) so `hasattr(tray, "showMessage")`
+     in MainWindow cannot go dead again.
+
+Offscreen Qt cannot prove compositor z-order on real Windows. That
+remains a human eyeball stop-ship in docs/UPDATE_RELEASE_CHECKLIST.md.
+These tests pin everything that *can* be pinned in CI.
 
 Referenced by PUBLISHING_POLICY.md as a STOP-SHIP rule.
 """
@@ -37,10 +47,10 @@ class UpdateDialogSmokeTests(unittest.TestCase):
     def _make_info(self, **overrides):
         from hgr.app.updater.release_checker import ReleaseInfo
         defaults = dict(
-            version="1.1.9",
+            version="1.1.10",
             body="## Test\n- item one\n- item two",
             download_url="https://example.com/x.exe",
-            html_url="https://github.com/example/example/releases/tag/v1.1.9",
+            html_url="https://github.com/example/example/releases/tag/v1.1.10",
             size_bytes=140_000_000,
             update_kind="full-exe",
         )
@@ -119,6 +129,101 @@ class UpdateDialogSmokeTests(unittest.TestCase):
             _is_newer("1.1.7", "1.1.8"),
             "older version must NOT be considered newer",
         )
+
+    def test_dialog_keeps_stays_on_top_and_frameless_flags(self) -> None:
+        """1.1.7 regression: r51 indigo chrome sets FramelessWindowHint,
+        which on Windows hid the dialog behind the parent. The 1.1.8.1
+        fix adds WindowStaysOnTopHint AFTER chrome. If either flag is
+        missing after construction, do not ship — isVisible() on the
+        offscreen platform would still pass."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QWidget
+        from hgr.app.updater.update_dialog import UpdateDialog
+
+        parent = QWidget()
+        parent.show()
+        self._app.processEvents()
+        dlg = UpdateDialog(self._make_info(), parent=parent)
+        try:
+            dlg.show()
+            self._app.processEvents()
+            flags = dlg.windowFlags()
+            self.assertTrue(
+                bool(flags & Qt.FramelessWindowHint),
+                "indigo chrome must still set FramelessWindowHint",
+            )
+            self.assertTrue(
+                bool(flags & Qt.WindowStaysOnTopHint),
+                "WindowStaysOnTopHint must survive install_indigo_chrome "
+                "(1.1.7 / 1.1.8 invisible-popup regression).",
+            )
+            self.assertTrue(hasattr(dlg, "_force_to_front"))
+            self.assertTrue(dlg.isVisible())
+        finally:
+            dlg.close()
+            dlg.deleteLater()
+            parent.close()
+            parent.deleteLater()
+
+    def test_dialog_download_button_is_usable(self) -> None:
+        """Human smoke test also requires a clickable Download Update
+        button with the new version in the title. Pin that in CI so a
+        construction-only pass can't hide a missing primary action."""
+        from hgr.app.updater.update_dialog import UpdateDialog
+        dlg = UpdateDialog(self._make_info(version="1.1.10", size_bytes=140_000_000), parent=None)
+        try:
+            dlg.show()
+            self._app.processEvents()
+            self.assertTrue(hasattr(dlg, "download_button"))
+            self.assertEqual(dlg.download_button.text(), "Download Update")
+            self.assertTrue(dlg.download_button.isEnabled())
+            from PySide6.QtWidgets import QLabel
+            labels = [w.text() for w in dlg.findChildren(QLabel) if w.text()]
+            self.assertTrue(
+                any("1.1.10" in text for text in labels),
+                f"version string must appear in the dialog labels, got {labels!r}",
+            )
+            self.assertTrue(
+                any("MB" in text or "download" in text.lower() for text in labels),
+                f"size/kind subtitle must appear in the dialog labels, got {labels!r}",
+            )
+        finally:
+            dlg.close()
+            dlg.deleteLater()
+
+    def test_tray_icon_exposes_show_message(self) -> None:
+        """The 1.1.7 / 1.1.8 safety net called showMessage on
+        TouchlessTrayIcon. That wrapper had no such method, so
+        hasattr(...) was False and the balloon never fired. This
+        assertion is the pin — do not delete it."""
+        from PySide6.QtGui import QIcon
+        from hgr.app.ui.tray_icon import TouchlessTrayIcon
+
+        tray = TouchlessTrayIcon(QIcon())
+        self.assertTrue(
+            hasattr(tray, "showMessage"),
+            "TouchlessTrayIcon.showMessage must exist so MainWindow's "
+            "update-popup balloon fallback actually runs.",
+        )
+        self.assertTrue(hasattr(tray, "message_clicked"))
+        tray.showMessage("t", "m", msecs=1)
+
+    def test_on_update_available_fires_tray_balloon(self) -> None:
+        """Both the website and Store branches of _on_update_available
+        must attempt a tray balloon. A refactor that drops showMessage
+        from either path re-creates the 1.1.8.1 Store-cohort gap."""
+        import inspect
+        from hgr.app.ui.main_window import MainWindow
+
+        src = inspect.getsource(MainWindow._on_update_available)
+        self.assertGreaterEqual(
+            src.count("showMessage"),
+            2,
+            "_on_update_available must call showMessage on both the "
+            "Store branch and the website-installer branch",
+        )
+        inspect.getsource(MainWindow._on_tray_message_clicked)
+        self.assertTrue(callable(MainWindow._on_tray_message_clicked))
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import subprocess
 import time
 import webbrowser
 from ctypes import wintypes
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 from .registry import Action
 
@@ -217,14 +217,48 @@ def execute_hotkey(keys: Iterable[str]) -> bool:
 
 def execute_text(text: str) -> bool:
     """Type a literal string via Unicode key events. Slower than clipboard
-    paste but avoids clobbering the clipboard and works in more targets."""
+    paste but avoids clobbering the clipboard and works in more targets.
+
+    Characters are sent exactly as stored — no URL-encoding, escaping,
+    or other substitution (a space stays a space, never '%20')."""
     events: List[_INPUT] = []
     for ch in text:
         events.extend(_unicode_press(ch))
     return _send_inputs(events)
 
 
+def _mistaken_https_plain_text(url: str) -> Optional[str]:
+    """Detect legacy payloads like 'https://my snap' where the wizard
+    auto-prefixed https:// onto plain words. Those open in a browser as
+    'https://my%20snap'. Returns the literal text to type instead, or
+    None when `url` looks like a real URL."""
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    lower = raw.lower()
+    prefix = ""
+    for candidate in ("https://", "http://"):
+        if lower.startswith(candidate):
+            prefix = candidate
+            break
+    if not prefix:
+        return None
+    rest = raw[len(prefix):]
+    host = rest.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    # Real hosts have a dot (example.com) or no whitespace. Spaced
+    # hosts with no dot were almost certainly meant as typed text.
+    if " " in host and "." not in host and ":" not in host:
+        return rest
+    return None
+
+
 def execute_open_url(url: str) -> bool:
+    # Never percent-encode in our layer. If this was plain text that
+    # accidentally got an https:// prefix, type it literally instead
+    # of handing the browser a space that becomes %20.
+    plain = _mistaken_https_plain_text(url)
+    if plain is not None:
+        return execute_text(plain)
     try:
         return bool(webbrowser.open(url))
     except Exception:

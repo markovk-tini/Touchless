@@ -8,11 +8,11 @@ start/stop signals.
 Three duration modes are supported (matching the UI radio buttons
 the wizard exposes):
 
-  * FIXED_SHORT (1.5 seconds): start collecting on `begin_take()`,
-    auto-stop after 1.5 s of real wall-clock time.
-  * FIXED_LONG (3 seconds): same, but 3 s.
   * UNTIL_STOPPED: collect until the caller fires `end_take()`. UI
     binds this to "press Start, then press Stop / Space again".
+  * FIXED_1S / FIXED_2S / FIXED_3S: start collecting on `begin_take()`,
+    auto-stop after 1 / 2 / 3 s of real wall-clock time.
+  * Legacy FIXED_SHORT (1.5 s) / FIXED_LONG (3 s) still accepted.
 
 After 10 takes (or the configured target), the recorder is "full"
 and the caller can run `build_artifacts()` to project takes through
@@ -54,18 +54,25 @@ class DurationMode(str, Enum):
     radio-button data slugs so the wizard can pass strings straight
     through without a translation table."""
 
-    FIXED_SHORT = "fixed_short"   # 1.5 s auto-stop
-    FIXED_LONG = "fixed_long"     # 3.0 s auto-stop
     UNTIL_STOPPED = "until_stopped"  # caller drives end_take()
+    FIXED_1S = "fixed_1s"            # 1.0 s auto-stop
+    FIXED_2S = "fixed_2s"            # 2.0 s auto-stop
+    FIXED_3S = "fixed_3s"            # 3.0 s auto-stop
+    # Legacy slugs still accepted from older wizard saves / tests.
+    FIXED_SHORT = "fixed_short"      # 1.5 s auto-stop
+    FIXED_LONG = "fixed_long"        # 3.0 s auto-stop
 
     @property
     def auto_stop_seconds(self) -> Optional[float]:
         """Wall-clock duration after which `feed_frame` will close
         the active take automatically. `None` for until-stopped mode."""
         return {
+            DurationMode.UNTIL_STOPPED: None,
+            DurationMode.FIXED_1S: 1.0,
+            DurationMode.FIXED_2S: 2.0,
+            DurationMode.FIXED_3S: 3.0,
             DurationMode.FIXED_SHORT: 1.5,
             DurationMode.FIXED_LONG: 3.0,
-            DurationMode.UNTIL_STOPPED: None,
         }[self]
 
 
@@ -124,7 +131,7 @@ class DynamicGestureRecorder:
 
     def __init__(
         self,
-        duration_mode: DurationMode = DurationMode.FIXED_SHORT,
+        duration_mode: DurationMode = DurationMode.UNTIL_STOPPED,
         *,
         target_takes: int = DEFAULT_TARGET_TAKES,
         on_state_changed: Optional[Callable[["RecorderState"], None]] = None,

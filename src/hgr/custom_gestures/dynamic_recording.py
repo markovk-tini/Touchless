@@ -338,6 +338,23 @@ def _per_frame_max_landmark_step(landmarks: np.ndarray) -> np.ndarray:
 _FINGERTIP_INDICES = (4, 8, 12, 16, 20)
 
 
+def fingertip_extensions(landmarks: np.ndarray) -> np.ndarray:
+    """Wrist-to-tip distances for the 5 fingertips (thumb→pinky).
+
+    `landmarks` is (21, 3) or (T, 21, 3) in wrist-relative space
+    (wrist at origin). Returns (5,) or (T, 5). This is the pose
+    fingerprint used to tell "open-hand swipe up" from "index-only
+    swipe up" — path alone cannot.
+    """
+    arr = np.asarray(landmarks, dtype=np.float32)
+    tips = list(_FINGERTIP_INDICES)
+    if arr.ndim == 2:
+        return np.linalg.norm(arr[tips], axis=-1).astype(np.float32)
+    if arr.ndim != 3 or arr.shape[1] < 21:
+        raise ValueError(f"expected (21, 3) or (T, 21, 3); got {arr.shape}")
+    return np.linalg.norm(arr[:, tips, :], axis=-1).astype(np.float32)
+
+
 def dynamic_feature_dim(num_key_indices: int) -> int:
     """Deterministic feature width. Keeps schema consistent between
     template build time and live feature construction."""

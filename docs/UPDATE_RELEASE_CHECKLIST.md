@@ -22,16 +22,17 @@ Partner Center action, or website deploy. Do not skip. Do not batch.
 ## 1. Pre-build sanity (before touching the build machine)
 
 - [ ] `src/hgr/__init__.py` `__version__` == the intended tag (e.g.
-      `"1.1.8.2"`)
+      `"1.1.9"`)
 - [ ] `installers/windows/hgr_app.iss` `#define MyAppVersion` == same
 - [ ] `git status` — nothing uncommitted in `src/hgr/app/updater/`, the
       installer script, or `src/hgr/__init__.py`. A WIP change to the
       updater is the #1 way a release ships broken.
 - [ ] Run tests: `python -m pytest tests/ -q` → 0 failed.
 - [ ] Run the popup smoke test explicitly:
-      `python -m pytest tests/test_update_dialog_smoke.py -q` → 4 passed.
+      `python -m pytest tests/test_update_dialog_smoke.py -q` → 8 passed.
       This sentinel catches the NameError class of bug that shipped in
-      1.1.8 and 1.1.8.1.
+      1.1.8 and 1.1.8.1, the 1.1.7 frameless z-order flags, and the
+      dead tray-balloon fallback (`TouchlessTrayIcon.showMessage`).
 - [ ] Import smoke:
       `python -c "from hgr.app.updater import update_dialog, updater, store_updater, release_checker; print('OK')"`
 

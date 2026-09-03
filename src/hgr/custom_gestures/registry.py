@@ -279,6 +279,25 @@ class GestureSample:
 
 
 @dataclass(frozen=True)
+class PoseSequenceStep:
+    """One held pose in an ordered sequence (e.g. 'three' in 3→2→1)."""
+    name: str
+    samples: List[GestureSample]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": str(self.name),
+            "samples": [s.to_dict() for s in self.samples],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PoseSequenceStep":
+        raw_samples = data.get("samples") or []
+        samples = [GestureSample.from_dict(s) for s in raw_samples]
+        return cls(name=str(data.get("name", "") or ""), samples=samples)
+
+
+@dataclass(frozen=True)
 class CustomGesture:
     name: str
     samples: List[GestureSample]
@@ -305,6 +324,8 @@ class CustomGesture:
     #   "dynamic" -> sample_trajectories holds N (=takes) trajectories
     #                of the SELECTED key-point landmarks over time;
     #                matched by DynamicGestureClassifier via DTW.
+    #   "pose_sequence" -> ordered held poses in pose_sequence_steps;
+    #                matched by PoseSequenceRuntime (dwell + order).
     # Default is "static" so any gesture deserialized from a v1 file
     # (which didn't have this field) behaves identically to before.
     kind: str = "static"
@@ -357,6 +378,15 @@ class CustomGesture:
     intent_direction: Optional[List[float]] = None
     intent_magnitude: float = 0.0
     intent_window_seconds: float = 0.0
+    intent_fingertip_extension: Optional[List[float]] = None
+    # pose_sequence-only: ordered steps + timing.
+    # dwell_ms = min continuous hold to count a pose.
+    # max_hold_ms = continuous hold longer than this fails the sequence.
+    # max_gap_ms = longer than this between poses fails the sequence.
+    pose_sequence_steps: List[PoseSequenceStep] = field(default_factory=list)
+    pose_sequence_dwell_ms: int = 250
+    pose_sequence_max_hold_ms: int = 700
+    pose_sequence_max_gap_ms: int = 1000
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -400,6 +430,15 @@ class CustomGesture:
             out["intent_magnitude"] = float(self.intent_magnitude)
         if self.intent_window_seconds:
             out["intent_window_seconds"] = float(self.intent_window_seconds)
+        if self.intent_fingertip_extension:
+            out["intent_fingertip_extension"] = list(self.intent_fingertip_extension)
+        if self.kind == "pose_sequence" or self.pose_sequence_steps:
+            out["pose_sequence"] = {
+                "dwell_ms": int(self.pose_sequence_dwell_ms),
+                "max_hold_ms": int(self.pose_sequence_max_hold_ms),
+                "max_gap_ms": int(self.pose_sequence_max_gap_ms),
+                "steps": [s.to_dict() for s in self.pose_sequence_steps],
+            }
         return out
 
     @classmethod
@@ -407,13 +446,13 @@ class CustomGesture:
         raw_hand = data.get("handedness")
         hand = str(raw_hand) if raw_hand in ("Left", "Right") else None
         kind = str(data.get("kind", "static") or "static").lower()
-        if kind not in ("static", "dynamic"):
+        if kind not in ("static", "dynamic", "pose_sequence"):
             kind = "static"
         # Static gestures must still load their per-frame feature
-        # vectors. Dynamic gestures don't HAVE static samples but the
-        # field is required by the dataclass, so default to empty.
-        if kind == "dynamic":
-            samples = []  # static-pose samples are not used in this kind
+        # vectors. Dynamic / pose_sequence don't use top-level samples
+        # but the field is required by the dataclass, so default empty.
+        if kind in ("dynamic", "pose_sequence"):
+            samples = []
         else:
             samples = [GestureSample.from_dict(s) for s in data.get("samples", [])]
         # Defensive coercion on the dynamic fields — a hand-edited
@@ -466,6 +505,44 @@ class CustomGesture:
             )
         except (TypeError, ValueError):
             intent_window_seconds_ = 0.0
+        raw_tip_ext = data.get("intent_fingertip_extension")
+        try:
+            intent_fingertip_extension_ = (
+                [float(x) for x in raw_tip_ext]
+                if raw_tip_ext and len(raw_tip_ext) == 5
+                else None
+            )
+        except (TypeError, ValueError):
+            intent_fingertip_extension_ = None
+        pose_steps: List[PoseSequenceStep] = []
+        dwell_ms = 250
+        max_hold_ms = 700
+        max_gap_ms = 1000
+        raw_seq = data.get("pose_sequence")
+        if isinstance(raw_seq, dict):
+            try:
+                dwell_ms = int(raw_seq.get("dwell_ms", 250) or 250)
+            except (TypeError, ValueError):
+                dwell_ms = 250
+            try:
+                max_hold_ms = int(
+                    raw_seq.get("max_hold_ms", max(dwell_ms, int(dwell_ms * 2.5)))
+                    or max(dwell_ms, int(dwell_ms * 2.5))
+                )
+            except (TypeError, ValueError):
+                max_hold_ms = max(dwell_ms, int(dwell_ms * 2.5))
+            try:
+                max_gap_ms = int(raw_seq.get("max_gap_ms", 1000) or 1000)
+            except (TypeError, ValueError):
+                max_gap_ms = 1000
+            for step in raw_seq.get("steps") or []:
+                try:
+                    pose_steps.append(PoseSequenceStep.from_dict(step))
+                except Exception:
+                    continue
+        dwell_ms = max(80, int(dwell_ms))
+        max_hold_ms = max(dwell_ms, int(max_hold_ms))
+        max_gap_ms = max(100, int(max_gap_ms))
         return cls(
             name=str(data["name"]),
             description=str(data.get("description", "")),
@@ -486,6 +563,11 @@ class CustomGesture:
             intent_direction=intent_direction_,
             intent_magnitude=intent_magnitude_,
             intent_window_seconds=intent_window_seconds_,
+            intent_fingertip_extension=intent_fingertip_extension_,
+            pose_sequence_steps=pose_steps,
+            pose_sequence_dwell_ms=dwell_ms,
+            pose_sequence_max_hold_ms=max_hold_ms,
+            pose_sequence_max_gap_ms=max_gap_ms,
         )
 
 
@@ -652,6 +734,7 @@ class GestureRegistry:
         intent_direction=None,  # v1.1.8.2 post-audit r2 INTENT SIGNATURE
         intent_magnitude: float = 0.0,
         intent_window_seconds: float = 0.0,
+        intent_fingertip_extension=None,
     ) -> CustomGesture:
         """Register a dynamic gesture. `sample_trajectories` is an
         iterable of arrays/lists with shape (resampled_length,
@@ -732,6 +815,67 @@ class GestureRegistry:
                 ),
                 intent_magnitude=float(intent_magnitude or 0.0),
                 intent_window_seconds=float(intent_window_seconds or 0.0),
+                intent_fingertip_extension=(
+                    [float(x) for x in intent_fingertip_extension]
+                    if intent_fingertip_extension is not None else None
+                ),
+            )
+            self._gestures[name] = gesture
+        return gesture
+
+    def add_pose_sequence(
+        self,
+        name: str,
+        steps: List[PoseSequenceStep],
+        action: Action,
+        *,
+        description: str = "",
+        overwrite: bool = False,
+        handedness: Optional[str] = None,
+        image_filename: str = "",
+        dwell_ms: int = 250,
+        max_hold_ms: Optional[int] = None,
+        max_gap_ms: int = 1000,
+    ) -> CustomGesture:
+        """Register an ordered pose-sequence gesture (e.g. 3→2→1)."""
+        if not self._loaded:
+            self.load()
+        name = name.strip()
+        if not name:
+            raise ValueError("gesture name must be non-empty")
+        if len(steps) < 2:
+            raise ValueError("pose sequence needs at least 2 steps")
+        for i, step in enumerate(steps):
+            if not step.samples:
+                raise ValueError(f"pose sequence step {i} has no samples")
+        if handedness is not None and handedness not in ("Left", "Right"):
+            raise ValueError(
+                f"handedness must be 'Left', 'Right', or None — got {handedness!r}"
+            )
+        dwell = max(80, int(dwell_ms))
+        if max_hold_ms is None:
+            hold_cap = max(dwell, int(round(dwell * 2.5)))
+        else:
+            hold_cap = max(dwell, int(max_hold_ms))
+        gap = max(100, int(max_gap_ms))
+        with self._lock:
+            if name in self._gestures and not overwrite:
+                raise ValueError(
+                    f"gesture {name!r} already exists (pass overwrite=True to replace)"
+                )
+            gesture = CustomGesture(
+                name=name,
+                samples=[],
+                action=action,
+                created_at=_utc_now_iso(),
+                description=description,
+                handedness=handedness,
+                image_filename=str(image_filename or ""),
+                kind="pose_sequence",
+                pose_sequence_steps=list(steps),
+                pose_sequence_dwell_ms=dwell,
+                pose_sequence_max_hold_ms=hold_cap,
+                pose_sequence_max_gap_ms=gap,
             )
             self._gestures[name] = gesture
         return gesture
@@ -757,6 +901,48 @@ class GestureRegistry:
             return candidate if candidate.exists() else None
         except Exception:
             return None
+
+    def replace_metadata(
+        self,
+        original_name: str,
+        *,
+        name: str,
+        action: Action,
+        description: str = "",
+        image_filename: Optional[str] = None,
+        duration_mode: Optional[str] = None,
+    ) -> CustomGesture:
+        """Update name / description / action (and optional image /
+        duration_mode) while preserving kind and all recognition data
+        (static samples, dynamic trajectories, pose-sequence steps).
+
+        Used by the Edit Custom Gesture flow, which does not re-record.
+        """
+        from dataclasses import replace
+
+        if not self._loaded:
+            self.load()
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("gesture name must be non-empty")
+        with self._lock:
+            existing = self._gestures.get(original_name)
+            if existing is None:
+                raise ValueError(f"gesture {original_name!r} not found")
+            kwargs: Dict[str, Any] = {
+                "name": name,
+                "action": action,
+                "description": description,
+            }
+            if image_filename is not None:
+                kwargs["image_filename"] = str(image_filename)
+            if duration_mode is not None and existing.kind == "dynamic":
+                kwargs["duration_mode"] = str(duration_mode or "")
+            updated = replace(existing, **kwargs)
+            if name != original_name:
+                self._gestures.pop(original_name, None)
+            self._gestures[name] = updated
+        return updated
 
     def remove(self, name: str) -> bool:
         if not self._loaded:

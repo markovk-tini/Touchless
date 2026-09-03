@@ -120,6 +120,46 @@ Planned-work / polish backlog has moved to [`Touchless to-do.md`](Touchless%20to
 
 Motion-based custom gestures (DTW over per-frame hand landmarks). End-to-end loop was wired 2026-05-13 but recall was low ("just rarely detects the dynamic gesture that i just recorded"). The 2026-08-24 diff addresses the root causes ranked by the audit workflow — see the block below.
 
+**2026-09-01 — false fire on hand entry + long gestures never firing:**
+
+User report: (a) bringing a hand into the bottom of the frame fired
+"wave up" even though the hand travelled far less than the recorded
+samples, (b) an open-hand circle never fired at all. Both reproduced
+offline with [tools/diag_dynamic_intent.py](tools/diag_dynamic_intent.py).
+
+- **Intent path confirmed gestures it never saw.** When no buffered
+  frame was older than `now - intent_window_seconds`, the window
+  start silently fell back to the oldest frame in the buffer, so a
+  1.2 s template could be confirmed from 0.3 s of history. The
+  coherence check then went unevaluated because a hand that arrives
+  and parks leaves the second half of the window motionless. Fixed by
+  requiring the buffer to actually span the window and by requiring
+  each half of it to carry ≥ `_INTENT_HALF_MIN_FRAC` of the total
+  displacement.
+- **SPRING tolerance was inversely proportional to gesture speed.**
+  Features carry velocity in palm-units-per-second while the
+  threshold is absolute, so a fast looping path (circle, ~4.2 palm/s)
+  matched only within about ±10 % of its recorded duration while a
+  short wave (~1.2 palm/s) tolerated 70–200 %. Fixed with
+  `_SPRING_THRESHOLD_MOTION_K`: the threshold floor now scales with
+  the template's own mean velocity magnitude, computed at classifier
+  load so templates already on disk benefit without re-recording.
+  Circle now matches at 70–130 % of its recorded duration; low-motion
+  templates keep their existing threshold exactly.
+
+**Still open here:** speed invariance is mitigated, not solved. A
+gesture performed at more than ~1.3x its recorded duration still
+misses. Recording the three takes at deliberately different speeds
+widens the band to roughly 60–200 % (measured in the `takespeed`
+scenario of the diag tool) — worth surfacing as recorder guidance.
+A real fix means making the velocity block speed-invariant, which was
+measured and rejected for now: direction-only velocity fixes the
+circle but lets a wave-up template match a circle's upward arc
+(cost 0.02 vs 1.17), because wrist-relative positions contribute
+nothing for whole-hand-translation gestures. That path needs a
+curvature/straightness channel to stay safe. See the `channels`
+scenario in the diag tool.
+
 **2026-08-24 recall fix (v1.1.8.1):**
 - **Segment timeout** — [dynamic_classifier.py](src/hgr/custom_gestures/dynamic_classifier.py) `_MAX_SEGMENT_SECONDS = 2.5`. Fixes the #1 root cause: at 15-25 fps in dim rooms, motion energy stays above LOW during small hand jitter after a gesture, so the segment never closes and no match is ever attempted. Timeout force-closes and matches.
 - **Timeout quality gate** — before a timeout-close fires DTW, requires accumulated wrist path ≥ 0.5 palm units OR max-finger displacement ≥ 0.3. Prevents random hand fidgeting during a 2.5 s window from firing the closest template.

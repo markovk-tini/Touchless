@@ -32,6 +32,10 @@ are a physical walk-through per release. Both are stop-ship.
       Reason: 1.1.8 and 1.1.8.1 both shipped a NameError inside
       `UpdateDialog.__init__` that made the dialog impossible to
       construct. A single instantiation test would have caught it.
+      The same file also pins `WindowStaysOnTopHint` (the 1.1.7
+      frameless z-order bug) and `TouchlessTrayIcon.showMessage`
+      (the tray-balloon fallback was previously a no-op because the
+      wrapper had no such method).
 - [ ] Version comparison test: `_is_newer("1.1.9", "1.1.9rc1")` returns
       True; `_is_newer("1.1.8.1", "1.1.8")` returns True. These pin the
       PEP 440 semantics we depend on.

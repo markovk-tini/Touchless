@@ -209,6 +209,9 @@ class GestureClassifier:
         self._sample_to_local_idx = []
         rows: List[List[float]] = []
         for g_idx, g in enumerate(self._gestures):
+            # Static runner only — dynamic / pose_sequence use other runtimes.
+            if str(getattr(g, "kind", "static") or "static") != "static":
+                continue
             for s_idx, sample in enumerate(g.samples):
                 rows.append(sample.features)
                 self._sample_to_gesture_idx.append(g_idx)

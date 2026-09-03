@@ -215,6 +215,40 @@ class DynamicGestureRuntime:
     def has_dynamic_gestures(self) -> bool:
         return self._classifier is not None and bool(self._gestures_by_name)
 
+    def spring_debug_rows(self):
+        """Sandbox diagnostic: latest SPRING cost vs threshold per gesture."""
+        if self._classifier is None:
+            return []
+        try:
+            return self._classifier.spring_debug_rows()
+        except Exception:
+            return []
+
+    def should_preempt_builtin_horizontal_swipe(
+        self,
+        landmarks_21x3: Optional[np.ndarray],
+        *,
+        palm_scale: float,
+        now: float,
+    ) -> bool:
+        """See DynamicGestureClassifier.preempts_builtin_horizontal_swipe.
+
+        Also true during the post-fire banner window so a builtin
+        swipe that latches a frame later than the custom fire is
+        still swallowed.
+        """
+        if self.current_match(now) is not None:
+            return True
+        if self._classifier is None or landmarks_21x3 is None:
+            return False
+        try:
+            raw = landmarks_21x3.astype(np.float32)
+            scale = max(float(palm_scale), 1e-6)
+            normalized = normalize_frame(raw, scale)
+            return bool(self._classifier.preempts_builtin_horizontal_swipe(normalized))
+        except Exception:
+            return False
+
     # ---- internal ----
 
     def _read_registry_mtime(self) -> float:
@@ -313,6 +347,10 @@ class DynamicGestureRuntime:
             intent_window_seconds = float(
                 getattr(gesture, "intent_window_seconds", 0.0) or 0.0
             )
+            raw_tip_ext = getattr(gesture, "intent_fingertip_extension", None)
+            intent_fingertip_extension = (
+                list(raw_tip_ext) if raw_tip_ext and len(raw_tip_ext) == 5 else None
+            )
             return DynamicGestureTemplate(
                 name=str(gesture.name),
                 key_point_indices=indices,
@@ -326,6 +364,7 @@ class DynamicGestureRuntime:
                 ),
                 intent_magnitude=intent_magnitude,
                 intent_window_seconds=intent_window_seconds,
+                intent_fingertip_extension=intent_fingertip_extension,
             )
         except Exception:
             return None

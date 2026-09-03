@@ -8,12 +8,13 @@ later by the recorder once samples exist.
 from __future__ import annotations
 
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QDoubleValidator
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QDoubleValidator, QPainter, QPolygonF
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -43,6 +44,57 @@ from .custom_gestures_chrome import apply_touchless_titlebar
 from .window_chrome import touchless_message_box
 
 
+# Cached PNG paths for spinbox / combo arrows. Qt stylesheet border
+# triangles often paint as solid rectangles on Win11 + PySide6; real
+# PNGs (same pattern as the app checkmark) render reliably.
+_SPIN_ARROW_PNG_CACHE: dict[str, str] = {}
+
+
+def _spin_arrow_image_path(direction: str) -> str:
+    """Write a small white triangle PNG and return a QSS-safe path.
+
+    direction: "up" | "down" | "combo" (chevron for QComboBox).
+    """
+    key = str(direction or "").lower()
+    cached = _SPIN_ARROW_PNG_CACHE.get(key)
+    if cached:
+        try:
+            if Path(cached).exists():
+                return cached
+        except Exception:
+            pass
+    try:
+        from PySide6.QtGui import QPixmap
+
+        pix = QPixmap(16, 16)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#FFFFFF"))
+        if key == "up":
+            poly = QPolygonF(
+                [QPointF(8, 3), QPointF(13, 12), QPointF(3, 12)]
+            )
+        elif key == "combo":
+            poly = QPolygonF(
+                [QPointF(3, 6), QPointF(13, 6), QPointF(8, 12)]
+            )
+        else:  # down
+            poly = QPolygonF(
+                [QPointF(3, 4), QPointF(13, 4), QPointF(8, 13)]
+            )
+        p.drawPolygon(poly)
+        p.end()
+        tmp = Path(tempfile.gettempdir()) / f"touchless_spin_arrow_{key}.png"
+        pix.save(str(tmp), "PNG")
+        path = str(tmp).replace("\\", "/")
+        _SPIN_ARROW_PNG_CACHE[key] = path
+        return path
+    except Exception:
+        return ""
+
+
 # (label, kind, value-prompt, placeholder)
 _ACTION_KINDS = (
     ("Press a single key", "keystroke", "Key name", "e.g. enter, f12, space"),
@@ -62,8 +114,8 @@ class WizardResult:
     hold_seconds: float
     cooldown_seconds: float
     action: Action
-    # Dynamic-only: one of "fixed_short" (1.5s), "fixed_long" (3s),
-    # "until_stopped". Ignored for static gestures; left empty for them.
+    # Dynamic-only: one of "until_stopped", "fixed_1s", "fixed_2s",
+    # "fixed_3s". Ignored for static gestures; left empty for them.
     duration_mode: str = ""
 
 
@@ -355,208 +407,113 @@ class _GreenDotRadio(QRadioButton):
 
 
 class GestureTypeToggle(QWidget):
-    """Segmented pill button with two halves split by a true diagonal
-    seam: [Static (pose) ╱ Dynamic (motion)].
+    """Three-segment pill: Static | Sequence | Dynamic.
 
-    Painted as ONE custom widget rather than two QPushButtons so the
-    seam between the halves can be a real diagonal (the previous
-    QPushButton + slash-overlay approach can only fake it with a
-    rectangular boundary). The inactive half also gets a subtle
-    edge-darkening gradient for a slight 3D "recessed" feel that
-    contrasts with the flat-filled active half.
-
-    Static = pose-based gesture (the existing recorder). Dynamic =
-    motion-based gesture. Defaults to "static". Emits
-    `selection_changed(str)` on every user-initiated click.
+    Equal-width checkable buttons in a single rounded frame. Defaults
+    to "static". Emits `selection_changed(str)` on user clicks.
     """
 
     selection_changed = Signal(str)
 
-    _HALF_WIDTH = 140
-    _HEIGHT = 44
-    _RADIUS = 18
-    # Horizontal offset of the seam at the top vs the bottom — controls
-    # the diagonal's slope. Positive = top of seam is right of center,
-    # bottom of seam is left of center → the slash leans bottom-left
-    # to top-right (matches the previous slash-overlay direction).
-    _SEAM_DX = 16
-    _SEAM_LINE_WIDTH = 2
+    _OPTIONS = (
+        ("static", "Static (pose)"),
+        ("pose_sequence", "Sequence"),
+        ("dynamic", "Dynamic (motion)"),
+    )
 
     def __init__(self, accent_color: str, parent=None) -> None:
         super().__init__(parent)
         self._accent = accent_color or "#1DE9B6"
         self._selection = "static"
-        self._hover_side: Optional[str] = None
         self.setObjectName("gestureTypeToggle")
-        self.setFixedSize(self._HALF_WIDTH * 2, self._HEIGHT)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setMouseTracking(True)
-        # Make clicks reach us instead of the parent.
-        self.setAttribute(Qt.WA_Hover, True)
-
-    # --- public API --------------------------------------------------
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(0)
+        self._buttons = {}
+        for key, label in self._OPTIONS:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFixedHeight(40)
+            btn.clicked.connect(lambda checked=False, k=key: self._on_clicked(k))
+            layout.addWidget(btn, 1)
+            self._buttons[key] = btn
+        self._buttons["static"].setChecked(True)
+        self._apply_styles()
 
     def selection(self) -> str:
         return self._selection
 
     def set_selection(self, value: str, *, emit: bool = True) -> None:
-        """Programmatic setter — pass emit=False to avoid double-firing
-        during dialog init."""
-        if value not in ("static", "dynamic") or value == self._selection:
+        if value not in self._buttons:
+            return
+        if value == self._selection:
+            # Still refresh checked state / styles; only skip the signal
+            # when nothing changed.
+            for key, btn in self._buttons.items():
+                btn.setChecked(key == value)
+            self._apply_styles()
             return
         self._selection = value
-        self.update()
+        for key, btn in self._buttons.items():
+            btn.setChecked(key == value)
+        self._apply_styles()
         if emit:
             self.selection_changed.emit(self._selection)
 
-    # --- mouse routing -----------------------------------------------
+    def set_interactive(self, enabled: bool) -> None:
+        """Enable/disable user clicks. Used in edit mode so the gesture
+        type stays locked to what was recorded."""
+        for btn in self._buttons.values():
+            btn.setEnabled(bool(enabled))
 
-    def _seam_x_at(self, y: float) -> float:
-        """Return the seam's x at vertical position y (0 = top, H = bottom).
-        Linear interp from (top_x = center+SEAM_DX) to
-        (bottom_x = center-SEAM_DX). Clicks left of this line belong
-        to the static half; right belongs to dynamic."""
-        cx = self.width() / 2.0
-        h = max(1.0, float(self.height()))
-        return cx + self._SEAM_DX * (1.0 - 2.0 * (float(y) / h))
-
-    def _side_at(self, x: float, y: float) -> str:
-        return "static" if x < self._seam_x_at(y) else "dynamic"
-
-    def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() != Qt.LeftButton:
-            super().mousePressEvent(event)
+    def _on_clicked(self, key: str) -> None:
+        if key == self._selection:
+            self._buttons[key].setChecked(True)
             return
-        side = self._side_at(event.position().x(), event.position().y())
-        if side != self._selection:
-            self._selection = side
-            self.update()
-            self.selection_changed.emit(side)
-        event.accept()
+        self.set_selection(key, emit=True)
 
-    def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        side = self._side_at(event.position().x(), event.position().y())
-        if side != self._hover_side:
-            self._hover_side = side
-            self.update()
-        super().mouseMoveEvent(event)
+    def _apply_styles(self) -> None:
+        accent = self._accent
+        for key, btn in self._buttons.items():
+            active = key == self._selection
+            if active:
+                btn.setStyleSheet(
+                    f"QPushButton {{ background: {accent}; color: #0b1220; "
+                    f"border: none; border-radius: 14px; font-weight: 600; "
+                    f"padding: 6px 10px; }}"
+                )
+            else:
+                btn.setStyleSheet(
+                    "QPushButton { background: rgba(255,255,255,0.06); "
+                    "color: rgba(255,255,255,0.72); border: none; "
+                    "border-radius: 14px; padding: 6px 10px; }"
+                    "QPushButton:hover { background: rgba(255,255,255,0.12); }"
+                )
 
-    def leaveEvent(self, event) -> None:  # noqa: N802
-        if self._hover_side is not None:
-            self._hover_side = None
-            self.update()
-        super().leaveEvent(event)
+class _WrappingInfoBanner(QLabel):
+    """Word-wrapped info banner that reports a correct height for its
+    current width so Static ↔ Dynamic ↔ Sequence switches don't leave
+    the green box crushed or over-tall."""
 
-    # --- painting ----------------------------------------------------
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWordWrap(True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
-    def paintEvent(self, event) -> None:  # noqa: N802
-        from PySide6.QtGui import (
-            QPainter, QPen, QColor, QPainterPath, QLinearGradient, QFont,
-        )
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
 
-        w = self.width()
-        h = self.height()
-        cx_top = w / 2.0 + self._SEAM_DX
-        cx_bot = w / 2.0 - self._SEAM_DX
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        # Account for stylesheet padding roughly; Qt's QLabel
+        # heightForWidth already includes font metrics for wrap.
+        return max(0, super().heightForWidth(max(1, width)))
 
-        # Outer pill (full rounded-rect) used as a clip region so the
-        # diagonal halves both keep the pill's outer rounded edges.
-        outer = QPainterPath()
-        outer.addRoundedRect(0.0, 0.0, float(w), float(h),
-                             float(self._RADIUS), float(self._RADIUS))
+    def sizeHint(self):  # noqa: N802
+        from PySide6.QtCore import QSize
 
-        # Left half — pill clipped to (0,0)→(cx_top,0)→(cx_bot,h)→(0,h).
-        left = QPainterPath()
-        left.moveTo(0.0, 0.0)
-        left.lineTo(cx_top, 0.0)
-        left.lineTo(cx_bot, float(h))
-        left.lineTo(0.0, float(h))
-        left.closeSubpath()
-        left = left.intersected(outer)
-
-        # Right half — the complement.
-        right = QPainterPath()
-        right.moveTo(cx_top, 0.0)
-        right.lineTo(float(w), 0.0)
-        right.lineTo(float(w), float(h))
-        right.lineTo(cx_bot, float(h))
-        right.closeSubpath()
-        right = right.intersected(outer)
-
-        active_bg = QColor(self._accent)
-        inactive_base = QColor("#1E293B")  # slate-800
-        # Edge-darken gradient for the 3D feel on the inactive half.
-        # Top + bottom strips are darker than the middle, so the half
-        # reads as a slightly recessed surface. Subtle on purpose.
-        inactive_edge = QColor("#0B1422")
-        inactive_grad = QLinearGradient(0.0, 0.0, 0.0, float(h))
-        inactive_grad.setColorAt(0.00, inactive_edge)
-        inactive_grad.setColorAt(0.18, inactive_base)
-        inactive_grad.setColorAt(0.82, inactive_base)
-        inactive_grad.setColorAt(1.00, inactive_edge)
-
-        # Hover tint for the inactive side — slightly lighter so
-        # users get feedback without a full flash.
-        hover_grad = QLinearGradient(0.0, 0.0, 0.0, float(h))
-        hover_edge = QColor("#15233A")
-        hover_mid = QColor("#334155")
-        hover_grad.setColorAt(0.00, hover_edge)
-        hover_grad.setColorAt(0.18, hover_mid)
-        hover_grad.setColorAt(0.82, hover_mid)
-        hover_grad.setColorAt(1.00, hover_edge)
-
-        active_fg = QColor("#0F172A")
-        inactive_fg = QColor("#94A3B8")
-
-        p = QPainter(self)
-        try:
-            p.setRenderHint(QPainter.Antialiasing)
-            p.setPen(Qt.NoPen)
-
-            # Fill each half with the appropriate brush.
-            for side, path, label in (
-                ("static", left, "Static (pose)"),
-                ("dynamic", right, "Dynamic (motion)"),
-            ):
-                if side == self._selection:
-                    p.setBrush(active_bg)
-                elif self._hover_side == side:
-                    p.setBrush(hover_grad)
-                else:
-                    p.setBrush(inactive_grad)
-                p.drawPath(path)
-
-            # Diagonal seam line on top so the divide is visible even
-            # when both halves are dark (e.g. neither selected — never
-            # happens in practice since one is always active, but a
-            # visible seam matches the user-requested look).
-            seam_pen = QPen(QColor("#E5F6FF"))
-            seam_pen.setWidth(self._SEAM_LINE_WIDTH)
-            seam_pen.setCapStyle(Qt.FlatCap)
-            p.setPen(seam_pen)
-            p.drawLine(int(cx_top), 0, int(cx_bot), h)
-
-            # Labels — center each half text by computing the half's
-            # bounding rect midpoint. Static is roughly (0..cx_top);
-            # dynamic is (cx_bot..w).
-            font = QFont(self.font())
-            font.setBold(True)
-            font.setPointSizeF(10.0)
-            p.setFont(font)
-            static_rect = self._half_text_rect(left, w, h)
-            dynamic_rect = self._half_text_rect(right, w, h)
-            p.setPen(active_fg if self._selection == "static" else inactive_fg)
-            p.drawText(static_rect, Qt.AlignCenter, "Static (pose)")
-            p.setPen(active_fg if self._selection == "dynamic" else inactive_fg)
-            p.drawText(dynamic_rect, Qt.AlignCenter, "Dynamic (motion)")
-        finally:
-            p.end()
-
-    def _half_text_rect(self, path, w: int, h: int):
-        from PySide6.QtCore import QRectF
-        r = path.boundingRect()
-        # Inset a few pixels horizontally so labels don't crowd the seam.
-        return QRectF(r.left() + 6.0, 0.0, max(0.0, r.width() - 12.0), float(h))
+        w = self.width() if self.width() > 1 else 480
+        return QSize(w, self.heightForWidth(w))
 
 
 class CreateGestureWizard(QDialog):
@@ -575,6 +532,8 @@ class CreateGestureWizard(QDialog):
         initial_cooldown: float = 2.0,
         initial_action_kind: Optional[str] = None,
         initial_action_value: str = "",
+        initial_gesture_type: str = "static",
+        initial_duration_mode: str = "",
         original_name: Optional[str] = None,
     ) -> None:
         super().__init__(parent)
@@ -607,6 +566,11 @@ class CreateGestureWizard(QDialog):
         self._initial_cooldown = float(initial_cooldown)
         self._initial_action_kind = initial_action_kind
         self._initial_action_value = initial_action_value
+        gtype = str(initial_gesture_type or "static").lower()
+        if gtype not in ("static", "dynamic", "pose_sequence"):
+            gtype = "static"
+        self._initial_gesture_type = gtype
+        self._initial_duration_mode = str(initial_duration_mode or "")
         self.result_payload: Optional[WizardResult] = None
         self._build()
         self._populate_initial_values()
@@ -621,18 +585,65 @@ class CreateGestureWizard(QDialog):
     # --- UI -------------------------------------------------------------
 
     def _build(self) -> None:
+        up_img = _spin_arrow_image_path("up")
+        down_img = _spin_arrow_image_path("down")
+        combo_img = _spin_arrow_image_path("combo")
+        up_url = f'url("{up_img}")' if up_img else "none"
+        down_url = f'url("{down_img}")' if down_img else "none"
+        combo_url = f'url("{combo_img}")' if combo_img else "none"
         self.setStyleSheet(
             f"""
             QDialog {{ background: #0E1822; }}
             QLabel {{ color: #DCE9F2; font-size: 13px; }}
             QLabel#sectionTitle {{ color: #E5F6FF; font-weight: 700; font-size: 16px; }}
-            QLineEdit, QDoubleSpinBox, QComboBox {{
+            QLineEdit, QComboBox {{
                 background: rgba(255,255,255,0.05);
                 color: #E5F6FF;
                 border: 1px solid rgba(255,255,255,0.12);
                 border-radius: 6px;
                 padding: 6px 8px;
                 font-size: 13px;
+            }}
+            /* Spinbox: same face as before. Arrows are side-by-side on
+               the right (the prior look); each button gets its own
+               non-overlapping hit box so up/down both click. Real PNG
+               triangles — CSS border-triangles paint as rectangles on
+               this Qt build. */
+            QDoubleSpinBox {{
+                background: rgba(255,255,255,0.05);
+                color: #E5F6FF;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 6px;
+                padding: 6px 36px 6px 8px;
+                font-size: 13px;
+            }}
+            QDoubleSpinBox::up-button {{
+                subcontrol-origin: border;
+                subcontrol-position: center right;
+                width: 16px;
+                height: 20px;
+                right: 18px;
+                border: none;
+                background: transparent;
+            }}
+            QDoubleSpinBox::down-button {{
+                subcontrol-origin: border;
+                subcontrol-position: center right;
+                width: 16px;
+                height: 20px;
+                right: 2px;
+                border: none;
+                background: transparent;
+            }}
+            QDoubleSpinBox::up-arrow {{
+                image: {up_url};
+                width: 10px;
+                height: 10px;
+            }}
+            QDoubleSpinBox::down-arrow {{
+                image: {down_url};
+                width: 10px;
+                height: 10px;
             }}
             QLineEdit:focus, QDoubleSpinBox:focus, QComboBox:focus {{
                 border: 1px solid {self._accent_color};
@@ -658,10 +669,9 @@ class CreateGestureWizard(QDialog):
                 width: 20px;
             }}
             QComboBox::down-arrow {{
-                image: none;
-                border-left: 4px solid transparent;
-                border-right: 4px solid transparent;
-                border-top: 5px solid #DCE9F2;
+                image: {combo_url};
+                width: 10px;
+                height: 10px;
                 margin-right: 8px;
             }}
             QPushButton {{
@@ -761,16 +771,12 @@ class CreateGestureWizard(QDialog):
         )
         gesture_type_block.addWidget(self.gesture_type_toggle)
 
-        # Dynamic-mode info banner: tells the user what to expect
-        # when they choose Dynamic.
-        self._dynamic_banner = QLabel(
-            "Dynamic gestures capture MOTION instead of a single pose. "
-            "You'll record the gesture 10 times — the app picks which "
-            "landmarks actually move and ignores the rest, then uses "
-            "DTW to match your live motion against the recordings."
-        )
-        self._dynamic_banner.setWordWrap(True)
-        self._dynamic_banner.setStyleSheet(
+        # One shared type-info banner (text swapped per selection). Two
+        # separate show/hide labels fought the layout when hopping
+        # Static → Dynamic → Sequence and left the green box looking
+        # crushed / over-wide.
+        self._type_banner = _WrappingInfoBanner()
+        self._type_banner.setStyleSheet(
             "QLabel {"
             "  background-color: rgba(29,233,182,0.10);"
             "  border: 1px solid rgba(29,233,182,0.45);"
@@ -781,8 +787,8 @@ class CreateGestureWizard(QDialog):
             "  margin-top: 4px;"
             "}"
         )
-        self._dynamic_banner.setVisible(False)
-        gesture_type_block.addWidget(self._dynamic_banner)
+        self._type_banner.setVisible(False)
+        gesture_type_block.addWidget(self._type_banner)
 
         # Dynamic-only: duration-per-take picker. Lives in the wizard
         # so the recorder window opens straight into the camera with a
@@ -796,18 +802,20 @@ class CreateGestureWizard(QDialog):
         dur_v.addWidget(dur_label)
         dur_row = QHBoxLayout()
         dur_row.setSpacing(14)
-        self._dur_short = _GreenDotRadio("1.5 s", color=self._accent_color)
-        self._dur_long = _GreenDotRadio("3 s", color=self._accent_color)
         self._dur_until = _GreenDotRadio("Until stopped", color=self._accent_color)
-        self._dur_short.setChecked(True)
-        for rb in (self._dur_short, self._dur_long, self._dur_until):
+        self._dur_1s = _GreenDotRadio("1 s", color=self._accent_color)
+        self._dur_2s = _GreenDotRadio("2 s", color=self._accent_color)
+        self._dur_3s = _GreenDotRadio("3 s", color=self._accent_color)
+        self._dur_until.setChecked(True)
+        for rb in (self._dur_until, self._dur_1s, self._dur_2s, self._dur_3s):
             rb.setStyleSheet("color: #E5F6FF; background: transparent;")
             dur_row.addWidget(rb)
         dur_row.addStretch(1)
         self._dur_group = QButtonGroup(self)
-        self._dur_group.addButton(self._dur_short, 0)
-        self._dur_group.addButton(self._dur_long, 1)
-        self._dur_group.addButton(self._dur_until, 2)
+        self._dur_group.addButton(self._dur_until, 0)
+        self._dur_group.addButton(self._dur_1s, 1)
+        self._dur_group.addButton(self._dur_2s, 2)
+        self._dur_group.addButton(self._dur_3s, 3)
         dur_v.addLayout(dur_row)
         self._duration_block.setVisible(False)
         gesture_type_block.addWidget(self._duration_block)
@@ -842,6 +850,8 @@ class CreateGestureWizard(QDialog):
         self.hold_spin.setSingleStep(0.1)
         self.hold_spin.setDecimals(1)
         self.hold_spin.setValue(1.0)
+        self.hold_spin.setButtonSymbols(QDoubleSpinBox.UpDownArrows)
+        self.hold_spin.setKeyboardTracking(False)
         timing_box1.addWidget(self.hold_spin)
         timing_row.addWidget(self._hold_block)
 
@@ -852,6 +862,8 @@ class CreateGestureWizard(QDialog):
         self.cooldown_spin.setSingleStep(0.5)
         self.cooldown_spin.setDecimals(1)
         self.cooldown_spin.setValue(2.0)
+        self.cooldown_spin.setButtonSymbols(QDoubleSpinBox.UpDownArrows)
+        self.cooldown_spin.setKeyboardTracking(False)
         timing_box2.addWidget(self.cooldown_spin)
         timing_row.addLayout(timing_box2)
 
@@ -949,6 +961,27 @@ class CreateGestureWizard(QDialog):
     def _populate_initial_values(self) -> None:
         """For edit mode: pre-fill the form with the existing gesture's
         values so the user can tweak instead of typing everything fresh."""
+        # Gesture type first so banners / hold / duration visibility
+        # match the recorded kind before other fields fill in.
+        try:
+            self.gesture_type_toggle.set_selection(
+                self._initial_gesture_type, emit=True
+            )
+            # Edit = metadata + action only; type can't change without
+            # re-recording samples / trajectories / sequence steps.
+            if self._edit_mode:
+                self.gesture_type_toggle.set_interactive(False)
+        except Exception:
+            pass
+        self._apply_duration_mode(self._initial_duration_mode)
+        if self._edit_mode:
+            try:
+                for rb in (
+                    self._dur_until, self._dur_1s, self._dur_2s, self._dur_3s
+                ):
+                    rb.setEnabled(False)
+            except Exception:
+                pass
         if self._initial_name:
             self.name_edit.setText(self._initial_name)
         if self._initial_description:
@@ -977,47 +1010,82 @@ class CreateGestureWizard(QDialog):
                 if self._initial_action_kind in ("keystroke", "hotkey"):
                     self.action_value_keyboard.set_value(self._initial_action_value)
 
-    def _on_gesture_type_changed(self, value: str) -> None:
-        """Show/hide the dynamic-mode banner + duration picker when the
-        user toggles between Static and Dynamic. The rest of the form
-        keeps the same fields — gesture type just controls which
-        recorder / classifier the saved gesture will be wired to."""
+    def _apply_duration_mode(self, mode: str) -> None:
+        """Select the matching Duration radio (dynamic edit prefill)."""
+        m = (mode or "").strip().lower()
         try:
-            self._dynamic_banner.setVisible(value == "dynamic")
+            if m == "fixed_1s" or m == "fixed_short":
+                self._dur_1s.setChecked(True)
+            elif m == "fixed_2s":
+                self._dur_2s.setChecked(True)
+            elif m in ("fixed_3s", "fixed_long"):
+                self._dur_3s.setChecked(True)
+            else:
+                self._dur_until.setChecked(True)
+        except Exception:
+            pass
+
+    _TYPE_BANNER_TEXT = {
+        "dynamic": (
+            "Dynamic captures your motion as keypoint paths over time — "
+            "shape changes, movement, and pacing included. Record "
+            "several takes; the app selects moving landmarks and matches "
+            "live motion against those paths. Prefer Until stopped for "
+            "longer sequences."
+        ),
+        "pose_sequence": (
+            "Sequence: record an ordered chain of held poses you invent "
+            "in one continuous take. Touchless learns each pose, timing, "
+            "order, and hand — and saves a video clip of your take."
+        ),
+    }
+
+    def _on_gesture_type_changed(self, value: str) -> None:
+        """Show/hide mode-specific banners + controls."""
+        text = self._TYPE_BANNER_TEXT.get(value, "")
+        try:
+            if text:
+                self._type_banner.setText(text)
+                self._type_banner.setVisible(True)
+            else:
+                self._type_banner.clear()
+                self._type_banner.setVisible(False)
         except Exception:
             pass
         try:
             self._duration_block.setVisible(value == "dynamic")
         except Exception:
             pass
-        # v1.1.8.2: hide "Hold to activate" on Dynamic. Dynamic gestures
-        # fire on motion match — no hold semantics — so showing the hold
-        # spinbox there was misleading. Cooldown still applies (post-fire
-        # debounce), so leave that column visible.
+        # Hold only applies to single static poses.
         try:
-            self._hold_block.setVisible(value != "dynamic")
+            self._hold_block.setVisible(value == "static")
         except Exception:
             pass
+        # Sequence / Dynamic banners (and Dynamic duration radios) add
+        # height; Static hides them and shows Hold instead. Grow or
+        # shrink so Action * stays visible without scrolling.
+        QTimer.singleShot(0, self._fit_action_value_into_view)
 
     def duration_mode(self) -> str:
         """Return the selected duration mode for Dynamic gestures.
 
-        One of "fixed_short" (1.5 s), "fixed_long" (3 s),
-        "until_stopped". Defaults to "fixed_short". Meaningful only
-        when gesture_type() == "dynamic".
+        One of "until_stopped", "fixed_1s", "fixed_2s", "fixed_3s".
+        Defaults to "until_stopped". Meaningful only when
+        gesture_type() == "dynamic".
         """
         try:
-            if self._dur_long.isChecked():
-                return "fixed_long"
-            if self._dur_until.isChecked():
-                return "until_stopped"
+            if self._dur_1s.isChecked():
+                return "fixed_1s"
+            if self._dur_2s.isChecked():
+                return "fixed_2s"
+            if self._dur_3s.isChecked():
+                return "fixed_3s"
         except Exception:
             pass
-        return "fixed_short"
+        return "until_stopped"
 
     def gesture_type(self) -> str:
-        """'static' or 'dynamic'. Read at save time so the recorder /
-        registry can branch on it."""
+        """'static', 'dynamic', or 'pose_sequence'."""
         toggle = getattr(self, "gesture_type_toggle", None)
         return toggle.selection() if toggle is not None else "static"
 
@@ -1090,20 +1158,36 @@ class CreateGestureWizard(QDialog):
             cap_h = 1080
         try:
             inner = scroll.widget()
-            needed = inner.sizeHint().height() + 200  # chrome + padding
+            banner = getattr(self, "_type_banner", None)
+            if banner is not None and banner.isVisible():
+                # Recompute wrap height for the current viewport without
+                # permanently pinning minWidth (that crushed the green
+                # box across Static/Dynamic/Sequence switches).
+                banner.setMinimumHeight(0)
+                banner.setMaximumHeight(16777215)
+                banner.updateGeometry()
+            if inner is not None and inner.layout() is not None:
+                inner.layout().invalidate()
+                inner.layout().activate()
+                inner.adjustSize()
+            needed = (
+                (inner.sizeHint().height() if inner is not None else 0) + 200
+            )  # chrome + padding
             target = min(cap_h, max(self.minimumHeight(), needed))
             # Only resize when the delta is meaningful — avoids a
             # one-pixel jitter from Qt's layout rounding on every
             # combo change.
             if abs(target - self.height()) >= 8:
                 self.resize(self.width(), target)
-            # Bring the keyboard (or value edit when keyboard is hidden)
-            # into the visible viewport.
-            target_widget = (
-                self.action_value_keyboard
-                if self.action_value_keyboard.isVisible()
-                else self.action_value_edit
-            )
+            # Prefer the deepest visible action-value widget; fall back
+            # to the Action combo so type-toggle / banner growth still
+            # keeps "Action *" on screen before an action is chosen.
+            if self.action_value_keyboard.isVisible():
+                target_widget = self.action_value_keyboard
+            elif self.action_value_edit.isVisible():
+                target_widget = self.action_value_edit
+            else:
+                target_widget = self.action_combo
             scroll.ensureWidgetVisible(target_widget, 0, 24)
         except Exception:
             pass
@@ -1327,15 +1411,16 @@ class CreateGestureWizard(QDialog):
         # semantics — so force hold_seconds = 0 regardless of what the
         # (now-hidden) hold spinbox holds. Keeps saved payloads honest
         # for anything that reads hold_s at run-time.
-        _is_dynamic = (self.gesture_type() == "dynamic")
+        gtype = self.gesture_type()
         self.result_payload = WizardResult(
             name=name,
             description=self.desc_edit.text().strip(),
-            hold_seconds=(0.0 if _is_dynamic else float(self.hold_spin.value())),
+            hold_seconds=(0.0 if gtype in ("dynamic", "pose_sequence")
+                          else float(self.hold_spin.value())),
             cooldown_seconds=float(self.cooldown_spin.value()),
             action=action,
             duration_mode=(
-                self.duration_mode() if _is_dynamic else ""
+                self.duration_mode() if gtype == "dynamic" else ""
             ),
         )
         self.accept()
@@ -1351,13 +1436,11 @@ class CreateGestureWizard(QDialog):
         # the live runner reads per-gesture timing back at run-time.
         # action.cooldown_seconds() already reads cooldown_s; the runner
         # reads hold_s.
-        # v1.1.8.2: dynamic gestures fire instantly on motion match; no
-        # hold semantics apply. Persist hold_s = 0 for dynamics so
-        # runtime timing readers don't accidentally apply a stale hold.
-        _is_dynamic = (self.gesture_type() == "dynamic")
+        # Dynamic / pose_sequence fire without a static hold_s.
+        _is_instant = self.gesture_type() in ("dynamic", "pose_sequence")
         timing_payload = {
             "cooldown_s": float(self.cooldown_spin.value()),
-            "hold_s": 0.0 if _is_dynamic else float(self.hold_spin.value()),
+            "hold_s": 0.0 if _is_instant else float(self.hold_spin.value()),
         }
         if kind == "keystroke":
             return Action(kind=kind, payload={"key": value, **timing_payload})
@@ -1367,11 +1450,44 @@ class CreateGestureWizard(QDialog):
                 raise ValueError("Hotkey combo must include at least one key.")
             return Action(kind=kind, payload={"keys": keys, **timing_payload})
         if kind == "text":
+            # Store exactly what the user typed — no escaping / encoding.
             return Action(kind=kind, payload={"text": value, **timing_payload})
         if kind == "open_url":
-            if "://" not in value and not value.startswith("/"):
-                value = "https://" + value
-            return Action(kind=kind, payload={"url": value, **timing_payload})
+            raw = value.strip()
+            # Never percent-encode here. Also don't auto-prefix https://
+            # onto spaced plain text ("my snap") — that used to become
+            # https://my snap and the browser then showed my%20snap.
+            if "://" not in raw and not raw.startswith("/"):
+                if any(ch.isspace() for ch in raw):
+                    raise ValueError(
+                        "That looks like plain text, not a URL. "
+                        "Choose “Type a text snippet” to type it exactly "
+                        "as written (spaces stay spaces), or enter a full "
+                        "URL like https://example.com."
+                    )
+                raw = "https://" + raw
+            else:
+                # Reject already-schemed URLs whose host is spaced words
+                # with no domain dot — same foot-gun as above.
+                try:
+                    from urllib.parse import urlparse
+
+                    host = (urlparse(raw).netloc or "").strip()
+                    if (
+                        " " in host
+                        and "." not in host
+                        and ":" not in host
+                    ):
+                        raise ValueError(
+                            "That URL host has spaces and isn't a website. "
+                            "Choose “Type a text snippet” to type the text "
+                            "exactly, or enter a real URL."
+                        )
+                except ValueError:
+                    raise
+                except Exception:
+                    pass
+            return Action(kind=kind, payload={"url": raw, **timing_payload})
         if kind == "run_command":
             return Action(kind=kind, payload={"command": value, "shell": True, **timing_payload})
         if kind == "open_file":

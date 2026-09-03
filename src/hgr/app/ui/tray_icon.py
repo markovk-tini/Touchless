@@ -98,6 +98,10 @@ class TouchlessTrayIcon(QObject):
     resume_requested = Signal()  # user clicked "Resume Gestures"
     settings_requested = Signal()
     quit_requested = Signal()
+    # Balloon click. MainWindow uses this to re-raise the update
+    # dialog so a frameless-window z-order regression still has a
+    # clickable recovery path (the 1.1.7 / 1.1.8 invisible popup).
+    message_clicked = Signal()
     # Emitted whenever the rendered state icon changes. MainWindow
     # wires this to setWindowIcon so the TASKBAR entry mirrors the
     # tray's state cue -- user always sees the colour at a glance
@@ -116,6 +120,7 @@ class TouchlessTrayIcon(QObject):
         self._tray.setIcon(_render_bordered_icon(base_icon, _BORDER_OFF))
         self._tray.setToolTip("Touchless — engine off")
         self._tray.activated.connect(self._on_activated)
+        self._tray.messageClicked.connect(self.message_clicked.emit)
 
         self._menu = QMenu()
         self._pause_action = QAction("Pause Gestures (30 min)", self._menu)
@@ -170,6 +175,19 @@ class TouchlessTrayIcon(QObject):
         self._tray.hide()
         self._auto_resume_timer.stop()
         self._tooltip_refresh_timer.stop()
+
+    def showMessage(self, title: str, message: str, *args, **kwargs) -> None:
+        """Forward a balloon to the real QSystemTrayIcon.
+
+        MainWindow's update-popup safety net calls this. The wrapper
+        used to have no such method, so `hasattr(tray, "showMessage")`
+        was False and the 1.1.7 / 1.1.8 invisible-dialog fallback
+        never fired.
+        """
+        try:
+            self._tray.showMessage(title, message, *args, **kwargs)
+        except Exception:
+            pass
 
     def set_engine_state(self, *, engine_running: bool, gestures_enabled: bool) -> None:
         """Public hook the MainWindow calls when running_state or

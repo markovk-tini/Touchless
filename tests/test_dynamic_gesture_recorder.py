@@ -253,6 +253,37 @@ class RegistryRoundTripTests(unittest.TestCase):
         self.assertEqual(g.action.kind, "hotkey")
         self.assertEqual(g.action.payload["keys"], ["ctrl", "d"])
 
+    def test_replace_metadata_preserves_dynamic_fields(self) -> None:
+        artifacts = self._record_swipe(take_count=3)
+        registry = GestureRegistry(self.registry_path)
+        registry.add_dynamic(
+            name="down_swipe",
+            key_point_indices=artifacts.key_points.indices,
+            sample_trajectories=artifacts.template.sample_trajectories,
+            action=Action(kind="noop", payload={}),
+            description="old",
+            handedness="Right",
+            duration_mode="fixed_2s",
+        )
+        updated = registry.replace_metadata(
+            "down_swipe",
+            name="down_swipe",
+            action=Action(kind="hotkey", payload={"keys": ["ctrl", "d"]}),
+            description="new",
+            duration_mode="until_stopped",
+        )
+        self.assertEqual(updated.kind, "dynamic")
+        self.assertEqual(updated.description, "new")
+        self.assertEqual(updated.duration_mode, "until_stopped")
+        self.assertEqual(
+            list(updated.key_point_indices),
+            list(artifacts.key_points.indices),
+        )
+        self.assertEqual(
+            len(updated.sample_trajectories),
+            len(artifacts.template.sample_trajectories),
+        )
+
     def test_static_gestures_unaffected_by_dynamic_fields(self) -> None:
         # A v1-format JSON (no kind / no dynamic fields) must still
         # load cleanly with kind="static". Smoke test the backward
