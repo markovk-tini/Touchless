@@ -4,6 +4,13 @@ This file is the consolidated memory for any AI agent (Claude, Codex,
 ChatGPT, etc.) working on Touchless. Read this first, then dive into
 the relevant subsystem doc under `docs/`.
 
+**Before ANY release, updater, installer, or Store-submission work:
+read `PUBLISHING_POLICY.md` at the repo root, then walk
+`docs/UPDATE_RELEASE_CHECKLIST.md` item by item.** Every stop-ship
+rule in the policy exists because a previous version shipped without
+it. Report green/red per line before running `git push`,
+`rclone copyto`, or any Partner Center action.
+
 ## Project identity
 
 **Touchless** is a hand-gesture + voice desktop control application

@@ -96,6 +96,28 @@ def _parse_dictation_command(text: str) -> Optional[str]:
         return "paragraph"
     return None
 
+
+# Left-hand "one" (voice listen) is a *held* pose, not a swipe. Net palm
+# travel is measured in palm-scale units from the start of the hold.
+# Landmark jitter is typically ~0.05–0.12; a small drift while holding
+# is fine. A committed swipe is usually >0.6. This cap sits in between
+# so the gate is not "perfectly still".
+_VOICE_ONE_MAX_HOLD_TRAVEL_PALM = 0.40
+
+
+def _palm_net_travel_exceeds(
+    origin_xy: tuple[float, float],
+    current_xy: tuple[float, float],
+    palm_scale: float,
+    *,
+    max_travel: float = _VOICE_ONE_MAX_HOLD_TRAVEL_PALM,
+) -> bool:
+    scale = max(float(palm_scale), 1e-6)
+    dx = (float(current_xy[0]) - float(origin_xy[0])) / scale
+    dy = (float(current_xy[1]) - float(origin_xy[1])) / scale
+    return math.hypot(dx, dy) > max_travel
+
+
 _DICTATION_TRAILING_HALLUCINATIONS = {"the", "you", "and", "a"}
 
 _WHISPER_STOCK_HALLUCINATIONS = (
@@ -1120,6 +1142,11 @@ class GestureWorker(QObject):
         self._voice_cooldown_until = 0.0
         self._voice_latched_label: str | None = None
         self._voice_one_two_triggered_at: float = 0.0
+        # Palm anchor for the left-hand "one" hold. Used to reject
+        # swipe-scale translation (custom 1-swipe-left must not start
+        # voice) while still allowing jitter / a little drift.
+        self._voice_hold_origin_xy: Optional[tuple[float, float]] = None
+        self._voice_hold_origin_scale: float = 1.0
         # Left-hand thumbs-up CLIP GESTURE state. Hold thumbs-up on
         # the left hand for 0.5 s to trigger a clip with the user's
         # configured default duration (Settings → Clip Presets).
@@ -1349,6 +1376,18 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] dynamic runtime init failed: {exc}")
             self._dynamic_gesture_runtime = None
+        try:
+            from ...custom_gestures.pose_sequence_runtime import PoseSequenceRuntime
+            self._pose_sequence_runtime = PoseSequenceRuntime()
+            self._pose_sequence_runtime.reload()
+        except Exception as exc:
+            print(f"[custom-gestures] pose sequence runtime init failed: {exc}")
+            self._pose_sequence_runtime = None
+        # When a custom horizontal swipe owns the live pose, builtin
+        # swipe_left/right must not also dispatch (sandbox never had
+        # this collision because it has no builtin swipe path).
+        self._suppress_builtin_horizontal_swipe = False
+        self._custom_dyn_builtin_suppress_until = 0.0
 
         # Per-tick timing markers shared between _tick and
         # _on_engine_result â€” needed because the engine call now
@@ -1485,6 +1524,18 @@ class GestureWorker(QObject):
             runner.reload()
         except Exception as exc:
             print(f"[custom-gestures] reload failed: {exc}")
+        dyn = getattr(self, "_dynamic_gesture_runtime", None)
+        if dyn is not None:
+            try:
+                dyn.reload()
+            except Exception as exc:
+                print(f"[custom-gestures] dynamic reload failed: {exc}")
+        seq = getattr(self, "_pose_sequence_runtime", None)
+        if seq is not None:
+            try:
+                seq.reload()
+            except Exception as exc:
+                print(f"[custom-gestures] pose sequence reload failed: {exc}")
 
     def _emit_voice_log_step(self, message: str) -> None:
         """Forward a step message from VoiceCommandProcessor to the
@@ -3663,6 +3714,21 @@ class GestureWorker(QObject):
         # showed labels the user couldn't use on the active hand,
         # which was visually noisy and misleading.
         return "", False
+
+    # Recognizer labels that are not shipped as named preset
+    # gestures. "one" (index finger up) is used internally for
+    # voice-listen / drawing / repeat-circle, but there is no
+    # user-facing gesture called "one". Showing it on the live
+    # viewer implies a preset and collides with custom names.
+    _UNNAMED_RECOGNIZER_LABELS = frozenset({"one"})
+
+    @classmethod
+    def _hide_unnamed_recognizer_label(
+        cls, label: str, active: bool,
+    ) -> tuple[str, bool]:
+        if str(label or "") in cls._UNNAMED_RECOGNIZER_LABELS:
+            return "", False
+        return label, active
 
     @staticmethod
     def _build_hand_overlay_info(
@@ -7310,6 +7376,7 @@ class GestureWorker(QObject):
                 label, active = self._filter_banner_label_by_handedness(
                     label, active, primary_handedness
                 )
+                label, active = self._hide_unnamed_recognizer_label(label, active)
                 label, active = _apply_custom_label(label, active, primary_handedness)
                 # Display: underscore -> space so derived labels read
                 # naturally ('three together', 'four together',
@@ -7334,6 +7401,7 @@ class GestureWorker(QObject):
                 label, active = self._filter_banner_label_by_handedness(
                     label, active, sec_handedness
                 )
+                label, active = self._hide_unnamed_recognizer_label(label, active)
                 label, active = _apply_custom_label(label, active, sec_handedness)
                 display_label = label.replace("_", " ") if label else label
                 hands_info.append(
@@ -7517,6 +7585,7 @@ class GestureWorker(QObject):
         # runner. Uses the same registry + same fire_once cooldown
         # but matches motion (DTW) instead of pose. Falls through
         # silently when no dynamic gestures are registered.
+        fired_dyn = None
         dynamic_runtime = getattr(self, "_dynamic_gesture_runtime", None)
         if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
             try:
@@ -7547,6 +7616,66 @@ class GestureWorker(QObject):
                         )
             except Exception as exc:
                 print(f"[custom-gestures] dynamic runtime error: {exc}")
+
+        # Pose-sequence runtime — ordered held poses (e.g. 3→2→1).
+        seq_runtime = getattr(self, "_pose_sequence_runtime", None)
+        if seq_runtime is not None and seq_runtime.has_sequences():
+            try:
+                runner_now = time.monotonic()
+                seq_runtime.maybe_reload_if_changed(runner_now)
+                hand_lost = not (
+                    result.found
+                    and result.tracked_hand is not None
+                    and result.hand_reading is not None
+                )
+                if hand_lost:
+                    seq_runtime.hand_lost()
+                else:
+                    fired_seq = seq_runtime.process_landmarks(
+                        result.hand_reading.landmarks,
+                        handedness=str(result.tracked_hand.handedness or ""),
+                        timestamp=runner_now,
+                    )
+                    if fired_seq:
+                        try:
+                            self.command_detected.emit(f"custom: {fired_seq}")
+                        except Exception:
+                            pass
+                        self._record_action(
+                            f"custom_sequence:{fired_seq}",
+                            f"custom pose sequence: {fired_seq}",
+                        )
+            except Exception as exc:
+                print(f"[custom-gestures] pose sequence runtime error: {exc}")
+
+        # Builtin swipe_left/right fire on the same index-only
+        # horizontal motion as a custom "1 swipe right". Preempt
+        # the builtin path when a horizontal custom template claims
+        # this pose, or for 1.2s after a custom dynamic fire.
+        self._suppress_builtin_horizontal_swipe = False
+        try:
+            if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
+                now_m = time.monotonic()
+                if fired_dyn:
+                    self._custom_dyn_builtin_suppress_until = now_m + 1.2
+                lm = None
+                scale = 1.0
+                if (
+                    result.found
+                    and result.hand_reading is not None
+                    and getattr(result.hand_reading, "landmarks", None) is not None
+                ):
+                    lm = result.hand_reading.landmarks
+                    scale = float(result.hand_reading.palm.scale)
+                if (
+                    now_m < float(getattr(self, "_custom_dyn_builtin_suppress_until", 0.0) or 0.0)
+                    or dynamic_runtime.should_preempt_builtin_horizontal_swipe(
+                        lm, palm_scale=scale, now=now_m,
+                    )
+                ):
+                    self._suppress_builtin_horizontal_swipe = True
+        except Exception:
+            self._suppress_builtin_horizontal_swipe = False
 
         hand_handedness = result.tracked_hand.handedness if result.found and result.tracked_hand is not None else None
         # MediaPipe occasionally labels a single visible right hand
@@ -7833,7 +7962,7 @@ class GestureWorker(QObject):
             self._volume_init_palm_x = None
             self._update_volume_overlay()
             return
-        if hand_handedness == "Right" and result.prediction.dynamic_label in {"swipe_left", "swipe_right"}:
+        if hand_handedness == "Right" and self._effective_dynamic_label(result.prediction) in {"swipe_left", "swipe_right"}:
             self._mute_block_until = max(self._mute_block_until, now + 0.5)
 
         features = None
@@ -8436,6 +8565,21 @@ class GestureWorker(QObject):
             # Cross-handedness â€” skip remap (see docstring).
             return prediction
         return self._rewrite_prediction_labels(prediction, target_raw_label)
+
+    def _effective_dynamic_label(self, prediction) -> str:
+        """Builtin swipe_left/right, with custom-horizontal preemption.
+
+        When a custom index-only swipe-right owns the pose, the live
+        app must not also dispatch the builtin swipe. Returns
+        "neutral" in that case; otherwise the prediction's label.
+        """
+        label = str(getattr(prediction, "dynamic_label", "neutral") or "neutral")
+        if (
+            getattr(self, "_suppress_builtin_horizontal_swipe", False)
+            and label in {"swipe_left", "swipe_right"}
+        ):
+            return "neutral"
+        return label
 
     @staticmethod
     def _neutralize_prediction(prediction):
@@ -9070,14 +9214,22 @@ class GestureWorker(QObject):
                 hand_handedness == "Right"
                 and hand_reading is not None
                 and now >= self._drawing_swipe_cooldown_until
-                # r53 v2: only fire drawing swipes when the pose is the
-                # index-only "one" shape (same pose active while drawing).
-                # Prevents open-hand or fist sweeps between strokes from
-                # accidentally undoing / clearing the canvas.
+                # r53 v2: drawing undo/clear stays index-only ("one").
+                # Builtin swipe_left/right (Spotify skip, HUD, etc.)
+                # are open-hand only, so they no longer share this
+                # label. Read the one-pose swipe from the recognizer.
                 and self._drawing_draw_pose_active(prediction, hand_reading)
             ):
-                dynamic_label = str(getattr(prediction, "dynamic_label", "neutral") or "neutral")
-                if dynamic_label in {"swipe_left", "swipe_right"}:
+                one_pose_swipe = "neutral"
+                try:
+                    recog = getattr(self.engine, "dynamic_recognizer", None)
+                    one_pose_swipe = str(
+                        getattr(recog, "last_one_pose_horizontal_label", "neutral")
+                        or "neutral"
+                    )
+                except Exception:
+                    one_pose_swipe = "neutral"
+                if one_pose_swipe in {"swipe_left", "swipe_right"}:
                     if (
                         self._drawing_render_target == "camera"
                         and self._camera_draw_active_stroke_points
@@ -9087,7 +9239,7 @@ class GestureWorker(QObject):
                     self._drawing_draw_grace_until = 0.0
                     self._drawing_erase_grace_until = 0.0
                     self._drawing_draw_active_streak = 0
-                    if self._perform_drawing_swipe_action(dynamic_label):
+                    if self._perform_drawing_swipe_action(one_pose_swipe):
                         self._drawing_swipe_cooldown_until = now + 1.2
                     self._chrome_control_text = self._drawing_control_text
                     self._spotify_control_text = self._drawing_control_text
@@ -9262,7 +9414,7 @@ class GestureWorker(QObject):
 
         youtube_snapshot = self.youtube_router.update(
             stable_label=app_static_label,
-            dynamic_label=prediction.dynamic_label,
+            dynamic_label=self._effective_dynamic_label(prediction),
             controller=self.youtube_controller,
             now=now,
         )
@@ -9298,7 +9450,7 @@ class GestureWorker(QObject):
 
         chrome_snapshot = self.chrome_router.update(
             stable_label=app_static_label,
-            dynamic_label=prediction.dynamic_label,
+            dynamic_label=self._effective_dynamic_label(prediction),
             controller=self.chrome_controller,
             now=now,
         )
@@ -9328,7 +9480,7 @@ class GestureWorker(QObject):
 
         snapshot = self.spotify_router.update(
             stable_label=prediction.stable_label,
-            dynamic_label=prediction.dynamic_label,
+            dynamic_label=self._effective_dynamic_label(prediction),
             controller=self.spotify_controller,
             now=now,
         )
@@ -9799,7 +9951,7 @@ class GestureWorker(QObject):
         # surfacing in the debug display and on _dynamic_hold_label,
         # which the user found distracting. Swipes are kept because
         # drawing mode actively uses left/right swipes for nav.
-        incoming_dynamic = prediction.dynamic_label
+        incoming_dynamic = self._effective_dynamic_label(prediction)
         if self._drawing_mode_enabled and incoming_dynamic == "repeat_circle":
             incoming_dynamic = "neutral"
         dynamic_display = incoming_dynamic
@@ -9816,6 +9968,8 @@ class GestureWorker(QObject):
         payload_stable_label = prediction.stable_label
         payload_dynamic_label = dynamic_display
         banner_text = prediction.stable_label if prediction.stable_label != "neutral" else prediction.raw_label
+        if banner_text in self._UNNAMED_RECOGNIZER_LABELS:
+            banner_text = "neutral"
         if self._drawing_mode_enabled:
             payload_raw_label = "neutral"
             payload_stable_label = "neutral"
@@ -10879,6 +11033,14 @@ class GestureWorker(QObject):
         if stable_label != self._voice_candidate:
             self._voice_candidate = stable_label
             self._voice_candidate_since = now
+            self._begin_voice_hold_anchor()
+            return
+
+        if self._voice_one_hold_is_translating():
+            # Hand is doing a swipe (or other committed move), not a
+            # stationary listen pose. Restart the hold from here so a
+            # later still "one" can still arm voice.
+            self._reset_voice_candidate(now)
             return
 
         if stable_label == "one" and (self._voice_listening or self._dictation_active):
@@ -11009,9 +11171,45 @@ class GestureWorker(QObject):
         except Exception:
             pass
 
+    def _begin_voice_hold_anchor(self) -> None:
+        self._voice_hold_origin_xy = None
+        self._voice_hold_origin_scale = 1.0
+        xy = self._palm_xy(getattr(self, "_left_hand_reading", None))
+        if xy is None:
+            return
+        try:
+            scale = float(self._left_hand_reading.palm.scale)
+        except Exception:
+            scale = 1.0
+        self._voice_hold_origin_xy = xy
+        self._voice_hold_origin_scale = max(scale, 1e-6)
+
+    def _voice_one_hold_is_translating(self) -> bool:
+        """True when left-hand palm has moved swipe-scale since hold start.
+
+        Small jitter and a little drift stay under the cap so a held
+        "one" still starts voice. Missing landmarks fail open (no
+        reading → not treated as moving).
+        """
+        reading = getattr(self, "_left_hand_reading", None)
+        xy = self._palm_xy(reading)
+        if xy is None:
+            return False
+        if self._voice_hold_origin_xy is None:
+            self._begin_voice_hold_anchor()
+            return False
+        try:
+            scale = float(reading.palm.scale)
+        except Exception:
+            scale = self._voice_hold_origin_scale
+        scale = max(float(scale), float(self._voice_hold_origin_scale), 1e-6)
+        return _palm_net_travel_exceeds(self._voice_hold_origin_xy, xy, scale)
+
     def _reset_voice_candidate(self, now: float) -> None:
         self._voice_candidate = "neutral"
         self._voice_candidate_since = now
+        self._voice_hold_origin_xy = None
+        self._voice_hold_origin_scale = 1.0
         if self._voice_latched_label is not None:
             self._voice_latched_label = None
 

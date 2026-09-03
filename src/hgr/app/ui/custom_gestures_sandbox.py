@@ -104,6 +104,9 @@ class SandboxWindow(QDialog):
         # up even in read-only mode.
         self._dynamic_runtime = DynamicGestureRuntime()
         self._dynamic_runtime.reload()
+        from hgr.custom_gestures.pose_sequence_runtime import PoseSequenceRuntime
+        self._sequence_runtime = PoseSequenceRuntime()
+        self._sequence_runtime.reload()
 
         # Hold-to-activate state.
         self._hold_name: Optional[str] = None
@@ -559,6 +562,25 @@ class SandboxWindow(QDialog):
                     self._last_fire_at = now
                     if fire_now:
                         self._cooldown_until = now + _DEFAULT_COOLDOWN
+                try:
+                    fired_seq = self._sequence_runtime.process_landmarks(
+                        lm,
+                        handedness=live_hand or "",
+                        timestamp=now,
+                        dispatch=fire_now,
+                    )
+                except Exception as exc:
+                    fired_seq = None
+                    print(f"[sandbox] pose sequence error: {exc}")
+                if fired_seq:
+                    self._last_match_label = (
+                        f"sequence: {fired_seq}"
+                        + ("  fired" if fire_now else "  (detected, fire-off)")
+                    )
+                    self._last_fire_name = fired_seq
+                    self._last_fire_at = now
+                    if fire_now:
+                        self._cooldown_until = now + _DEFAULT_COOLDOWN
             else:
                 self._latest_sig = {}
                 self._latest_feats = None
@@ -571,6 +593,10 @@ class SandboxWindow(QDialog):
                     self._fired_for_hold = False
                 try:
                     self._dynamic_runtime.hand_lost()
+                except Exception:
+                    pass
+                try:
+                    self._sequence_runtime.hand_lost()
                 except Exception:
                     pass
 
@@ -624,6 +650,50 @@ class SandboxWindow(QDialog):
                 frame, f"FIRED: {self._last_fire_name}", (12, 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA,
             )
+
+        # Dynamic SPRING scoreboard — shows why a circle / wave is or
+        # isn't firing (cost vs threshold). Green when cost is under
+        # threshold; grey otherwise. Also show live wrist path so a
+        # near-threshold circle that hasn't traveled enough is obvious.
+        try:
+            rows = self._dynamic_runtime.spring_debug_rows()
+        except Exception:
+            rows = []
+        y = 110
+        live_path = None
+        try:
+            clf = getattr(self._dynamic_runtime, "_classifier", None)
+            if clf is not None:
+                live_path = float(clf._live_wrist_path_length(2.5))
+        except Exception:
+            live_path = None
+        if live_path is not None:
+            cv2.putText(
+                frame,
+                f"wrist_path={live_path:.2f}",
+                (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (180, 180, 180),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 20
+        for name, cost, thr, rising in rows[:6]:
+            under = cost < thr
+            color = (40, 220, 40) if under else (170, 170, 170)
+            mark = "*" if rising else " "
+            cv2.putText(
+                frame,
+                f"{mark}{name}: {cost:.2f}/{thr:.2f}",
+                (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            y += 20
 
     def _draw_progress_bar(
         self,

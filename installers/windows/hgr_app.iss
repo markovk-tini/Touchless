@@ -21,7 +21,7 @@
 ;   /DMONOLITHIC=1                     (optional — switches to embedded zip)
 
 #define MyAppName "Touchless"
-#define MyAppVersion "1.1.8.1"
+#define MyAppVersion "1.1.9"
 #define MyAppPublisher "Konstantin Markov"
 #define MyAppExeName "Touchless.exe"
 #define DistDir "..\..\dist\Touchless"

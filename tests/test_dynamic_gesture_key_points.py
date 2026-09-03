@@ -212,18 +212,13 @@ class KeyPointSelectorTests(unittest.TestCase):
         self.assertIn(0, result.indices)
         self.assertIn(9, result.indices)
 
-        # The other fingertips (curled, didn't move) must NOT make it
-        # into the selected set. This is the killer property: the
-        # algorithm drops landmarks that contribute no information.
-        for static_tip in (4, 12, 16, 20):
-            self.assertNotIn(
-                static_tip, result.indices,
-                msg=f"static tip {static_tip} should have been rejected "
-                    f"(motion={result.motion_scores[static_tip]:.3f}, "
-                    f"consistency={result.consistency_scores[static_tip]:.3f})",
-            )
+        # All five fingertips are pose identity — static curled tips
+        # stay in the set so "index-only swipe" cannot match "open
+        # hand swipe" on path alone.
+        for tip in (4, 8, 12, 16, 20):
+            self.assertIn(tip, result.indices)
 
-        # Sanity: motion scores reflect what actually moved.
+        # Sanity: motion scores still reflect what actually moved.
         self.assertGreater(result.motion_scores[8], result.motion_scores[4])
         self.assertGreater(result.motion_scores[8], result.motion_scores[20])
 

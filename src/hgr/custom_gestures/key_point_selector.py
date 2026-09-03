@@ -3,13 +3,15 @@
 Given N takes of the user performing the same gesture, this module
 inspects every landmark's trajectory and picks the subset that is:
 
-  (1) MOVING during the gesture (i.e. contributes information), and
+  (1) MOVING during the gesture (i.e. contributes path information), and
   (2) MOVING THE SAME WAY across all N takes (i.e. it's the gesture
       and not random hand wobble that happens to be high-motion in
       this one recording).
 
-A landmark that fails (1) — say the curled pinky tip in a "single
-finger down-swipe" gesture — is dropped because it's just a constant.
+All five fingertips are ALWAYS kept even when they do not move. A
+curled pinky in an index-only swipe is not "noise" — it is the pose
+that distinguishes that gesture from an open-hand swipe on the same
+path. Intermediate joints that fail (1) are still dropped.
 A landmark that fails (2) — say the thumb sliding in random
 directions every time — is dropped because it's noise that would hurt
 the runtime matcher's accuracy.
@@ -83,19 +85,12 @@ _CONSISTENCY_FLOOR = 0.55
 # by raw relevance so the gesture still has SOMETHING to match on.
 _FALLBACK_TOP_K = 3
 
-# When MANY landmarks pass, cap the selected set. 7 = the principled
-# minimum: 2 anchors (wrist + mid-MCP) + up to 5 fingertips. That
-# covers every realistic gesture cleanly:
-#   * 1-finger swipe: 2 anchors + 1-3 joints from the active finger
-#     = 3-5 landmarks (cap never binds).
-#   * 5-finger fist/clap/spread: 2 anchors + 5 tips = 7 landmarks
-#     (cap binds exactly, drops the redundant DIP/PIP that follow
-#     the same arc as their tip).
-# Raising the cap doesn't add accuracy — intermediate joints on a
-# moving finger are highly correlated with that finger's tip, so
-# they're matcher-redundant. They DO add runtime cost (DTW scales
-# with feature count), so the cap is a real perf-quality tradeoff.
-_MAX_SELECTED = 7
+# Identity set (always kept): 2 anchors + 5 fingertips = 7. Cap is
+# higher so a one-finger swipe can still add that finger's DIP/PIP
+# for path shape without evicting a static (but identifying) tip.
+#   * 1-finger swipe: 7 identity + 2-3 active-finger joints.
+#   * 5-finger fist/clap/spread: 7 identity, extra joints optional.
+_MAX_SELECTED = 12
 
 
 @dataclass(frozen=True)
@@ -129,9 +124,8 @@ def select_key_points(
     to reliably reject noise.
 
     Selection order (so the cap drops sensibly):
-      1. Anchors (always).
-      2. Fingertips that pass both gates, ranked by relevance.
-      3. Intermediate joints (PIP / DIP / MCP / proximal) that pass.
+      1. Anchors (always) + all five fingertips (always — pose identity).
+      2. Intermediate joints (PIP / DIP / MCP / proximal) that pass.
 
     Result indices are sorted ascending so the gesture's saved
     trajectory has a stable column order across saves.
@@ -189,7 +183,9 @@ def select_key_points(
     # 6. Pick.
     anchors_set = set(int(i) for i in anchor_indices)
     fingertip_set = set(int(i) for i in fingertip_indices)
-    selected: list[int] = list(anchors_set)
+    # Pose identity: static fingertips are HOW the user holds the
+    # hand, not matcher-noise. Always keep them.
+    selected: list[int] = sorted(anchors_set | fingertip_set)
 
     def _passes(i: int) -> bool:
         return (
@@ -197,17 +193,7 @@ def select_key_points(
             and consistency_scores[i] >= consistency_floor
         )
 
-    # Stage A: fingertips that pass, by relevance.
-    tip_candidates = sorted(
-        (i for i in fingertip_set if i not in selected and _passes(i)),
-        key=lambda i: -relevance[i],
-    )
-    for idx in tip_candidates:
-        if len(selected) >= max_selected:
-            break
-        selected.append(idx)
-
-    # Stage B: everything else that passes, by relevance.
+    # Extra moving joints (beyond identity) by relevance.
     other_candidates = sorted(
         (
             i for i in range(n_landmarks)
@@ -221,9 +207,9 @@ def select_key_points(
         selected.append(idx)
 
     fell_back = False
-    if len(selected) == len(anchors_set):
-        # Nothing passed beyond anchors — fall back to top-K by raw
-        # relevance so the gesture still has something distinctive
+    if len(selected) < 2:
+        # Degenerate: identity set failed to populate. Fall back to
+        # top-K by raw relevance so the gesture still has something
         # to match. UI should surface this as a warning.
         fell_back = True
         ranked = sorted(

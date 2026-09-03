@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -72,39 +72,29 @@ from hgr.custom_gestures.registry import CustomGesture, GestureRegistry
 
 
 _HOW_IT_WORKS_HTML = (
-    "<p style='margin-top:0;'>Custom Gestures lets you record your own hand "
-    "pose and bind it to any keystroke, hotkey, text snippet, URL, or shell "
-    "command. Once saved, the gesture works alongside the built-in Touchless "
-    "controls.</p>"
-    "<p><b>How to use it:</b></p>"
+    "<p style='margin-top:0;'>Custom Gestures lets you teach Touchless your "
+    "own hand controls and bind them to a keystroke, hotkey, text snippet, "
+    "URL, file, shell command, or overlay. Saved gestures work alongside "
+    "built-in Touchless controls.</p>"
+    "<p><b>How to use:</b></p>"
     "<ol style='margin-top:2px; padding-left:18px;'>"
-    "<li><b>Click Create New Gesture.</b> Give it a name and (optional) "
-    "description.</li>"
-    "<li><b>Set timing.</b> Hold-to-activate (default 1s) is how long you "
-    "must keep the pose before the action fires. Cooldown (default 2s) "
-    "prevents back-to-back firing while you keep holding.</li>"
-    "<li><b>Pick an action.</b> Press a key, fire a hotkey combo, type "
-    "text, open a URL, or run a shell command. The form will ask for the "
-    "specific value once you choose.</li>"
-    "<li><b>Click Start to record.</b> The camera opens. Hold your pose "
-    "and click <b>Begin Recording</b>. Touchless captures 100 frames "
-    "(~10 seconds) — let your hand drift naturally during this so the "
-    "classifier learns your real range. The live finger-state readout "
-    "in the top-right shows what the system is perceiving.</li>"
-    "<li><b>Save when done.</b> Touchless prints a Hand Pose summary so "
-    "you can verify the recording captured what you intended.</li>"
+    "<li><b>Create New Gesture</b> — name it, pick an action, then choose "
+    "a type: <b>Static</b> (one held pose), <b>Sequence</b> (ordered held "
+    "poses you invent), or <b>Dynamic</b> (continuous motion path).</li>"
+    "<li><b>Record</b> — follow the on-screen guide for that type. Each "
+    "recorder page has specifics and a Show more section.</li>"
+    "<li><b>Save</b> — test in Sandbox, then use it live. Expand a card "
+    "to preview the clip / Paths (for motion).</li>"
     "</ol>"
-    "<p><b>Limitations of the current model (Beta):</b></p>"
+    "<p><b>Limitations (general):</b></p>"
     "<ul style='margin-top:2px; padding-left:18px;'>"
-    "<li><b>Static poses only.</b> The classifier matches single-frame "
-    "shapes. Swipes, waves, and motion-based gestures aren't supported "
-    "yet.</li>"
-    "<li><b>Avoid heavy occlusion.</b> Poses where one finger is hidden "
-    "behind another (interlocked fingers, pinky tucked behind thumb) "
-    "produce noisy landmark predictions and unreliable matches. Pick "
-    "poses where every fingertip is visible to the camera.</li>"
-    "<li><b>One hand at a time.</b> Custom gestures are matched on the "
-    "primary tracked hand only.</li>"
+    "<li><b>One hand at a time</b> on the primary tracked hand.</li>"
+    "<li><b>Keep fingertips visible</b> — heavy occlusion makes matching "
+    "unreliable.</li>"
+    "<li><b>Lighting &amp; framing</b> — stay clearly in camera view; "
+    "very dark or blurry takes train poorly.</li>"
+    "<li><b>Beta</b> — pick the gesture type that matches what you’re "
+    "doing; the wrong type is the most common failure mode.</li>"
     "</ul>"
 )
 
@@ -359,6 +349,10 @@ class CustomGesturesPanel(QWidget):
         # scrollbar for the whole page.
         self._cards_container = QWidget()
         self._cards_container.setStyleSheet("background: transparent;")
+        self._cards_container.setMinimumWidth(0)
+        self._cards_container.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred
+        )
         self._cards_container_layout = QVBoxLayout(self._cards_container)
         self._cards_container_layout.setContentsMargins(0, 0, 0, 0)
         self._cards_container_layout.setSpacing(8)
@@ -497,6 +491,7 @@ class GestureCard(QFrame):
             "}"
         )
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        self.setMinimumWidth(0)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
@@ -508,7 +503,15 @@ class GestureCard(QFrame):
         # of many custom gestures scrolls cleanly.
         top_row = QHBoxLayout()
         top_row.setSpacing(10)
-        self._toggle_button = QPushButton(f"▶  {gesture.name}")
+        kind = str(getattr(gesture, "kind", "static") or "static")
+        if kind == "pose_sequence":
+            n_steps = len(getattr(gesture, "pose_sequence_steps", None) or [])
+            title = f"▶  {gesture.name}  · sequence ({n_steps})"
+        elif kind == "dynamic":
+            title = f"▶  {gesture.name}  · motion"
+        else:
+            title = f"▶  {gesture.name}"
+        self._toggle_button = QPushButton(_soft_wrap_breaks(title))
         self._toggle_button.setStyleSheet(
             "QPushButton {"
             "  background: transparent;"
@@ -520,7 +523,8 @@ class GestureCard(QFrame):
             "  border: none;"
             "}"
         )
-        self._toggle_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._toggle_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._toggle_button.setMinimumWidth(0)
         self._toggle_button.clicked.connect(self._toggle)
         top_row.addWidget(self._toggle_button, 1)
 
@@ -594,22 +598,30 @@ class GestureCard(QFrame):
             hand_prefix = f"[{gesture.handedness} hand] "
         else:
             hand_prefix = "[Either hand] "
-        action_label = QLabel(hand_prefix + describe_action(gesture.action))
+        action_label = QLabel(
+            _soft_wrap_breaks(hand_prefix + describe_action(gesture.action))
+        )
         action_label.setStyleSheet("color: #9FB3C2; font-size: 12px;")
-        action_label.setWordWrap(True)
+        _configure_wrapping_label(action_label)
         root.addWidget(action_label)
 
-        # Expanded body: description on the left, thumbnail on the
-        # right. Was previously two stacked widgets (description above,
-        # thumbnail below); side-by-side reads more like a "details
-        # card" — the user can scan the summary text while seeing the
-        # captured pose without having to scroll.
-        expanded_row = QHBoxLayout()
-        expanded_row.setSpacing(10)
+        # Expanded body. Normal: details | thumb side-by-side.
+        # Zoomed (thumb clicked): details full-width on top, large
+        # playback below so long text still wraps instead of shoving
+        # the card off-screen.
+        self._thumb_zoomed = False
+        self._thumb_source_path: Optional[str] = None
+        self._THUMB_NORMAL = (200, 150)
+        self._THUMB_ZOOMED = (500, 375)  # ~2.5×
+
+        self._expanded_column = QVBoxLayout()
+        self._expanded_column.setSpacing(10)
+
+        self._expanded_row = QHBoxLayout()
+        self._expanded_row.setSpacing(10)
 
         self._details = QLabel()
-        self._details.setWordWrap(True)
-        self._details.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        _configure_wrapping_label(self._details)
         self._details.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._details.setStyleSheet(
             f"color: {self._text_color};"
@@ -619,16 +631,16 @@ class GestureCard(QFrame):
             " padding: 10px;"
             " border-radius: 6px;"
         )
-        self._details.setText(format_gesture_summary(gesture))
+        self._details.setText(_soft_wrap_breaks(format_gesture_summary(gesture)))
         self._details.hide()
-        expanded_row.addWidget(self._details, 1)
+        self._expanded_row.addWidget(self._details, 1)
 
-        # Thumbnail: fixed width so it doesn't squeeze the description
-        # away when the card is wide. Shown only when expanded.
         self._expanded_thumb_label = QLabel()
         self._expanded_thumb_label.setObjectName("gestureCardExpandedThumb")
         self._expanded_thumb_label.setAlignment(Qt.AlignCenter)
-        self._expanded_thumb_label.setFixedSize(240, 180)
+        self._expanded_thumb_label.setFixedSize(*self._THUMB_NORMAL)
+        self._expanded_thumb_label.setCursor(Qt.PointingHandCursor)
+        self._expanded_thumb_label.setToolTip("Click to enlarge · click again to shrink")
         self._expanded_thumb_label.setStyleSheet(
             "QLabel#gestureCardExpandedThumb {"
             "  background: rgba(0,0,0,0.30);"
@@ -638,24 +650,164 @@ class GestureCard(QFrame):
             "  font-size: 12px;"
             "  padding: 8px;"
             "}"
+            "QLabel#gestureCardExpandedThumb:hover {"
+            "  border: 1px solid rgba(29,233,182,0.55);"
+            "}"
         )
         self._expanded_thumb_label.hide()
-        expanded_row.addWidget(self._expanded_thumb_label, 0, Qt.AlignTop)
+        self._expanded_thumb_label.installEventFilter(self)
+        self._expanded_row.addWidget(self._expanded_thumb_label, 0, Qt.AlignTop)
 
-        root.addLayout(expanded_row)
+        self._expanded_column.addLayout(self._expanded_row)
+        root.addLayout(self._expanded_column)
+
+        # Paths lives inside the expanded gesture details (not next to
+        # Export on the header row) so the collapsed card stays compact.
+        self._paths_button = None
+        if str(getattr(gesture, "kind", "static") or "static") == "dynamic":
+            self._paths_button = QPushButton("Paths — view recorded wrist & finger trails")
+            self._paths_button.setToolTip(
+                "Show the recorded wrist paths and finger poses for this gesture."
+            )
+            self._paths_button.setStyleSheet(
+                "QPushButton {"
+                "  background: rgba(127,127,127,0.12);"
+                f"  color: {self._text_color};"
+                "  border: 1px solid rgba(127,127,127,0.35);"
+                "  border-radius: 6px;"
+                "  padding: 6px 12px;"
+                "  font-size: 12px;"
+                "  text-align: left;"
+                "}"
+                "QPushButton:hover {"
+                "  background: rgba(127,127,127,0.22);"
+                "}"
+            )
+            self._paths_button.clicked.connect(self._show_paths)
+            self._paths_button.hide()
+            root.addWidget(self._paths_button)
+
+    def _show_paths(self) -> None:
+        try:
+            from .gesture_path_preview_dialog import show_gesture_path_preview
+            show_gesture_path_preview(self._gesture, parent=self.window())
+        except Exception as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Path preview",
+                f"Could not render recorded paths:\n{exc}",
+            )
 
     def _toggle(self) -> None:
         self._expanded = not self._expanded
+        kind = str(getattr(self._gesture, "kind", "static") or "static")
+        if kind == "pose_sequence":
+            n_steps = len(getattr(self._gesture, "pose_sequence_steps", None) or [])
+            suffix = f"  · sequence ({n_steps})"
+        elif kind == "dynamic":
+            suffix = "  · motion"
+        else:
+            suffix = ""
         self._toggle_button.setText(
-            f"{'▼' if self._expanded else '▶'}  {self._gesture.name}"
+            _soft_wrap_breaks(
+                f"{'▼' if self._expanded else '▶'}  {self._gesture.name}{suffix}"
+            )
         )
         self._details.setVisible(self._expanded)
+        if not self._expanded and self._thumb_zoomed:
+            # Collapse zoom when the card itself collapses.
+            self._thumb_zoomed = False
+            self._apply_thumb_layout()
         if self._expanded:
             # Lazy-load the thumbnail the first time the card is
             # expanded so a list of many custom gestures doesn't pay
             # the disk cost up-front.
             self._refresh_expanded_thumbnail()
         self._expanded_thumb_label.setVisible(self._expanded)
+        if self._paths_button is not None:
+            self._paths_button.setVisible(self._expanded)
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt API)
+        if obj is self._expanded_thumb_label and event.type() == QEvent.MouseButtonRelease:
+            try:
+                if event.button() == Qt.LeftButton and (
+                    self._thumb_source_path
+                    or self._expanded_thumb_label.movie() is not None
+                    or (
+                        self._expanded_thumb_label.pixmap() is not None
+                        and not self._expanded_thumb_label.pixmap().isNull()
+                    )
+                ):
+                    self._toggle_thumb_zoom()
+                    return True
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
+    def _toggle_thumb_zoom(self) -> None:
+        self._thumb_zoomed = not self._thumb_zoomed
+        self._apply_thumb_layout()
+        self._apply_thumb_media_size()
+
+    def _apply_thumb_layout(self) -> None:
+        """Side-by-side when normal; stack details above large thumb when zoomed."""
+        thumb = self._expanded_thumb_label
+        # Detach from whichever layout currently owns it.
+        self._expanded_row.removeWidget(thumb)
+        try:
+            self._expanded_column.removeWidget(thumb)
+        except Exception:
+            pass
+        if self._thumb_zoomed:
+            tw, th = self._THUMB_ZOOMED
+            thumb.setFixedSize(tw, th)
+            self._expanded_column.addWidget(thumb, 0, Qt.AlignHCenter)
+            # Slightly tighter body text while the preview owns the width.
+            self._details.setStyleSheet(
+                f"color: {self._text_color};"
+                " font-family: Consolas, 'Courier New', monospace;"
+                " font-size: 11px;"
+                " background: rgba(127,127,127,0.18);"
+                " padding: 10px;"
+                " border-radius: 6px;"
+            )
+        else:
+            tw, th = self._THUMB_NORMAL
+            thumb.setFixedSize(tw, th)
+            self._expanded_row.addWidget(thumb, 0, Qt.AlignTop)
+            self._details.setStyleSheet(
+                f"color: {self._text_color};"
+                " font-family: Consolas, 'Courier New', monospace;"
+                " font-size: 12px;"
+                " background: rgba(127,127,127,0.18);"
+                " padding: 10px;"
+                " border-radius: 6px;"
+            )
+
+    def _thumb_content_size(self) -> tuple[int, int]:
+        tw, th = self._THUMB_ZOOMED if self._thumb_zoomed else self._THUMB_NORMAL
+        # Leave room for the label's 8px padding on each side.
+        return max(1, tw - 16), max(1, th - 16)
+
+    def _apply_thumb_media_size(self) -> None:
+        cw, ch = self._thumb_content_size()
+        movie = self._expanded_thumb_label.movie()
+        if movie is not None:
+            from PySide6.QtCore import QSize
+            movie.setScaledSize(QSize(cw, ch))
+            return
+        path = self._thumb_source_path
+        if path and not str(path).lower().endswith(".gif"):
+            pix = QPixmap(str(path))
+            if not pix.isNull():
+                self._expanded_thumb_label.setPixmap(
+                    pix.scaled(
+                        cw, ch,
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation,
+                    )
+                )
 
     def _refresh_expanded_thumbnail(self) -> None:
         """Load the user-picked thumbnail (or animated motion clip)
@@ -679,26 +831,24 @@ class GestureCard(QFrame):
             except Exception:
                 pass
             self._expanded_thumb_movie = None
+        self._thumb_source_path = str(path) if path is not None else None
         if path is not None:
             spath = str(path)
+            cw, ch = self._thumb_content_size()
             if spath.lower().endswith(".gif"):
                 from PySide6.QtGui import QMovie
                 from PySide6.QtCore import QSize
                 movie = QMovie(spath)
-                movie.setScaledSize(QSize(224, 164))
+                movie.setScaledSize(QSize(cw, ch))
                 self._expanded_thumb_label.setMovie(movie)
                 movie.start()
                 self._expanded_thumb_movie = movie
                 return
             pix = QPixmap(spath)
             if not pix.isNull():
-                # Subtract the label's CSS padding (8px each side) so
-                # the scaled pixmap doesn't render past the rounded
-                # border. The fixed label size is 240×180.
                 self._expanded_thumb_label.setPixmap(
                     pix.scaled(
-                        224,
-                        164,
+                        cw, ch,
                         Qt.KeepAspectRatio,
                         Qt.SmoothTransformation,
                     )
@@ -707,3 +857,29 @@ class GestureCard(QFrame):
         self._expanded_thumb_label.setText("No image picked for this gesture.")
 
 # Author: Konstantin Markov
+
+
+def _soft_wrap_breaks(text: str) -> str:
+    """Insert zero-width spaces after common separators so QLabel can
+    wrap long paths / URLs / names instead of forcing the card wider."""
+    if not text:
+        return text
+    out: list[str] = []
+    for ch in text:
+        out.append(ch)
+        if ch in "\\/._-@:?&=%":
+            out.append("\u200b")
+    return "".join(out)
+
+
+def _configure_wrapping_label(label: QLabel) -> None:
+    """Make a QLabel take the width its layout gives and wrap down.
+
+    Without this, a long sizeHint (e.g. an unbreakable file path)
+    expands the whole gesture card past the settings scroll viewport.
+    """
+    label.setWordWrap(True)
+    label.setMinimumWidth(0)
+    # Ignored horizontal policy: width comes from the parent layout;
+    # height grows via heightForWidth when text wraps.
+    label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
