@@ -22,7 +22,8 @@ _HOLD_LO_FACTOR = 0.65   # dwell: slightly under shortest hold
 _HOLD_HI_FACTOR = 1.35   # max hold: slightly over longest hold
 _GAP_HI_FACTOR = 1.40    # max gap: slightly over longest gap
 _MIN_DWELL_MS = 80
-_MIN_GAP_MS = 150
+_MIN_GAP_MS = 800
+_MIN_MAX_HOLD_MS = 1600
 _MIN_HOLD_S = 0.10
 _CHANGE_SIM = 0.90
 _MERGE_SIM = 0.945
@@ -156,7 +157,11 @@ def _derive_timing(
     shortest = min(hold_ms)
     longest = max(hold_ms)
     dwell = max(_MIN_DWELL_MS, int(round(shortest * _HOLD_LO_FACTOR)))
-    max_hold = max(dwell + 40, int(round(longest * _HOLD_HI_FACTOR)))
+    max_hold = max(
+        dwell + 40,
+        _MIN_MAX_HOLD_MS,
+        int(round(longest * _HOLD_HI_FACTOR)),
+    )
     if gap_ms:
         max_gap = max(_MIN_GAP_MS, int(round(max(gap_ms) * _GAP_HI_FACTOR)))
     else:

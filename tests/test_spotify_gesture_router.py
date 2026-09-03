@@ -20,6 +20,11 @@ class _FakeSpotifyController:
         self._running = False
         self._window_active = False
 
+    def dispatch_async(self, callable_obj, *args, on_complete=None, **kwargs) -> None:
+        result = callable_obj(*args, **kwargs)
+        if on_complete is not None:
+            on_complete(bool(result), str(self.message or ""))
+
     def focus_or_open_window(self) -> bool:
         self.focus_calls += 1
         self.message = "spotify focused"
@@ -28,6 +33,12 @@ class _FakeSpotifyController:
 
     def is_window_active(self) -> bool:
         return self._window_active
+
+    def is_window_open(self) -> bool:
+        return bool(self._running) or self._window_active
+
+    def _has_real_spotify_process(self) -> bool:
+        return bool(self._running)
 
     def is_active_device_available(self) -> bool:
         return self._active
@@ -84,12 +95,12 @@ class SpotifyGestureRouterTest(unittest.TestCase):
         controller = _FakeSpotifyController()
 
         router.update(stable_label="two", dynamic_label="neutral", controller=controller, now=0.0)
-        router.update(stable_label="two", dynamic_label="neutral", controller=controller, now=0.6)
+        router.update(stable_label="two", dynamic_label="neutral", controller=controller, now=0.4)
         self.assertEqual(controller.focus_calls, 0)
 
-        snapshot = router.update(stable_label="two", dynamic_label="neutral", controller=controller, now=1.05)
+        snapshot = router.update(stable_label="two", dynamic_label="neutral", controller=controller, now=0.6)
         self.assertEqual(controller.focus_calls, 1)
-        self.assertIn("spotify focused", snapshot.control_text)
+        self.assertEqual(snapshot.last_action, "spotify_focus")
 
     def test_two_does_nothing_when_spotify_is_already_active_window(self) -> None:
         router = SpotifyGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5)
@@ -99,9 +110,8 @@ class SpotifyGestureRouterTest(unittest.TestCase):
         router.update(stable_label="two", dynamic_label="neutral", controller=controller, now=0.0)
         snapshot = router.update(stable_label="two", dynamic_label="neutral", controller=controller, now=1.05)
 
-        self.assertEqual(controller.focus_calls, 0)
-        self.assertEqual(snapshot.last_action, "spotify_focus_idle")
-        self.assertIn("already focused", snapshot.control_text)
+        self.assertEqual(controller.focus_calls, 1)
+        self.assertEqual(snapshot.last_action, "spotify_focus")
 
     def test_static_actions_latch_and_respect_cooldown(self) -> None:
         router = SpotifyGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5)

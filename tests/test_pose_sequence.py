@@ -94,6 +94,8 @@ class PoseSequenceRuntimeTests(unittest.TestCase):
         dwell_ms: int = 150,
         max_hold_ms: int = 400,
         max_gap_ms: int = 900,
+        live_timing_floor: bool = False,
+        handedness: str | None = None,
     ) -> PoseSequenceRuntime:
         reg = GestureRegistry(path)
         feats_a = np.zeros(_FEATURE_VECTOR_LEN, dtype=np.float32)
@@ -115,9 +117,12 @@ class PoseSequenceRuntimeTests(unittest.TestCase):
             dwell_ms=dwell_ms,
             max_hold_ms=max_hold_ms,
             max_gap_ms=max_gap_ms,
+            handedness=handedness,
         )
         reg.save()
-        rt = PoseSequenceRuntime(match_threshold=0.78)
+        rt = PoseSequenceRuntime(
+            match_threshold=0.78, live_timing_floor=live_timing_floor
+        )
         rt.reload()
         return rt
 
@@ -188,6 +193,55 @@ class PoseSequenceRuntimeTests(unittest.TestCase):
                         t += 0.05
                     self.assertEqual(fired, "ab")
                     fire.assert_called()
+            finally:
+                if old is None:
+                    os.environ.pop("HGR_CUSTOM_GESTURES_PATH", None)
+                else:
+                    os.environ["HGR_CUSTOM_GESTURES_PATH"] = old
+
+    def test_next_step_winning_score_advances_without_release(self) -> None:
+        """3→2 style: the old pose still matches, but the next step
+        scores higher, so the sequence must advance instead of
+        sitting on step 1 until max-hold reset."""
+        import os
+
+        from hgr.custom_gestures.classifier import MatchResult
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.json"
+            old = os.environ.get("HGR_CUSTOM_GESTURES_PATH")
+            os.environ["HGR_CUSTOM_GESTURES_PATH"] = str(path)
+            try:
+                rt = self._make_ab_runtime(
+                    path, dwell_ms=100, max_hold_ms=800, live_timing_floor=False,
+                )
+                lm = np.zeros((21, 3), dtype=np.float32)
+                feats_a = np.zeros(_FEATURE_VECTOR_LEN, dtype=np.float32)
+                t = 1.0
+                with mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.normalize_landmarks",
+                    side_effect=lambda _lm: feats_a.copy(),
+                ), mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.fire_once",
+                ):
+                    for _ in range(6):
+                        rt.process_landmarks(lm, timestamp=t, dispatch=True)
+                        t += 0.05
+                    self.assertTrue(rt._states["ab"].dwell_met)
+                    self.assertEqual(rt._states["ab"].step_index, 0)
+                    _g, clfs = rt._entries[0]
+                    clfs[0].classify_raw = lambda feats, sticky_name=None: MatchResult(
+                        gesture=clfs[0]._gestures[0],
+                        score=0.80,
+                        distance=1.0,
+                        sample_index=0,
+                    )
+                    clfs[1].raw_score = lambda feats: 0.88
+                    rt.process_landmarks(lm, timestamp=t, dispatch=True)
+                    self.assertEqual(rt._states["ab"].step_index, 1)
+                    banner = rt.current_banner()
+                    self.assertIsNotNone(banner)
+                    self.assertTrue(str(banner[0]).startswith("ab 2/"))
             finally:
                 if old is None:
                     os.environ.pop("HGR_CUSTOM_GESTURES_PATH", None)
@@ -273,6 +327,224 @@ class PoseSequenceRuntimeTests(unittest.TestCase):
                     os.environ.pop("HGR_CUSTOM_GESTURES_PATH", None)
                 else:
                     os.environ["HGR_CUSTOM_GESTURES_PATH"] = old
+
+    def test_one_frame_hand_lost_does_not_reset_in_progress(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.json"
+            old = os.environ.get("HGR_CUSTOM_GESTURES_PATH")
+            os.environ["HGR_CUSTOM_GESTURES_PATH"] = str(path)
+            try:
+                rt = self._make_ab_runtime(path, dwell_ms=150, max_hold_ms=500)
+                lm = np.zeros((21, 3), dtype=np.float32)
+                feats_a = np.zeros(_FEATURE_VECTOR_LEN, dtype=np.float32)
+                t = 1.0
+                with mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.normalize_landmarks",
+                    side_effect=lambda _lm: feats_a.copy(),
+                ), mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.fire_once",
+                ):
+                    for _ in range(6):
+                        rt.process_landmarks(lm, timestamp=t, dispatch=True)
+                        t += 0.05
+                    self.assertTrue(rt.is_in_progress())
+                    rt.hand_lost(t)
+                    self.assertTrue(rt.is_in_progress())
+                    self.assertTrue(rt._states["ab"].dwell_met)
+                    t += 1.05
+                    rt.hand_lost(t)
+                    self.assertFalse(rt.is_in_progress())
+                    self.assertEqual(rt._states["ab"].step_index, 0)
+            finally:
+                if old is None:
+                    os.environ.pop("HGR_CUSTOM_GESTURES_PATH", None)
+                else:
+                    os.environ["HGR_CUSTOM_GESTURES_PATH"] = old
+
+    def test_live_timing_floor_keeps_tight_learned_gap_alive(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.json"
+            old = os.environ.get("HGR_CUSTOM_GESTURES_PATH")
+            os.environ["HGR_CUSTOM_GESTURES_PATH"] = str(path)
+            try:
+                rt = self._make_ab_runtime(
+                    path,
+                    dwell_ms=100,
+                    max_hold_ms=400,
+                    max_gap_ms=150,
+                    live_timing_floor=True,
+                )
+                lm = np.zeros((21, 3), dtype=np.float32)
+                feats_a = np.zeros(_FEATURE_VECTOR_LEN, dtype=np.float32)
+                t = 1.0
+                with mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.normalize_landmarks",
+                    side_effect=lambda _lm: feats_a.copy(),
+                ), mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.fire_once",
+                ):
+                    for _ in range(5):
+                        rt.process_landmarks(lm, timestamp=t, dispatch=True)
+                        t += 0.05
+                    self.assertTrue(rt._states["ab"].dwell_met)
+                    with mock.patch(
+                        "hgr.custom_gestures.pose_sequence_runtime.GestureClassifier.classify_raw",
+                        return_value=None,
+                    ):
+                        rt.process_landmarks(lm, timestamp=t, dispatch=True)
+                        t += 0.05
+                        self.assertEqual(rt._states["ab"].step_index, 1)
+                        t += 0.40
+                        rt.process_landmarks(lm, timestamp=t, dispatch=True)
+                    self.assertEqual(rt._states["ab"].step_index, 1)
+            finally:
+                if old is None:
+                    os.environ.pop("HGR_CUSTOM_GESTURES_PATH", None)
+                else:
+                    os.environ["HGR_CUSTOM_GESTURES_PATH"] = old
+
+    def test_tracking_pause_does_not_count_against_max_hold(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.json"
+            old = os.environ.get("HGR_CUSTOM_GESTURES_PATH")
+            os.environ["HGR_CUSTOM_GESTURES_PATH"] = str(path)
+            try:
+                rt = self._make_ab_runtime(
+                    path, dwell_ms=100, max_hold_ms=250, max_gap_ms=900,
+                )
+                lm = np.zeros((21, 3), dtype=np.float32)
+                feats_a = np.zeros(_FEATURE_VECTOR_LEN, dtype=np.float32)
+                t = 1.0
+                with mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.normalize_landmarks",
+                    side_effect=lambda _lm: feats_a.copy(),
+                ), mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.fire_once",
+                ):
+                    for _ in range(4):
+                        rt.process_landmarks(lm, timestamp=t, dispatch=True)
+                        t += 0.05
+                    self.assertTrue(rt.is_in_progress())
+                    rt.hand_lost(t)
+                    t += 0.20
+                    rt.process_landmarks(lm, timestamp=t, dispatch=True)
+                    self.assertTrue(rt.is_in_progress())
+                    self.assertEqual(rt._states["ab"].step_index, 0)
+            finally:
+                if old is None:
+                    os.environ.pop("HGR_CUSTOM_GESTURES_PATH", None)
+                else:
+                    os.environ["HGR_CUSTOM_GESTURES_PATH"] = old
+
+    def test_builtin_hint_counts_when_knn_misses(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.json"
+            old = os.environ.get("HGR_CUSTOM_GESTURES_PATH")
+            os.environ["HGR_CUSTOM_GESTURES_PATH"] = str(path)
+            try:
+                rt = self._make_ab_runtime(
+                    path, dwell_ms=400, max_hold_ms=2000, live_timing_floor=True,
+                )
+                lm = np.zeros((21, 3), dtype=np.float32)
+                t = 1.0
+                with mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.GestureClassifier.classify_raw",
+                    return_value=None,
+                ), mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.GestureClassifier.raw_score",
+                    return_value=0.1,
+                ), mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.fire_once",
+                ) as fire:
+                    for _ in range(5):
+                        rt.process_landmarks(
+                            lm, timestamp=t, dispatch=True, hint_label="three",
+                        )
+                        t += 0.05
+                    self.assertTrue(rt._states["ab"].dwell_met)
+                    banner = rt.current_banner()
+                    self.assertIsNotNone(banner)
+                    self.assertTrue(str(banner[0]).startswith("ab 1/"))
+                    rt.process_landmarks(
+                        lm, timestamp=t, dispatch=True, hint_label="two",
+                    )
+                    t += 0.05
+                    self.assertEqual(rt._states["ab"].step_index, 1)
+                    fired = None
+                    for _ in range(5):
+                        name = rt.process_landmarks(
+                            lm, timestamp=t, dispatch=True, hint_label="two",
+                        )
+                        if name:
+                            fired = name
+                        t += 0.05
+                    self.assertEqual(fired, "ab")
+                    fire.assert_called()
+            finally:
+                if old is None:
+                    os.environ.pop("HGR_CUSTOM_GESTURES_PATH", None)
+                else:
+                    os.environ["HGR_CUSTOM_GESTURES_PATH"] = old
+
+    def test_single_hand_label_mismatch_still_matches(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.json"
+            old = os.environ.get("HGR_CUSTOM_GESTURES_PATH")
+            os.environ["HGR_CUSTOM_GESTURES_PATH"] = str(path)
+            try:
+                rt = self._make_ab_runtime(
+                    path, dwell_ms=100, max_hold_ms=400, handedness="Right",
+                )
+                lm = np.zeros((21, 3), dtype=np.float32)
+                feats_a = np.zeros(_FEATURE_VECTOR_LEN, dtype=np.float32)
+                t = 1.0
+                with mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.normalize_landmarks",
+                    side_effect=lambda _lm: feats_a.copy(),
+                ), mock.patch(
+                    "hgr.custom_gestures.pose_sequence_runtime.fire_once",
+                ):
+                    rt.process_landmarks(
+                        lm, handedness="Left", timestamp=t, dispatch=True,
+                        strict_hand=True,
+                    )
+                    self.assertFalse(rt.is_in_progress())
+                    rt.process_landmarks(
+                        lm, handedness="Left", timestamp=t, dispatch=True,
+                        strict_hand=False,
+                    )
+                    self.assertTrue(rt.is_in_progress())
+            finally:
+                if old is None:
+                    os.environ.pop("HGR_CUSTOM_GESTURES_PATH", None)
+                else:
+                    os.environ["HGR_CUSTOM_GESTURES_PATH"] = old
+
+
+def test_sequence_preview_does_not_flip_worker_frames() -> None:
+    from hgr.app.ui.pose_sequence_recorder_window import (
+        _should_flip_sequence_preview,
+    )
+
+    assert _should_flip_sequence_preview(
+        using_worker=True, owns_camera=False, source_is_mirrored=False,
+    ) is False
+    assert _should_flip_sequence_preview(
+        using_worker=False, owns_camera=True, source_is_mirrored=False,
+    ) is True
+    assert _should_flip_sequence_preview(
+        using_worker=False, owns_camera=True, source_is_mirrored=True,
+    ) is False
 
 
 def _synthetic_hand(*, mode: str) -> np.ndarray:

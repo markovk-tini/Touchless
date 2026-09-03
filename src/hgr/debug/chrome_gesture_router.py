@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 
 from .chrome_controller import ChromeController
@@ -19,7 +20,7 @@ class ChromeGestureRouter:
     def __init__(
         self,
         *,
-        static_hold_seconds: float = 0.5,
+        static_hold_seconds: float = 1.0,
         static_cooldown_seconds: float = 1.5,
         dynamic_cooldown_seconds: float = 1.5,
     ) -> None:
@@ -104,10 +105,18 @@ class ChromeGestureRouter:
         self._static_latched_label = stable_label
 
         if stable_label == "three":
-            success = controller.focus_or_open_window()
-            self._control_text = controller.message
-            self._set_action("chrome_focus" if success else "chrome_focus_failed")
+            self._control_text = "opening chrome"
+            self._set_action("chrome_focus")
             self._consume_other_routes = True
+            dispatch = getattr(controller, "dispatch_async", None)
+            if callable(dispatch):
+                dispatch(controller.focus_or_open_window)
+            else:
+                threading.Thread(
+                    target=controller.focus_or_open_window,
+                    name="chrome-focus",
+                    daemon=True,
+                ).start()
             return
 
         if stable_label == "three_together":
