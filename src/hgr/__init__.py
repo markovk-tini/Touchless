@@ -12,6 +12,6 @@ __version__ = "1.1.9"
 # v1.1.7 build-round marker. Bump on each shipped-source polish round so
 # the build_marker_label in Settings → About (and any future diagnostics
 # HUD) pull from one source of truth instead of a scattered literal.
-BUILD_ROUND = 52
+BUILD_ROUND = 53
 
 # Author: Konstantin Markov

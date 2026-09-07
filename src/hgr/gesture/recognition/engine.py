@@ -196,16 +196,20 @@ class GestureRecognitionEngine:
     def _mute_ready(self, hand_reading: HandReading) -> bool:
         fingers = hand_reading.fingers
         pinky = fingers["pinky"]
-        pinky_ready = (
-            pinky.state == "fully_open"
-            or (
-                pinky.state in {"partially_curled", "mostly_curled"}
-                and pinky.openness >= 0.46
-                and (
-                    pinky.reach >= 0.18
-                    or pinky.palm_distance >= 0.86
-                    or pinky.bend_distal >= 138.0
-                )
+        # Pinky must actually be extended (shaka). Thumbs-up keeps the
+        # pinky curled in the fist; older gates treated mostly_curled +
+        # residual openness as "open enough" and promoted mute.
+        pinky_curl = float(getattr(pinky, "curl", 0.0) or 0.0)
+        # Reject closed / mostly_curled pinky (thumbs-up in a fist).
+        # Real shaka often reads as partially_curled with high reach
+        # rather than fully_open.
+        pinky_ready = pinky.state == "fully_open" or (
+            pinky.state == "partially_curled"
+            and pinky.openness >= 0.56
+            and pinky_curl <= 0.48
+            and (
+                pinky.reach >= 0.22
+                or pinky.palm_distance >= 0.90
             )
         )
         thumb_ready = fingers["thumb"].state == "fully_open" or fingers["thumb"].openness >= 0.70

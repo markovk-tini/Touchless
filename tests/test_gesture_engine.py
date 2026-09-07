@@ -12,6 +12,24 @@ from hgr.gesture.recognition.engine import GestureRecognitionEngine
 from .helpers import make_landmarks, make_pose, translate_landmarks
 
 
+def _ready_pose(name: str) -> np.ndarray:
+    """Synthetic two / volume_pose with a tucked thumb and close index-
+    middle tips so the 1.1.9 ready-gates match. Shared make_pose() is
+    left unchanged — volume-tracker tests still use the original
+    helper geometry."""
+    points = make_pose(name).copy()
+    if name not in {"two", "volume_pose"}:
+        return points
+    points[2] = np.array([0.00, 0.02, 0.0], dtype=np.float32)
+    points[3] = np.array([0.06, 0.05, 0.0], dtype=np.float32)
+    points[4] = np.array([0.08, 0.04, 0.0], dtype=np.float32)
+    if name == "volume_pose":
+        mid = (points[8] + points[12]) * 0.5
+        points[8] = mid + np.array([-0.02, 0.0, 0.0], dtype=np.float32)
+        points[12] = mid + np.array([0.02, 0.0, 0.0], dtype=np.float32)
+    return points
+
+
 class GestureEngineTest(unittest.TestCase):
     def test_engine_classifies_core_static_poses(self) -> None:
         engine = GestureRecognitionEngine(stable_frames_required=2)
@@ -34,7 +52,8 @@ class GestureEngineTest(unittest.TestCase):
         for pose, expected in expectations.items():
             with self.subTest(pose=pose):
                 engine.reset()
-                result = engine.process_landmarks(make_pose(pose), frame_bgr=frame, handedness="Right", timestamp=1.0)
+                pose_lm = _ready_pose(pose) if pose in {"two", "volume_pose"} else make_pose(pose)
+                result = engine.process_landmarks(pose_lm, frame_bgr=frame, handedness="Right", timestamp=1.0)
                 self.assertEqual(result.prediction.raw_label, expected)
 
     def test_open_hand_is_available_in_candidates_but_surfaces_as_neutral(self) -> None:
@@ -45,16 +64,43 @@ class GestureEngineTest(unittest.TestCase):
         self.assertEqual(result.prediction.stable_label, "neutral")
         self.assertGreater(engine.last_static_scores.get("open_hand", 0.0), 0.60)
 
-    def test_mute_allows_softer_pinky_extension(self) -> None:
+    def test_mute_requires_extended_pinky(self) -> None:
+        engine = GestureRecognitionEngine(stable_frames_required=2)
+        hand_reading = SimpleNamespace(
+            fingers={
+                "thumb": SimpleNamespace(state="fully_open", openness=0.84, curl=0.12),
+                "index": SimpleNamespace(state="closed", openness=0.20, reach=0.04, palm_distance=0.35, bend_distal=90.0),
+                "middle": SimpleNamespace(state="closed", openness=0.22, reach=0.04, palm_distance=0.35, bend_distal=90.0),
+                "ring": SimpleNamespace(state="closed", openness=0.22, reach=0.04, palm_distance=0.35, bend_distal=90.0),
+                "pinky": SimpleNamespace(
+                    state="mostly_curled",
+                    openness=0.52,
+                    curl=0.55,
+                    reach=0.20,
+                    palm_distance=0.90,
+                    bend_distal=140.0,
+                ),
+            }
+        )
+        self.assertFalse(engine._mute_ready(hand_reading))
+
+    def test_thumbs_up_is_not_mute(self) -> None:
         engine = GestureRecognitionEngine(stable_frames_required=2)
         frame = np.zeros((32, 32, 3), dtype=np.uint8)
-        landmarks = make_landmarks(
-            {"index": "curled", "middle": "curled", "ring": "curled", "pinky": "hooked"},
-            thumb_state="mute",
-            spread="normal",
+        result = engine.process_landmarks(
+            make_landmarks(
+                {"index": "closed", "middle": "closed", "ring": "closed", "pinky": "closed"},
+                thumb_state="open",
+                spread="normal",
+            ),
+            frame_bgr=frame,
+            handedness="Right",
+            timestamp=1.0,
         )
-        result = engine.process_landmarks(landmarks, frame_bgr=frame, handedness="Right", timestamp=1.0)
-        self.assertEqual(result.prediction.raw_label, "mute")
+        assert result.hand_reading is not None
+        self.assertNotEqual(result.prediction.raw_label, "mute")
+        self.assertNotEqual(result.prediction.stable_label, "mute")
+        self.assertFalse(engine._mute_ready(result.hand_reading))
 
     def test_zero_allows_thumb_out_closed_hand_pose(self) -> None:
         engine = GestureRecognitionEngine(stable_frames_required=2)
@@ -277,7 +323,7 @@ class GestureEngineTest(unittest.TestCase):
     def test_true_volume_pose_stays_volume_pose(self) -> None:
         engine = GestureRecognitionEngine(stable_frames_required=2)
         frame = np.zeros((32, 32, 3), dtype=np.uint8)
-        result = engine.process_landmarks(make_pose("volume_pose"), frame_bgr=frame, handedness="Right", timestamp=1.0)
+        result = engine.process_landmarks(_ready_pose("volume_pose"), frame_bgr=frame, handedness="Right", timestamp=1.0)
         self.assertEqual(result.prediction.raw_label, "volume_pose")
 
     def test_volume_pose_allows_partially_curled_primaries_when_close(self) -> None:
@@ -293,7 +339,11 @@ class GestureEngineTest(unittest.TestCase):
             spreads={
                 "index_middle": SimpleNamespace(state="together", distance=0.28, together_strength=0.40, apart_strength=0.17),
             },
+            landmarks=np.zeros((21, 3), dtype=np.float32),
+            palm=SimpleNamespace(scale=1.0),
         )
+        hand_reading.landmarks[8] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        hand_reading.landmarks[12] = np.array([0.05, 0.0, 0.0], dtype=np.float32)
         self.assertTrue(engine._volume_pose_ready(hand_reading))
 
     def test_wheel_pose_requires_triplet_open_and_folded_middle_ring(self) -> None:
@@ -306,6 +356,7 @@ class GestureEngineTest(unittest.TestCase):
         engine = GestureRecognitionEngine(stable_frames_required=2)
         frame = np.zeros((32, 32, 3), dtype=np.uint8)
         result = engine.process_landmarks(make_pose("mute"), frame_bgr=frame, handedness="Right", timestamp=1.0)
+        self.assertEqual(result.prediction.raw_label, "mute")
         self.assertNotEqual(result.prediction.raw_label, "wheel_pose")
 
     def test_chrome_wheel_pose_requires_distinct_open_index_and_pinky(self) -> None:
@@ -349,7 +400,7 @@ class GestureEngineTest(unittest.TestCase):
                 },
             )
             with patch.object(engine.static_recognizer, "predict", return_value=("two", 0.50, tuple(), conservative_scores)):
-                result = engine.process_landmarks(make_pose("volume_pose"), frame_bgr=frame, handedness="Right", timestamp=1.0)
+                result = engine.process_landmarks(_ready_pose("volume_pose"), frame_bgr=frame, handedness="Right", timestamp=1.0)
         self.assertEqual(result.prediction.raw_label, "volume_pose")
 
     def test_sideways_fist_does_not_fall_back_to_zero(self) -> None:

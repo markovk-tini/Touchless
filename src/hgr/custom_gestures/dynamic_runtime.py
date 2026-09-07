@@ -215,6 +215,14 @@ class DynamicGestureRuntime:
     def has_dynamic_gestures(self) -> bool:
         return self._classifier is not None and bool(self._gestures_by_name)
 
+    def has_loop_or_complex_templates(self) -> bool:
+        if self._classifier is None:
+            return False
+        try:
+            return bool(self._classifier.has_loop_or_complex_templates())
+        except Exception:
+            return False
+
     def spring_debug_rows(self):
         """Sandbox diagnostic: latest SPRING cost vs threshold per gesture."""
         if self._classifier is None:
@@ -237,8 +245,15 @@ class DynamicGestureRuntime:
         swipe that latches a frame later than the custom fire is
         still swallowed.
         """
+        if self.has_loop_or_complex_templates():
+            return True
         if self.current_match(now) is not None:
             return True
+        try:
+            if self._classifier is not None and self._classifier.live_path_looks_like_loop():
+                return True
+        except Exception:
+            pass
         if self._classifier is None or landmarks_21x3 is None:
             return False
         try:

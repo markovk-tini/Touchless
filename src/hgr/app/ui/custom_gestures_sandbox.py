@@ -423,15 +423,23 @@ class SandboxWindow(QDialog):
                     return
             if np_frame.ndim != 3 or np_frame.shape[2] not in (3, 4):
                 return
+            # Always copy. Worker frames are a reused capture buffer;
+            # drawing landmarks / putText on that array leaves ghosts
+            # (duplicate skeletons, stacked "hand present" text) on
+            # the next emit of the same memory.
+            if np_frame.shape[2] == 4:
+                np_frame = np_frame[:, :, :3]
+            work = np.ascontiguousarray(np_frame).copy()
             # Mirror to selfie view when we own the camera; skip when
             # borrowing the worker's frames (already mirrored upstream).
             should_flip = self._owns_camera and not bool(
                 getattr(self._config, "camera_source_is_mirrored", False)
             )
-            mirrored = cv2.flip(np_frame, 1) if should_flip else np_frame
-            rgb = cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB) if mirrored.shape[2] == 3 else mirrored[:, :, :3]
+            display_bgr = cv2.flip(work, 1) if should_flip else work
+            rgb = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
             result = self._mp_hands.process(rgb)
-            display_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            rgb.flags.writeable = True
 
             now = time.monotonic()
             match = None

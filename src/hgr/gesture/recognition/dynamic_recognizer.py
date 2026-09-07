@@ -125,7 +125,10 @@ class DynamicGestureRecognizer:
         open_pose_strength = sum(sample.pose_gate for sample in window) / len(window)
         one_pose_strength = sum(sample.one_pose_gate for sample in window) / len(window)
         straightness = clamp01(abs(horizontal) / max(path, 1e-6))
-        horizontal_axis_gate = clamp01(((abs(horizontal) / max(vertical + 0.62 * depth, 1e-6)) - 1.35) / 0.90)
+        # Circles have comparable X and Y travel. Require a clearly
+        # horizontal axis (was 1.35) so an arc of a loop cannot pass
+        # as swipe_left/right.
+        horizontal_axis_gate = clamp01(((abs(horizontal) / max(vertical + 0.62 * depth, 1e-6)) - 1.75) / 0.80)
         if self.low_fps_mode:
             horizontal_min_duration_gate = clamp01((duration - 0.04) / 0.05)
             horizontal_max_duration_gate = clamp01((1.25 - duration) / 0.50)
@@ -169,9 +172,9 @@ class DynamicGestureRecognizer:
                     0.32 * clamp01((horizontal - right_h_floor) / 0.26)
                     + 0.18 * clamp01((path - path_floor_r) / 0.46)
                     + 0.16 * clamp01((peak_horizontal_speed - speed_floor_r) / 0.95)
-                    + 0.14 * clamp01((horizontal - 1.08 * vertical - 0.66 * depth - 0.06) / 0.24)
+                    + 0.14 * clamp01((horizontal - 1.45 * vertical - 0.66 * depth - 0.06) / 0.24)
                     + 0.10 * straightness
-                    + 0.10 * clamp01((0.24 - vertical_noise) / 0.18)
+                    + 0.10 * clamp01((0.16 - vertical_noise) / 0.14)
                 )
                 * (0.28 + 0.72 * pose_strength)
                 * horizontal_duration_gate
@@ -185,9 +188,9 @@ class DynamicGestureRecognizer:
                     0.32 * clamp01(((-horizontal) - left_h_floor) / 0.30)
                     + 0.18 * clamp01((path - path_floor_l) / 0.50)
                     + 0.16 * clamp01((peak_horizontal_speed - speed_floor_l) / 1.00)
-                    + 0.14 * clamp01(((-horizontal) - 1.00 * vertical - 0.62 * depth - 0.04) / 0.26)
+                    + 0.14 * clamp01(((-horizontal) - 1.40 * vertical - 0.62 * depth - 0.04) / 0.26)
                     + 0.10 * straightness
-                    + 0.10 * clamp01((0.26 - vertical_noise) / 0.20)
+                    + 0.10 * clamp01((0.16 - vertical_noise) / 0.16)
                 )
                 * (0.28 + 0.72 * pose_strength)
                 * horizontal_duration_gate
@@ -248,6 +251,32 @@ class DynamicGestureRecognizer:
                 * (0.18 + 0.82 * one_pose_strength)
                 * circle_duration_gate
             )
+
+        # A looping path reverses in X and travels in Y. That is a
+        # circle / arc, not a committed swipe — even when one short
+        # window of the loop looks mostly horizontal.
+        plus_x = minus_x = plus_y = minus_y = 0
+        loop_window = list(self.history)[-12:]
+        for prev, current in zip(loop_window, loop_window[1:]):
+            scale = max(current.scale, 1e-6)
+            dx = float(current.center[0] - prev.center[0]) / scale
+            dy = float(current.center[1] - prev.center[1]) / scale
+            tip_dx = float(current.index_tip[0] - prev.index_tip[0]) / scale
+            tip_dy = float(current.index_tip[1] - prev.index_tip[1]) / scale
+            if dx > 0.02 or tip_dx > 0.02:
+                plus_x += 1
+            if dx < -0.02 or tip_dx < -0.02:
+                minus_x += 1
+            if dy > 0.02 or tip_dy > 0.02:
+                plus_y += 1
+            if dy < -0.02 or tip_dy < -0.02:
+                minus_y += 1
+        if min(plus_x, minus_x) >= 2 and min(plus_y, minus_y) >= 1:
+            left_score = 0.0
+            right_score = 0.0
+        elif repeat_score >= 0.40 and repeat_score + 0.02 >= max(left_score, right_score):
+            left_score = 0.0
+            right_score = 0.0
 
         if self._blocked_horizontal_label == "swipe_left" and timestamp < self._blocked_horizontal_until:
             left_score = 0.0

@@ -17,7 +17,7 @@ class SpotifyGestureRouter:
     def __init__(
         self,
         *,
-        static_hold_seconds: float = 0.5,
+        static_hold_seconds: float = 1.0,
         static_cooldown_seconds: float = 1.5,
         dynamic_cooldown_seconds: float = 0.9,
     ) -> None:
@@ -120,7 +120,7 @@ class SpotifyGestureRouter:
 
         if now < self._static_cooldown_until:
             return
-        required_hold = 1.0 if stable_label == "two" else self.static_hold_seconds
+        required_hold = self.static_hold_seconds
         if now - self._static_candidate_since < required_hold:
             return
 
@@ -137,16 +137,12 @@ class SpotifyGestureRouter:
         except Exception:
             pass
         if stable_label == "two":
-            if controller.is_window_active():
-                self._control_text = "spotify already focused"
-                self._set_action("spotify_focus_idle")
-            else:
-                ready = controller.focus_or_open_window()
-                self._control_text = controller.message
-                self._set_action("spotify_focus" if ready else "spotify_focus_failed")
-                if ready and controller.is_active_device_available():
-                    details = controller.get_current_track_details()
-                    self._info_text = details.summary() if details is not None else "Spotify ready on device"
+            self._control_text = "opening spotify"
+            self._set_action("spotify_focus")
+            controller.dispatch_async(
+                controller.focus_or_open_window,
+                on_complete=self._spotify_result_callback("focus"),
+            )
         elif stable_label == "fist":
             if not self._can_control_without_focus(controller):
                 self._control_text = "spotify inactive on device"

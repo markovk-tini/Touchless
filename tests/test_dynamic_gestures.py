@@ -111,6 +111,20 @@ class DynamicGestureTest(unittest.TestCase):
         best = max(result.dynamic_candidate_scores.get('repeat_circle', 0.0) for result in results)
         self.assertGreater(best, 0.60)
         self.assertTrue(any(result.raw_gesture == 'repeat_circle' for result in results[-3:]))
+        self.assertTrue(all(result.raw_gesture not in {'swipe_left', 'swipe_right'} for result in results))
+
+    def test_open_hand_circle_does_not_fire_swipe(self) -> None:
+        base = make_pose('open_hand')
+        sequence = [
+            translate_landmarks(
+                base,
+                dx=0.075 * math.cos(math.radians(angle)),
+                dy=0.065 * math.sin(math.radians(angle)),
+            )
+            for angle in (0, 40, 85, 140, 210, 275, 330, 360)
+        ]
+        results = _run_sequence(sequence)
+        self.assertTrue(all(result.raw_gesture not in {'swipe_left', 'swipe_right'} for result in results))
 
     def test_repeat_circle_stays_low_for_horizontal_swipe(self) -> None:
         base = make_pose('open_hand')

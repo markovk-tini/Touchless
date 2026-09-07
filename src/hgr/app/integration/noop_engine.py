@@ -454,6 +454,7 @@ class _EngineRunner:
         self._current_engine: GestureRecognitionEngine | None = None
         self._busy = False
         self._result_callback = None
+        self._post_infer = None
 
     @property
     def busy(self) -> bool:
@@ -554,6 +555,16 @@ class _EngineRunner:
                 result = None
             finally:
                 self._busy = False
+            # GPU/Lite custom-gesture MediaPipe must not run on the
+            # GUI thread — it was pulling camera display from ~50 fps
+            # toward ~30. Attach landmarks here so _on_engine_result
+            # only classifies.
+            post = self._post_infer
+            if post is not None and result is not None:
+                try:
+                    post(frame, result)
+                except Exception:
+                    traceback.print_exc()
             inference_seconds = time.perf_counter() - inference_start
             found = bool(getattr(result, "found", False)) if result is not None else False
             log_samples.append((inference_seconds, found))
@@ -581,6 +592,13 @@ class _EngineRunner:
                     cb(frame, result)
                 except Exception:
                     traceback.print_exc()
+
+
+# Fire-once static poses (open Chrome / Spotify / Touchless, mode
+# toggles, voice, clip) must be held this long before the action
+# runs. Continuous poses (volume, wheels, mouse-once-on) keep their
+# own timings.
+_STATIC_GESTURE_HOLD_SECONDS = 1.0
 
 
 class GestureWorker(QObject):
@@ -955,7 +973,7 @@ class GestureWorker(QObject):
         # Hold-and-fire state for the right-hand plain-three / plain-four
         # actions (open_chrome / open_touchless). These bindings have
         # no router consuming them — fired here directly from
-        # _maybe_fire_open_chrome_touchless on a 0.5 s hold.
+        # _maybe_fire_open_chrome_touchless on a 1.0 s hold.
         self._open_action_candidate: Optional[str] = None
         self._open_action_candidate_since: float = 0.0
         self._open_action_cooldown_until: float = 0.0
@@ -1037,13 +1055,13 @@ class GestureWorker(QObject):
 
         _pump_events()
         self.chrome_controller = ChromeController()
-        self.chrome_router = ChromeGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.5)
+        self.chrome_router = ChromeGestureRouter(static_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.5)
         self._chrome_mode_enabled = False
         self._chrome_control_text = self.chrome_controller.message
 
         _pump_events()
         self.spotify_controller = SpotifyController()
-        self.spotify_router = SpotifyGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.5)
+        self.spotify_router = SpotifyGestureRouter(static_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.5)
         self._spotify_control_text = self.spotify_controller.message
 
         _pump_events()
@@ -1053,9 +1071,9 @@ class GestureWorker(QObject):
         # discord_router below for gesture-driven control.
         self.discord_controller = DiscordController()
         self.discord_router = DiscordGestureRouter(
-            static_hold_seconds=0.5,
+            static_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS,
             static_cooldown_seconds=1.5,
-            toggle_hold_seconds=0.7,
+            toggle_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS,
             toggle_cooldown_seconds=1.5,
         )
         self._discord_control_text = self.discord_controller.message
@@ -1064,7 +1082,12 @@ class GestureWorker(QObject):
 
         _pump_events()
         self.youtube_controller = YouTubeController(volume_controller=self.volume_controller)
-        self.youtube_router = YouTubeGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.0)
+        self.youtube_router = YouTubeGestureRouter(
+            static_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS,
+            static_cooldown_seconds=1.5,
+            dynamic_cooldown_seconds=1.0,
+            toggle_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS,
+        )
         self._youtube_control_text = "YouTube idle"
         self._youtube_mode_info = "off"
         self._youtube_mode_prev_active = False
@@ -1331,6 +1354,7 @@ class GestureWorker(QObject):
         # even with the GPU port. With this off-main, the QTimer can
         # fire as fast as the camera feeds frames.
         self._engine_runner = _EngineRunner()
+        self._engine_runner._post_infer = self._attach_custom_hands_on_engine_thread
         self._engine_result_ready.connect(self._on_engine_result)
 
         # Custom-gesture live runner â€” owns its own classifier + hold/
@@ -1346,22 +1370,15 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] runner init failed: {exc}")
             self._custom_gesture_runner = None
-        # v1.1.7 event-loop optimization (Step 3): rate-limit the
-        # slow-path custom-gesture inference. When the engine runtime
-        # produces landmarks the runner can reuse (mediapipe-cpu /
-        # tasks-gpu / onnx-directml with model_complexity=1), the fast
-        # path is nearly free. But Lite Mode uses model_complexity=0,
-        # forcing the slow path: a private MediaPipe pass on the raw
-        # frame, ~5-10 ms/frame on the MAIN THREAD every tick, purely
-        # to feed the custom-gesture classifier. Users hold static
-        # custom poses for a full second+ before firing, so sampling
-        # the slow path every OTHER frame is indistinguishable from
-        # per-frame at UX level while halving the main-thread cost.
-        # Skip counter cycles 0/1/2 — process_frame runs at cycle 0
-        # only. hand_lost() still fires every frame (it's a state
-        # update, not inference).
+        # Rate-limit the GPU/Lite private MediaPipe pass used when
+        # engine landmarks are not the recorder distribution. Runs on
+        # the engine thread (see _attach_custom_hands_on_engine_thread),
+        # every other inference, so the GUI camera tick stays free.
         self._custom_runner_slow_path_skip_ratio = 2
-        self._custom_runner_slow_path_counter = 0
+        # Start at 1 so the first GPU/Lite tick samples immediately
+        # ((1+1)%2==0) instead of skipping with an empty cache.
+        self._custom_runner_slow_path_counter = 1
+        self._last_custom_mp_hands: list | None = None
 
         # Dynamic custom-gesture runtime. Parallel to the static
         # runner above — same registry, same `fire_once` cooldown
@@ -1383,6 +1400,7 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] pose sequence runtime init failed: {exc}")
             self._pose_sequence_runtime = None
+        self._seq_suppress_dynamic_until = 0.0
         # When a custom horizontal swipe owns the live pose, builtin
         # swipe_left/right must not also dispatch (sandbox never had
         # this collision because it has no builtin swipe path).
@@ -1447,19 +1465,17 @@ class GestureWorker(QObject):
         self._timing_samples: deque[tuple[float, float, float, float, float, float, float, float]] = deque(maxlen=240)
         self._last_timing_log: float = 0.0
 
-        # Skip-frame inference state. When Lite Mode is on AND no
-        # hand was visible in the previous frame, we skip MediaPipe
-        # on every other tick â€” the detector is the single biggest
-        # CPU cost (12-25 ms), and there's nothing it could surface
-        # on an empty frame that the next-tick inference won't catch
-        # one frame (~16 ms) later. As soon as a hand appears we go
-        # back to full-rate inference so dynamic gestures (swipe,
-        # repeat-circle) â€” which depend on frame-by-frame motion â€”
-        # are never sampled at half-rate. `_inference_skipped_last`
-        # guarantees we never skip two ticks in a row, so we always
-        # re-sample to detect a new hand entering the frame.
+        # Skip-frame inference state. Empty frames skip MediaPipe on
+        # a cadence (every other tick, then 2-of-3 after a short idle)
+        # because the detector is the single biggest CPU cost
+        # (12-25 ms) and there's nothing it could surface on an empty
+        # frame that the next inference tick won't catch. As soon as a
+        # hand appears we go back to full-rate inference so dynamic
+        # gestures (swipe, repeat-circle) — which depend on
+        # frame-by-frame motion — are never sampled at half-rate.
         self._last_result_had_hand: bool = False
         self._inference_skipped_last: bool = False
+        self._idle_skip_ticks: int = 0
         # C13 (v1.1.7): track whether the last engine_landmarks_ready
         # emit carried a non-empty hands list. When no hand is detected
         # in the current cycle AND the previous emit also had no hands
@@ -2013,7 +2029,7 @@ class GestureWorker(QObject):
             self._drawing_toggle_candidate_since = now
             self._drawing_control_text = "hold left hand four for drawing mode"
             return True
-        if now - self._drawing_toggle_candidate_since >= 0.6:
+        if now - self._drawing_toggle_candidate_since >= _STATIC_GESTURE_HOLD_SECONDS:
             self._toggle_drawing_mode(now)
             return True
         return True
@@ -3665,13 +3681,13 @@ class GestureWorker(QObject):
     def _derive_display_label(self, prediction, hand_reading) -> tuple[str, bool]:
         # Like _gesture_banner_label but promotes the recognizer's
         # base label to its derived variant (three_together,
-        # four_together, thumb_up, thumb_down) when the finger
-        # pattern matches — so the bbox banner reflects the same
-        # label the action-routing layer uses, instead of stalling
-        # on "three" / "four" / "fist" while the engine is firing
-        # YouTube actions off the derived form. Active flag stays
-        # True for any non-neutral chosen label, which keeps the
-        # bbox green via the existing color branch.
+        # four_together) when the finger pattern matches — so the
+        # bbox banner reflects the same label the action-routing
+        # layer uses, instead of stalling on "three" / "four" while
+        # the engine is firing Chrome / YouTube actions off the
+        # derived form. Active flag stays True for any non-neutral
+        # chosen label, which keeps the bbox green via the existing
+        # color branch.
         if prediction is None:
             return "", False
         if hand_reading is not None:
@@ -3709,18 +3725,20 @@ class GestureWorker(QObject):
             return label, active
         # Suppress labels not bound on this hand. Covers the
         # other-hand-only case (e.g. mute on left hand — only bound
-        # right) and the bound-nowhere case (e.g. thumb_up / thumb_down
-        # on a hand with no binding entry). Without this the banner
-        # showed labels the user couldn't use on the active hand,
-        # which was visually noisy and misleading.
+        # right) and labels with no binding entry at all. Without
+        # this the banner showed names the user couldn't use on the
+        # active hand, which was visually noisy and misleading.
         return "", False
 
     # Recognizer labels that are not shipped as named preset
     # gestures. "one" (index finger up) is used internally for
     # voice-listen / drawing / repeat-circle, but there is no
-    # user-facing gesture called "one". Showing it on the live
-    # viewer implies a preset and collides with custom names.
-    _UNNAMED_RECOGNIZER_LABELS = frozenset({"one"})
+    # user-facing gesture called "one". thumb_up / thumb_down were
+    # derived heuristics that collided with snap / fist and are
+    # not product gestures — YouTube like/dislike stay on the wheel.
+    # Showing any of these on the live viewer implies a preset and
+    # collides with custom names.
+    _UNNAMED_RECOGNIZER_LABELS = frozenset({"one", "thumb_up", "thumb_down"})
 
     @classmethod
     def _hide_unnamed_recognizer_label(
@@ -4420,6 +4438,57 @@ class GestureWorker(QObject):
                 self.low_fps_suggestion_overlay.dismiss()
             except Exception:
                 pass
+
+    @staticmethod
+    def _empty_frame_skip_inference(had_hand: bool, idle_ticks: int) -> tuple[bool, int]:
+        """Decide whether this empty frame can skip MediaPipe.
+
+        Returns (skip, new_idle_ticks). Never skip while a hand is
+        tracked so swipe sampling stays full-rate. Empty frames skip
+        every other tick so idle GPU cost drops without starving
+        reacquisition (bbox / 3→2→1) or collapsing overlay FPS.
+        """
+        if had_hand:
+            return False, 0
+        next_ticks = int(idle_ticks) + 1
+        return (next_ticks % 2) != 0, next_ticks
+
+    def _note_display_fps(self) -> None:
+        """Drive overlay / auto-Low-FPS from camera emit rate.
+
+        Inference-only FPS collapsed to ~6 when empty-frame skip
+        avoided `_on_engine_result`, which then auto-engaged Low FPS
+        and made 3→2→1 look like repeat_circle.
+        """
+        now = time.time()
+        last = float(getattr(self, "_last_time", 0.0) or 0.0)
+        dt = max(now - last, 1e-6) if last > 0.0 else 1e-6
+        self._fps = 0.86 * self._fps + 0.14 * (1.0 / dt) if self._fps else (1.0 / dt)
+        self._last_time = now
+
+    @staticmethod
+    def _builtin_open_hand_swipe_in_flight(prediction) -> bool:
+        """True while builtin swipe_left/right is scoring as in-progress.
+
+        Used to park custom SPRING matching during Spotify skip swipes
+        so DTW does not hitch the live view on the GUI thread.
+        """
+        if prediction is None:
+            return False
+        label = str(getattr(prediction, "dynamic_label", "") or "")
+        if label in {"swipe_left", "swipe_right"}:
+            return True
+        for cand in getattr(prediction, "dynamic_candidates", ()) or ():
+            cand_label = str(getattr(cand, "label", "") or "")
+            if cand_label not in {"swipe_left", "swipe_right"}:
+                continue
+            try:
+                score = float(getattr(cand, "score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            if score >= 0.45:
+                return True
+        return False
 
     def _perf_optimisations_enabled(self) -> bool:
         # Lite Mode, GPU Mode, AND Low FPS Mode (manual or auto-engaged)
@@ -7133,6 +7202,7 @@ class GestureWorker(QObject):
             # workflow. Emitting the raw frame like before.
             self.raw_frame_ready.emit(display_frame, capture_ts)
             self._raw_emit_count += 1
+            self._note_display_fps()
         except Exception:
             pass
         # C14 diagnostic: raw emit rate + tick fire rate. Camera
@@ -7203,22 +7273,16 @@ class GestureWorker(QObject):
         # without the worker firing the matching binding.
         if self._frozen:
             return
-        # Smart skip-frame inference: when Lite Mode is on AND we
-        # know the previous frame was empty (no hand), skip MediaPipe
-        # this tick and synthesise a "no hand" result. Never skip two
-        # ticks in a row â€” that guarantees we'll always detect a new
-        # hand within one camera frame (~16 ms). When a hand was
-        # visible last tick we always run inference, so dynamic
-        # gestures (swipes, repeat-circle) â€” which feed every frame's
-        # landmark velocity to the dynamic recognizer â€” never lose
-        # any frames during a gesture. Net: ~50% of MediaPipe's cost
-        # disappears during empty-frame periods (idle / between
-        # gestures), no impact during active gesturing.
-        skip_inference = (
-            self._perf_optimisations_enabled()
-            and not self._low_fps_active
-            and not self._last_result_had_hand
-            and not self._inference_skipped_last
+        # Smart skip-frame inference: when the previous frame was
+        # empty (no hand), skip MediaPipe this tick without running
+        # the result pipeline. Always on — not just Lite/GPU — because
+        # empty-frame MediaPipe was the random live-view hitch with
+        # nobody in frame. Full-rate inference resumes the instant a
+        # hand is tracked, so swipes / repeat-circle keep every
+        # landmark sample. Empty frames skip every other tick so idle
+        # GPU cost drops without starving hand reacquisition.
+        skip_inference, self._idle_skip_ticks = self._empty_frame_skip_inference(
+            self._last_result_had_hand, self._idle_skip_ticks
         )
         # Stash timing context so _on_engine_result can finish the
         # debug breakdown using the same per-tick start markers, even
@@ -7226,15 +7290,13 @@ class GestureWorker(QObject):
         # thread.
         self._tick_timing_state = (debug_timing, t0, t_read, t_prep)
         if skip_inference:
-            # neutral_result_for_frame is a cheap helper (no detector
-            # call) â€” keep it inline so we don't pay a thread hop for
-            # what would otherwise be a sub-millisecond operation.
-            # v1.1.7.5: neutral path uses the raw display frame — no
-            # detection actually happens, so the boosted copy would be
-            # wasted work.
-            result = self.engine.neutral_result_for_frame(frame)
+            # Empty-frame skip used to synthesise a no-hand result and
+            # still run the full _on_engine_result pipeline (YouTube
+            # ticks, custom hand_lost, overlay, FPS). That GUI-thread
+            # work was the remaining idle hitch in GPU mode. Display
+            # already went out via raw_frame_ready above; the last
+            # real empty inference already cleared the skeleton.
             self._inference_skipped_last = True
-            self._on_engine_result(frame, result)
             return
         self._inference_skipped_last = False
         # Push left-handed mode to the engine each tick (cheap bool set
@@ -7257,18 +7319,21 @@ class GestureWorker(QObject):
         except Exception:
             traceback.print_exc()
             return
+        try:
+            self._attach_custom_hands_on_engine_thread(detection_frame, result)
+        except Exception:
+            pass
         self._on_engine_result(detection_frame, result)
 
     def _on_engine_result(self, frame, result) -> None:
-        # Runs on the GUI (main) thread. Reached via three paths:
-        #   1. Direct call from _tick for the skip-inference fast path
-        #      (synthetic neutral result, no thread hop needed).
-        #   2. Direct call from _tick when the runner couldn't accept
+        # Runs on the GUI (main) thread. Reached via two paths:
+        #   1. Direct call from _tick when the runner couldn't accept
         #      a submission and we fell back to inline inference.
-        #   3. Queued signal from the _EngineRunner thread when async
+        #   2. Queued signal from the _EngineRunner thread when async
         #      inference completes â€” Qt's auto-connection routes the
         #      cross-thread emit through the GUI thread's event loop,
         #      so widget mutations below are safe.
+        # Empty-frame skip returns from _tick without coming here.
         # Clear the async-pending guard up front so the next _tick is
         # free to dispatch even if the bail-outs below trigger. The
         # skip-inference / inline-fallback paths set this flag to
@@ -7301,9 +7366,6 @@ class GestureWorker(QObject):
         t_engine = time.perf_counter() if debug_timing else 0.0
         self._drawing_secondary_hand_reading = getattr(result, "secondary_hand_reading", None)
         now = time.time()
-        dt = max(now - self._last_time, 1e-6)
-        self._fps = 0.86 * self._fps + 0.14 * (1.0 / dt) if self._fps else (1.0 / dt)
-        self._last_time = now
         self._refresh_fullscreen_foreground(now)
         self._maybe_auto_toggle_low_fps(now)
         self._maybe_offer_low_fps_suggestion(now)
@@ -7353,6 +7415,13 @@ class GestureWorker(QObject):
                         custom_match = dyn.current_match(time.monotonic())
                     except Exception:
                         custom_match = None
+            if custom_match is None:
+                seq = getattr(self, "_pose_sequence_runtime", None)
+                if seq is not None:
+                    try:
+                        custom_match = seq.current_banner()
+                    except Exception:
+                        custom_match = None
 
             def _apply_custom_label(default_label: str, default_active: bool, hand_handedness: Optional[str]):
                 """Override the banner with the custom gesture's name
@@ -7379,10 +7448,10 @@ class GestureWorker(QObject):
                 label, active = self._hide_unnamed_recognizer_label(label, active)
                 label, active = _apply_custom_label(label, active, primary_handedness)
                 # Display: underscore -> space so derived labels read
-                # naturally ('three together', 'four together',
-                # 'thumb up', 'thumb down') instead of with underscores.
-                # Done after the filter pipeline so any binding lookup
-                # that needs the underscore form still sees it.
+                # naturally ('three together', 'four together')
+                # instead of with underscores. Done after the filter
+                # pipeline so any binding lookup that needs the
+                # underscore form still sees it.
                 display_label = label.replace("_", " ") if label else label
                 hands_info.append(
                     self._build_hand_overlay_info(
@@ -7505,104 +7574,94 @@ class GestureWorker(QObject):
         except Exception:
             pass
 
-        # Custom-gesture live processing. Runs on the tracked hand's
-        # landmarks after the built-in pipeline has had its turn this
-        # frame. The runner manages its own hold/cooldown state and
-        # calls fire_once() on activation. Falls through silently if
-        # the user has no custom gestures registered.
+        # Custom-gesture live processing (static, dynamic, pose
+        # sequence). Recorders use MediaPipe Hands at complexity=1;
+        # GPU/Lite engine landmarks are a different distribution, so
+        # one shared hand list per tick is either engine output (CPU
+        # MediaPipe complexity 1) or a private MediaPipe pass.
+        fired_dyn = None
+        custom_hands: list = []
+        custom_hands_sampled = False
+        runner_now = time.monotonic()
+        dynamic_runtime = getattr(self, "_dynamic_gesture_runtime", None)
+        seq_runtime = getattr(self, "_pose_sequence_runtime", None)
+        try:
+            if self._custom_gesture_runner is not None:
+                self._custom_gesture_runner.maybe_reload_if_changed(runner_now)
+            if dynamic_runtime is not None:
+                dynamic_runtime.maybe_reload_if_changed(runner_now)
+            if seq_runtime is not None:
+                seq_runtime.maybe_reload_if_changed(runner_now)
+        except Exception:
+            pass
+
+        need_custom = False
+        try:
+            if self._custom_gesture_runner is not None and self._custom_gesture_runner.has_gestures:
+                need_custom = True
+            if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
+                need_custom = True
+            if seq_runtime is not None and seq_runtime.has_sequences():
+                need_custom = True
+        except Exception:
+            need_custom = bool(self._custom_gesture_runner is not None)
+
+        if need_custom:
+            try:
+                custom_hands, custom_hands_sampled = self._custom_hands_this_frame(
+                    result, frame
+                )
+            except Exception as exc:
+                print(f"[custom-gestures] landmark extract error: {exc}")
+                custom_hands, custom_hands_sampled = [], True
+
         if self._custom_gesture_runner is not None:
             try:
-                # Auto-reload from the registry file if it changed on
-                # disk since our last check (recorder / sandbox /
-                # wizard saved a new gesture). Throttled internally to
-                # one stat() per ~3 s, so the per-frame cost is
-                # negligible.
-                runner_now = time.monotonic()
-                self._custom_gesture_runner.maybe_reload_if_changed(runner_now)
-
-                # Fast path: when the engine's hand-tracking runtime is
-                # MediaPipe-compatible AND configured the same way the
-                # recorder uses (model_complexity=1), reuse the engine's
-                # already-extracted landmarks. Skips a redundant private
-                # MediaPipe pass and saves ~5â€“10 ms/frame.
-                #
-                # Slow path: when the runtime differs from the recorder
-                # (ONNX/DirectML GPU, or lite mode with model_complexity=0),
-                # fall back to the runner's private MediaPipe pass so the
-                # landmark distribution matches what the user trained
-                # against. Without this, classifier scores drop ~0.10â€“0.15
-                # below the trained baseline and gestures get missed.
-                use_engine_landmarks = self._custom_runner_can_use_engine_landmarks()
                 fired = None
-                if use_engine_landmarks:
-                    hands_for_runner = self._build_engine_hands_for_runner(result)
-                    if hands_for_runner:
-                        fired = self._custom_gesture_runner.process_engine_hands(
-                            hands_for_runner, runner_now
-                        )
-                    else:
-                        self._custom_gesture_runner.hand_lost(runner_now)
-                else:
-                    # Slow path: private MediaPipe pass. Rate-limited
-                    # per Step 3 above so Lite Mode's ~5-10ms/frame
-                    # main-thread inference doesn't cap the tick rate.
-                    self._custom_runner_slow_path_counter = (
-                        (self._custom_runner_slow_path_counter + 1)
-                        % max(1, self._custom_runner_slow_path_skip_ratio)
+                if custom_hands:
+                    fired = self._custom_gesture_runner.process_engine_hands(
+                        custom_hands, runner_now
                     )
-                    should_run_slow_path = (self._custom_runner_slow_path_counter == 0)
-                    frame_for_mp = getattr(result, "annotated_frame", None)
-                    if frame_for_mp is not None:
-                        if should_run_slow_path:
-                            fired = self._custom_gesture_runner.process_frame(
-                                frame_for_mp, runner_now
-                            )
-                        # else: skip this tick — the runner's internal
-                        # hold-and-fire cooldown expects gaps between
-                        # samples anyway, and static poses persist across
-                        # 2-3 frames. No hand_lost() on the skip — that
-                        # would confuse the hold detector.
-                    else:
-                        self._custom_gesture_runner.hand_lost(runner_now)
+                elif custom_hands_sampled and need_custom:
+                    self._custom_gesture_runner.hand_lost(runner_now)
                 if fired:
                     try:
                         self.command_detected.emit(f"custom: {fired}")
                     except Exception:
                         pass
-                    # Log custom-gesture fires to recent-actions so
-                    # users can see ALL gesture activity in one place,
-                    # not just the built-in media/volume routes.
                     self._record_action(
                         f"custom:{fired}",
                         f"custom gesture: {fired}",
                     )
             except Exception as exc:
-                # A bad sample / classifier hiccup must not break the
-                # main pipeline â€” log once and continue.
                 print(f"[custom-gestures] process error: {exc}")
 
-        # Dynamic custom-gesture runtime — parallel to the static
-        # runner. Uses the same registry + same fire_once cooldown
-        # but matches motion (DTW) instead of pose. Falls through
-        # silently when no dynamic gestures are registered.
-        fired_dyn = None
-        dynamic_runtime = getattr(self, "_dynamic_gesture_runtime", None)
         if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
             try:
-                runner_now = time.monotonic()
-                dynamic_runtime.maybe_reload_if_changed(runner_now)
-                hand_lost = not (
-                    result.found
-                    and result.tracked_hand is not None
-                    and result.hand_reading is not None
+                swipe_in_flight = self._builtin_open_hand_swipe_in_flight(
+                    getattr(result, "prediction", None)
                 )
-                if hand_lost:
+                pred = getattr(result, "prediction", None)
+                counting = str(getattr(pred, "stable_label", "") or "") in {"two", "three"}
+                loop_custom = False
+                try:
+                    loop_custom = bool(dynamic_runtime.has_loop_or_complex_templates())
+                except Exception:
+                    loop_custom = False
+                lm, live_hand = self._pick_custom_hand(custom_hands)
+                if (
+                    (not custom_hands and custom_hands_sampled)
+                    or (swipe_in_flight and not loop_custom)
+                    or counting
+                    or self._pose_sequence_owns_motion(runner_now)
+                ):
                     dynamic_runtime.hand_lost()
-                else:
+                elif lm is not None:
+                    from ...custom_gestures.dynamic_recording import palm_scale_from_landmarks
                     fired_dyn = dynamic_runtime.process_frame(
-                        result.hand_reading.landmarks,
-                        palm_scale=float(result.hand_reading.palm.scale),
-                        handedness=str(result.tracked_hand.handedness or ""),
+                        lm,
+                        palm_scale=palm_scale_from_landmarks(lm),
+                        handedness=str(live_hand or ""),
                         timestamp=runner_now,
                     )
                     if fired_dyn:
@@ -7617,26 +7676,27 @@ class GestureWorker(QObject):
             except Exception as exc:
                 print(f"[custom-gestures] dynamic runtime error: {exc}")
 
-        # Pose-sequence runtime — ordered held poses (e.g. 3→2→1).
-        seq_runtime = getattr(self, "_pose_sequence_runtime", None)
         if seq_runtime is not None and seq_runtime.has_sequences():
             try:
-                runner_now = time.monotonic()
-                seq_runtime.maybe_reload_if_changed(runner_now)
-                hand_lost = not (
-                    result.found
-                    and result.tracked_hand is not None
-                    and result.hand_reading is not None
-                )
-                if hand_lost:
-                    seq_runtime.hand_lost()
-                else:
+                lm, live_hand = self._pick_custom_hand(custom_hands)
+                if not custom_hands and custom_hands_sampled:
+                    seq_runtime.hand_lost(runner_now)
+                elif lm is not None:
                     fired_seq = seq_runtime.process_landmarks(
-                        result.hand_reading.landmarks,
-                        handedness=str(result.tracked_hand.handedness or ""),
+                        lm,
+                        handedness=str(live_hand or ""),
                         timestamp=runner_now,
+                        # Lone-hand GPU labels often say Left for a
+                        # right hand. Never drop a recorded sequence
+                        # on that flicker.
+                        strict_hand=False,
+                        hint_label=str(
+                            getattr(getattr(result, "prediction", None), "stable_label", "")
+                            or ""
+                        ),
                     )
                     if fired_seq:
+                        self._seq_suppress_dynamic_until = runner_now + 1.2
                         try:
                             self.command_detected.emit(f"custom: {fired_seq}")
                         except Exception:
@@ -7660,7 +7720,12 @@ class GestureWorker(QObject):
                     self._custom_dyn_builtin_suppress_until = now_m + 1.2
                 lm = None
                 scale = 1.0
-                if (
+                pick_lm, _pick_hand = self._pick_custom_hand(custom_hands)
+                if pick_lm is not None:
+                    from ...custom_gestures.dynamic_recording import palm_scale_from_landmarks
+                    lm = pick_lm
+                    scale = float(palm_scale_from_landmarks(pick_lm))
+                elif (
                     result.found
                     and result.hand_reading is not None
                     and getattr(result.hand_reading, "landmarks", None) is not None
@@ -8315,8 +8380,15 @@ class GestureWorker(QObject):
                             ).start()
                         fired = True
                     else:
-                        if not self.spotify_controller.is_window_active():
-                            self.spotify_controller.focus_or_open_window()
+                        # EnumWindows + process walk + possible launch
+                        # used to run on the gesture/UI thread and hitch
+                        # the live view for a split second. Same work,
+                        # background thread.
+                        threading.Thread(
+                            target=self.spotify_controller.focus_or_open_window,
+                            name="spotify-focus",
+                            daemon=True,
+                        ).start()
                         fired = True
                 except Exception:
                     fired = False
@@ -8328,7 +8400,11 @@ class GestureWorker(QObject):
                     fired = False
             elif action_id == "open_chrome":
                 try:
-                    self.chrome_controller.focus_or_open_window()
+                    threading.Thread(
+                        target=self.chrome_controller.focus_or_open_window,
+                        name="chrome-focus",
+                        daemon=True,
+                    ).start()
                     fired = True
                 except Exception:
                     fired = False
@@ -8436,7 +8512,7 @@ class GestureWorker(QObject):
         now: float,
     ) -> None:
         """Right-hand plain-three -> open_chrome,
-        right-hand plain-four -> open_touchless. Fire after a 0.4 s
+        right-hand plain-four -> open_touchless. Fire after a 1.0 s
         hold with a 2.0 s cooldown so a quick gesture doesn't double-
         fire when the user is in transit between poses.
 
@@ -8451,6 +8527,11 @@ class GestureWorker(QObject):
         binding remap step above this call already rewrote the
         stable_label, so the labels here will be different and this
         method early-exits. No competing path."""
+        seq = getattr(self, "_pose_sequence_runtime", None)
+        if seq is not None and seq.has_sequences() and seq.is_in_progress():
+            # Mid-count 3→2→1 owns the right-hand "three"; do not
+            # also arm open-Chrome on that hold.
+            return
         # Resolve which prediction is from the RIGHT hand. _handle_app_controls
         # is called with the primary prediction + its handedness. If the
         # primary is the right hand, use it. Otherwise, walk the engine's
@@ -8501,7 +8582,7 @@ class GestureWorker(QObject):
         if now < self._open_action_cooldown_until:
             return
         held = now - self._open_action_candidate_since
-        if held < 0.4:
+        if held < _STATIC_GESTURE_HOLD_SECONDS:
             return
         self._open_action_cooldown_until = now + 2.0
         action_id = "open_chrome" if stable_label == "three" else "open_touchless"
@@ -8579,7 +8660,26 @@ class GestureWorker(QObject):
             and label in {"swipe_left", "swipe_right"}
         ):
             return "neutral"
+        if label == "repeat_circle":
+            stable = str(getattr(prediction, "stable_label", "") or "")
+            if stable in {"two", "three", "four"}:
+                return "neutral"
+            if self._pose_sequence_owns_motion():
+                return "neutral"
         return label
+
+    def _pose_sequence_owns_motion(self, now: float | None = None) -> bool:
+        """True while a 3→2→1 (or similar) sequence is mid-count, or
+        briefly after it fires, so repeat_circle / custom circle cannot
+        steal the last 'one' pose."""
+        seq = getattr(self, "_pose_sequence_runtime", None)
+        if seq is not None and seq.has_sequences() and seq.is_in_progress():
+            return True
+        until = float(getattr(self, "_seq_suppress_dynamic_until", 0.0) or 0.0)
+        if until <= 0.0:
+            return False
+        now_m = float(now if now is not None else time.monotonic())
+        return now_m < until
 
     @staticmethod
     def _neutralize_prediction(prediction):
@@ -8660,11 +8760,106 @@ class GestureWorker(QObject):
             model_complexity = int(getattr(detector, "model_complexity", 1)) if detector is not None else 1
         except Exception:
             return False
-        if backend not in ("mediapipe-cpu", "mediapipe-tasks-gpu", "onnx-directml"):
+        if backend not in ("mediapipe-cpu", "mediapipe-tasks-gpu"):
             return False
         if model_complexity != 1:
             return False
         return True
+
+    def _custom_hands_this_frame(self, result, frame) -> tuple[list, bool]:
+        """Landmarks for custom static / dynamic / pose-sequence.
+
+        Returns (hands, sampled). `sampled` is True on a fresh engine
+        or MediaPipe observation. False means the MediaPipe path was
+        rate-limited and `hands` is the previous sample — callers must
+        not treat an empty list as hand_lost in that case.
+
+        Recorders always use MediaPipe Hands at complexity=1. GPU
+        (ONNX) and Lite landmarks are a different distribution, so
+        those modes run a private MediaPipe pass on the detection
+        frame (already selfie-mirrored) rather than engine output.
+        When the engine runner attached a payload on its thread,
+        reuse that so this method stays cheap on the GUI thread.
+        """
+        attached = getattr(result, "custom_hands_payload", None)
+        if attached is not None:
+            hands, sampled = attached
+            return (list(hands) if hands else []), bool(sampled)
+        return GestureWorker._compute_custom_hands(self, result, frame)
+
+    def _attach_custom_hands_on_engine_thread(self, frame, result) -> None:
+        """Run GPU/Lite custom MediaPipe on the engine thread.
+
+        Called after process_frame, before the queued GUI delivery.
+        Stashes (hands, sampled) on the result so the GUI path does
+        not pay 5–10 ms of MediaPipe on the camera tick.
+        """
+        if result is None:
+            return
+        need_custom = False
+        try:
+            if self._custom_gesture_runner is not None and self._custom_gesture_runner.has_gestures:
+                need_custom = True
+            dynamic_runtime = getattr(self, "_dynamic_gesture_runtime", None)
+            if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
+                need_custom = True
+            seq_runtime = getattr(self, "_pose_sequence_runtime", None)
+            if seq_runtime is not None and seq_runtime.has_sequences():
+                need_custom = True
+        except Exception:
+            need_custom = bool(self._custom_gesture_runner is not None)
+        if not need_custom:
+            result.custom_hands_payload = ([], True)
+            return
+        try:
+            result.custom_hands_payload = GestureWorker._compute_custom_hands(
+                self, result, frame
+            )
+        except Exception:
+            result.custom_hands_payload = ([], True)
+
+    def _compute_custom_hands(self, result, frame) -> tuple[list, bool]:
+        """Landmarks for custom static / dynamic / pose-sequence.
+
+        Returns (hands, sampled). `sampled` is True on a fresh engine
+        or MediaPipe observation. False means the MediaPipe path was
+        rate-limited and `hands` is the previous sample — callers must
+        not treat an empty list as hand_lost in that case.
+
+        Recorders always use MediaPipe Hands at complexity=1. GPU
+        (ONNX) and Lite landmarks are a different distribution, so
+        those modes run a private MediaPipe pass on the detection
+        frame (already selfie-mirrored) rather than engine output.
+        """
+        if self._custom_runner_can_use_engine_landmarks():
+            return self._build_engine_hands_for_runner(result), True
+        self._custom_runner_slow_path_counter = (
+            (self._custom_runner_slow_path_counter + 1)
+            % max(1, self._custom_runner_slow_path_skip_ratio)
+        )
+        should_run = self._custom_runner_slow_path_counter == 0
+        if not should_run:
+            cached = getattr(self, "_last_custom_mp_hands", None)
+            return (list(cached) if cached else []), False
+        frame_for_mp = frame if frame is not None else getattr(result, "annotated_frame", None)
+        runner = getattr(self, "_custom_gesture_runner", None)
+        if runner is None or frame_for_mp is None:
+            self._last_custom_mp_hands = []
+            return [], True
+        try:
+            hands = runner.extract_hands(frame_for_mp)
+        except Exception:
+            hands = []
+        self._last_custom_mp_hands = list(hands) if hands else []
+        return self._last_custom_mp_hands, True
+
+    @staticmethod
+    def _pick_custom_hand(hands: list):
+        """First (landmarks, handedness) pair, or (None, None)."""
+        if not hands:
+            return None, None
+        lm, label = hands[0]
+        return lm, label
 
     @staticmethod
     def _build_engine_hands_for_runner(result) -> list:
@@ -9085,11 +9280,20 @@ class GestureWorker(QObject):
         # also fires it via _dispatch_action. See the helper docstring.
         prediction = self._apply_gesture_binding_remap(prediction, hand_handedness, now)
 
+        # Mid-count 3→2→1 owns one/two/three. Do not arm Chrome,
+        # Spotify, or YouTube holds from the builtin label — the
+        # banner is not a fire, but those routers start timers as
+        # soon as they see the name.
+        if self._pose_sequence_owns_motion():
+            sl = str(getattr(prediction, "stable_label", "") or "")
+            if sl in {"one", "two", "three", "four"}:
+                prediction = self._neutralize_prediction(prediction)
+
         # Default-bound open_chrome (right_three) / open_touchless
         # (right_four) actions have no router. Fire them here on a
-        # short hold. Runs BEFORE the rest of the handler so a brief
-        # three / four reliably opens its target before any other
-        # router (spotify, chrome) gets a turn.
+        # 1.0 s hold. Runs BEFORE the rest of the handler so a
+        # three / four opens its target before any other router
+        # (spotify, chrome) gets a turn.
         self._maybe_fire_open_chrome_touchless(prediction, hand_handedness, now)
 
         # When a save-location prompt is awaiting input, give the left-hand voice handler
@@ -9366,10 +9570,8 @@ class GestureWorker(QObject):
         if self._left_hand_prediction is not None:
             self._handle_left_hand_voice(self._left_hand_prediction, now)
             # CLIP GESTURE — runs alongside voice handler. Voice
-            # handler returns early on fist/one/two; clip gesture
-            # only fires on routed_label="thumb_up" so the two
-            # never collide. Order doesn't matter (no shared state
-            # mutation between them).
+            # handler returns early on fist/one/two; clip fires on
+            # left-hand TWO so the two never collide.
             self._handle_left_hand_clip_gesture(
                 self._left_hand_prediction,
                 self._left_hand_reading,
@@ -9970,6 +10172,13 @@ class GestureWorker(QObject):
         banner_text = prediction.stable_label if prediction.stable_label != "neutral" else prediction.raw_label
         if banner_text in self._UNNAMED_RECOGNIZER_LABELS:
             banner_text = "neutral"
+        seq_banner = None
+        try:
+            seq = getattr(self, "_pose_sequence_runtime", None)
+            if seq is not None:
+                seq_banner = seq.current_banner()
+        except Exception:
+            seq_banner = None
         if self._drawing_mode_enabled:
             payload_raw_label = "neutral"
             payload_stable_label = "neutral"
@@ -9992,6 +10201,8 @@ class GestureWorker(QObject):
             # chip used to flip on/off once a second instead of
             # showing the user that volume control is engaged.
             gesture_chip = "Volume"
+        elif seq_banner:
+            gesture_chip = f"Gesture: {seq_banner[0]}"
         elif dynamic_display != "neutral":
             gesture_chip = f"Dynamic: {dynamic_display.replace('_', ' ')}"
         else:
@@ -10252,18 +10463,6 @@ class GestureWorker(QObject):
                 return "three"
         if stable_label in {"four", "neutral"} and self._is_four_together(hand_reading):
             return "four_together"
-        # Thumb-up / thumb-down: only thumb extended, four others
-        # folded. Direction picked from thumb-tip vs wrist in image
-        # y-coordinates (y grows downward). Tested against fist /
-        # neutral base labels because a thumb-only-extended hand
-        # typically gets classified as fist by the static recognizer
-        # (the thumb is short relative to palm scale and the
-        # finger-count heuristic rounds toward fist).
-        if stable_label in {"fist", "neutral"}:
-            if self._is_thumb_up(hand_reading):
-                return "thumb_up"
-            if self._is_thumb_down(hand_reading):
-                return "thumb_down"
         return stable_label
 
     def _is_three_together(self, hand_reading) -> bool:
@@ -11047,7 +11246,7 @@ class GestureWorker(QObject):
             return
         if now < self._voice_cooldown_until:
             return
-        if now - self._voice_candidate_since < 0.5:
+        if now - self._voice_candidate_since < _STATIC_GESTURE_HOLD_SECONDS:
             return
 
         self._voice_latched_label = stable_label
@@ -11059,7 +11258,7 @@ class GestureWorker(QObject):
         self._start_voice_command()
 
     def _handle_left_hand_clip_gesture(self, prediction, hand_reading, now: float) -> None:
-        """LEFT-hand TWO (V-shape) held for 0.5 s → instant clip.
+        """LEFT-hand TWO (V-shape) held for 1.0 s → instant clip.
 
         r53 v7: gesture swapped from left-fist to left-two. Dictation
         used to live on left-two but was retired; the fist-based clip
@@ -11094,8 +11293,8 @@ class GestureWorker(QObject):
             self._clip_gesture_candidate_since = now
             return
         # Hold satisfied? Threshold matches voice trigger hold
-        # (0.5 s) for muscle-memory parity.
-        if now - self._clip_gesture_candidate_since < 0.5:
+        # (1.0 s) for muscle-memory parity.
+        if now - self._clip_gesture_candidate_since < _STATIC_GESTURE_HOLD_SECONDS:
             return
         # Trigger. Reset candidate and arm cooldown so the same
         # held pose doesn't fire again.

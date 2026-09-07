@@ -28,25 +28,25 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
         "left_one",
         "Left Hand One",
         "Left One.png",
-        "Face your left palm toward the monitor, extend only the index finger, and keep the thumb, middle, ring, and pinky closed. Hold for ~0.5s.",
+        "Face your left palm toward the monitor, extend only the index finger, and keep the thumb, middle, ring, and pinky closed. Hold for ~1s.",
     ),
     (
         "left_two",
         "Left Hand Two",
         "Left Two.png",
-        "Face your left palm toward the monitor, extend the index and middle fingers in a V, and keep the thumb, ring, and pinky closed. Hold for ~0.5s.",
+        "Face your left palm toward the monitor, extend the index and middle fingers in a V, and keep the thumb, ring, and pinky closed. Hold for ~1s.",
     ),
     (
         "left_three",
         "Left Hand Three",
         "Left Three.png",
-        "Face your left palm toward the monitor. Extend the index, middle, and ring fingers and fold the thumb and pinky. Hold for ~0.5s.",
+        "Face your left palm toward the monitor. Extend the index, middle, and ring fingers and fold the thumb and pinky. Hold for ~1s.",
     ),
     (
         "left_four",
         "Left Hand Four",
         "Left Hand Four.png",
-        "Face your left palm toward the monitor. Extend the index, middle, ring, and pinky fingers and fold the thumb across the palm. Hold for ~0.5s.",
+        "Face your left palm toward the monitor. Extend the index, middle, ring, and pinky fingers and fold the thumb across the palm. Hold for ~1s.",
     ),
     # r53: left_fist retired (was Cancel voice/dictation). Left hand
     # fist gesture no longer surfaced in bindings, guide, or picker.
@@ -60,25 +60,25 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
         "right_fist",
         "Right Hand Fist",
         "Fist.png",
-        "Face your right palm toward the monitor and close all five fingers into a tight, compact fist. Hold for ~0.5s.",
+        "Face your right palm toward the monitor and close all five fingers into a tight, compact fist. Hold for ~1s.",
     ),
     (
         "right_three",
         "Right Hand Three (together)",
         "Three.png",
-        "Face your right palm toward the monitor. Extend the index, middle, and ring fingers and hold them TOGETHER (touching, not spread); fold the thumb and pinky. Hold for ~0.5s.",
+        "Face your right palm toward the monitor. Extend the index, middle, and ring fingers and hold them TOGETHER (touching, not spread); fold the thumb and pinky. Hold for ~1s.",
     ),
     (
         "right_four",
         "Right Hand Four",
         "Four.png",
-        "Face your right palm toward the monitor. Extend the index, middle, ring, and pinky fingers; fold the thumb across the palm. Hold for ~0.75s.",
+        "Face your right palm toward the monitor. Extend the index, middle, ring, and pinky fingers; fold the thumb across the palm. Hold for ~1s.",
     ),
     (
         "mute",
         "Mute",
         "Mute.png",
-        "Face your right palm toward the monitor. Extend the thumb and pinky outward (a 'call me' shape) while folding the index, middle, and ring fingers. Hold for ~0.5s.",
+        "Face your right palm toward the monitor. Extend the thumb and pinky outward (a 'call me' shape) while folding the index, middle, and ring fingers. Hold for ~1s.",
     ),
     (
         "wheel_pose",
@@ -170,15 +170,6 @@ STATIC_POSE_LABEL_MAP: dict[str, tuple[str, str]] = {
     "wheel_pose": ("Right", "wheel_pose"),
     "right_pinch": ("Right", "pinch"),
     "left_pinch":  ("Left",  "pinch"),
-    # Right-hand-only pose entries with no action binding. They exist
-    # so the banner filter recognises these labels as right-hand
-    # gestures and suppresses them on the left hand. thumb_up /
-    # thumb_down are the YT like / dislike gestures — handled inside
-    # the YouTube router, not via the global action registry, so they
-    # have no _GESTURE_BIND_ACTIONS entry but DO have visible meaning
-    # on the right hand.
-    "right_thumb_up":      ("Right", "thumb_up"),
-    "right_thumb_down":    ("Right", "thumb_down"),
 }
 
 STATIC_LABEL_TO_POSE: dict[tuple[str, str], str] = {

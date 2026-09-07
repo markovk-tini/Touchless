@@ -4,6 +4,7 @@ import ctypes
 import platform
 import re
 import subprocess
+import threading
 import time
 from ctypes import wintypes
 from difflib import SequenceMatcher
@@ -123,6 +124,24 @@ class ChromeController:
             return True
         self._message = "chrome focus failed"
         return False
+
+    def dispatch_async(self, callable_obj, *args, on_complete=None, **kwargs) -> None:
+        # Window enum / launch used to run on the gesture thread and
+        # hitch the live view for a split second on "open chrome".
+        def _runner():
+            result = None
+            try:
+                result = callable_obj(*args, **kwargs)
+            except Exception:
+                pass
+            if on_complete is not None:
+                try:
+                    on_complete(bool(result), str(self._message or ""))
+                except Exception:
+                    pass
+
+        worker = threading.Thread(target=_runner, name="chrome-action", daemon=True)
+        worker.start()
 
     def launch_chrome(self) -> bool:
         if self._launch_target():

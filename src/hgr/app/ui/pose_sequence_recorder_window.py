@@ -90,6 +90,22 @@ class _SpacePassthroughFilter(QObject):
         return False
 
 
+def _should_flip_sequence_preview(
+    *,
+    using_worker: bool,
+    owns_camera: bool,
+    source_is_mirrored: bool,
+) -> bool:
+    """Worker raw_frame_ready frames are already selfie-mirrored.
+
+    Flipping them again is what made the sequence recorder look
+    backwards when recording while the live app was running.
+    """
+    if using_worker:
+        return False
+    return bool(owns_camera) and not bool(source_is_mirrored)
+
+
 class PoseSequenceRecorderWindow(QDialog):
     """One-take capture + analysis for pose_sequence gestures."""
 
@@ -506,7 +522,7 @@ class PoseSequenceRecorderWindow(QDialog):
         if ok:
             self._handle_frame(frame)
 
-    def _on_worker_frame(self, frame) -> None:
+    def _on_worker_frame(self, frame, capture_ts: float = 0.0) -> None:
         if frame is None:
             return
         try:
@@ -517,9 +533,20 @@ class PoseSequenceRecorderWindow(QDialog):
     def _handle_frame(self, frame_bgr: np.ndarray) -> None:
         if frame_bgr is None or frame_bgr.size == 0:
             return
-        mirrored = cv2.flip(frame_bgr, 1)
+        work = np.ascontiguousarray(frame_bgr).copy()
+        source_mirrored = bool(
+            getattr(self._config, "camera_source_is_mirrored", False)
+        ) if self._config is not None else False
+        should_flip = _should_flip_sequence_preview(
+            using_worker=self._using_worker,
+            owns_camera=self._owns_camera,
+            source_is_mirrored=source_mirrored,
+        )
+        mirrored = cv2.flip(work, 1) if should_flip else work
         rgb = cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
         result = self._mp_hands.process(rgb)
+        rgb.flags.writeable = True
         hand_present = bool(result.multi_hand_landmarks)
         if hand_present:
             hand_lms = result.multi_hand_landmarks[0]

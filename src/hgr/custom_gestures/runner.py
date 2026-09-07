@@ -17,8 +17,8 @@ exactly what the user sees while testing.
 
 CPU cost: ~5–10 ms/frame at 30 fps. The MediaPipe Hands model is
 loaded LAZILY on the first frame, and only when the registry has
-at least one custom gesture, so there's zero overhead for users who
-haven't recorded anything.
+at least one custom gesture (static, dynamic, or pose-sequence),
+so there's zero overhead for users who haven't recorded anything.
 """
 from __future__ import annotations
 
@@ -146,6 +146,18 @@ class CustomGestureRunner:
             return False
         return bool(self._classifier._gestures)  # internal, but cheap to peek
 
+    def _registry_wants_private_mp(self) -> bool:
+        """True when any custom gesture (static / dynamic / sequence)
+        needs recorder-matching MediaPipe landmarks on GPU / Lite."""
+        if self.has_gestures:
+            return True
+        try:
+            if self._registry is None:
+                return False
+            return bool(self._registry.list())
+        except Exception:
+            return False
+
     @property
     def current_match(self) -> Optional[Tuple[str, Optional[str]]]:
         """If a gesture is currently being classified / held this
@@ -234,7 +246,7 @@ class CustomGestureRunner:
         background thread so the main thread doesn't block."""
         if self._mp_hands is not None or self._mp_init_in_flight:
             return
-        if not self.has_gestures:
+        if not self._registry_wants_private_mp():
             return
         # Synchronous import on the calling thread. Cheap if the
         # module is already cached, ~0.5 s on cold cache. Avoids
@@ -336,6 +348,41 @@ class CustomGestureRunner:
 
         return self.process(pick[0], now, handedness=pick[1])
 
+    def extract_hands(
+        self, frame_bgr: np.ndarray
+    ) -> list:
+        """MediaPipe Hands pass matching the recorder (complexity=1).
+
+        Used on GPU / Lite so static, dynamic, and pose-sequence
+        custom gestures see the same landmark distribution they were
+        trained on. Returns a list of (landmarks_21x3, handedness).
+        """
+        self._ensure_mediapipe()
+        if self._mp_hands is None or frame_bgr is None:
+            return []
+        try:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            result = self._mp_hands.process(rgb)
+        except Exception:
+            return []
+        if not result.multi_hand_landmarks:
+            return []
+        hands: list[Tuple[np.ndarray, Optional[str]]] = []
+        for i, hand_landmarks in enumerate(result.multi_hand_landmarks):
+            label: Optional[str] = None
+            try:
+                if result.multi_handedness and i < len(result.multi_handedness):
+                    raw = str(result.multi_handedness[i].classification[0].label)
+                    label = raw if raw in ("Left", "Right") else None
+            except Exception:
+                pass
+            lm = np.array(
+                [[p.x, p.y, p.z] for p in hand_landmarks.landmark],
+                dtype=np.float32,
+            )
+            hands.append((lm, label))
+        return hands
+
     def process_frame(self, frame_bgr: np.ndarray, now: float) -> Optional[str]:
         """Run a private MediaPipe pass on the camera frame to extract
         hand landmarks, then classify + advance hold state. Returns the
@@ -357,42 +404,11 @@ class CustomGestureRunner:
             # pass on the half of the frames it would have run.
             return None
         self._last_classify_at = now
-        self._ensure_mediapipe()
-        if self._mp_hands is None:
-            self.hand_lost(now)
-            return None
-
-        try:
-            # The frame coming into _on_engine_result is ALREADY
-            # cv2.flip'd by noop_engine before the engine runs (so
-            # MP labels are user-perspective). Don't flip again — that
-            # would swap Left and Right back to camera-perspective.
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            result = self._mp_hands.process(rgb)
-        except Exception as exc:
-            self._maybe_debug(now, f"MediaPipe process error: {exc}")
-            return None
-
-        if not result.multi_hand_landmarks:
+        hands = self.extract_hands(frame_bgr)
+        if not hands:
             self.hand_lost(now)
             self._maybe_debug(now, "no hand detected (MP)")
             return None
-
-        # Build (landmarks, label) for each detected hand.
-        hands: list[Tuple[np.ndarray, Optional[str]]] = []
-        for i, hand_landmarks in enumerate(result.multi_hand_landmarks):
-            label: Optional[str] = None
-            try:
-                if result.multi_handedness and i < len(result.multi_handedness):
-                    raw = str(result.multi_handedness[i].classification[0].label)
-                    label = raw if raw in ("Left", "Right") else None
-            except Exception:
-                pass
-            lm = np.array(
-                [[p.x, p.y, p.z] for p in hand_landmarks.landmark],
-                dtype=np.float32,
-            )
-            hands.append((lm, label))
 
         # Pick which hand to feed the runner this frame. If we're
         # already holding a gesture, prefer the hand whose label

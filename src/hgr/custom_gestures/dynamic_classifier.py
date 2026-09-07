@@ -1124,6 +1124,47 @@ class DynamicGestureClassifier:
         False now."""
         return False
 
+    def has_loop_or_complex_templates(self) -> bool:
+        """True when a registered custom is a circle / snake / other
+        looping path. Builtin swipe_left/right must not eat those."""
+        for i, tpl in enumerate(self._templates):
+            try:
+                if float(tpl.intent_magnitude) <= _SPRING_LOOP_INTENT_MAX:
+                    return True
+            except Exception:
+                pass
+            try:
+                if int(self._template_reversals[i]) >= _SPRING_COMPLEX_MIN_REVERSALS:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def live_path_looks_like_loop(self) -> bool:
+        """Recent index-tip path reversed in both X and Y — a circle
+        in progress, not a committed linear swipe."""
+        window = list(self._frames)[-12:]
+        if len(window) < 6:
+            return False
+        plus_x = minus_x = plus_y = minus_y = 0
+        for prev, current in zip(window, window[1:]):
+            try:
+                a = prev[1]
+                b = current[1]
+                dx = float(b[8, 0] - a[8, 0])
+                dy = float(b[8, 1] - a[8, 1])
+            except Exception:
+                continue
+            if dx > 0.02:
+                plus_x += 1
+            if dx < -0.02:
+                minus_x += 1
+            if dy > 0.02:
+                plus_y += 1
+            if dy < -0.02:
+                minus_y += 1
+        return min(plus_x, minus_x) >= 2 and min(plus_y, minus_y) >= 1
+
     def reset(self) -> None:
         """Drop the sliding window + reset every SpringMatcher. Call
         when entering a state where recent motion is irrelevant
@@ -1148,6 +1189,8 @@ class DynamicGestureClassifier:
         builtin horizontal swipes. Sandbox has no builtin swipes,
         which is why this collision only shows in the full app.
         """
+        if self.has_loop_or_complex_templates() and self.live_path_looks_like_loop():
+            return True
         if landmarks_normalized is None or landmarks_normalized.shape != (NUM_LANDMARKS, 3):
             return False
         try:

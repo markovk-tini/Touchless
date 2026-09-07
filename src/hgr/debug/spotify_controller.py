@@ -136,17 +136,16 @@ class SpotifyController:
         self._active_device_cache: bool | None = None
         self._active_device_cache_until: float = 0.0
         self._active_device_cache_seconds: float = 3.0
-        # r50: TTL cache for _has_real_spotify_process. The new
-        # r50 gate in SpotifyGestureRouter._can_control_without_focus
-        # calls this once per gesture commit. Without a cache the
-        # psutil.process_iter walk (10-20 procs when Spotify is
-        # running) would spike gesture-commit latency. 1 s is short
-        # enough that a fresh open/close of Spotify becomes visible
-        # to gestures within one gesture cadence, long enough to
-        # absorb a 60 fps gesture loop into one psutil scan.
+        # r50: TTL cache for _has_real_spotify_process. The gate in
+        # SpotifyGestureRouter._can_control_without_focus calls this
+        # on gesture commit. The walk is stale-while-revalidate on a
+        # background thread after the first probe so a cache miss
+        # cannot hitch a Spotify swipe. 3 s matches the active-device
+        # cache.
         self._has_real_spotify_cache: bool | None = None
         self._has_real_spotify_cache_until: float = 0.0
-        self._has_real_spotify_cache_seconds: float = 1.0
+        self._has_real_spotify_cache_seconds: float = 3.0
+        self._has_real_spotify_refresh_in_flight: bool = False
         # Stale-while-revalidate latch for is_active_device_available().
         # When the 3 s cache expires while a hand is in frame, we used
         # to fire the 50-300 ms /me/player HTTP call on the calling
@@ -377,6 +376,24 @@ class SpotifyController:
             time.sleep(0.25)
         return self._has_real_spotify_process()
 
+    def _probe_real_spotify_process(self) -> bool:
+        try:
+            for proc in psutil.process_iter(["name", "exe"]):
+                name = (proc.info.get("name") or "").lower()
+                if name != "spotify.exe":
+                    continue
+                exe_path = proc.info.get("exe")
+                if not exe_path:
+                    return True
+                try:
+                    if Path(exe_path).stat().st_size > 1024 * 1024:
+                        return True
+                except Exception:
+                    return True
+        except Exception:
+            return False
+        return False
+
     def _has_real_spotify_process(self) -> bool:
         # is_running() returns True for any process whose name
         # contains 'spotify' — including Spotify-WebHelper.exe,
@@ -385,35 +402,44 @@ class SpotifyController:
         # spins up. For verifying a fresh launch we want to know
         # the *interactive* client started, so we accept the match
         # only when the executable has a meaningful size (>1MB).
-        # r50: 1 s TTL cache. See __init__ for rationale.
+        # Stale-while-revalidate: psutil.process_iter can take
+        # 50-200 ms and used to run on the gesture/UI thread on
+        # cache miss, hitching the live view during a swipe.
         _now = time.monotonic()
         if (
             self._has_real_spotify_cache is not None
             and _now < self._has_real_spotify_cache_until
         ):
             return self._has_real_spotify_cache
-        result = False
-        try:
-            for proc in psutil.process_iter(["name", "exe"]):
-                name = (proc.info.get("name") or "").lower()
-                if name != "spotify.exe":
-                    continue
-                exe_path = proc.info.get("exe")
-                if not exe_path:
-                    result = True
-                    break
-                try:
-                    if Path(exe_path).stat().st_size > 1024 * 1024:
-                        result = True
-                        break
-                except Exception:
-                    result = True
-                    break
-        except Exception:
-            result = False
-        self._has_real_spotify_cache = result
+        if self._has_real_spotify_cache is None:
+            # First probe must be accurate so the first swipe after
+            # launch isn't dropped. Later misses refresh off-thread.
+            self._has_real_spotify_cache = self._probe_real_spotify_process()
+            self._has_real_spotify_cache_until = (
+                _now + self._has_real_spotify_cache_seconds
+            )
+            return self._has_real_spotify_cache
         self._has_real_spotify_cache_until = _now + self._has_real_spotify_cache_seconds
-        return result
+        if not self._has_real_spotify_refresh_in_flight:
+            self._has_real_spotify_refresh_in_flight = True
+
+            def _refresh() -> None:
+                try:
+                    self._has_real_spotify_cache = self._probe_real_spotify_process()
+                except Exception:
+                    pass
+                finally:
+                    self._has_real_spotify_refresh_in_flight = False
+
+            try:
+                threading.Thread(
+                    target=_refresh,
+                    name="spotify-process-probe",
+                    daemon=True,
+                ).start()
+            except Exception:
+                self._has_real_spotify_refresh_in_flight = False
+        return bool(self._has_real_spotify_cache) if self._has_real_spotify_cache is not None else False
 
     def is_running(self) -> bool:
         try:
