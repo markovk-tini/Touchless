@@ -6757,7 +6757,22 @@ class MainWindow(QMainWindow):
         # an installer URL and update_kind='full-exe', which flows through the
         # normal Updater below (downloads the Store's own installer + runs it).
         if getattr(info, "update_kind", "") == "store":
-            self._update_dialog = UpdateDialog(info, parent=self)
+            # Balloon FIRST. 1.1.8.1 constructed UpdateDialog (NameError)
+            # before any tray fallback, so the crash hid the update entirely.
+            try:
+                tray = getattr(self, "_tray_icon", None)
+                if tray is not None and hasattr(tray, "showMessage"):
+                    tray.showMessage(
+                        "Touchless update available",
+                        f"Touchless {info.version} is ready to install from the Store.",
+                        msecs=8000,
+                    )
+            except Exception:
+                pass
+            try:
+                self._update_dialog = UpdateDialog(info, parent=self)
+            except Exception:
+                return
             def _open_store(*_a, _url=getattr(info, "html_url", "") or ""):
                 try:
                     import os as _os
@@ -6771,21 +6786,6 @@ class MainWindow(QMainWindow):
             self._update_dialog.show()
             self._update_dialog.raise_()
             self._update_dialog.activateWindow()
-            # Hardening: mirror the regular-path tray balloon so Store
-            # users on any future frameless-dialog visibility regression
-            # still see a notification. Previously this branch returned
-            # before the tray-fallback block, so Store users were the
-            # one cohort with zero backup signal.
-            try:
-                tray = getattr(self, "_tray_icon", None)
-                if tray is not None and hasattr(tray, "showMessage"):
-                    tray.showMessage(
-                        "Touchless update available",
-                        f"Touchless {info.version} is ready to install from the Store.",
-                        msecs=8000,
-                    )
-            except Exception:
-                pass
             return
 
         from ..updater import Updater
@@ -6847,7 +6847,22 @@ class MainWindow(QMainWindow):
                 self._updater.start_download(info)
                 return
 
-        self._update_dialog = UpdateDialog(info, parent=self)
+        # Balloon FIRST so a constructor crash (the 1.1.8 / 1.1.8.1
+        # NameError) cannot swallow the only user-visible signal.
+        try:
+            tray = getattr(self, "_tray_icon", None)
+            if tray is not None and hasattr(tray, "showMessage"):
+                tray.showMessage(
+                    "Touchless update available",
+                    f"Touchless {info.version} is ready to install. Click to open the installer.",
+                    msecs=8000,
+                )
+        except Exception:
+            pass
+        try:
+            self._update_dialog = UpdateDialog(info, parent=self)
+        except Exception:
+            return
         self._update_dialog.download_requested.connect(self._updater.start_download)
         self._update_dialog.dismissed.connect(
             lambda v=info.version: self._on_update_dismissed(v)
@@ -6864,21 +6879,6 @@ class MainWindow(QMainWindow):
         self._update_dialog.show()
         self._update_dialog.raise_()
         self._update_dialog.activateWindow()
-        # v1.1.8.1 dialog-visibility safety net. Even with the
-        # WindowStaysOnTopHint fix in update_dialog.py, we double up
-        # with a tray balloon so users on any future frameless-window
-        # regression still see the notification. Clicking the balloon
-        # re-fires show/raise/activate via _on_tray_message_clicked.
-        try:
-            tray = getattr(self, "_tray_icon", None)
-            if tray is not None and hasattr(tray, "showMessage"):
-                tray.showMessage(
-                    "Touchless update available",
-                    f"Touchless {info.version} is ready to install. Click to open the installer.",
-                    msecs=8000,
-                )
-        except Exception:
-            pass
 
     def _on_tray_message_clicked(self) -> None:
         """Balloon click: bring the update dialog (or main window) forward.
@@ -16613,15 +16613,16 @@ class MainWindow(QMainWindow):
             # StoreUpdateChecker (winget manifest) and offers an in-app install,
             # in addition to the Store's own automatic updates. Keep it enabled.
             self._updates_check_button.setToolTip(
-                "Check the Microsoft Store for a newer version."
+                "Check GitHub for a newer version, then apply the small in-app update."
             )
         version_row.addWidget(self._updates_check_button)
         current_layout.addLayout(version_row)
 
         if _is_store_build:
             initial_updates_status = (
-                "Click 'Check for Updates' to check the Microsoft Store for a "
-                "newer version (the Store also updates automatically)."
+                "Click 'Check for Updates' to look for a newer version "
+                "(same GitHub check as the website build; download is the "
+                "small in-place update, not a full reinstall)."
             )
         else:
             initial_updates_status = "Click 'Check for Updates' to look for a newer version."

@@ -43,6 +43,24 @@ are a physical walk-through per release. Both are stop-ship.
       from hgr.app.updater import update_dialog; from hgr.app.updater
       import updater; from hgr.app.updater import store_updater;
       print('OK')"` returns "OK" with no traceback.
+- [ ] **No Windows system DLLs inside the bundle.** `dist\Touchless\_internal`
+      must contain NO `icuuc.dll` / `icuin.dll` / `icudt*.dll` / `icu.dll`,
+      NO `ucrtbase.dll`, and NO `api-ms-win-*.dll`. Enforced by the filter +
+      `RuntimeError` guard in `builder/windows/hgr_app.spec`; verify with
+      `dir /b dist\Touchless\_internal\icu*.dll dist\Touchless\_internal\ucrtbase.dll`
+      returning "File Not Found". (`PySide6\resources\icudtl.dat` is
+      QtWebEngine data, NOT a DLL — it stays.)
+      Reason: 1.1.9 shipped Anaconda's ICU 73 because the build ran from a
+      shell where `anaconda3\Library\bin` was reachable, and PyInstaller
+      resolves DLL imports off the build machine's PATH. `_internal` sits
+      AHEAD of System32 on the frozen app's DLL search path, so that copy
+      shadowed Windows' ICU for every user. Conda's build exports
+      version-suffixed symbols (`ucnv_open_73`) while PySide6 6.10+ Qt6Core
+      imports the plain names, so 1.1.9 could not start on ANY machine:
+      "DLL load failed while importing QtGui: The specified procedure could
+      not be found". The Qt binaries were byte-identical to working 1.1.8.1 —
+      only the build environment differed, which is why nothing in the source
+      diff hinted at it.
 
 ### Human eyeball — must pass on a real machine
 

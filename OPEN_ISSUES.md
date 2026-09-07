@@ -7,6 +7,24 @@ Last reviewed 2026-05-14.
 
 ## Section 1 — Active bugs
 
+### 1.0 v1.1.9 cannot start on ANY machine — bundled Anaconda ICU shadows Windows ICU [FIXED + REBUILT 2026-09-07, republish pending]
+
+**Symptom:** Every 1.1.9 launch dies before the UI exists, with a traceback popup:
+`ImportError: DLL load failed while importing QtGui: The specified procedure could not be found`.
+Uninstall + clean Store reinstall does NOT help, because the offending file ships inside the package.
+
+**Root cause:** PySide6 6.10+ made `Qt6Core.dll` a hard importer of `icuuc.dll`, and the PySide6 wheel ships no ICU — upstream expects Windows' own (System32, Win10 1703+). PyInstaller resolves DLL imports off the **build machine's PATH**, and the 1.1.9 build (Sept 3) ran where `anaconda3\Library\bin` was reachable, so conda's **ICU 73** got copied into `_internal/`. That directory precedes System32 on the frozen app's DLL search path. Conda builds ICU with symbol renaming (`ucnv_open_73`); Qt imports the plain `ucnv_open` → error 127.
+
+Confirmed with the shipped payloads: `Qt6Core.dll`, `Qt6Gui.dll`, `QtGui.pyd` and `shiboken6.abi3.dll` are **byte-identical** between 1.1.8.1 (works) and 1.1.9 (broken). The only delta is `_internal/icuuc.dll` + `_internal/icudt73.dll` in 1.1.9. Nothing in the source diff caused it.
+
+**Fix (in the working tree):** `builder/windows/hgr_app.spec` now filters ICU, `ucrtbase.dll` and the `api-ms-win-*.dll` stubs out of `a.binaries` and raises if any survive, so the bundle uses Windows' copies no matter which shell the build starts from. Verified by renaming those files out of `dist\Touchless\_internal` and launching: the app starts, and `icuuc.dll` + `icu.DLL` resolve from System32. Removing the stale bundled `ucrtbase.dll` (10.0.10240) also stops a **second** C runtime from loading beside System32's — both were confirmed mapped into the process, which is a plausible source of the `0xc0000409` Qt6Core faults in Event Viewer.
+
+**Second bug found while fixing this:** `installers/windows/hgr_app.iss` had no `[InstallDelete]` section, and Inno does not remove orphaned files on an in-place upgrade. So running the FIXED installer over a broken 1.1.9 left `_internal\icuuc.dll` in place and the app still crashed — including via the Microsoft Store's own Update button, which runs this installer over the existing folder. An `[InstallDelete]` section now deletes the ICU / `ucrtbase.dll` / `api-ms-win-*.dll` orphans before the new files land. Verified end-to-end: installing over the broken 1.1.9 removed all 45 stale files, kept `PySide6\resources\icudtl.dat`, and the app launched (round 55, no import error).
+
+**Recovery note:** a broken 1.1.9 install cannot self-heal on its own. It never reaches the updater, and the app-zip carries only `Touchless.exe` + assets (no `_internal` DLLs), so a zip update cannot delete the bad file. Only a full installer run — or the Store's Update button — fixes an affected machine, and only now that `[InstallDelete]` exists. The broken 1.1.9 Store package still needs replacing with a higher package version (1.1.9.1).
+
+**Build hygiene:** builds should be started from a shell with no conda env active. The spec filter makes that non-load-bearing, but it removes the class of surprise entirely.
+
 ### 1.1 Stub installer "Installing…" page sits at 0% for 3–8 minutes (FIX READY, queued for b9)
 
 **Symptom:** During first install (stub mode), the wizard moves past Download fine but then the "Installing…" page shows a frozen progress bar for the full extraction duration. Users think the installer hung.

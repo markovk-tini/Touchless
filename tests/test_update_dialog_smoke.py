@@ -208,6 +208,26 @@ class UpdateDialogSmokeTests(unittest.TestCase):
         self.assertTrue(hasattr(tray, "message_clicked"))
         tray.showMessage("t", "m", msecs=1)
 
+    def test_tray_balloon_fires_before_dialog_construct(self) -> None:
+        """1.1.8.1 hid the update: UpdateDialog.__init__ NameError ran
+        before the tray balloon, so neither signal reached the user.
+        The first showMessage in _on_update_available must precede the
+        first UpdateDialog(...) call."""
+        import inspect
+        from hgr.app.ui.main_window import MainWindow
+
+        src = inspect.getsource(MainWindow._on_update_available)
+        balloon = src.find("showMessage")
+        dialog = src.find("UpdateDialog(")
+        self.assertNotEqual(balloon, -1, "tray showMessage must exist")
+        self.assertNotEqual(dialog, -1, "UpdateDialog construct must exist")
+        self.assertLess(
+            balloon,
+            dialog,
+            "tray balloon must run before UpdateDialog(...) so a "
+            "constructor crash cannot hide the update (1.1.8.1).",
+        )
+
     def test_on_update_available_fires_tray_balloon(self) -> None:
         """Both the website and Store branches of _on_update_available
         must attempt a tray balloon. A refactor that drops showMessage

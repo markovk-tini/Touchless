@@ -377,6 +377,68 @@ a = Analysis(
     noarchive=False,
 )
 
+# --- Never ship Windows' own runtime libraries (1.1.9 stop-ship) ------------
+# PyInstaller resolves each binary's DLL imports by searching the build
+# machine's PATH. Whatever it finds gets copied into `_internal/`, which is on
+# the frozen app's DLL search path AHEAD of System32 — so a stray build-machine
+# DLL silently shadows the system one for every user.
+#
+# That is exactly how 1.1.9 shipped broken. PySide6 6.10+ made Qt6Core.dll a
+# hard (non-delay-load) importer of `icuuc.dll`, and the PySide6 wheel ships no
+# ICU at all — upstream expects Windows' own ICU (System32, Windows 10 1703+).
+# The 1.1.9 build ran from a shell where Anaconda's `Library\bin` was reachable,
+# so PyInstaller bundled conda's ICU 73. That build exports version-SUFFIXED
+# symbols (`ucnv_open_73`), while Qt imports the plain names (`ucnv_open`), so
+# every launch died with:
+#     ImportError: DLL load failed while importing QtGui:
+#     The specified procedure could not be found.
+# 1.1.8.1 was built without conda on PATH, bundled no ICU, and worked — the Qt
+# binaries are byte-identical between the two releases, so the ONLY difference
+# was the build environment. Bundling ICU is also wrong even when the symbols
+# match: a newer Windows `icuuc.dll` is a stub that forwards to `icu.dll`, which
+# doesn't exist on older Windows, so copying it breaks those machines too.
+#
+# `ucrtbase.dll` + the `api-ms-win-*.dll` stubs are the same class of bug. They
+# shipped in earlier releases without an obvious failure, but they load a SECOND
+# C runtime alongside System32's (both were confirmed mapped into the running
+# process), giving the process two CRT heaps and two locale states — a known
+# source of `0xc0000409` __fastfail aborts. Windows 10+ always provides these,
+# so drop them and use exactly one system CRT.
+#
+# Filtering here rather than sanitising PATH in build_windows.bat keeps the
+# guarantee attached to the build definition, so a build started from any shell
+# (conda-activated or not) produces the same bundle.
+def _is_system_runtime_dll(dest_path: str) -> bool:
+    name = Path(dest_path).name.lower()
+    if name.startswith("api-ms-win-") and name.endswith(".dll"):
+        return True
+    if name == "ucrtbase.dll":
+        return True
+    # icuuc.dll / icuin.dll / icudt73.dll / icu.dll and their versioned names.
+    if name.endswith(".dll") and name.startswith(("icuuc", "icuin", "icudt", "icu.")):
+        return True
+    return False
+
+
+_stripped_system_dlls = sorted(
+    Path(entry[0]).name for entry in a.binaries if _is_system_runtime_dll(entry[0])
+)
+a.binaries = [entry for entry in a.binaries if not _is_system_runtime_dll(entry[0])]
+print(
+    f"[spec] stripped {len(_stripped_system_dlls)} build-machine system DLL(s) "
+    f"so the app uses Windows' own copies: "
+    + ", ".join(_stripped_system_dlls[:6])
+    + (" ..." if len(_stripped_system_dlls) > 6 else "")
+)
+for _required_system_dll in ("icuuc.dll", "ucrtbase.dll"):
+    if any(
+        Path(entry[0]).name.lower() == _required_system_dll for entry in a.binaries
+    ):
+        raise RuntimeError(
+            f"{_required_system_dll} is still in the bundle — the system-DLL "
+            "filter above did not catch it. Shipping it will break startup."
+        )
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

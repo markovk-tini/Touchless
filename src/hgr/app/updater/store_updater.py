@@ -2,16 +2,15 @@
 
 The Store distributes Touchless as a "bring your own installer" Win32 app via
 the Windows Package Manager (winget) channel. That means the installed app has
-NO MSIX package identity, so the WinRT `StoreContext` API cannot be used. Instead
-we query the Store's public `packageManifests` endpoint (the exact source winget
-reads) for the latest published version + its installer URL, compare to the
-running version, and — if newer — surface the SAME UpdateDialog the website
-build uses.
+NO MSIX package identity, so the WinRT `StoreContext` API cannot be used.
 
-Applying the update reuses the normal `Updater`: it downloads the Store's OWN
-installer (the R2 URL the manifest points at — not GitHub) and runs it, so the
-user updates from inside the app without ever visiting the Store. The version is
-read from the Store, so the in-app prompt always matches what the Store offers.
+v1.1.9.1: GitHub `/releases/latest` is the prompt trigger (same as website
+builds). Release process is still Store-certified first, then GitHub, so
+Store users see the popup when GitHub is published. The payload is the
+GitHub app-zip (~140 MB in-place), not Partner Center's full installer.
+The Store `packageManifests` listing is a fallback if GitHub has nothing
+newer (or the latest fetch fails), and its installer URL is the fallback
+when the zip is missing.
 
 Only the Store build runs this (build_channel() == 'store'); website/source
 builds keep the GitHub `ReleaseChecker`. No third-party dependency — plain HTTP.
@@ -28,6 +27,7 @@ from typing import Any, Optional, Tuple
 from PySide6.QtCore import QThread, Signal
 
 from .release_checker import (
+    GITHUB_RELEASES_LATEST_URL,
     ReleaseInfo,
     _is_newer,
     _strip_v_prefix,
@@ -61,9 +61,9 @@ _HTTP_TIMEOUT = 12.0
 
 
 class StoreUpdateChecker(QThread):
-    """Polls the Store manifest for a newer version. Emits update_available with
-    a ReleaseInfo whose download_url is the Store's own installer (update_kind=
-    'full-exe', so the existing Updater downloads + runs it), or no_update."""
+    """Polls GitHub for a newer version (Store builds). Emits update_available
+    with the GitHub app-zip when present so Store users get the same in-place
+    update website users do, not Partner Center's full installer."""
 
     update_available = Signal(object)   # ReleaseInfo
     no_update = Signal()
@@ -74,44 +74,47 @@ class StoreUpdateChecker(QThread):
         self._logger = logger
 
     def run(self) -> None:
+        gh_tag = ""
+        gh_html = ""
+        try:
+            gh_tag, gh_html = self._fetch_github_latest_meta()
+        except Exception as exc:
+            self._log("github_latest_fetch_failed", exc)
+
+        gh_ver = _strip_v_prefix(gh_tag)
+        if gh_ver and is_safe_version(gh_ver) and _is_newer(gh_ver, RUNNING_VERSION):
+            installer_url = ""
+            try:
+                _store_ver, installer_url = self._fetch_latest()
+            except Exception as exc:
+                self._log("store_manifest_fetch_failed", exc)
+            self._emit_update(gh_ver, gh_html or STORE_DEEP_LINK, installer_url)
+            return
+
+        # GitHub has nothing newer (or the latest fetch failed). Fall
+        # back to the Store listing so a Store-only publish still surfaces.
         try:
             version, installer_url = self._fetch_latest()
         except Exception as exc:
             self._log("store_manifest_fetch_failed", exc)
-            self.check_failed.emit("Couldn't reach the Microsoft Store.")
+            self.check_failed.emit("Couldn't reach GitHub or the Microsoft Store.")
             return
         if not version or not _is_newer(version, RUNNING_VERSION):
             self.no_update.emit()
             return
+        self._emit_update(_strip_v_prefix(version), STORE_DEEP_LINK, installer_url)
 
+    def _emit_update(self, version: str, html_url: str, installer_url: str) -> None:
         version_clean = _strip_v_prefix(version)
         if not is_safe_version(version_clean):
-            # Same trust-boundary guard the website ReleaseChecker uses.
-            # The Store manifest version is interpolated into a bat
-            # helper and a registry key, so we refuse anything that
-            # can't be safely shell-escaped. Pretend there's no update.
             self._log("store_unsafe_version", None)
             self.no_update.emit()
             return
 
-        # Best-effort fetch the GitHub release for the same version. Gives
-        # us three things: real release notes (the Store manifest has
-        # none), the small app-zip URL (~140 MB) so the in-app update
-        # path downloads that instead of the 1+ GB Store installer, and
-        # the published SHA-256 of the asset so the Updater can verify
-        # the download before applying. Falls back to the Store installer
-        # URL if GitHub is unreachable or doesn't have a matching tagged
-        # release. The raw body (incl. markers) is preserved so we can
-        # parse markers later; gh_body is the cleaned text shown to the
-        # user.
-        gh_body, gh_body_raw, gh_zip_url, gh_zip_size = self._fetch_github_release(version)
+        gh_body, gh_body_raw, gh_zip_url, gh_zip_size = self._fetch_github_release(
+            version_clean
+        )
 
-        # Decide which URL the in-app Updater downloads + applies.
-        # Preference: GitHub app-zip > Store installer > Store deep link.
-        # The app-zip path runs without Inno Setup (no UAC, no install
-        # dialog, no full reinstall) and lands in the same per-user dir
-        # the Store installer would have written — so the result is
-        # identical from the user's perspective, just ~10x faster.
         try:
             from .updater import Updater
             install_writable = Updater.is_install_dir_writable()
@@ -131,46 +134,50 @@ class StoreUpdateChecker(QThread):
         else:
             preferred_url = ""
             preferred_size = 0
-            kind = "store"  # button just opens the Store page
+            kind = "store"
             fallback = ""
 
-        # Build the body shown in the in-app update dialog. Prefer the
-        # GitHub release notes (real changelog). Fall back to a short
-        # generic message when GitHub didn't have anything — same wording
-        # as before, just no longer the only option.
         if gh_body:
             body = gh_body
         else:
             body = (
-                f"Touchless {version} is available from the Microsoft Store.\n\n"
+                f"Touchless {version_clean} is available.\n\n"
                 "Click **Download Update** to install it now."
             )
 
-        # Pick the SHA-256 matching the asset we actually chose to
-        # download. If we landed on the app-zip path, parse the
-        # app-update-zip marker from the GitHub body. If we fell back
-        # to the Store installer URL, parse the full-installer marker
-        # (still hosted on R2, but the hash is the same artifact). Empty
-        # string when no marker is present, in which case the Updater
-        # logs a warning and proceeds (backward compat for the 1.1.3
-        # release which pre-dates the marker convention).
         if kind == "app-zip":
             expected_sha256 = _parse_app_update_zip_sha256(gh_body_raw)
         elif kind == "full-exe":
             expected_sha256 = _parse_full_installer_sha256(gh_body_raw)
         else:
             expected_sha256 = ""
-        info = ReleaseInfo(
-            version=_strip_v_prefix(version),
-            body=body,
-            download_url=preferred_url,
-            html_url=STORE_DEEP_LINK,
-            size_bytes=preferred_size,
-            update_kind=kind,
-            fallback_url=fallback,
-            expected_sha256=expected_sha256,
+        self.update_available.emit(
+            ReleaseInfo(
+                version=version_clean,
+                body=body,
+                download_url=preferred_url,
+                html_url=html_url or STORE_DEEP_LINK,
+                size_bytes=preferred_size,
+                update_kind=kind,
+                fallback_url=fallback,
+                expected_sha256=expected_sha256,
+            )
         )
-        self.update_available.emit(info)
+
+    def _fetch_github_latest_meta(self) -> Tuple[str, str]:
+        """Return (tag_name, html_url) from GitHub /releases/latest."""
+        req = urllib.request.Request(
+            GITHUB_RELEASES_LATEST_URL,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "Touchless-Updater",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        tag = str((payload or {}).get("tag_name") or "").strip()
+        html = str((payload or {}).get("html_url") or "").strip()
+        return tag, html
 
     def _fetch_latest(self) -> Tuple[Optional[str], str]:
         """Return (latest_version, installer_url) from the Store manifest."""

@@ -21,7 +21,7 @@
 ;   /DMONOLITHIC=1                     (optional — switches to embedded zip)
 
 #define MyAppName "Touchless"
-#define MyAppVersion "1.1.9"
+#define MyAppVersion "1.1.9.1"
 #define MyAppPublisher "Konstantin Markov"
 #define MyAppExeName "Touchless.exe"
 #define DistDir "..\..\dist\Touchless"
@@ -122,6 +122,32 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 ; UAC-free. Users whose GPU mode falls back to CPU because Defender
 ; quarantined DirectML.dll can add the exclusion manually via
 ; Windows Security -> Virus & threat protection -> Exclusions.
+
+[InstallDelete]
+; v1.1.9 rebuild — remove Windows system DLLs that older builds wrongly
+; shipped inside the bundle. 1.1.9 shipped Anaconda's ICU 73 in
+; `_internal\` (PyInstaller resolves DLL imports off the build machine's
+; PATH), and `_internal\` precedes System32 on the frozen app's DLL search
+; path, so that copy shadowed Windows' own ICU. Its symbols are
+; version-suffixed (`ucnv_open_73`) while PySide6 6.10+ Qt6Core imports the
+; plain names, so the app could not start at all:
+;   ImportError: DLL load failed while importing QtGui:
+;   The specified procedure could not be found
+; Inno does NOT delete orphaned files on an in-place upgrade, and neither
+; does the app-zip updater (it only carries Touchless.exe + assets). Without
+; this section, "updating" a broken 1.1.9 — including the Microsoft Store's
+; own Update button, which runs this installer over the existing folder —
+; would leave the shadowing DLL behind and the app would keep crashing.
+; `builder\windows\hgr_app.spec` now strips these at build time; this
+; section heals machines that already have them.
+; NOTE: only `_internal\*.dll` at the top level is matched. QtWebEngine's
+; `PySide6\resources\icudtl.dat` is a required data file and is NOT touched.
+Type: files; Name: "{app}\_internal\icuuc.dll"
+Type: files; Name: "{app}\_internal\icuin.dll"
+Type: files; Name: "{app}\_internal\icu.dll"
+Type: files; Name: "{app}\_internal\icudt*.dll"
+Type: files; Name: "{app}\_internal\ucrtbase.dll"
+Type: files; Name: "{app}\_internal\api-ms-win-*.dll"
 
 [Files]
 #ifdef MONOLITHIC
