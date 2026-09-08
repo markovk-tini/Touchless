@@ -279,6 +279,25 @@ class GestureSample:
 
 
 @dataclass(frozen=True)
+class PoseSequenceStep:
+    """One held pose in an ordered sequence (e.g. 'three' in 3→2→1)."""
+    name: str
+    samples: List[GestureSample]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": str(self.name),
+            "samples": [s.to_dict() for s in self.samples],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PoseSequenceStep":
+        raw_samples = data.get("samples") or []
+        samples = [GestureSample.from_dict(s) for s in raw_samples]
+        return cls(name=str(data.get("name", "") or ""), samples=samples)
+
+
+@dataclass(frozen=True)
 class CustomGesture:
     name: str
     samples: List[GestureSample]
@@ -305,6 +324,8 @@ class CustomGesture:
     #   "dynamic" -> sample_trajectories holds N (=takes) trajectories
     #                of the SELECTED key-point landmarks over time;
     #                matched by DynamicGestureClassifier via DTW.
+    #   "pose_sequence" -> ordered held poses in pose_sequence_steps;
+    #                matched by PoseSequenceRuntime (dwell + order).
     # Default is "static" so any gesture deserialized from a v1 file
     # (which didn't have this field) behaves identically to before.
     kind: str = "static"
@@ -317,11 +338,55 @@ class CustomGesture:
     # ALL takes (not a centroid) so DTW can match against the
     # variant that best resembles the user's current attempt.
     sample_trajectories: List[List[List[List[float]]]] = field(default_factory=list)
+    # Dynamic-only: parallel list of absolute (palm-scaled) wrist
+    # trajectories — one (resampled_length, 3) per take. Carries the
+    # whole-hand translation signal that the wrist-relative
+    # `sample_trajectories` discards, so the classifier can match
+    # swipes by the wrist's path and stationary-wrist gestures (fist
+    # squeeze, finger wiggle) by fingers alone — no binary
+    # wrist-travel gate required. Empty for legacy records (loaded
+    # back with wrist_motion_strength=0 → finger-only matching).
+    wrist_trajectories: List[List[List[float]]] = field(default_factory=list)
+    # Dynamic-only: [0, _WRIST_WEIGHT_MAX] weight derived from the
+    # takes' wrist path lengths at save time. Drives the classifier's
+    # finger-vs-wrist DTW blend. Stored on the record so the runtime
+    # doesn't have to recompute it on every reload.
+    wrist_motion_strength: float = 0.0
     # Dynamic-only: recording duration policy used when the takes
     # were captured. Useful for the wizard's "edit gesture" flow so
     # the user re-records with the same mode by default. One of:
     # "fixed_short" / "fixed_long" / "until_stopped".
     duration_mode: str = ""
+    # v1.1.8.1 dynamic-only. Per-template DTW match threshold derived
+    # from intra-take pairwise distance at build time. None → runtime
+    # falls back to the classifier's global _DEFAULT_MATCH_THRESHOLD
+    # (which is what every legacy schema=1 record uses).
+    match_threshold: Optional[float] = None
+    # v1.1.8.1 dynamic-only. Schema version for the wrist channel.
+    # 1 = absolute palm-scaled position (legacy). 2 = displacement
+    # from the take's first frame (new semantics; matches live
+    # classifier post-fix). Registry.load() migrates 1 → 2 in-memory
+    # and persists on next save so users don't have to re-record.
+    wrist_schema: int = 1
+    # v1.1.8.2 SPRING architecture. Per-take (32, F) feature matrices
+    # used by the streaming classifier for peak-time firing. Empty for
+    # legacy templates (they fall back to segment-DTW automatically).
+    # F = 3 * (num_key_points + 6). Stored as nested lists in JSON.
+    sample_features: List[List[List[float]]] = field(default_factory=list)
+    # v1.1.8.2 (post-audit round 2) INTENT SIGNATURE — see the
+    # DynamicGestureTemplate docstring in dynamic_classifier.py.
+    intent_direction: Optional[List[float]] = None
+    intent_magnitude: float = 0.0
+    intent_window_seconds: float = 0.0
+    intent_fingertip_extension: Optional[List[float]] = None
+    # pose_sequence-only: ordered steps + timing.
+    # dwell_ms = min continuous hold to count a pose.
+    # max_hold_ms = continuous hold longer than this fails the sequence.
+    # max_gap_ms = longer than this between poses fails the sequence.
+    pose_sequence_steps: List[PoseSequenceStep] = field(default_factory=list)
+    pose_sequence_dwell_ms: int = 250
+    pose_sequence_max_hold_ms: int = 700
+    pose_sequence_max_gap_ms: int = 1000
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -342,8 +407,38 @@ class CustomGesture:
             out["key_point_indices"] = list(self.key_point_indices)
         if self.sample_trajectories:
             out["sample_trajectories"] = self.sample_trajectories
+        if self.wrist_trajectories:
+            out["wrist_trajectories"] = self.wrist_trajectories
+        if self.wrist_motion_strength:
+            out["wrist_motion_strength"] = float(self.wrist_motion_strength)
         if self.duration_mode:
             out["duration_mode"] = self.duration_mode
+        # v1.1.8.1 — emit only when present so legacy static JSON stays
+        # byte-for-byte identical to before.
+        if self.match_threshold is not None:
+            out["match_threshold"] = float(self.match_threshold)
+        if self.wrist_schema and self.wrist_schema != 1:
+            out["wrist_schema"] = int(self.wrist_schema)
+        # v1.1.8.2: sample_features (SPRING). Only emit if populated so
+        # legacy static / dynamic JSON stays byte-for-byte identical.
+        if self.sample_features:
+            out["sample_features"] = self.sample_features
+        # v1.1.8.2 (post-audit round 2) intent-signature persistence.
+        if self.intent_direction is not None:
+            out["intent_direction"] = list(self.intent_direction)
+        if self.intent_magnitude:
+            out["intent_magnitude"] = float(self.intent_magnitude)
+        if self.intent_window_seconds:
+            out["intent_window_seconds"] = float(self.intent_window_seconds)
+        if self.intent_fingertip_extension:
+            out["intent_fingertip_extension"] = list(self.intent_fingertip_extension)
+        if self.kind == "pose_sequence" or self.pose_sequence_steps:
+            out["pose_sequence"] = {
+                "dwell_ms": int(self.pose_sequence_dwell_ms),
+                "max_hold_ms": int(self.pose_sequence_max_hold_ms),
+                "max_gap_ms": int(self.pose_sequence_max_gap_ms),
+                "steps": [s.to_dict() for s in self.pose_sequence_steps],
+            }
         return out
 
     @classmethod
@@ -351,13 +446,13 @@ class CustomGesture:
         raw_hand = data.get("handedness")
         hand = str(raw_hand) if raw_hand in ("Left", "Right") else None
         kind = str(data.get("kind", "static") or "static").lower()
-        if kind not in ("static", "dynamic"):
+        if kind not in ("static", "dynamic", "pose_sequence"):
             kind = "static"
         # Static gestures must still load their per-frame feature
-        # vectors. Dynamic gestures don't HAVE static samples but the
-        # field is required by the dataclass, so default to empty.
-        if kind == "dynamic":
-            samples = []  # static-pose samples are not used in this kind
+        # vectors. Dynamic / pose_sequence don't use top-level samples
+        # but the field is required by the dataclass, so default empty.
+        if kind in ("dynamic", "pose_sequence"):
+            samples = []
         else:
             samples = [GestureSample.from_dict(s) for s in data.get("samples", [])]
         # Defensive coercion on the dynamic fields — a hand-edited
@@ -371,7 +466,83 @@ class CustomGesture:
         # We accept it as-is and rely on the runtime template builder
         # to validate shape (the registry doesn't own numpy import).
         sample_trajectories = list(raw_traj)
+        raw_wrist = data.get("wrist_trajectories") or []
+        wrist_trajectories = list(raw_wrist)
+        try:
+            wrist_motion_strength = float(data.get("wrist_motion_strength", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            wrist_motion_strength = 0.0
         duration_mode = str(data.get("duration_mode", "") or "")
+        # v1.1.8.1 — new dynamic-only fields.
+        try:
+            raw_mt = data.get("match_threshold")
+            match_threshold = float(raw_mt) if raw_mt is not None else None
+        except (TypeError, ValueError):
+            match_threshold = None
+        try:
+            wrist_schema = int(data.get("wrist_schema", 1) or 1)
+        except (TypeError, ValueError):
+            wrist_schema = 1
+        # v1.1.8.2 SPRING features (per-take (32, F) matrices). Empty
+        # for legacy records — those fall back to segment-DTW.
+        raw_features = data.get("sample_features") or []
+        sample_features_ = list(raw_features)
+        # v1.1.8.2 (post-audit round 2) intent-signature load.
+        raw_int_dir = data.get("intent_direction")
+        try:
+            intent_direction_ = (
+                [float(x) for x in raw_int_dir] if raw_int_dir else None
+            )
+        except (TypeError, ValueError):
+            intent_direction_ = None
+        try:
+            intent_magnitude_ = float(data.get("intent_magnitude", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            intent_magnitude_ = 0.0
+        try:
+            intent_window_seconds_ = float(
+                data.get("intent_window_seconds", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            intent_window_seconds_ = 0.0
+        raw_tip_ext = data.get("intent_fingertip_extension")
+        try:
+            intent_fingertip_extension_ = (
+                [float(x) for x in raw_tip_ext]
+                if raw_tip_ext and len(raw_tip_ext) == 5
+                else None
+            )
+        except (TypeError, ValueError):
+            intent_fingertip_extension_ = None
+        pose_steps: List[PoseSequenceStep] = []
+        dwell_ms = 250
+        max_hold_ms = 700
+        max_gap_ms = 1000
+        raw_seq = data.get("pose_sequence")
+        if isinstance(raw_seq, dict):
+            try:
+                dwell_ms = int(raw_seq.get("dwell_ms", 250) or 250)
+            except (TypeError, ValueError):
+                dwell_ms = 250
+            try:
+                max_hold_ms = int(
+                    raw_seq.get("max_hold_ms", max(dwell_ms, int(dwell_ms * 2.5)))
+                    or max(dwell_ms, int(dwell_ms * 2.5))
+                )
+            except (TypeError, ValueError):
+                max_hold_ms = max(dwell_ms, int(dwell_ms * 2.5))
+            try:
+                max_gap_ms = int(raw_seq.get("max_gap_ms", 1000) or 1000)
+            except (TypeError, ValueError):
+                max_gap_ms = 1000
+            for step in raw_seq.get("steps") or []:
+                try:
+                    pose_steps.append(PoseSequenceStep.from_dict(step))
+                except Exception:
+                    continue
+        dwell_ms = max(80, int(dwell_ms))
+        max_hold_ms = max(dwell_ms, int(max_hold_ms))
+        max_gap_ms = max(100, int(max_gap_ms))
         return cls(
             name=str(data["name"]),
             description=str(data.get("description", "")),
@@ -383,7 +554,20 @@ class CustomGesture:
             kind=kind,
             key_point_indices=key_point_indices,
             sample_trajectories=sample_trajectories,
+            wrist_trajectories=wrist_trajectories,
+            wrist_motion_strength=wrist_motion_strength,
             duration_mode=duration_mode,
+            match_threshold=match_threshold,
+            wrist_schema=wrist_schema,
+            sample_features=sample_features_,
+            intent_direction=intent_direction_,
+            intent_magnitude=intent_magnitude_,
+            intent_window_seconds=intent_window_seconds_,
+            intent_fingertip_extension=intent_fingertip_extension_,
+            pose_sequence_steps=pose_steps,
+            pose_sequence_dwell_ms=dwell_ms,
+            pose_sequence_max_hold_ms=max_hold_ms,
+            pose_sequence_max_gap_ms=max_gap_ms,
         )
 
 
@@ -420,12 +604,65 @@ class GestureRegistry:
                 # Corrupt file — start fresh rather than crashing the caller.
                 # A future version can back up the broken file here.
                 return
+            migrated_any = False
             for entry in raw.get("gestures", []):
                 try:
                     gesture = CustomGesture.from_dict(entry)
                 except Exception:
                     continue
+                # v1.1.8.1: migrate legacy wrist_schema=1 (absolute
+                # palm-scaled position) to schema=2 (displacement from
+                # first frame). Fixes the correctness bug where a
+                # swipe recorded at one in-frame position couldn't
+                # match the same swipe performed elsewhere. Idempotent
+                # via the schema flag: schema>=2 skips.
+                if (
+                    gesture.kind == "dynamic"
+                    and gesture.wrist_trajectories
+                    and gesture.wrist_schema < 2
+                ):
+                    try:
+                        migrated_wrist: List[List[List[float]]] = []
+                        for take in gesture.wrist_trajectories:
+                            if not take:
+                                migrated_wrist.append(take)
+                                continue
+                            first = take[0]
+                            new_take = []
+                            for row in take:
+                                new_take.append(
+                                    [
+                                        float(row[k]) - float(first[k])
+                                        for k in range(len(row))
+                                    ]
+                                )
+                            migrated_wrist.append(new_take)
+                        # Frozen dataclass — swap in a new instance with
+                        # the migrated field. Same object identity
+                        # replaced in the dict below.
+                        object.__setattr__(gesture, "wrist_trajectories", migrated_wrist)
+                        object.__setattr__(gesture, "wrist_schema", 2)
+                        migrated_any = True
+                    except Exception:
+                        # Bad migration → leave the record alone.
+                        pass
                 self._gestures[gesture.name] = gesture
+            if migrated_any:
+                # Persist the migration immediately so a later process
+                # doesn't re-migrate. Guard against write failures —
+                # in-memory migration is enough for THIS process even
+                # if the disk write can't happen.
+                try:
+                    self._path.parent.mkdir(parents=True, exist_ok=True)
+                    payload = {
+                        "schema_version": self._SCHEMA_VERSION,
+                        "gestures": [g.to_dict() for g in self._gestures.values()],
+                    }
+                    tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+                    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                    tmp.replace(self._path)
+                except Exception:
+                    pass
 
     def save(self) -> None:
         with self._lock:
@@ -489,12 +726,28 @@ class GestureRegistry:
         handedness: Optional[str] = None,
         image_filename: str = "",
         duration_mode: str = "",
+        wrist_trajectories=None,  # parallel iterable of (T, 3) per take
+        wrist_motion_strength: float = 0.0,
+        match_threshold: Optional[float] = None,
+        wrist_schema: int = 2,  # v1.1.8.1 default: displacement semantics
+        sample_features=None,   # v1.1.8.2 SPRING features
+        intent_direction=None,  # v1.1.8.2 post-audit r2 INTENT SIGNATURE
+        intent_magnitude: float = 0.0,
+        intent_window_seconds: float = 0.0,
+        intent_fingertip_extension=None,
     ) -> CustomGesture:
         """Register a dynamic gesture. `sample_trajectories` is an
         iterable of arrays/lists with shape (resampled_length,
         num_key_points, 3). We coerce each to nested lists for JSON
         serialization so callers can pass numpy arrays directly from
-        the recorder."""
+        the recorder.
+
+        `wrist_trajectories` (optional) is a parallel iterable of
+        (resampled_length, 3) absolute-wrist arrays — one per take —
+        and `wrist_motion_strength` is the [0, _WRIST_WEIGHT_MAX]
+        weight derived at template-build time. Pre-existing dynamic
+        records persist without these; loading falls back to
+        finger-only matching for them."""
         if not self._loaded:
             self.load()
         name = name.strip()
@@ -517,6 +770,21 @@ class GestureRegistry:
                 serialized.append(traj.tolist())
             else:
                 serialized.append([[[float(v) for v in coord] for coord in frame] for frame in traj])
+        serialized_wrist: List[List[List[float]]] = []
+        for w in (wrist_trajectories or []):
+            if hasattr(w, "tolist"):
+                serialized_wrist.append(w.tolist())
+            else:
+                serialized_wrist.append([[float(v) for v in coord] for coord in w])
+        # v1.1.8.2 SPRING sample_features: list of (32, F) matrices.
+        serialized_features: List[List[List[float]]] = []
+        for feat in (sample_features or []):
+            if hasattr(feat, "tolist"):
+                serialized_features.append(feat.tolist())
+            else:
+                serialized_features.append(
+                    [[float(v) for v in row] for row in feat]
+                )
         with self._lock:
             if name in self._gestures and not overwrite:
                 raise ValueError(
@@ -533,7 +801,81 @@ class GestureRegistry:
                 kind="dynamic",
                 key_point_indices=[int(i) for i in key_point_indices],
                 sample_trajectories=serialized,
+                wrist_trajectories=serialized_wrist,
+                wrist_motion_strength=float(wrist_motion_strength or 0.0),
                 duration_mode=str(duration_mode or ""),
+                match_threshold=(
+                    float(match_threshold) if match_threshold is not None else None
+                ),
+                wrist_schema=int(wrist_schema),
+                sample_features=serialized_features,
+                intent_direction=(
+                    [float(x) for x in intent_direction]
+                    if intent_direction is not None else None
+                ),
+                intent_magnitude=float(intent_magnitude or 0.0),
+                intent_window_seconds=float(intent_window_seconds or 0.0),
+                intent_fingertip_extension=(
+                    [float(x) for x in intent_fingertip_extension]
+                    if intent_fingertip_extension is not None else None
+                ),
+            )
+            self._gestures[name] = gesture
+        return gesture
+
+    def add_pose_sequence(
+        self,
+        name: str,
+        steps: List[PoseSequenceStep],
+        action: Action,
+        *,
+        description: str = "",
+        overwrite: bool = False,
+        handedness: Optional[str] = None,
+        image_filename: str = "",
+        dwell_ms: int = 250,
+        max_hold_ms: Optional[int] = None,
+        max_gap_ms: int = 1000,
+    ) -> CustomGesture:
+        """Register an ordered pose-sequence gesture (e.g. 3→2→1)."""
+        if not self._loaded:
+            self.load()
+        name = name.strip()
+        if not name:
+            raise ValueError("gesture name must be non-empty")
+        if len(steps) < 2:
+            raise ValueError("pose sequence needs at least 2 steps")
+        for i, step in enumerate(steps):
+            if not step.samples:
+                raise ValueError(f"pose sequence step {i} has no samples")
+        if handedness is not None and handedness not in ("Left", "Right"):
+            raise ValueError(
+                f"handedness must be 'Left', 'Right', or None — got {handedness!r}"
+            )
+        dwell = max(80, int(dwell_ms))
+        if max_hold_ms is None:
+            hold_cap = max(dwell, int(round(dwell * 2.5)))
+        else:
+            hold_cap = max(dwell, int(max_hold_ms))
+        gap = max(100, int(max_gap_ms))
+        with self._lock:
+            if name in self._gestures and not overwrite:
+                raise ValueError(
+                    f"gesture {name!r} already exists (pass overwrite=True to replace)"
+                )
+            gesture = CustomGesture(
+                name=name,
+                samples=[],
+                action=action,
+                created_at=_utc_now_iso(),
+                description=description,
+                handedness=handedness,
+                image_filename=str(image_filename or ""),
+                kind="pose_sequence",
+                pose_sequence_steps=list(steps),
+                pose_sequence_dwell_ms=dwell,
+                pose_sequence_max_hold_ms=hold_cap,
+                pose_sequence_max_gap_ms=gap,
             )
             self._gestures[name] = gesture
         return gesture
@@ -559,6 +901,48 @@ class GestureRegistry:
             return candidate if candidate.exists() else None
         except Exception:
             return None
+
+    def replace_metadata(
+        self,
+        original_name: str,
+        *,
+        name: str,
+        action: Action,
+        description: str = "",
+        image_filename: Optional[str] = None,
+        duration_mode: Optional[str] = None,
+    ) -> CustomGesture:
+        """Update name / description / action (and optional image /
+        duration_mode) while preserving kind and all recognition data
+        (static samples, dynamic trajectories, pose-sequence steps).
+
+        Used by the Edit Custom Gesture flow, which does not re-record.
+        """
+        from dataclasses import replace
+
+        if not self._loaded:
+            self.load()
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("gesture name must be non-empty")
+        with self._lock:
+            existing = self._gestures.get(original_name)
+            if existing is None:
+                raise ValueError(f"gesture {original_name!r} not found")
+            kwargs: Dict[str, Any] = {
+                "name": name,
+                "action": action,
+                "description": description,
+            }
+            if image_filename is not None:
+                kwargs["image_filename"] = str(image_filename)
+            if duration_mode is not None and existing.kind == "dynamic":
+                kwargs["duration_mode"] = str(duration_mode or "")
+            updated = replace(existing, **kwargs)
+            if name != original_name:
+                self._gestures.pop(original_name, None)
+            self._gestures[name] = updated
+        return updated
 
     def remove(self, name: str) -> bool:
         if not self._loaded:

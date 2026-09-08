@@ -36,6 +36,61 @@ class VoiceCommandResult:
     speech_end_ts: float | None = None
 
 
+def _live_windows_input_endpoints_via_pycaw() -> list[str]:
+    """Enumerate ACTIVE Windows audio-capture endpoints via pycaw
+    (Windows Core Audio). This bypasses PortAudio's PA_Initialize
+    device cache — sounddevice/PortAudio snapshots the device list
+    once at startup and never re-scans, so mid-session hotplug
+    (headset plugged in after Touchless launched) is invisible to
+    sd.query_devices() until process restart. pycaw's GetAllDevices
+    calls IMMDeviceEnumerator::EnumAudioEndpoints directly which
+    always returns live data.
+
+    v1.1.7 fix (round 8): the previous implementation guessed at a
+    ``.direction`` attribute that pycaw's AudioDevice does not
+    expose, and called ``int(dev.state)`` on a plain Enum which
+    raises TypeError. Both errors were swallowed by a broad
+    try/except so every device was silently dropped — the function
+    returned [] deterministically and dad's hot-plug bug was never
+    touched. Correct call: pass eCapture + ACTIVE at the COM layer
+    so no Python-side filtering is needed. Verified live to return
+    exactly the real capture endpoints Windows Sound shows.
+
+    Returns [] on any failure so callers fall back to the
+    sounddevice enumeration path.
+    """
+    try:
+        from pycaw.pycaw import AudioUtilities  # type: ignore
+        from pycaw.constants import EDataFlow, DEVICE_STATE  # type: ignore
+    except Exception:
+        return []
+    # Suppress pycaw's occasional COMError-during-property-fetch
+    # UserWarnings — the diff timer would spam stderr every 3 s
+    # otherwise. Real errors still propagate.
+    import warnings as _warnings
+    try:
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            devs = AudioUtilities.GetAllDevices(
+                data_flow=EDataFlow.eCapture.value,
+                device_state=DEVICE_STATE.ACTIVE.value,
+            )
+    except Exception:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for dev in devs or []:
+        try:
+            name = str(getattr(dev, "FriendlyName", "") or "").strip()
+        except Exception:
+            continue
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
 def list_input_microphones() -> list[str]:
     """Return readable names for available input-capable microphone devices.
 
@@ -49,16 +104,26 @@ def list_input_microphones() -> list[str]:
     Sound control panel uses, so the dropdown matches what the user
     sees there. Other platforms fall back to the previous all-API
     listing (where the duplicate-host-API problem doesn't exist).
+
+    v1.1.7 hot-plug fix: sounddevice caches the device list at
+    PA_Initialize and does NOT re-scan on subsequent query_devices()
+    calls, so a headset plugged in mid-session was invisible until
+    process restart. Now we FIRST try pycaw (Windows Core Audio)
+    which always returns live data, then union with the sounddevice
+    result. Union guarantees no regression when pycaw is missing
+    or returns a subset.
     """
+    live_windows_names = _live_windows_input_endpoints_via_pycaw()
+
     try:
         import sounddevice as sd
     except Exception:
-        return []
+        return live_windows_names
 
     try:
         devices = sd.query_devices()
     except Exception:
-        return []
+        return live_windows_names
 
     # Identify the WASAPI host-api index on Windows. On other
     # platforms we leave wasapi_index=None and the filter no-ops.
@@ -116,6 +181,20 @@ def list_input_microphones() -> list[str]:
                 continue
             seen.add(name)
             names.append(name)
+    # v1.1.7 hot-plug union: merge any pycaw-discovered live
+    # Windows endpoints that sounddevice didn't see (they might
+    # be brand-new hot-plug devices that PortAudio's PA_Initialize
+    # cache doesn't know about yet). This is the union that fixes
+    # dad's headset-not-appearing bug.
+    for live_name in live_windows_names:
+        try:
+            live_name = str(live_name or "").strip()
+        except Exception:
+            continue
+        if not live_name or live_name in seen:
+            continue
+        seen.add(live_name)
+        names.append(live_name)
     return names
 
 
@@ -790,14 +869,16 @@ class VoiceCommandListener:
                     audio_seconds=float(max_seconds or 0.0),
                     transcript_mode=transcript_mode)
         except Exception:
+            # v1.1.7: SAPI PowerShell fallback removed (Windows
+            # Defender flagged its `-EncodedCommand` shell-out as a
+            # malware-dropper pattern). Whisper failing here is now a
+            # terminal condition — the user sees "voice transcription
+            # failed" and the audio is preserved for debug. Whisper
+            # ships with three backend variants (CUDA/Vulkan/CPU) so
+            # a total transcription-engine failure only happens on a
+            # broken install; a rare miss is preferable to shipping a
+            # binary that gets quarantined by every scanner.
             transcription_failed = True
-            fallback = self._fallback_system_speech(max_seconds=max_seconds, transcript_mode=transcript_mode)
-            if fallback.success:
-                try:
-                    audio_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                return fallback
             self._message = "voice transcription failed"
             self._preserve_debug_audio(audio_path, transcript_mode=transcript_mode, text="<transcription_failed>")
             return VoiceCommandResult(heard_text="", success=False, message=self._message)
@@ -812,9 +893,9 @@ class VoiceCommandListener:
                     self._preserve_debug_audio(audio_path, transcript_mode=transcript_mode, text="empty")
 
         if not text:
-            fallback = self._fallback_system_speech(max_seconds=max_seconds, transcript_mode=transcript_mode)
-            if fallback.success:
-                return fallback
+            # v1.1.7: SAPI PowerShell fallback removed. See the earlier
+            # except-branch comment for rationale. When Whisper produces
+            # an empty transcript, surface that directly.
             self._message = "dictation not understood" if transcript_mode == "dictation" else "voice command not understood"
             return VoiceCommandResult(heard_text="", success=False, message=self._message)
 
@@ -2050,143 +2131,5 @@ class VoiceCommandListener:
         for source, target in replacements:
             value = value.replace(source, target)
         return value
-
-    def _fallback_system_speech(self, *, max_seconds: float, transcript_mode: str = "command") -> VoiceCommandResult:
-        import base64
-        import subprocess
-
-        command = [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-EncodedCommand",
-            self._encoded_system_speech_script(max_seconds=max_seconds),
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=max_seconds + 4.0,
-                check=False,
-                **hidden_subprocess_kwargs(),
-            )
-        except Exception:
-            return VoiceCommandResult(heard_text="", success=False, message="voice command not heard")
-
-        payload = self._parse_payload(completed.stdout)
-        if not payload or payload.get("error"):
-            return VoiceCommandResult(heard_text="", success=False, message="voice command not heard")
-        heard_text = self._select_phrase(payload.get("phrases") or [], transcript_mode=transcript_mode)
-        if not heard_text:
-            return VoiceCommandResult(heard_text="", success=False, message="voice command not heard")
-        return VoiceCommandResult(heard_text=heard_text, success=True, message=f"heard: {heard_text}")
-
-    def _parse_payload(self, stdout_text: str) -> dict | None:
-        lines = [line.strip() for line in (stdout_text or "").splitlines() if line.strip()]
-        for line in reversed(lines):
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                return value
-        return None
-
-    def _select_phrase(self, phrases: list[dict], *, transcript_mode: str = "command") -> str:
-        best_text = ""
-        best_score = -1.0
-        structural_phrases = (
-            "file",
-            "folder",
-            "documents",
-            "downloads",
-            "desktop",
-            "outlook",
-            "sent items",
-            "inbox",
-            "settings",
-        )
-        for item in phrases:
-            if not isinstance(item, dict):
-                continue
-            text = self._normalize_text(str(item.get("text", "")), transcript_mode=transcript_mode)
-            if not text:
-                continue
-            confidence = float(item.get("confidence", 0.0) or 0.0)
-            word_count = len(text.split())
-            hint_bonus = min(0.16, sum(0.04 for hint in self._app_hints[:20] if hint and hint in text))
-            structure_bonus = min(0.12, sum(0.03 for phrase in structural_phrases if phrase in text))
-            chain_bonus = 0.05 if len(re.findall(r"\b(?:in|inside|under|within)\b", text)) >= 2 else 0.0
-            score = (
-                confidence
-                + min(word_count, 16) * 0.075
-                + min(len(text), 120) * 0.0015
-                + hint_bonus
-                + structure_bonus
-                + chain_bonus
-            )
-            if score > best_score:
-                best_score = score
-                best_text = text
-        return best_text
-
-    def _encoded_system_speech_script(self, *, max_seconds: float) -> str:
-        import base64
-
-        seconds = max(6.0, float(max_seconds))
-        script = f"""
-$ErrorActionPreference = 'Stop'
-try {{
-    Add-Type -AssemblyName System.Speech
-    $culture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
-    $recognizer = New-Object System.Speech.Recognition.SpeechRecognitionEngine($culture)
-    $grammar = New-Object System.Speech.Recognition.DictationGrammar
-    $recognizer.LoadGrammar($grammar)
-    $recognizer.SetInputToDefaultAudioDevice()
-    $recognizer.InitialSilenceTimeout = [TimeSpan]::FromSeconds(3.0)
-    $recognizer.BabbleTimeout = [TimeSpan]::FromSeconds(3.0)
-    $recognizer.EndSilenceTimeout = [TimeSpan]::FromSeconds(1.20)
-    $recognizer.EndSilenceTimeoutAmbiguous = [TimeSpan]::FromSeconds(1.55)
-    $deadline = [DateTime]::UtcNow.AddSeconds({seconds})
-    $phrases = New-Object System.Collections.Generic.List[object]
-    while ([DateTime]::UtcNow -lt $deadline) {{
-        $remaining = $deadline - [DateTime]::UtcNow
-        if ($remaining.TotalSeconds -lt 1) {{ break }}
-        try {{
-            $result = $recognizer.Recognize([TimeSpan]::FromSeconds([Math]::Min(4.5, $remaining.TotalSeconds)))
-        }} catch {{
-            $result = $null
-        }}
-        if ($null -ne $result -and -not [string]::IsNullOrWhiteSpace($result.Text)) {{
-            $phrases.Add([PSCustomObject]@{{
-                text = $result.Text
-                confidence = [double]$result.Confidence
-            }})
-            $wordCount = $result.Text.Trim().Split().Count
-            $confidence = [double]$result.Confidence
-            if (
-                ($wordCount -ge 8 -and $confidence -ge 0.45) -or
-                ($wordCount -ge 6 -and $confidence -ge 0.62)
-            ) {{
-                break
-            }}
-        }}
-    }}
-    $recognizer.Dispose()
-    [PSCustomObject]@{{
-        phrases = $phrases
-        error = $null
-    }} | ConvertTo-Json -Compress -Depth 4
-}} catch {{
-    [PSCustomObject]@{{
-        phrases = @()
-        error = $_.Exception.Message
-    }} | ConvertTo-Json -Compress -Depth 4
-}}
-"""
-        return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
 # Author: Konstantin Markov

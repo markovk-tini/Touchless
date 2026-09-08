@@ -47,7 +47,7 @@ class MouseGestureTracker:
     def __init__(
         self,
         *,
-        toggle_hold_seconds: float = 0.65,
+        toggle_hold_seconds: float = 1.0,
         toggle_cooldown_seconds: float = 0.90,
         open_confirm_frames: int = 2,
         curl_confirm_frames: int = 2,

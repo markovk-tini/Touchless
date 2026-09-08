@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List
 
-from .base import Connector, connector_result
+from .base import Connector, connector_result, friendly_api_error
 
 
 def _maps_api_key() -> str:
@@ -74,7 +74,7 @@ class DirectionsConnector(Connector):
             with urllib.request.urlopen(url, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
-            return connector_result("error", error=f"{type(exc).__name__}: {exc}")
+            return connector_result("error", error=friendly_api_error(exc, api_label="Google Maps"))
         status = data.get("status")
         if status != "OK" or not data.get("routes"):
             return connector_result("error", error=f"no route ({status})",

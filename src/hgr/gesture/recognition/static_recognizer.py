@@ -114,13 +114,14 @@ class StaticGestureRecognizer:
 
     def _mute_pinky_gate(self, hand: HandReading) -> float:
         finger = hand.fingers["pinky"]
+        if finger.state in {"mostly_curled", "closed"}:
+            return 0.0
         return max(
-            clamp01((self._openish(hand, "pinky") - 0.58) / 0.18),
-            clamp01((finger.openness - 0.46) / 0.16)
+            clamp01((self._openish(hand, "pinky") - 0.54) / 0.18),
+            clamp01((finger.openness - 0.54) / 0.16)
             * max(
-                clamp01((finger.reach - 0.18) / 0.24),
-                clamp01((finger.palm_distance - 0.86) / 0.26),
-                clamp01((finger.bend_distal - 138.0) / 22.0),
+                clamp01((finger.reach - 0.20) / 0.24),
+                clamp01((finger.palm_distance - 0.88) / 0.24),
             ),
         )
 
@@ -448,8 +449,8 @@ class StaticGestureRecognizer:
         if non_thumb_extended < 0.52:
             scores["open_hand"] *= 0.40
             scores["four"] *= 0.54
-        if thumb_open_core < 0.24 or pinky_open_core < 0.18:
-            scores["mute"] *= 0.34
+        if thumb_open_core < 0.24 or pinky_open_core < 0.22:
+            scores["mute"] *= 0.12
         if spread["index_middle"].distance > 0.62:
             scores["volume_pose"] *= 0.18
         if spread["index_middle"].apart_strength > 0.72:

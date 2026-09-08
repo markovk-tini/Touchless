@@ -25,6 +25,66 @@ def connector_result(status: str = "ok", **fields: Any) -> Dict[str, Any]:
     return out
 
 
+def friendly_api_error(exc: Exception, *, api_label: str = "The service") -> str:
+    """Translate an HTTP client exception into a spoken-friendly message.
+
+    googleapiclient.HttpError.__str__ (and most requests-style errors)
+    dumps the entire response body including a JSON blob. Passing that
+    to the user unfiltered produces a wall of text that reads badly in
+    chat and is impossible aloud. This helper extracts the status code
+    and (for Google APIs) the machine-readable 'reason' string
+    (SERVICE_DISABLED, PERMISSION_DENIED, ...) and returns one
+    conversational sentence with an actionable next step. Falls back to
+    type+summary for non-HTTP exceptions.
+
+    api_label: human-readable name of the failing API ("Google
+    Contacts", "Gmail", "Phone Link") — surfaces in the message so the
+    user knows which integration hit the wall.
+    """
+    status = None
+    reason = None
+    try:
+        resp = getattr(exc, "resp", None)
+        if resp is not None:
+            status = int(getattr(resp, "status", 0)) or None
+    except Exception:
+        status = None
+    # Parse Google's error detail JSON for the machine-readable reason.
+    try:
+        import json as _json
+        content = getattr(exc, "content", None)
+        if content:
+            body = _json.loads(
+                content.decode("utf-8") if isinstance(content, bytes)
+                else content)
+            errors = ((body or {}).get("error") or {}).get("errors") or []
+            if errors:
+                reason = (errors[0] or {}).get("reason")
+            details = ((body or {}).get("error") or {}).get("details") or []
+            for d in details:
+                if isinstance(d, dict) and d.get("reason"):
+                    reason = d.get("reason")
+                    break
+    except Exception:
+        reason = None
+    if status == 403 and reason == "SERVICE_DISABLED":
+        return (f"{api_label} isn't enabled for this project yet. "
+                f"Turn it on in Google Cloud Console and try again in "
+                f"a minute.")
+    if status == 403:
+        return (f"{api_label} refused the request — probably a missing "
+                f"scope or permission. Try re-authorizing.")
+    if status == 404:
+        return f"{api_label} couldn't find that item."
+    if status == 401:
+        return f"{api_label} says the session expired — re-authorize."
+    if status == 429:
+        return f"{api_label} is rate-limiting me. Give it a minute."
+    if status and status >= 500:
+        return f"{api_label} had a server-side hiccup. Worth a retry."
+    return f"{api_label} error: {type(exc).__name__}"
+
+
 class Connector:
     """Base class for an iris capability connector."""
 
@@ -96,26 +156,48 @@ class ConnectorRegistry:
             return f"availability check failed: {type(exc).__name__}"
         return None
 
-    def available_tool_schemas(self) -> List[Dict[str, Any]]:
+    def available_tool_schemas(
+        self, *, exclude_lazy: bool = False,
+    ) -> List[Dict[str, Any]]:
         """Schemas for all currently-available connectors. Also (re)builds
-        the name->connector ownership map used for routing."""
+        the name->connector ownership map used for routing.
+
+        `exclude_lazy=True` filters out connectors flagged for on-demand
+        loading (currently any MCP connector, since `mcp_*` catalogs can
+        balloon to hundreds of tools — those load via find_capability
+        instead). Ownership map is still built across ALL connectors so
+        a lazy-loaded tool can be routed once it has been exposed."""
         schemas: List[Dict[str, Any]] = []
         owner: Dict[str, Connector] = {}
         for c in self._connectors:
             try:
                 if not c.available():
                     continue
+                is_lazy = self._is_lazy(c)
                 for schema in c.tools():
                     name = schema.get("name")
                     if not name or name in owner:
                         continue
                     owner[name] = c
+                    if exclude_lazy and is_lazy:
+                        continue
                     schemas.append(dict(schema))
             except Exception:
                 # A broken connector must never take down tool assembly.
                 continue
         self._owner = owner
         return schemas
+
+    @staticmethod
+    def _is_lazy(connector: "Connector") -> bool:
+        """True if this connector's tools should be lazy-loaded (via the
+        find_capability meta-tool) instead of eagerly exposed in the
+        initial session.update. MCP bridges qualify because each server
+        can register dozens of tools; eagerly exposing them all would
+        bloat the realtime model's context and degrade tool-call
+        accuracy. Detected by `id` prefix to keep the contract narrow."""
+        cid = (getattr(connector, "id", "") or "").lower()
+        return cid.startswith("mcp_")
 
     def catalog(self) -> List[Dict[str, Any]]:
         """For each *available* connector, its id/description and the tool
@@ -207,5 +289,8 @@ class ConnectorRegistry:
             return connector.execute(name, args or {})
         except Exception as exc:  # pragma: no cover - defensive
             return connector_result(
-                "error", error=f"{type(exc).__name__}: {exc}", code="connector_exception"
+                "error",
+                error=friendly_api_error(
+                    exc, api_label=f"The {connector.id} connector"),
+                code="connector_exception",
             )

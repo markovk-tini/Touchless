@@ -30,7 +30,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import (
+    QObject, Signal, QMetaObject, Qt, Q_ARG, Slot, QThread,
+)
 
 from . import cortex_emit
 from .audio_stream import AudioStream
@@ -40,6 +42,9 @@ from .realtime_client import RealtimeClient
 from .schemas import all_tool_schemas
 from .screen_context import ScreenContext
 from .tool_executor import ToolExecutor
+from .tool_invocation import (
+    InvocationSource, ToolInvocation, publish as _publish_invocation,
+)
 from .tool_registry import ToolRegistry
 from .user_prefs import get_default_email
 from . import cost_policy
@@ -58,17 +63,92 @@ SYSTEM_INSTRUCTIONS = (
     "Screenshots show the FULL multi-monitor desktop — read the image; your "
     "own 'Touchless' window is not the target, ignore it. If unsure of screen "
     "state, get_screen_context first.\n"
-    "HARD RULE — NEVER FABRICATE TOOL DATA: when you report what a tool "
-    "returned (emails, files, search results, calendar events, weather "
-    "values, ANY structured data), every name, subject, number, count, "
-    "date, file path, and quoted detail you mention MUST come literally "
-    "from that tool's response. If the response is empty or the field is "
-    "missing, say so plainly ('no unread emails', 'nothing matched') — "
-    "do NOT invent plausible-sounding examples to fill the gap. If a tool "
-    "returned 7 messages, report 7; if it returned 0, report 0; never "
-    "guess. Your conversational tone (warm, witty, Jarvis-style) applies "
-    "to HOW you phrase real facts, never to inventing facts. Hallucinated "
-    "data is the worst failure mode — when in doubt, quote less, not more.\n"
+    "HARD RULE — NEVER FABRICATE TOOL DATA: every name, count, date, "
+    "subject, path, or quoted detail you report from a tool MUST come "
+    "literally from that tool's response. If empty/missing, say so "
+    "plainly ('no unread emails', 'nothing matched'); never invent "
+    "plausible examples. Tone shapes HOW you phrase real facts, never "
+    "license to invent them.\n"
+    "HARD RULE — NEVER FABRICATE CONTACT / RECORD FIELDS: when a tool "
+    "returns a person or record with a field that is empty, null, or "
+    "missing (contact with emails=[], phones=[]; event with no location; "
+    "task with no due date), report that field as absent in plain words "
+    "— 'no email on file for John', 'I don't have a phone number for "
+    "her', 'the event has no location set'. NEVER generate a plausible-"
+    "looking substitute from context: no jsmith@company.com, no "
+    "john@gmail.com, no 555-XXXX, no guessed office address, no "
+    "'(email withheld)' or any synthetic marker. Concrete example: if "
+    "contacts_lookup returns {name:'John Smith', emails:[], phones:[]}, "
+    "say 'John Smith — no email or phone on file', not 'John Smith — "
+    "john.smith@company.com' and not 'John Smith — jsmith@gmail.com'. "
+    "If the user asks 'what's John's email' and the tool result shows "
+    "emails=[] for John, the correct answer is 'I don't have an email "
+    "for John on file' — full stop. This applies to every field on "
+    "every record, not just contacts.\n"
+    "HARD RULE — NEVER FABRICATE PERSONAL / RECALL CONTEXT: for recall, "
+    "recap, or 'remind me' questions (including artifact retrieval like "
+    "'show me the email we drafted', 'pull up that poem'), every "
+    "concrete detail — topic, room, person, date, draft body — MUST "
+    "come from your injected memory / recall-context note / session "
+    "summary / visible RECENT CONVERSATION. If a 'Recall context for "
+    "this turn' note says NONE or weak, treat memory as empty and ask "
+    "the user to remind you ('I don't have specifics on that handy — "
+    "want to walk me through it?'). Plausibility is NOT evidence; "
+    "pattern-matching typical scenarios is fabrication. Do NOT invent "
+    "a procedural backstory ('we never finished that', 'you said you'd "
+    "send specifics later') to cover a gap.\n"
+    "HARD RULE — CLARIFY BEFORE ACTING ON AMBIGUOUS NAMES: when the user "
+    "says 'delete X' / 'open X' / 'send X' / 'change X' and there are two "
+    "or more session artifacts with the same or overlapping name across "
+    "DIFFERENT kinds (e.g. a sheet named 'notes' AND a task named 'notes'), "
+    "do NOT silently pick one. Ask which they meant, naming both kinds: "
+    "'I see a sheet and a task both called notes — which one?' Only after "
+    "the user confirms do you dispatch the tool. If the user's own next "
+    "turn already disambiguates ('the task' / 'the sheet'), you may act "
+    "without another prompt.\n"
+    "MEDIA TOOL SELECTION RULE (read BEFORE picking a tool):\n"
+    "  • 'play <song/artist/playlist/album/anything-named>' → "
+    "    ALWAYS spotify_play(query='<the named thing>'). NEVER "
+    "    media_play_pause for these — that's just a toggle key, "
+    "    it won't search, it won't change track. The user said a "
+    "    name; they want THAT thing playing, not a blind toggle.\n"
+    "  • Bare 'play' / 'resume' (no object) → media_play_pause OR "
+    "    spotify_play() with no args.\n"
+    "  • Bare 'pause' / 'stop' → media_play_pause or spotify_pause.\n"
+    "  • 'skip' / 'next' → media_next_track or spotify_next.\n"
+    "  • 'previous' / 'back' → media_previous_track or "
+    "    spotify_previous.\n"
+    "  • 'what's playing' → spotify_now_playing or "
+    "    media_now_playing.\n"
+    "MEDIA PLAYBACK RULE — REQUIRED after any play/queue command "
+    "(spotify_play, run_quick_command with a media phrase, etc.):\n"
+    "  1. ALWAYS write a short natural-language confirmation in the "
+    "user's reply channel. Never dump raw tool call args or JSON. "
+    "Never go silent.\n"
+    "  2. Do NOT name a specific song or artist UNLESS the tool "
+    "response from THIS call contains fresh now_playing_title / "
+    "now_playing_artist fields. The previous song from earlier in "
+    "the conversation is STALE — quoting it after a new play is "
+    "fabrication.\n"
+    "  3. Safe replies: echo the user's request ('Playing your feel-"
+    "good rock playlist now.' / 'Queuing Poker Face.' / 'Pulling that "
+    "up.'), or confirm without naming ('On it.' / 'Done, sir.' / "
+    "'Got it.'). Match the active voice preset.\n"
+    "  4. Never claim a specific track is playing from memory.\n"
+    "  5. spotify_play / play_search_request AUTO-PLAYS the result. "
+    "NEVER tell the user to 'hit play whenever you're ready' or "
+    "'press play' or 'start it when you want' — the music is "
+    "ALREADY playing once the tool returns started=true. Saying "
+    "otherwise contradicts what's actually happening on their "
+    "speakers.\n"
+    "  6. If the tool returns started=false or error, say so plainly "
+    "('Couldn't queue that — Spotify wasn't reachable') instead of "
+    "pretending it worked.\n"
+    "CALENDAR: when the turn is a calendar create/list/modify, a "
+    "'Calendar context for this turn' session note (with the active "
+    "tool priority + override grammar) will be injected — follow it. "
+    "Always mention WHICH calendar the event landed in using the "
+    "tool result's `calendar` field.\n"
     "LANGUAGE (hard rule): ALWAYS respond in English, regardless of any single "
     "letters, short inputs, or odd tokens you receive — never switch to another "
     "language unless the user clearly writes to you in that language.\n"
@@ -95,6 +175,21 @@ SYSTEM_INSTRUCTIONS = (
     "underlying voice identity throughout the session — do not shift "
     "gender, accent, or vocal weight between turns. Only the prosody / "
     "energy varies with content.\n"
+    # Phase-1 trust substrate: prompt-injection defense. The actual
+    # rule text lives in content_quarantine.SYSTEM_PROMPT_RULE so the
+    # wording + the wrap delimiters stay co-located. Injected into the
+    # string via concatenation at module import (see below).
+    "##QUARANTINE_RULE##\n"
+    "PERSONA ANCHOR (identity lock): You are 'Iris' — warm, capable, "
+    "lightly witty when the moment fits, never sycophantic. Your voice "
+    "has consistent timbre and pacing across every turn of this session "
+    "regardless of topic. You speak the way a smart-and-trusted "
+    "assistant who knows the user well does: confident, efficient, "
+    "occasionally dry, never performative. This identity is fixed for "
+    "the entire conversation — DO NOT shift register to match the "
+    "user's mood when it would change WHO you are; just adjust prosody. "
+    "If the user pushes back or jokes, respond from the same Iris "
+    "identity, not as a different character.\n"
     "SAFETY: confirm before destructive/risky actions; never expose secrets; "
     "never bypass security, DRM, anti-cheat, CAPTCHA, or non-skippable ads.\n"
     "ROUTING DEFAULTS (decide BEFORE answering — never default to "
@@ -139,6 +234,18 @@ SYSTEM_INSTRUCTIONS = (
     "'to the right of'/'below' a previous shape, offset the box. Use draw_path "
     "only for freeform/custom strokes."
 )
+# Replace the ##QUARANTINE_RULE## marker with the canonical text from
+# content_quarantine.SYSTEM_PROMPT_RULE. Done post-construction so
+# the wording + the wrap delimiters in content_quarantine.py stay
+# the single source of truth — edit the rule there and it propagates
+# here automatically on next module load.
+try:
+    from .content_quarantine import SYSTEM_PROMPT_RULE as _QUARANTINE_RULE
+    SYSTEM_INSTRUCTIONS = SYSTEM_INSTRUCTIONS.replace(
+        "##QUARANTINE_RULE##", _QUARANTINE_RULE + "\n")
+except Exception:
+    SYSTEM_INSTRUCTIONS = SYSTEM_INSTRUCTIONS.replace(
+        "##QUARANTINE_RULE##", "")
 
 
 # The capability-search meta-tool. Always exposed (it's cheap — one
@@ -206,6 +313,15 @@ def build_system_instructions() -> str:
             "EMAIL ACTIONS: to SEND an email use gmail_send (Gmail API, reliable, "
             "confirms first). For a draft the user sends themselves, use "
             "outlook_compose. Always include a concise subject. "
+            "NEVER pick outlook_compose / email_send / gmail_send when the "
+            "utterance contains an A1-style spreadsheet cell reference "
+            "([A-Z]+[0-9]+, e.g. C1, B12, AA3) or a spreadsheet/doc/slide "
+            "context word (sheet, spreadsheet, doc, document, slide, cell, "
+            "range, row, column) — those go to sheets_update_range / "
+            "gdocs_append / slides_*. Treat the word 'email' as CONTENT (not "
+            "an action) whenever it appears after 'to say/write/enter/type/"
+            "put/set to/change to', inside quotes, or as the final token of a "
+            "sheets/docs edit request. "
         )
     else:
         email_actions = (
@@ -215,203 +331,84 @@ def build_system_instructions() -> str:
             "outlook_compose. Always include a concise subject. Call the send "
             "ONCE — if it reports it couldn't send, tell the user the draft is "
             "open to send manually; never retry in a loop. "
+            "NEVER pick outlook_compose / email_send when the utterance "
+            "contains an A1-style spreadsheet cell reference ([A-Z]+[0-9]+, "
+            "e.g. C1, B12, AA3) or a spreadsheet/doc/slide context word "
+            "(sheet, spreadsheet, doc, document, slide, cell, range, row, "
+            "column) — those go to sheets_update_range / gdocs_append / "
+            "slides_*. Treat the word 'email' as CONTENT (not an action) "
+            "whenever it appears after 'to say/write/enter/type/put/set to/"
+            "change to', inside quotes, or as the final token of a sheets/"
+            "docs edit request. "
         )
     email_clause = email_identity + email_actions
+    # Phase-3 polish: resolve the user-tunable persona block and
+    # tack it onto the system prompt's tail so the user's prefs
+    # (TOUCHLESS_PERSONA, memory-stored 'persona' fact, etc.)
+    # override the baked-in tone.
+    try:
+        from .persona import get_persona_block
+        persona = get_persona_block()
+    except Exception:
+        persona = ""
+    # PERSONA PROMOTION (Phase-7 polish): the persona block goes
+    # FIRST — before the long tool-list / safety rules. The model
+    # anchors on opening tokens; burying tone in the middle of a
+    # 20k-char prompt is why earlier "Jarvis" still sounded like
+    # generic-helpful-assistant. Wrap in hard-rule language.
+    persona_header = (
+        f"### ACTIVE VOICE (REQUIRED — overrides default tone) ###\n"
+        f"{persona}\n"
+        f"### END ACTIVE VOICE ###\n\n"
+        if persona else "")
+    # Inject CURRENT TIME so the model never hallucinates the clock.
+    # Without this, "what time is it" gets a confident-but-wrong
+    # answer + the model triggers screen_read to "verify" — wasteful.
+    import datetime as _dt
+    try:
+        _now = _dt.datetime.now().astimezone()
+        time_clause = (
+            f"CURRENT TIME (use this when asked; never guess, never "
+            f"call get_screen_context to check the clock): "
+            f"{_now.strftime('%A, %B %d, %Y at %I:%M %p %Z').strip()} "
+            f"(ISO: {_now.isoformat(timespec='seconds')}).\n\n"
+        )
+    except Exception:
+        time_clause = ""
     return (
-        SYSTEM_INSTRUCTIONS
+        persona_header
+        + time_clause
+        + SYSTEM_INSTRUCTIONS
         + "\n\nMACHINE PATHS (use these EXACT paths; never guess the username): "
         f"Username {user}; Home {home}; Documents {docs}; Desktop {desktop}. "
         "Pass one (or a subfolder you made) as `base_dir` for file tools.\n"
-        "APPS: open_app names — code, chrome, spotify, notepad, explorer; retry "
-        "a shorter/lowercase name on error. Open an app ON a monitor in ONE "
-        "call: open_app(name, monitor='secondary', placement='maximize') — it "
-        "launches, waits for the window, and places+focuses it ('open Discord "
-        "on my second monitor').\n"
-        "CONNECTORS (FAST API PATH — prefer these): for an action ON a specific "
-        "app/service, prefer the dedicated API tool when one exists — it's one "
-        "call, no screenshots or clicking. These are available directly when "
-        "set up: volume_* (system volume), discord_* (Discord voice), "
-        "youtube_* (a YouTube tab), chrome_* (browser), and the email/Google "
-        "tools below. Only control the app on-screen (click/type) when no such "
-        "tool is available for the task.\n"
-        "READING THE SCREEN: to READ or SUMMARIZE on-screen text — a "
-        "document, a chat, a web page — call read_screen (accurate OCR text, "
-        "cheap, no image). Use get_screen_context (a picture) only to SEE "
-        "layout or find something to click. If content is cut off below the "
-        "fold (a long inbox/doc), call read_screen with scroll_passes (e.g. "
-        "6) so it scrolls and reads ALL of it — don't say items may be "
-        "hidden, just scroll.\n"
-        "EMAIL READS / SUMMARIES (HARD RULE — email_summary FIRST, "
-        "screen-read last): for ANY 'read/summarize/check/show my "
-        "email(s) / inbox / unread' request, ALWAYS call email_summary "
-        "FIRST — it is the PRIMARY tool for this. It auto-cascades "
-        "Gmail → Microsoft (Outlook) → helpful fallback, so it always "
-        "finds the user's real inbox whether it lives in Gmail or "
-        "Outlook. Call it with unread_only=true AND max=50 (the cap) "
-        "so you get every unread message. DO NOT call gmail_list or "
-        "ms_mail_list directly for general 'summarize my unread' "
-        "requests — they only check ONE account and will return 0 if "
-        "the user's real inbox lives in the other account. Use "
-        "gmail_list / ms_mail_list ONLY for account-specific SEARCHES "
-        "with a query (e.g. 'emails from boss@example.com', 'find my "
-        "Gmail message about the invoice'). FINAL REPLY: email_summary "
-        "returns a `summary` field containing a faithful, "
-        "deterministically-rendered summary of the real messages (built "
-        "directly from the message array — every sender, subject, and "
-        "snippet is real). EMIT `result.summary` VERBATIM as your reply — "
-        "do not rephrase, do not re-summarize, do not re-rank, do not "
-        "invent or substitute different senders/subjects. Writing your "
-        "own summary from `result.messages` is BANNED here — you have "
-        "hallucinated demo emails (Carl, Sarah, Mark, IT Support, etc.) "
-        "in the past when given that freedom. Only if `result.summary` "
-        "is missing or empty, fall back to summarizing from "
-        "`result.messages` and quote sender/subject/snippet fields "
-        "VERBATIM. If `result.count` is 0 and `result.source` is "
-        "'none', no email connector is wired — fall back to "
-        "open_app('outlook') + read_screen. Do NOT default to opening "
-        "Outlook + read_screen when a connector is available. Do NOT "
-        "compose a new email when asked to READ one. To read ONE "
-        "email's full body via the connector pass include_body=true on "
-        "email_summary (or gmail_read with the id) instead of clicking "
-        "into the message in a window.\n"
-        "PERSONAL TEAMS / APPS WITH NO API: teams_send/teams_channel_post work "
-        "only for work/school Microsoft accounts. For a PERSONAL Teams account "
-        "(or any app the connectors don't cover), DRIVE THE APP BY SCREEN: "
-        "open_app('Teams'), read_screen to see it, click the search / 'New "
-        "chat' box (click_text_on_screen), type_text the person's name, open "
-        "their chat, click the message box, type_text the message, then press "
-        "Enter (or click Send). Confirm with the user before sending. Never say "
-        "you can't message someone — fall back to this GUI path.\n"
-        "GUI CLICKING — BE EFFICIENT: call read_screen ONCE; it returns "
-        "clickable_elements with screen-pixel x,y. Click them with "
-        "click_screen(coordinate_space='screen', x=<px>, y=<py>) — exact, no "
-        "guessing, no OCR retries. To fill a box AND send in ONE step, use "
-        "click_type(x, y, coordinate_space='screen', text='...', submit=true) "
-        "instead of separate click+type+send turns (fewer round trips, avoids "
-        "rate limits). Do NOT call get_screen_context (a costly image) or "
-        "re-read between actions; reuse the one read_screen result and only "
-        "re-read if the screen actually changed.\n"
+        "CONNECTORS FIRST: when a dedicated API tool exists for the task "
+        "(email, calendar, spotify, volume, discord, youtube, drive, "
+        "files, web), prefer it over GUI clicking. Each tool's schema "
+        "description explains its own usage — read it before calling.\n"
+        "EMAIL READS — email_summary FIRST: for any 'read/summarize/check "
+        "my email/inbox/unread' request, call email_summary "
+        "(unread_only=true, max=50). It cascades Gmail → Microsoft → "
+        "fallback so it finds the user's real inbox. EMIT "
+        "`result.summary` VERBATIM — do not rephrase, re-summarize, or "
+        "invent senders/subjects (you have hallucinated demo emails "
+        "before). Only if `result.summary` is empty, fall back to "
+        "summarizing from `result.messages` quoting fields verbatim. "
+        "Use gmail_list / ms_mail_list ONLY for account-specific "
+        "searches with a query.\n"
         + email_clause +
-        "MICROSOFT ACCOUNTS: several can be connected at once. ms_* tools act "
-        "on the ACTIVE one. If the user wants a different one (e.g. their school "
-        "account for Teams/work mail), call ms_use_account('<email or name>') "
-        "first; ms_list_accounts shows what's connected.\n"
-        "FILES: open files/folders by NAME with open_path (don't ask where) — "
-        "status='ambiguous'→list+ask, not_found→retry deep=true; open several "
-        "at once via its `queries` list. read_file(name) returns a file's text "
-        "(incl. PDF/docx) so you can SUMMARIZE without opening it ('summarize / "
-        "what's in / read me X'). When the user names a file by DESCRIPTION not "
-        "exact name ('my most recent screenshot', 'the three latest touchless "
-        "drawings', 'the newest file on my desktop'), call list_files FIRST "
-        "(name_contains + optional file_type; OMIT folder to search everywhere "
-        "if unsure where it is — spaces/underscores match either way) and use "
-        "the top result paths — results are newest-first, so 'the N latest X' = "
-        "the first N. NEVER guess/invent a path for move_file/read_file/"
-        "open_path, and don't fall back to open_path just to FIND a file. "
-        "Build files with create_folder, create_file/"
-        "write_file/append_file (base_dir = a real path above). To open a "
-        "folder/PROJECT in VS Code (the user says 'in VS Code' / 'the project'), "
-        "use open_in_editor(name) — that opens the EDITOR; open_path opens it in "
-        "File Explorer instead, so don't use open_path for 'open … in VS Code'. "
-        "Use the EXACT project name (don't shorten it); open_in_editor finds the "
-        "folder or asks if it can't. If open_in_editor errors, RETRY "
-        "open_in_editor (with the exact name/path) — do NOT fall back to "
-        "open_path (that just opens File Explorer, the wrong thing).\n"
-        "WINDOWS: move_window_to_monitor(window_title, monitor, placement) — "
-        "placement is maximize/center OR a snap left/right/top/bottom/quadrant. "
-        "For 'move/drag a window to the right/left side of monitor X' use "
-        "placement='right'/'left' on that monitor — do NOT pixel-drag the title "
-        "bar. Pass a SHORT generic title matching "
-        "the user's words ('file explorer', or a folder name), NOT a full "
-        "guessed title; status='ambiguous'→list the names and ask which, then "
-        "call again. control_window(window_title, action=close/minimize/"
-        "maximize/restore/focus) acts on that window IN PLACE — its maximize "
-        "does NOT move it to another monitor. So for 'open X (maximized) on "
-        "monitor 2' use open_app('X', monitor='secondary', placement='maximize') "
-        "(or, if already open, move_window_to_monitor) — NOT control_window. "
-        "NEVER Alt+F4 to close — it hits the focused window (often the "
-        "assistant).\n"
-        "DESKTOP DIALOGS / native apps: read_ui lists a window's controls; "
-        "click_ui(name) clicks one; set_field types into a field. React to a "
-        "prompt that appears later with wait_and_click('Yes'); for a keystroke "
-        "prompt ('1. Yes / 2. No') use wait_and_press(text='proceed', "
-        "keys=['1']).\n"
-        "TYPING INTO AN APP (e.g. 'open Notepad, type X, save as Y'): open_app("
-        "'notepad') → type_text(text, window_title='Notepad') → press_hotkey("
-        "['ctrl','s'], window_title='Notepad') → in the Save dialog set_field("
-        "'File name', 'Y', window_title='Save As') then wait_and_click('Save', "
-        "window_title='Save As'). ALWAYS pass window_title to type_text/"
-        "press_hotkey — the Iris chat is always-on-top, so untargeted keystrokes "
-        "type into the wrong window (nothing lands in the app).\n"
-        "AUTO-APPROVE: to keep approving an agent's prompts ('keep clicking yes "
-        "/ watch my Claude tab / approve while I'm away'), call "
-        "auto_approve(window_title='Visual Studio Code') — a background watcher "
-        "(focus-independent) that clicks Yes/Allow/Keep; stop_auto_approve to "
-        "stop. If the user just wants watching (no new task), call it directly. "
-        "Always pass window_title so it stays locked on the right window.\n"
-        "CODING AGENTS (Claude/Codex in VS Code): send_to_coding_agent(prompt=<"
-        "task>, agent='claude'|'codex'). ACTUALLY call the tool — never write "
-        "its JSON as a chat message. It opens a FRESH tab itself and types "
-        "there, and auto-starts the approve-watcher — so call it EXACTLY ONCE, "
-        "prompt only (no assume_focused, no pre-opening, no screenshot to "
-        "'verify'; never type 'claude'/'codex' yourself). project_folder is for "
-        "creating a BRAND-NEW project ('make a folder called iris demo') — it "
-        "creates the folder under Documents and opens it. Do NOT use "
-        "project_folder for an EXISTING project (it would create a duplicate); "
-        "instead open_in_editor(name) to open the existing one, THEN "
-        "send_to_coding_agent(open_only=true) for a Claude tab (or with a "
-        "prompt if there's a task). To run+verify, "
-        "end the prompt with 'run it, fix errors, re-run until it works, report "
-        "the output' (Claude sees its own terminal). Then just say it's working "
-        "and relay the watcher's done-note. follow_up_coding_agent(message) "
-        "sends a follow-up into the SAME tab (e.g. paste output back) — never "
-        "open a new tab for a follow-up. Codex: if the tab flow misses, "
-        "via='terminal'. background=true ONLY if asked to run it without "
-        "watching (it hands focus back). If the user only asks to OPEN a Claude "
-        "tab (no task for Claude), call send_to_coding_agent(open_only=true) — "
-        "do NOT invent a prompt or tell Claude to do anything.\n"
-        "CROSS-APP RUN (e.g. MATLAB): send_to_coding_agent(project_folder='X', "
-        "prompt to create main.m doing Y), then run_matlab_script(folder/"
-        "main.m) — MATLAB opens and runs it, plots appear. Don't ask Claude to "
-        "test MATLAB. Same idea elsewhere: have Claude write the file, then run "
-        "it in the real app.\n"
-        "GAMES: prefer a direct launch — open_app('valorant'/'genshin') boots "
-        "the game. If it stops at a launcher PLAY/Start button, "
-        "click_text_on_screen('PLAY' or 'Start Game', timeout_sec=60, "
-        "double=true, retries=3) (polls, double-clicks the unfocused window, "
-        "re-clicks if the layout shifted; verified=false → tell the user to "
-        "click it). Launcher UIs are Chromium — read_ui/click_ui don't work.\n"
-        "UAC / Windows security prompts: you CANNOT click them (secure desktop). "
-        "When launching something that elevates (game launcher, installer), "
-        "warn in one line ('click Yes if a Windows prompt appears, I can't') "
-        "and keep waiting for the app — don't fail or try to click it.\n"
-        "WEB: use web_* (never pixel-click links). web_navigate(url or query) "
-        "opens/searches AND opens the browser itself (don't also open_app "
-        "chrome). To SEARCH AND SUMMARIZE, do exactly TWO calls: "
-        "web_navigate(query) → web_get_text, then write the summary. Do NOT "
-        "open individual result links, click around, or call web_get_links — "
-        "the results page already has the headlines; opening a link is slower "
-        "and only needed if the user explicitly asks to open a result. Other "
-        "tools when needed: web_get_links lists {index,text,url}; web_scroll; "
-        "web_fill(label,text); web_wait_for; web_click(text); web_eval(js). To "
-        "open the Nth result (only if asked): web_get_links → web_navigate(its "
-        "url). web_* drive a dedicated debug Chrome (not the user's everyday "
-        "one). A page may take 1-3s; if blank, retry once.\n"
-        "run_quick_command: MEDIA / built-in voice commands ONLY ('play X on "
-        "spotify', 'next song', 'pause') — not for web/clicking/windows.\n"
-        "MULTI-STEP: a request with several actions is USUALLY auto-split and "
-        "fed to you ONE sub-task at a time ('[Step N of M] do ONLY this…'). "
-        "Finish that ONE task fully (right tool, confirm it actually worked), "
-        "give a one-line confirmation (which ends the step — the next is sent "
-        "automatically), and don't do other steps in it. If a step fails or is "
-        "ambiguous, retry or ask — never skip it.\n"
-        "MULTI-ACTION FALLBACK: occasionally a multi-action request slips "
-        "through WITHOUT '[Step N of M]' wrapping (e.g. 'write me a haiku "
-        "about coffee and add a task to drink some'). When that happens, do "
-        "ALL the actions yourself in sequence — call each tool in turn, "
-        "don't stop after the first verb. Treat 'X and Y', 'X, then Y', "
-        "and comma-separated verb lists as multiple actions you must each "
-        "complete, not as a single action."
+        "TYPING INTO AN APP: ALWAYS pass window_title to type_text / "
+        "press_hotkey — the Iris chat is always-on-top, so untargeted "
+        "keystrokes type into the wrong window.\n"
+        "UAC / Windows security prompts are on the secure desktop — you "
+        "CANNOT click them. Warn once and keep waiting.\n"
+        "MULTI-STEP: a multi-action request is usually auto-split into "
+        "'[Step N of M] do ONLY this…' sub-tasks — finish each ONE "
+        "fully, give a one-line confirmation, don't do other steps in "
+        "it. If a step slips through WITHOUT '[Step N of M]' wrapping "
+        "(e.g. 'write me a haiku and add a task to drink some'), do ALL "
+        "the actions yourself in sequence — call each tool in turn, "
+        "don't stop after the first verb."
     )
 
 
@@ -443,6 +440,118 @@ _CORTEX_STATE_MAP = {
 ConfirmCallback = Callable[[str, str], bool]
 
 
+_SERVICE_DISABLED_URL_RE = re.compile(
+    r"https?://console\.(?:developers|cloud)\.google\.com/apis/api/"
+    r"([a-z0-9_.-]+)\.googleapis\.com/overview\?project=(\d+)"
+)
+_API_LABEL = {
+    "tasks": "Google Tasks",
+    "forms": "Google Forms",
+    "youtube": "YouTube Data",
+    "sheets": "Google Sheets",
+    "docs": "Google Docs",
+    "slides": "Google Slides",
+    "drive": "Google Drive",
+    "gmail": "Gmail",
+    "calendar": "Google Calendar",
+    "photoslibrary": "Google Photos",
+    "people": "Google People (Contacts)",
+}
+
+
+def _verb_for_tool(name: str) -> str:
+    """Best-effort verb phrase for a tool's failure line."""
+    n = (name or "").lower()
+    if n.endswith("_upload"):
+        return "upload that"
+    if n.endswith("_send"):
+        return "send that"
+    if n.endswith("_create"):
+        return "create that"
+    if n.endswith("_delete"):
+        return "delete that"
+    if n.endswith("_update"):
+        return "update that"
+    if n.endswith("_list") or n.endswith("_search") or n.endswith("_read"):
+        return "look that up"
+    if n.endswith("_get"):
+        return "fetch that"
+    if n.endswith("_open") or n.endswith("_play"):
+        return "open that"
+    if n.endswith("_move"):
+        return "move that"
+    return f"run {name}"
+
+
+def _format_connector_error(name: str, code: str, err_msg: str) -> str:
+    """Map a connector error result to a short, human-friendly spoken line.
+
+    Used by the universal error short-circuit in _dispatch_function_call
+    so error responses never get handed to the realtime LLM (which can
+    loop / stall while it "interprets" the failure).
+    """
+    c = (code or "").lower().strip()
+    m = (err_msg or "").strip()
+    n = (name or "").strip()
+    tool_label = n.replace("_", " ") if n else "that"
+
+    if c in ("not_ready", "not_connected", "not_authorized"):
+        if n.startswith("photos_"):
+            return ("I do not have access to your Google Photos yet — "
+                    "want me to walk you through connecting it?")
+        if n.startswith("gmail_") or n.startswith("gdocs_") or n.startswith("drive_") \
+                or n.startswith("sheets_") or n.startswith("slides_") \
+                or n.startswith("calendar_") or n.startswith("contacts_") \
+                or n.startswith("forms_"):
+            return ("I do not have access to your Google account for that yet "
+                    "— want me to walk you through connecting it?")
+        if n.startswith("ms_") or n.startswith("outlook_") or n.startswith("teams_"):
+            return ("I do not have access to your Microsoft 365 account for "
+                    "that yet — want me to walk you through connecting it?")
+        if n.startswith("spotify_"):
+            return ("Spotify is not connected yet — want me to walk you "
+                    "through connecting it?")
+        return (f"{tool_label} is not connected yet — want me to walk you "
+                "through setting it up?")
+    if c == "timeout":
+        return (f"{tool_label} took too long to respond. Try again in a "
+                "moment.")
+    if c == "user_declined" or c == "user_declined_speed_bump":
+        return "Okay, cancelled."
+    if c == "not_found":
+        return f"Could not find that file. {m}" if m else "Could not find that file."
+    if "SERVICE_DISABLED" in m or "has not been used in project" in m:
+        url_match = _SERVICE_DISABLED_URL_RE.search(m)
+        if url_match:
+            svc_key = url_match.group(1).lower()
+            api_label = _API_LABEL.get(svc_key, f"{svc_key.title()} API")
+            enable_url = url_match.group(0)
+            return (
+                f"The {api_label} API isn't enabled for this project. "
+                f"Enable it at:\n{enable_url}\n"
+                "— then retry in 1-2 minutes."
+            )
+        return (
+            "That Google API isn't enabled for this project. Open the "
+            "Cloud Console for this OAuth client, enable the API, and "
+            "retry in 1-2 minutes."
+        )
+    if "403" in m or "permission" in m.lower() or "forbidden" in m.lower():
+        if n.startswith("photos_"):
+            return ("Google rejected that — looks like the Photos scope is "
+                    "not granted. Reconnect Google to fix it.")
+        return ("Google rejected that — looks like a required permission "
+                "is not granted. Reconnecting the account should fix it.")
+    if "401" in m or "unauthorized" in m.lower():
+        return ("Auth expired for that account — reconnect it and I will "
+                "try again.")
+    if "429" in m or "rate" in m.lower():
+        return "Hit a rate limit on that. Try again in a minute."
+    if m:
+        return f"Could not {_verb_for_tool(n)}: {m}"
+    return f"Could not {_verb_for_tool(n)}."
+
+
 class LiveApiManager(QObject):
     state_changed = Signal(object, str)        # (LiveApiState, status text)
     error_occurred = Signal(str)
@@ -466,6 +575,13 @@ class LiveApiManager(QObject):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
+        # Publish ourselves at module level so cross-cutting
+        # substrate (e.g., earcon_wiring) can check "is Iris
+        # currently speaking?" without importing this whole class.
+        # Most-recent instance wins; in practice the UI constructs
+        # exactly one manager per session.
+        import sys as _sys
+        _sys.modules[__name__]._last_constructed = self  # type: ignore[attr-defined]
         self._config = config or load_config()
         # text_only=True means we don't open the mic / VAD pipeline; the
         # only inputs come from explicit `send_user_text` calls. Used by
@@ -477,6 +593,13 @@ class LiveApiManager(QObject):
         self._voice_output = bool(voice_output)
         # Lazily-created PCM player; only built when voice_output is True.
         self._audio_player: Optional[Any] = None
+        # Phase-1 substrate: append-only audit log. Subscribes to the
+        # global InvocationBus so every planner + realtime tool call is
+        # recorded. Built lazily on first use to avoid filesystem touches
+        # at import-time. A SINGLE process-wide instance is sufficient —
+        # multiple LiveApiManagers would race on the same DB, so we
+        # share one. See `_ensure_audit_log` below.
+        self._audit_log: Optional[Any] = None
         self._logger: Optional[LiveApiLogger] = None
         self._client: Optional[RealtimeClient] = None
         self._audio: Optional[AudioStream] = None
@@ -499,6 +622,18 @@ class LiveApiManager(QObject):
         self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
         # Set to True by stop() to make late WS-thread callbacks no-op.
         self._teardown_in_progress = False
+        # Set to False by stop() so late WS-thread callbacks that would
+        # construct Qt objects (QTimer.singleShot, edge pulses) against a
+        # dying event dispatcher become no-ops instead.
+        self._gui_alive = True
+        # Names of every watcher this manager registered with the
+        # global Sentinel via _register_phase_3_watchers /
+        # _wire_proactive_nudges / _ensure_registry_wiring. stop()
+        # iterates this list and unregisters each so the next reopen
+        # gets a clean slate and idle sentinel ticks can't fire
+        # callbacks against a torn-down manager. The Sentinel daemon
+        # itself is process-wide and intentionally left running.
+        self._registered_watcher_names: list[str] = []
         # True while the server has a response in progress. Background notes
         # (auto-approve conclude, etc.) must NOT call response.create while
         # one is active — the server rejects it with
@@ -509,6 +644,56 @@ class LiveApiManager(QObject):
         # A model turn was requested while a response was active; fired once
         # on response.done so parallel tool calls don't each create one.
         self._response_requested = False
+        # ---- response-cycle watchdog ----
+        # Armed on response.created; disarmed on response.done /
+        # response.cancelled / error / ws_close. If it fires before
+        # response.done lands, the manager force-clears the _response_active
+        # latch (which would otherwise wedge every subsequent turn), cancels
+        # the server response, surfaces a friendly assistant_text, and drops
+        # back to LISTENING. Without this, a Realtime server stall between
+        # response.created and response.done leaves Iris pinned to THINKING
+        # forever and silently swallows future user turns.
+        self._response_watchdog: Optional[threading.Timer] = None
+        try:
+            self._RESPONSE_TIMEOUT_SEC = float(
+                os.environ.get("TOUCHLESS_REALTIME_RESPONSE_TIMEOUT", "45")
+            )
+        except Exception:
+            self._RESPONSE_TIMEOUT_SEC = 45.0
+        # ---- deferred-request watchdog ----
+        # _request_model_response silently defers when _response_active is
+        # already True (the normal "parallel tool call" case). If the active
+        # response NEVER drains (server cancelled / failed without emitting
+        # response.done, ws bounce inherited a stale latch, etc.) the
+        # deferred request would wedge forever — every subsequent user turn
+        # would just flip _response_requested=True and return. This timer is
+        # armed on defer and, if the active response hasn't completed within
+        # the window, force-clears the latch and drains the queued request
+        # so the user's turn actually reaches the server.
+        self._deferred_request_watchdog: Optional[threading.Timer] = None
+        try:
+            self._DEFERRED_REQUEST_TIMEOUT_SEC = float(
+                os.environ.get("TOUCHLESS_REALTIME_DEFERRED_TIMEOUT", "12")
+            )
+        except Exception:
+            self._DEFERRED_REQUEST_TIMEOUT_SEC = 12.0
+        # ---- response.create -> response.created watchdog ----
+        # Armed in _fire_response_create after a successful send; disarmed in
+        # the response.created handler (the normal case) or by the benign-
+        # error / teardown paths. The post-create watchdog above is the SOLE
+        # recovery path once response.created arrives, but it cannot help if
+        # response.created NEVER arrives (e.g. the server silently dropped
+        # response.create because the conversation already had an active
+        # response, or the ws send failed). Without this pre-create timer,
+        # _response_active stays latched True from the optimistic set in
+        # _request_model_response and Iris hangs on THINKING forever.
+        self._response_create_watchdog: Optional[threading.Timer] = None
+        try:
+            self._RESPONSE_CREATE_TIMEOUT_SEC = float(
+                os.environ.get("TOUCHLESS_REALTIME_CREATE_TIMEOUT", "10")
+            )
+        except Exception:
+            self._RESPONSE_CREATE_TIMEOUT_SEC = 10.0
         # ---- multi-step auto-continue ----
         # The realtime model tends to STOP after a text-only turn mid-task
         # (e.g. after giving a summary). When a multi-action request is armed,
@@ -532,10 +717,23 @@ class LiveApiManager(QObject):
         # tool's reply.
         self._pending_override_text: Optional[str] = None
         self._last_override_tool: str = ""
+        # Response-id this override was armed against. The defensive wipe
+        # in `response.created` fires ONLY when the armed id differs from
+        # the new response — otherwise an override armed mid-dispatch
+        # (e.g. confirm-gated tool that runs across a response boundary)
+        # would be nuked before its consumer ever ran.
+        self._override_armed_response_id: str = ""
+        self._active_response_id_seen: str = ""
         # Action chips to surface after the next reply (Connect Gmail
         # button, etc.). Cleared each time we emit the signal.
         self._pending_actions: List[str] = []
         self._last_user_text = ""     # for realtime fact-extraction observation
+        # Track whether the most recent user turn came from the mic
+        # (voice) vs the typed input field. Safety gate uses this to
+        # decide whether to surface the "[voice command]" confirm
+        # banner + run voice-spoof defense. Defaults to False so
+        # typed-only sessions don't get the voice treatment.
+        self._last_input_was_voice: bool = False
         # Rolling conversation buffer for the Jarvis prose renderer — the
         # last ~6 (role, text) turns so replies can naturally reference
         # earlier context ("heads up before your meeting", "since you
@@ -544,6 +742,24 @@ class LiveApiManager(QObject):
         self._CONVO_BUFFER_MAX = 8
         self._memory_summary_sent = False  # send memory note once per session
         self._failed_retries = 0      # retries used for a failed response turn
+        # One-shot latch: True between when we send client.cancel_response()
+        # due to a user-declined safety-gate modal and the resulting server
+        # response.done arriving. Consumed in the response.done handler so
+        # the retry block (built for TPM rate-limits) does NOT fire a phantom
+        # response.create that would wedge the next user turn behind a stuck
+        # _response_active latch.
+        self._intentional_cancel_pending: bool = False
+        # Monotonically-increasing turn counter — bumped in the
+        # response.created handler so every new server response is a new
+        # "turn". Used by _fire_override_inline to detect a stale queued
+        # GUI-thread invocation racing against a fresh user turn: the WS
+        # reader queues _fire_override_inline_on_gui_thread and returns
+        # immediately, so if the user starts a new turn before the queued
+        # slot runs, the slot would flash the pill back to LISTENING and
+        # drop a stale decline bubble on top of the fresh turn. The slot
+        # compares the turn_id it was queued with against the current
+        # value and no-ops on mismatch.
+        self._turn_id: int = 0
         self._last_nudge_ts = 0.0     # min-interval guard against nudge bursts
         # Task QUEUE — a multi-action command is split into atomic sub-tasks and
         # fed to the model ONE AT A TIME (each like its own prompt), so every
@@ -612,18 +828,697 @@ class LiveApiManager(QObject):
 
     def set_confirm_callback(self, cb: Optional[ConfirmCallback]) -> None:
         self._confirm_callback = cb
+        try:
+            from .safety_gate import install_confirm_callback
+            install_confirm_callback(cb)
+        except Exception:
+            pass
 
     def is_running(self) -> bool:
         return self._state not in (LiveApiState.OFF, LiveApiState.ERROR)
 
-    def start(self) -> None:
+    def _ensure_audit_log(self) -> None:
+        """Lazily construct the process-wide AuditLog and let it
+        subscribe to the global InvocationBus. Idempotent — subsequent
+        calls are no-ops. Failures are non-fatal: audit logging is a
+        substrate convenience, not a session-blocking dependency."""
+        if self._audit_log is not None:
+            return
+        try:
+            from .audit_log import AuditLog
+            self._audit_log = AuditLog()
+            if self._logger:
+                self._logger.event(
+                    "audit_log_attached",
+                    db_path=str(self._audit_log.db_path))
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("audit_log_attach_failed", exc)
+            self._audit_log = None
+        # Phase-1 speed-pass: kick off the hot-tool prewarmer in a
+        # background thread. Idempotent (start_background_prewarm
+        # short-circuits on second call). The user perceives the win
+        # on their FIRST tool call after Iris starts — imports + UIA
+        # walker etc. are warm rather than cold.
+        try:
+            from .hot_prewarm import start_background_prewarm
+            start_background_prewarm()
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("hot_prewarm_start_failed", exc)
+        # Phase-2 substrate: the reliability ledger and the stuck-
+        # pattern detector both auto-subscribe to the global
+        # InvocationBus on construction. Lazy-construct them here so
+        # every tool call this session gets observed. Failure is
+        # non-fatal — substrate, not session-blocking.
+        try:
+            from .reliability_ledger import global_ledger
+            global_ledger()
+            if self._logger:
+                self._logger.event("reliability_ledger_attached")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "reliability_ledger_attach_failed", exc)
+        try:
+            from .stuck_pattern_detector import global_stuck_detector
+            stuck = global_stuck_detector()
+            stuck.attach_to_bus()
+            if self._logger:
+                self._logger.event("stuck_pattern_detector_attached")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "stuck_pattern_detector_attach_failed", exc)
+        # Phase-3 wiring: subscribe the earcon dispatcher to the bus
+        # so the user hears soft non-verbal acks (done/error/needs-
+        # confirm) for tool calls instead of waiting for a full
+        # spoken reply. Honors QuietMode and incognito internally.
+        try:
+            from .earcon_wiring import global_earcon_dispatcher
+            global_earcon_dispatcher().attach_to_bus()
+            if self._logger:
+                self._logger.event("earcon_dispatcher_attached")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "earcon_dispatcher_attach_failed", exc)
+        # Phase-3 polish: on the FIRST auth_revoked / not_connected
+        # error per session, surface a 1-click "Reconnect X" chip
+        # via the existing suggested_actions signal. Without this,
+        # users had to wait for the proactive_nudge cooldown (5
+        # errors in 30 min) or read the raw error.
+        try:
+            from .reauth_nudge import ReauthNudger
+            self._reauth_nudger = ReauthNudger(
+                notifier=lambda actions:
+                    self.suggested_actions.emit(list(actions)))
+            self._reauth_nudger.attach_to_bus()
+            if self._logger:
+                self._logger.event("reauth_nudger_attached")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "reauth_nudger_attach_failed", exc)
+        # Phase-4 self-learning: skill consolidator watches the bus
+        # for recurring multi-step shapes. When the same plan shape
+        # has run successfully 3+ times, surface a "Want me to save
+        # this as a skill?" nudge so future runs are 0-token replays.
+        try:
+            from .skill_consolidator import SkillConsolidator
+            self._skill_consolidator = SkillConsolidator(
+                handler=self._on_skill_consolidation_nudge)
+            self._skill_consolidator.attach_to_bus()
+            if self._logger:
+                self._logger.event("skill_consolidator_attached")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "skill_consolidator_attach_failed", exc)
+
+    def _on_skill_consolidation_nudge(self, nudge) -> None:
+        """Surface a 'save this as a skill' suggestion in chat. Body
+        queued into _pending_notes so Iris speaks it in the next
+        reply window."""
+        try:
+            shape = (nudge.shape or "").replace(">", " → ")
+            body = (f"I've noticed you've done this {nudge.occurrence_count}"
+                    f" times: {shape}. Want me to save it as a "
+                    f"\"{nudge.suggested_skill_name}\" skill so it's "
+                    "one-tap next time?")
+            should_kick = False
+            with self._lock:
+                self._pending_notes.append(f"💡 {body}")
+                if not self._response_active \
+                        and not self._response_requested:
+                    self._response_requested = True
+                    should_kick = True
+            if self._logger:
+                self._logger.event(
+                    "skill_consolidation_nudge",
+                    shape=nudge.shape,
+                    count=nudge.occurrence_count,
+                    kicked=should_kick)
+            if should_kick:
+                try:
+                    self._drain_pending()
+                except Exception:
+                    with self._lock:
+                        self._response_requested = False
+                        self._response_active = False
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "skill_consolidation_nudge_failed", exc)
+
+    def _track_watcher(self, name: str) -> None:
+        """Record a watcher name we just registered with the global
+        Sentinel so stop() can unregister exactly the set this manager
+        wired in (and nothing else)."""
         with self._lock:
-            if self._state not in (LiveApiState.OFF, LiveApiState.ERROR):
+            if name not in self._registered_watcher_names:
+                self._registered_watcher_names.append(name)
+
+    def _register_phase_3_watchers(self) -> None:
+        """Wire the Phase-3+ background watchers (sentinel start,
+        standing-orders evaluator, anticipation engine, vision
+        observer, proactive nudges, etc.). Idempotent: re-runs are
+        no-ops because Sentinel.register() replaces watchers with the
+        same name. Called from start() after the logger is created
+        so wiring events land in the session log.
+
+        Ordering note: the global Sentinel daemon is started AT THE
+        END of this method, AFTER every watcher has been registered.
+        Starting it first lets the tick thread spin while we're still
+        wiring — and with last_run_at=0.0 the very first tick would
+        run every just-registered watcher back-to-back on the daemon
+        thread, contending with start()'s own GUI-thread work."""
+        # Phase-3 wiring: prime InterruptionGate signals with a
+        # synchronous baseline-False seed; the actual Win32 probe
+        # runs on a daemon thread inside prime_signals_safely() so
+        # the GUI thread is never blocked by psutil + ConsentStore.
+        # Without the seed, the gate would fail-CLOSED for every
+        # NORMAL/LOW interruption until the first watcher tick,
+        # blocking legitimate startup earcons / briefings.
+        try:
+            from .system_signals import (
+                prime_signals_safely,
+                register_with_sentinel as _register_signals,
+            )
+            prime_signals_safely()
+            _register_signals()
+            self._track_watcher("system_signals")
+            if self._logger:
+                self._logger.event("system_signals_wired")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("system_signals_wire_failed", exc)
+        # Phase-3 wiring: IDE focus watcher → repo context. When the
+        # user switches to VS Code / Cursor / JetBrains with a known
+        # project open, the watcher caches RepoContext so the planner
+        # auto-injects project name + branch + recent commits into
+        # prompts without the user having to say "while we're in
+        # my Touchless repo...".
+        try:
+            from .repo_focus_watcher import (
+                register_with_sentinel as _register_repo_focus)
+            _register_repo_focus()
+            self._track_watcher("repo_focus")
+            if self._logger:
+                self._logger.event("repo_focus_watcher_wired")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "repo_focus_watcher_wire_failed", exc)
+        # Phase-4 wiring: ambient screen awareness. Sentinel-tickable
+        # capture (~30s) of a compact ScreenSummary. Honors incognito
+        # + screen-sharing signal. Planner's _recall_context reads
+        # the cached summary whenever the user's request looks
+        # vision-relevant.
+        try:
+            from .screen_awareness import (
+                register_with_sentinel as _register_screen)
+            _register_screen()
+            self._track_watcher("screen_awareness")
+            if self._logger:
+                self._logger.event("screen_awareness_wired")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "screen_awareness_wire_failed", exc)
+        # Phase-5 wiring: standing orders evaluator. Persistent
+        # background goals ("watch my inbox for the Q3 contract")
+        # survive restarts via SQLite. Sentinel tick every ~60s
+        # evaluates conditions and fires the notifier when a goal's
+        # trigger is met. The notifier surfaces the result through
+        # the same pending-notes path as proactive nudges.
+        try:
+            from .standing_orders import (global_evaluator,
+                                           global_store)
+            evaluator = global_evaluator(
+                notifier=self._on_standing_order_fire)
+            # Registry will be set after _ensure_registry_wiring;
+            # ensure the evaluator picks it up there.
+            self._standing_orders_evaluator = evaluator
+            self._standing_orders_store = global_store()
+            from .sentinel import global_sentinel
+            # 15s tick (was 60s): short-fuse reminders ("in 1
+            # minute to check the bacon") used to take up to 2 min
+            # to fire — felt broken. 15s gives sub-minute reminders
+            # accuracy within ~15s and still keeps the tick cost
+            # negligible (the evaluator just iterates active orders
+            # — typically <20).
+            global_sentinel().register(
+                "standing_orders", evaluator.tick,
+                interval_sec=15.0, max_run_ms=2000)
+            self._track_watcher("standing_orders")
+            if self._logger:
+                self._logger.event(
+                    "standing_orders_wired",
+                    active=len(global_store().all_active()))
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "standing_orders_wire_failed", exc)
+        # Phase-5: autonomous reliability advisor. Every ~6h scans
+        # the reliability ledger; surfaces a 'this connector is
+        # chronically unhealthy — want me to switch to <alternate>?'
+        # nudge when the chronic threshold is crossed. Once-per-tool-
+        # per-week cooldown so we don't nag.
+        try:
+            from .reliability_advisor import (
+                register_with_sentinel as _register_advisor)
+            _register_advisor(handler=self._on_reliability_advice)
+            self._track_watcher("reliability_advisor")
+            if self._logger:
+                self._logger.event("reliability_advisor_wired")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "reliability_advisor_wire_failed", exc)
+        # Phase-6 wiring: anticipatory action engine. Sentinel-tickable
+        # predictor that fires "your 9am starts in 12 min — want me
+        # to prep?" / "you usually open this app around now — save
+        # as a routine?" / "this standing order fired 12h ago and
+        # you didn't act on it — refresh?" Registry-dependent
+        # predicates (meeting_imminent) gracefully no-op until
+        # _ensure_registry_wiring hands the registry over.
+        try:
+            from .anticipation_engine import (
+                register_with_sentinel as _register_antic)
+            self._anticipation_engine = _register_antic(
+                handler=self._on_anticipation)
+            self._track_watcher("anticipation")
+            if self._logger:
+                self._logger.event("anticipation_engine_wired")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "anticipation_engine_wire_failed", exc)
+        # Phase-6 wiring: vision observer. Sentinel-tickable
+        # delta-detector that watches screen transitions and
+        # surfaces "noticed an error popup — read it for you?"
+        # / "looks like a stack trace — want me to look it up?"
+        # / "you just opened stripe.com which you mentioned —
+        # want a summary?" Cooldown-gated per pattern kind.
+        try:
+            from .vision_observer import (
+                register_with_sentinel as _register_vobs)
+            self._vision_observer = _register_vobs(
+                handler=self._on_vision_observation)
+            self._track_watcher("vision_observer")
+            try:
+                from .session_buffer import global_session_buffer
+                self._vision_observer._session = (
+                    global_session_buffer())
+            except Exception:
+                pass
+            if self._logger:
+                self._logger.event("vision_observer_wired")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "vision_observer_wire_failed", exc)
+        # Start the Sentinel daemon LAST — after every watcher above
+        # has been registered. Doing this here (rather than first)
+        # guarantees the tick thread can't fire a watcher mid-wiring,
+        # which would have it racing start()'s GUI-thread setup.
+        try:
+            from .sentinel import global_sentinel
+            global_sentinel().start()
+            if self._logger:
+                self._logger.event("sentinel_started")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("sentinel_start_failed", exc)
+
+    def _watcher_deliverable(self) -> bool:
+        """Shared early-exit for proactive-watcher callbacks. Sentinel
+        runs on a process-global daemon thread; after stop() the
+        manager is torn down but the registered ticks keep firing.
+        Returns False when the manager has no live client or is in a
+        teardown / non-running state, so callbacks bail without
+        appending to _pending_notes or kicking _drain_pending."""
+        if self._teardown_in_progress:
+            return False
+        if self._state in (LiveApiState.OFF, LiveApiState.ERROR,
+                           LiveApiState.CONNECTING):
+            return False
+        client = self._client
+        if client is None:
+            return False
+        return True
+
+    def _on_anticipation(self, anticipation) -> None:
+        """AnticipationEngine fired — queue the headline + proactive
+        surface it if we're idle."""
+        if not self._watcher_deliverable():
+            return
+        try:
+            body = f"🔮 {anticipation.headline}"
+            should_kick = False
+            with self._lock:
+                self._pending_notes.append(body)
+                if not self._response_active \
+                        and not self._response_requested:
+                    self._response_requested = True
+                    should_kick = True
+            if self._logger:
+                self._logger.event(
+                    "anticipation_queued",
+                    kind=getattr(anticipation.kind, "value",
+                                 str(anticipation.kind)),
+                    severity=anticipation.severity,
+                    kicked=should_kick)
+            if should_kick:
+                try:
+                    self._drain_pending()
+                except Exception:
+                    with self._lock:
+                        self._response_requested = False
+                        self._response_active = False
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "anticipation_notify_failed", exc)
+
+    def _on_vision_observation(self, observation) -> None:
+        """VisionObserver fired — queue the headline + proactive
+        surface it if we're idle. Uses 👁 prefix so the UI / TTS
+        knows it came from on-screen reasoning."""
+        if not self._watcher_deliverable():
+            return
+        try:
+            body = f"👁 {observation.headline}"
+            should_kick = False
+            with self._lock:
+                self._pending_notes.append(body)
+                if not self._response_active \
+                        and not self._response_requested:
+                    self._response_requested = True
+                    should_kick = True
+            if self._logger:
+                self._logger.event(
+                    "vision_observation_queued",
+                    kind=getattr(observation.kind, "value",
+                                 str(observation.kind)),
+                    severity=observation.severity,
+                    kicked=should_kick)
+            if should_kick:
+                try:
+                    self._drain_pending()
+                except Exception:
+                    with self._lock:
+                        self._response_requested = False
+                        self._response_active = False
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "vision_observation_notify_failed", exc)
+
+    def _on_reliability_advice(self, advice) -> None:
+        """ReliabilityAdvisor fired — queue the headline into
+        pending notes + proactive-surface it if we're idle."""
+        if not self._watcher_deliverable():
+            return
+        try:
+            body = f"📊 {advice.headline}"
+            should_kick = False
+            with self._lock:
+                self._pending_notes.append(body)
+                if not self._response_active \
+                        and not self._response_requested:
+                    self._response_requested = True
+                    should_kick = True
+            if self._logger:
+                self._logger.event(
+                    "reliability_advice_queued",
+                    tool=advice.tool,
+                    error_rate=advice.error_rate,
+                    alternate=advice.suggested_alternate,
+                    kicked=should_kick)
+            if should_kick:
+                try:
+                    self._drain_pending()
+                except Exception:
+                    with self._lock:
+                        self._response_requested = False
+                        self._response_active = False
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "reliability_advice_notify_failed", exc)
+
+    def _on_standing_order_fire(self, order, result) -> bool:
+        """Standing order fired. Queue the user-facing notification
+        into _pending_notes + proactive-surface it if we're idle.
+        Returns True when the reminder was queued/delivered to a path
+        that will surface it, False when delivery is impossible right
+        now (no client, OFF / CONNECTING state). The evaluator uses
+        the return value to decide whether to mark the order as fired
+        or leave it for retry on the next tick — without this, a
+        disconnected client silently bumped fire_count and the
+        reminder was lost forever."""
+        client = self._client
+        deliverable = (client is not None
+                       and getattr(client, "connected", False)
+                       and self._state not in (
+                           LiveApiState.OFF, LiveApiState.ERROR,
+                           LiveApiState.CONNECTING))
+        if not deliverable:
+            if self._logger:
+                self._logger.event(
+                    "standing_order_fire_deferred",
+                    order_id=order.id,
+                    trigger=order.trigger_kind,
+                    state=(self._state.value
+                           if self._state else "?"))
+            return False
+        try:
+            label = order.short_label()
+            body = f"📌 \"{label}\" — {result.detail}"
+            should_kick = False
+            with self._lock:
+                self._pending_notes.append(body)
+                if not self._response_active \
+                        and not self._response_requested:
+                    self._response_requested = True
+                    should_kick = True
+            if self._logger:
+                self._logger.event(
+                    "standing_order_fired",
+                    order_id=order.id,
+                    trigger=order.trigger_kind,
+                    kicked=should_kick)
+            if should_kick:
+                try:
+                    self._drain_pending()
+                except Exception:
+                    with self._lock:
+                        self._response_requested = False
+                        self._response_active = False
+            return True
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "standing_order_notify_failed", exc)
+            return False
+
+    def _wire_proactive_nudges(self) -> None:
+        """Phase-3 wiring: proactive nudges (long-idle, cost-cap
+        approaching, unhealthy tool). Handler queues the nudge body
+        into _pending_notes so the assistant surfaces it in its next
+        reply window. Respects incognito + Gate."""
+        try:
+            from .proactive_nudges import (
+                register_with_sentinel as _register_nudges)
+            _register_nudges(handler=self._on_proactive_nudge)
+            self._track_watcher("proactive_nudges")
+            if self._logger:
+                self._logger.event("proactive_nudges_wired")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "proactive_nudges_wire_failed", exc)
+
+    def _on_proactive_nudge(self, nudge) -> None:
+        """Nudge handler — queues the nudge body into pending notes
+        so it surfaces in the next reply window. When no response is
+        currently active (user is idle), proactively kicks off a
+        response.create so the nudge actually gets spoken instead of
+        sitting in the queue forever."""
+        if not self._watcher_deliverable():
+            return
+        try:
+            body = getattr(nudge, "body", "") or ""
+            if not body:
                 return
-            self._teardown_in_progress = False
+            tag = "💡" if nudge.severity == "low" else "⚠️"
+            should_kick = False
+            with self._lock:
+                self._pending_notes.append(f"{tag} {body}")
+                # If nothing is in flight, surface the nudge now.
+                if not self._response_active \
+                        and not self._response_requested:
+                    self._response_requested = True
+                    should_kick = True
+            if self._logger:
+                self._logger.event(
+                    "proactive_nudge_queued",
+                    kind=getattr(nudge.kind, "value", str(nudge.kind)),
+                    severity=nudge.severity,
+                    kicked=should_kick)
+            if should_kick:
+                # Drain via the existing helper which handles the
+                # response_active flip + pending_notes consumption.
+                try:
+                    self._drain_pending()
+                except Exception:
+                    with self._lock:
+                        self._response_requested = False
+                        self._response_active = False
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("nudge_queue_failed", exc)
+        # Registry-dependent wiring (calendar briefing, file
+        # watcher) runs LATER via _ensure_registry_wiring() once
+        # self._registry is built.
+
+    def _ensure_registry_wiring(self) -> None:
+        """Called by start() after self._registry is constructed.
+        Wires Phase-3 watchers that need a real ToolRegistry to
+        dispatch through. Idempotent: re-runs are no-ops because
+        the Sentinel's register() replaces watchers with the same
+        name."""
+        if getattr(self, "_registry", None) is None:
+            return
+        # Phase-5: hand the registry to the standing-orders
+        # evaluator so its predicates (inbox_match, tool_returns_ok)
+        # can dispatch real tools. Without this they all return
+        # "no registry available" and never fire.
+        try:
+            evaluator = getattr(self, "_standing_orders_evaluator",
+                                None)
+            if evaluator is not None:
+                evaluator.set_registry(self._registry)
+        except Exception:
+            pass
+        # Phase-6: anticipation engine also needs the registry for
+        # its meeting_imminent predicate (calls calendar_list_events).
+        try:
+            engine = getattr(self, "_anticipation_engine", None)
+            if engine is not None:
+                engine.set_registry(self._registry)
+        except Exception:
+            pass
+        # Calendar briefing: poll Google/MS Calendar every ~60s,
+        # surface briefings through the interruption gate.
+        try:
+            from .calendar_briefing_watcher import (
+                register_with_sentinel as _register_briefing)
+            _register_briefing(
+                registry=self._registry,
+                notifier=self._on_briefing_due,
+            )
+            self._track_watcher("calendar_briefing")
+            if self._logger:
+                self._logger.event("calendar_briefing_wired")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "calendar_briefing_wire_failed", exc)
+        # File watcher: polling daemon over rule roots, dispatches
+        # via the tool registry. No watchdog dep.
+        try:
+            from .file_watcher_daemon import (
+                register_with_sentinel as _register_files)
+            from .file_watcher_rules import RulesEngine
+            if not hasattr(self, "_file_rules_engine") \
+                    or self._file_rules_engine is None:
+                self._file_rules_engine = RulesEngine()
+            _register_files(
+                engine=self._file_rules_engine,
+                dispatcher=lambda action, args:
+                    self._registry.call(action, args),
+            )
+            self._track_watcher("file_watcher")
+            if self._logger:
+                self._logger.event("file_watcher_wired")
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "file_watcher_wire_failed", exc)
+
+    def _on_briefing_due(self, briefing, decision) -> None:
+        """Calendar briefing watcher fires this when an upcoming
+        meeting is eligible to be announced. Pushes the briefing
+        body into the assistant's pending-notes queue + proactively
+        surfaces it if no response is currently active."""
+        if not self._watcher_deliverable():
+            return
+        try:
+            if not getattr(briefing, "body", ""):
+                return
+            text = f"📅 {briefing.body}"
+            should_kick = False
+            with self._lock:
+                self._pending_notes.append(text)
+                if not self._response_active \
+                        and not self._response_requested:
+                    self._response_requested = True
+                    should_kick = True
+            if self._logger:
+                self._logger.event(
+                    "briefing_queued",
+                    event_id=briefing.event_id,
+                    starts_in_min=briefing.starts_in_minutes,
+                    channel=getattr(decision, "suggested_channel",
+                                    "voice"),
+                    kicked=should_kick)
+            if should_kick:
+                try:
+                    self._drain_pending()
+                except Exception:
+                    with self._lock:
+                        self._response_requested = False
+                        self._response_active = False
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception("briefing_queue_failed", exc)
+
+    def start(self) -> None:
+        # Fast state-reset section under the lock. We intentionally
+        # DROP the lock before the heavy substrate wiring below — the
+        # original implementation held self._lock across the entire
+        # start() body (audit_log + bus subscribers + connectors +
+        # project indexer + self-learner + audio player + Win32 signal
+        # probes). That serialized 3-10 s of work onto the GUI thread
+        # AND, if any construction raised, left the lock permanently
+        # held — producing the "Application is not responding" overlay
+        # and the freeze-on-second-open the user was hitting.
+        with self._lock:
+            # Response-cycle state ALWAYS resets, even if start() re-entered
+            # while we're already CONNECTING / LISTENING / THINKING. Without
+            # this, a re-entered start() that hits the early-return below
+            # would leave any stale latch in place — and any prior session
+            # that exited without draining (ws bounce, transient error,
+            # response.failed) would silently swallow every subsequent user
+            # turn via _request_model_response's deferred-but-never-sent path.
+            # Heavy substrate (connectors, indexer, audio) is still guarded
+            # to avoid rebuilding it for an already-live session.
             self._response_active = False
             self._pending_notes = []
             self._response_requested = False
+            if self._state not in (LiveApiState.OFF, LiveApiState.ERROR):
+                return
+            self._teardown_in_progress = False
+            # Re-arm the GUI-alive guard. stop() sets this False; without
+            # re-arming here every code path guarded by
+            # `getattr(self, "_gui_alive", True)` (_fire_override_inline,
+            # the cortex-edge pulses, the queued GUI marshals) silently
+            # becomes a permanent no-op after the first stop()/start()
+            # cycle in the same process.
+            self._gui_alive = True
             self._multistep_active = False
             self._nudge_count = 0
             self._turn_text = ""
@@ -632,226 +1527,256 @@ class LiveApiManager(QObject):
             self._task_queue = []
             self._in_queue = False
             self._planning = False
-            if not self._config.enabled:
-                self._emit_error("Live API is disabled (TOUCHLESS_LIVE_API_ENABLED=false)")
-                return
-            backend_kind = (self._config.backend or "cloud").strip().lower()
-            # Cloud needs an OpenAI key. Local doesn't.
-            if backend_kind == "cloud" and not self._config.api_key:
-                self._emit_error("OPENAI_API_KEY is not set")
-                return
+        # Defensive: clear any leftover response watchdog from a prior
+        # session so its callback can't race the new session.
+        self._cancel_response_watchdog()
+        self._cancel_deferred_request_watchdog()
+        # --- Heavy wiring OUTSIDE the lock from here on ---
+        # Phase-1 substrate: ensure the audit log is subscribed so
+        # every tool invocation this session is recorded. Idempotent
+        # — the helper short-circuits if already built.
+        self._ensure_audit_log()
+        if not self._config.enabled:
+            self._emit_error("Live API is disabled (TOUCHLESS_LIVE_API_ENABLED=false)")
+            return
+        backend_kind = (self._config.backend or "cloud").strip().lower()
+        # Cloud needs an OpenAI key. Local doesn't.
+        if backend_kind == "cloud" and not self._config.api_key:
+            self._emit_error("OPENAI_API_KEY is not set")
+            return
 
-            self._logger = LiveApiLogger(
-                log_dir=self._config.log_dir,
-                debug_text_logging=self._config.debug_text_logging,
-            )
-            # Bind the tool-call log session id to this LiveApiManager
-            # session so cross-tool co-occurrence buckets line up with
-            # what the user perceives as one conversation. Best-effort.
+        self._logger = LiveApiLogger(
+            log_dir=self._config.log_dir,
+            debug_text_logging=self._config.debug_text_logging,
+        )
+        # Bind the tool-call log session id to this LiveApiManager
+        # session so cross-tool co-occurrence buckets line up with
+        # what the user perceives as one conversation. Best-effort.
+        try:
+            from .cortex.tool_call_log import set_session_id as _set_tc_sid
+            _set_tc_sid(Path(self._logger.jsonl_log_path).stem)
+        except Exception:
+            pass
+        self._logger.event(
+            "session_start",
+            backend=backend_kind,
+            model=self._config.model if backend_kind == "cloud" else self._config.local_llm_model_filename,
+            send_screen_always=self._config.send_screen_always,
+            send_screen_interval_sec=self._config.send_screen_interval_sec,
+        )
+
+        self._screen = ScreenContext(
+            max_width=self._config.screen_max_width,
+            jpeg_quality=self._config.screen_jpeg_quality,
+            logger=self._logger,
+            debug_save_dir=(self._config.log_dir / "screenshots") if self._config.debug_save_screenshots else None,
+        )
+        self._executor = ToolExecutor(
+            config=self._config,
+            logger=self._logger,
+            screen_context=self._screen,
+            confirm_callback=self._confirm_callback,
+            external_action_router=self._external_action_router,
+            notify_callback=self._push_assistant_note,
+        )
+        # API-first connectors (OpenClaw-style). The registry only exposes
+        # the ones whose available() is True this session; everything else
+        # falls through to the GUI computer-use executor as before.
+        try:
+            from .connectors import build_connector_registry
+            connectors = build_connector_registry(self._executor)
+        except Exception as exc:
+            self._logger.exception("connector_registry_init_failed", exc)
+            connectors = None
+        self._registry = ToolRegistry(self._executor, connectors)
+        # Phase-3+ background watchers (sentinel, standing
+        # orders, anticipation, vision, proactive nudges). Idempotent
+        # — Sentinel.register replaces watchers with the same name,
+        # so re-running on every start() is safe and ensures
+        # persistent reminders fire even after the user closed and
+        # reopened the Iris chat panel.
+        try:
+            self._register_phase_3_watchers()
+            self._wire_proactive_nudges()
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "phase3_watcher_wiring_failed", exc)
+        # Phase-3 wiring that needs the tool registry: register
+        # the calendar-briefing watcher + file-watcher daemon.
+        try:
+            self._ensure_registry_wiring()
+        except Exception as exc:
+            if self._logger:
+                self._logger.exception(
+                    "phase3_registry_wiring_failed", exc)
+        # Fresh session: nothing loaded on demand yet.
+        self._loaded_connector_schemas = []
+        self._iris_planner = None
+        self._memory_summary_sent = False  # re-send on fresh session
+        # Layer 0 router. Lazy-import keeps the manager loadable on
+        # systems where Touchless's voice modules can't initialize
+        # (e.g. headless CI without sounddevice).
+        try:
+            from .command_router import CommandRouter
+            self._command_router = CommandRouter(logger=self._logger)
+        except Exception as exc:
+            self._logger.exception("command_router_init_failed", exc)
+            self._command_router = None
+
+        # Project-RAG: lazily build the shared ProjectMemoryStore,
+        # register the known sibling roots, and spawn ONE daemon
+        # indexer thread that runs incremental re-indexes on a
+        # 5-min interval. All best-effort — a RAG failure must
+        # NEVER block realtime startup. The thread itself is a
+        # no-op when TOUCHLESS_IRIS_MEMORY=0.
+        if (self._project_store is None
+                and self._indexer_thread is None
+                and os.environ.get("TOUCHLESS_IRIS_MEMORY", "1") != "0"):
             try:
-                from .cortex.tool_call_log import set_session_id as _set_tc_sid
-                _set_tc_sid(Path(self._logger.jsonl_log_path).stem)
-            except Exception:
-                pass
-            self._logger.event(
-                "session_start",
-                backend=backend_kind,
-                model=self._config.model if backend_kind == "cloud" else self._config.local_llm_model_filename,
-                send_screen_always=self._config.send_screen_always,
-                send_screen_interval_sec=self._config.send_screen_interval_sec,
-            )
+                self._init_project_indexer()
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception("project_indexer_init_failed", exc)
+                self._project_store = None
 
-            self._screen = ScreenContext(
-                max_width=self._config.screen_max_width,
-                jpeg_quality=self._config.screen_jpeg_quality,
-                logger=self._logger,
-                debug_save_dir=(self._config.log_dir / "screenshots") if self._config.debug_save_screenshots else None,
-            )
-            self._executor = ToolExecutor(
+        # Self-learning daemon — mines project files, git config,
+        # tool call patterns, and email/calendar contacts for
+        # facts. Same lifecycle as the project indexer; gated by
+        # TOUCHLESS_SELF_LEARN_ENABLED (default on). Memory wiring
+        # also requires TOUCHLESS_IRIS_MEMORY to be enabled — the
+        # daemon writes through a MemoryManager and there's nothing
+        # to do without that store.
+        if (self._self_learner_thread is None
+                and os.environ.get("TOUCHLESS_IRIS_MEMORY", "1") != "0"
+                and os.environ.get("TOUCHLESS_SELF_LEARN_ENABLED", "1") != "0"):
+            try:
+                self._init_self_learner()
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception("self_learner_init_failed", exc)
+                self._self_learner = None
+
+        backend_kind = (self._config.backend or "cloud").strip().lower()
+        if backend_kind == "subscription":
+            # Stub — the hosted Touchless proxy doesn't exist yet.
+            # Surface a clear error so the chat panel can show a
+            # "Subscription not yet available — falling back to
+            # local model. Restart Iris to use it." note instead of
+            # silently hanging on session start.
+            self._emit_error(
+                "Touchless subscription backend isn't shipped yet. "
+                "Set OPENAI_API_KEY to use the cloud backend, or "
+                "wait for the bundled local model to ship in a "
+                "future Touchless update.")
+            self._set_state(LiveApiState.ERROR, "Subscription unavailable")
+            return
+        if backend_kind == "local":
+            # Local backend exposes the same shape as RealtimeClient
+            # (start/stop/join, send_audio_chunk, send_tool_result,
+            # request_response, on_event/on_connected/on_closed/
+            # on_error). LiveApiManager treats them interchangeably.
+            from .local_backend import LocalBackend
+            self._client = LocalBackend(
                 config=self._config,
                 logger=self._logger,
-                screen_context=self._screen,
-                confirm_callback=self._confirm_callback,
-                external_action_router=self._external_action_router,
-                notify_callback=self._push_assistant_note,
+                tools=self._current_tool_schemas(),
+                system_instructions=build_system_instructions(),
+                on_event=self._handle_event,
+                on_connected=self._on_ws_connected,
+                on_closed=self._on_ws_closed,
+                on_error=self._on_ws_error,
+                require_audio=not self._text_only,
             )
-            # API-first connectors (OpenClaw-style). The registry only exposes
-            # the ones whose available() is True this session; everything else
-            # falls through to the GUI computer-use executor as before.
+        else:
+            self._client = RealtimeClient(
+                config=self._config,
+                logger=self._logger,
+                tools=self._current_tool_schemas(),
+                system_instructions=build_system_instructions(),
+                on_event=self._handle_event,
+                on_connected=self._on_ws_connected,
+                on_closed=self._on_ws_closed,
+                on_error=self._on_ws_error,
+                text_only=self._text_only,
+                voice_output=self._voice_output,
+            )
+
+        # Reset per-session diagnostic flag so the first audio-drop
+        # event re-logs each new session (helps diagnose 'audio went
+        # silent again' after a stop()/start() cycle).
+        self._audio_drop_logged = False
+        # Spin up the audio output player on demand. Lives as a child
+        # of the manager so it gets cleaned up on stop(). Failure
+        # leaves the player as None and audio deltas become no-ops.
+        if self._voice_output and self._audio_player is None:
             try:
-                from .connectors import build_connector_registry
-                connectors = build_connector_registry(self._executor)
-            except Exception as exc:
-                self._logger.exception("connector_registry_init_failed", exc)
-                connectors = None
-            self._registry = ToolRegistry(self._executor, connectors)
-            # Fresh session: nothing loaded on demand yet.
-            self._loaded_connector_schemas = []
-            self._iris_planner = None
-            self._memory_summary_sent = False  # re-send on fresh session
-            # Layer 0 router. Lazy-import keeps the manager loadable on
-            # systems where Touchless's voice modules can't initialize
-            # (e.g. headless CI without sounddevice).
-            try:
-                from .command_router import CommandRouter
-                self._command_router = CommandRouter(logger=self._logger)
-            except Exception as exc:
-                self._logger.exception("command_router_init_failed", exc)
-                self._command_router = None
-
-            # Project-RAG: lazily build the shared ProjectMemoryStore,
-            # register the known sibling roots, and spawn ONE daemon
-            # indexer thread that runs incremental re-indexes on a
-            # 5-min interval. All best-effort — a RAG failure must
-            # NEVER block realtime startup. The thread itself is a
-            # no-op when TOUCHLESS_IRIS_MEMORY=0.
-            if (self._project_store is None
-                    and self._indexer_thread is None
-                    and os.environ.get("TOUCHLESS_IRIS_MEMORY", "1") != "0"):
-                try:
-                    self._init_project_indexer()
-                except Exception as exc:
-                    if self._logger:
-                        self._logger.exception("project_indexer_init_failed", exc)
-                    self._project_store = None
-
-            # Self-learning daemon — mines project files, git config,
-            # tool call patterns, and email/calendar contacts for
-            # facts. Same lifecycle as the project indexer; gated by
-            # TOUCHLESS_SELF_LEARN_ENABLED (default on). Memory wiring
-            # also requires TOUCHLESS_IRIS_MEMORY to be enabled — the
-            # daemon writes through a MemoryManager and there's nothing
-            # to do without that store.
-            if (self._self_learner_thread is None
-                    and os.environ.get("TOUCHLESS_IRIS_MEMORY", "1") != "0"
-                    and os.environ.get("TOUCHLESS_SELF_LEARN_ENABLED", "1") != "0"):
-                try:
-                    self._init_self_learner()
-                except Exception as exc:
-                    if self._logger:
-                        self._logger.exception("self_learner_init_failed", exc)
-                    self._self_learner = None
-
-            backend_kind = (self._config.backend or "cloud").strip().lower()
-            if backend_kind == "subscription":
-                # Stub — the hosted Touchless proxy doesn't exist yet.
-                # Surface a clear error so the chat panel can show a
-                # "Subscription not yet available — falling back to
-                # local model. Restart Iris to use it." note instead of
-                # silently hanging on session start.
-                self._emit_error(
-                    "Touchless subscription backend isn't shipped yet. "
-                    "Set OPENAI_API_KEY to use the cloud backend, or "
-                    "wait for the bundled local model to ship in a "
-                    "future Touchless update.")
-                self._set_state(LiveApiState.ERROR, "Subscription unavailable")
-                return
-            if backend_kind == "local":
-                # Local backend exposes the same shape as RealtimeClient
-                # (start/stop/join, send_audio_chunk, send_tool_result,
-                # request_response, on_event/on_connected/on_closed/
-                # on_error). LiveApiManager treats them interchangeably.
-                from .local_backend import LocalBackend
-                self._client = LocalBackend(
-                    config=self._config,
-                    logger=self._logger,
-                    tools=self._current_tool_schemas(),
-                    system_instructions=build_system_instructions(),
-                    on_event=self._handle_event,
-                    on_connected=self._on_ws_connected,
-                    on_closed=self._on_ws_closed,
-                    on_error=self._on_ws_error,
-                    require_audio=not self._text_only,
+                from .audio_player import AudioPlayer
+                self._audio_player = AudioPlayer(
+                    sample_rate=self._config.audio_sample_rate,
+                    parent=self,
                 )
-            else:
-                self._client = RealtimeClient(
-                    config=self._config,
-                    logger=self._logger,
-                    tools=self._current_tool_schemas(),
-                    system_instructions=build_system_instructions(),
-                    on_event=self._handle_event,
-                    on_connected=self._on_ws_connected,
-                    on_closed=self._on_ws_closed,
-                    on_error=self._on_ws_error,
-                    text_only=self._text_only,
-                    voice_output=self._voice_output,
-                )
-
-            # Reset per-session diagnostic flag so the first audio-drop
-            # event re-logs each new session (helps diagnose 'audio went
-            # silent again' after a stop()/start() cycle).
-            self._audio_drop_logged = False
-            # Spin up the audio output player on demand. Lives as a child
-            # of the manager so it gets cleaned up on stop(). Failure
-            # leaves the player as None and audio deltas become no-ops.
-            if self._voice_output and self._audio_player is None:
-                try:
-                    from .audio_player import AudioPlayer
-                    self._audio_player = AudioPlayer(
-                        sample_rate=self._config.audio_sample_rate,
-                        parent=self,
-                    )
-                    if not self._audio_player.is_enabled():
-                        # Init failed (no device, format unsupported) — drop
-                        # the reference so we don't try to feed it bytes.
-                        reason = "unknown"
-                        try:
-                            reason = self._audio_player.init_error() or "unknown"
-                        except Exception:
-                            pass
-                        # Surface to terminal too — JSONL logs are easy
-                        # to miss; users hit 'why is voice silent' a lot.
-                        print(
-                            f"AUDIO: player init failed (no device) — {reason}",
-                            file=sys.stderr, flush=True,
-                        )
-                        if self._logger:
-                            self._logger.event(
-                                "audio_player_init_no_device",
-                                reason=reason)
-                        self._audio_player = None
-                    else:
-                        print(
-                            f"AUDIO: player init ok (voice_output={self._voice_output}, "
-                            f"sample_rate={self._config.audio_sample_rate})",
-                            file=sys.stderr, flush=True,
-                        )
-                        if self._logger:
-                            self._logger.event(
-                                "audio_player_init_ok",
-                                voice_output=self._voice_output,
-                                sample_rate=self._config.audio_sample_rate)
-                except Exception as exc:
+                if not self._audio_player.is_enabled():
+                    # Init failed (no device, format unsupported) — drop
+                    # the reference so we don't try to feed it bytes.
+                    reason = "unknown"
+                    try:
+                        reason = self._audio_player.init_error() or "unknown"
+                    except Exception:
+                        pass
+                    # Surface to terminal too — JSONL logs are easy
+                    # to miss; users hit 'why is voice silent' a lot.
                     print(
-                        f"AUDIO: player init crashed — {type(exc).__name__}: {exc}",
+                        f"AUDIO: player init failed (no device) — {reason}",
                         file=sys.stderr, flush=True,
                     )
                     if self._logger:
-                        self._logger.exception("audio_player_init_failed", exc)
+                        self._logger.event(
+                            "audio_player_init_no_device",
+                            reason=reason)
                     self._audio_player = None
-            elif self._voice_output and self._audio_player is not None:
-                if self._logger:
-                    self._logger.event("audio_player_already_alive")
-            elif not self._voice_output and self._logger:
-                self._logger.event("audio_player_skipped_voice_off")
-
-            if self._text_only:
-                # No mic in text-only mode — the user types commands in
-                # the UI instead of speaking. AudioStream stays None and
-                # send_audio_chunk is never called.
-                self._audio = None
-            else:
-                self._audio = AudioStream(
-                    sample_rate=self._config.audio_sample_rate,
-                    chunk_ms=self._config.audio_chunk_ms,
-                    on_chunk=self._on_audio_chunk,
-                    logger=self._logger,
+                else:
+                    print(
+                        f"AUDIO: player init ok (voice_output={self._voice_output}, "
+                        f"sample_rate={self._config.audio_sample_rate})",
+                        file=sys.stderr, flush=True,
+                    )
+                    if self._logger:
+                        self._logger.event(
+                            "audio_player_init_ok",
+                            voice_output=self._voice_output,
+                            sample_rate=self._config.audio_sample_rate)
+            except Exception as exc:
+                print(
+                    f"AUDIO: player init crashed — {type(exc).__name__}: {exc}",
+                    file=sys.stderr, flush=True,
                 )
+                if self._logger:
+                    self._logger.exception("audio_player_init_failed", exc)
+                self._audio_player = None
+        elif self._voice_output and self._audio_player is not None:
+            if self._logger:
+                self._logger.event("audio_player_already_alive")
+        elif not self._voice_output and self._logger:
+            self._logger.event("audio_player_skipped_voice_off")
 
-            self._set_state(LiveApiState.CONNECTING, "Connecting to Realtime API...")
-            if not self._client.start():
-                self._emit_error("WebSocket failed to start")
-                return
+        if self._text_only:
+            # No mic in text-only mode — the user types commands in
+            # the UI instead of speaking. AudioStream stays None and
+            # send_audio_chunk is never called.
+            self._audio = None
+        else:
+            self._audio = AudioStream(
+                sample_rate=self._config.audio_sample_rate,
+                chunk_ms=self._config.audio_chunk_ms,
+                on_chunk=self._on_audio_chunk,
+                logger=self._logger,
+            )
+
+        self._set_state(LiveApiState.CONNECTING, "Connecting to Realtime API...")
+        if not self._client.start():
+            self._emit_error("WebSocket failed to start")
+            return
 
     # ---- response.create gating ------------------------------------------
     # The server allows only ONE response in flight at a time; a second
@@ -863,7 +1788,10 @@ class LiveApiManager(QObject):
 
     def _fire_response_create(self, prefix_notes: Optional[list] = None) -> bool:
         """Actually send the response.create (with optional leading note text).
-        Returns False if the client isn't in a state to send."""
+        Returns False if the client isn't in a state to send, or if the
+        underlying WS send returned False (e.g. ws disconnected mid-send).
+        On a successful send, arms the pre-create watchdog so a missing
+        response.created (silent server drop) can be recovered from."""
         client = self._client
         if client is None or not getattr(client, "connected", False):
             return False
@@ -872,12 +1800,239 @@ class LiveApiManager(QObject):
         try:
             if prefix_notes:
                 client.send_text_message("\n\n".join(prefix_notes))
-            client.request_response()
+            ok = bool(client.request_response())
+            if not ok:
+                if self._logger:
+                    try:
+                        self._logger.event("request_response_send_failed")
+                    except Exception:
+                        pass
+                return False
+            self._arm_response_create_watchdog()
             return True
         except Exception as exc:
             if self._logger:
                 self._logger.exception("request_response_failed", exc)
             return False
+
+    def _arm_response_watchdog(self, response_id: str) -> None:
+        """Arm a one-shot timer that recovers a stuck THINKING state.
+
+        Called from the response.created handler. If response.done never
+        arrives (server stalled / read thread parked on recv() with no
+        bytes / model emitted nothing for a slow tool plan), this fires
+        and force-clears the latch so the next user turn isn't silently
+        deferred forever."""
+        self._cancel_response_watchdog()
+
+        def _fire() -> None:
+            # Bail if we already returned to LISTENING via the normal path.
+            if not self._response_active:
+                return
+            if self._logger:
+                try:
+                    self._logger.event(
+                        "response_watchdog_timeout",
+                        response_id=response_id,
+                        sec=self._RESPONSE_TIMEOUT_SEC,
+                    )
+                except Exception:
+                    pass
+            client = self._client
+            if client is not None:
+                try:
+                    client.cancel_response()
+                except Exception:
+                    pass
+            with self._lock:
+                self._response_active = False
+                self._response_requested = False
+            # Drop any armed deterministic-summary override that belonged
+            # to the stalled turn so it can't fire against the next reply.
+            self._pending_override_text = None
+            self._override_armed_response_id = ""
+            self._last_override_tool = ""
+            msg = (
+                "I lost the thread on that one — say it again and I'll "
+                "give it another shot."
+            )
+            try:
+                self.assistant_text.emit(msg)
+            except Exception:
+                pass
+            try:
+                self._set_state(LiveApiState.LISTENING, "Listening")
+            except Exception:
+                pass
+
+        try:
+            t = threading.Timer(self._RESPONSE_TIMEOUT_SEC, _fire)
+            t.daemon = True
+            self._response_watchdog = t
+            t.start()
+        except Exception as exc:
+            if self._logger:
+                try:
+                    self._logger.exception("response_watchdog_arm_failed", exc)
+                except Exception:
+                    pass
+
+    def _cancel_response_watchdog(self) -> None:
+        """Disarm the response-cycle watchdog. Safe to call repeatedly."""
+        t = self._response_watchdog
+        self._response_watchdog = None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _arm_response_create_watchdog(self) -> None:
+        """Arm a one-shot timer that recovers a stuck THINKING when
+        response.create was sent but response.created never arrived.
+
+        The post-create watchdog (_arm_response_watchdog) is armed inside
+        the response.created handler — if that event never lands, the
+        latch stays wedged True with NO recovery. This pre-create timer
+        unwedges _response_active, defensively cancels any phantom server
+        response, surfaces a friendly retry message, and drops back to
+        LISTENING."""
+        self._cancel_response_create_watchdog()
+
+        def _fire() -> None:
+            # Bail if response.created already landed (the handler nulls
+            # this timer) or if we're already idle via some other path.
+            if self._response_create_watchdog is None:
+                return
+            if not self._response_active:
+                return
+            if self._logger:
+                try:
+                    self._logger.event(
+                        "response_create_watchdog_timeout",
+                        sec=self._RESPONSE_CREATE_TIMEOUT_SEC,
+                    )
+                except Exception:
+                    pass
+            client = self._client
+            if client is not None:
+                try:
+                    client.cancel_response()
+                except Exception:
+                    pass
+            with self._lock:
+                self._response_active = False
+                self._response_requested = False
+            # Drop any armed deterministic-summary override that belonged
+            # to the never-started turn so it can't fire against a later one.
+            self._pending_override_text = None
+            self._override_armed_response_id = ""
+            self._last_override_tool = ""
+            try:
+                self.assistant_text.emit(
+                    "I didn't get a response back from the server — "
+                    "say it again and I'll give it another shot."
+                )
+            except Exception:
+                pass
+            try:
+                self._set_state(LiveApiState.LISTENING, "Listening")
+            except Exception:
+                pass
+
+        try:
+            t = threading.Timer(self._RESPONSE_CREATE_TIMEOUT_SEC, _fire)
+            t.daemon = True
+            self._response_create_watchdog = t
+            t.start()
+        except Exception as exc:
+            if self._logger:
+                try:
+                    self._logger.exception(
+                        "response_create_watchdog_arm_failed", exc)
+                except Exception:
+                    pass
+
+    def _cancel_response_create_watchdog(self) -> None:
+        """Disarm the response.create -> response.created watchdog.
+        Safe to call repeatedly."""
+        t = self._response_create_watchdog
+        self._response_create_watchdog = None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _arm_deferred_request_watchdog(self) -> None:
+        """Arm a one-shot timer that recovers a wedged deferred request.
+
+        When _request_model_response is called while _response_active is
+        already True, the new request is stashed in _response_requested and
+        nothing is sent — the design assumes the active response will land
+        a response.done and _drain_pending will fire the deferred request.
+        But if the active response NEVER drains (server cancelled / failed
+        with an unhandled terminal event, ws bounce inherited a stale
+        latch, parallel tool-call orchestration glitched), no recovery
+        path exists and every subsequent user turn just stacks behind the
+        stuck latch forever — the 45 s response watchdog can't help
+        because it's only armed inside the response.created handler.
+
+        This timer force-clears the latch and drains the queued request
+        so the user's turn actually reaches the server."""
+        self._cancel_deferred_request_watchdog()
+
+        def _fire() -> None:
+            stuck = False
+            with self._lock:
+                if self._response_active and self._response_requested:
+                    # Force-clear the stale latch so _drain_pending below
+                    # can fire (it only re-enters the active state from a
+                    # clean baseline).
+                    self._response_active = False
+                    stuck = True
+            if not stuck:
+                return
+            if self._logger:
+                try:
+                    self._logger.event(
+                        "deferred_request_watchdog_force_clear",
+                        sec=self._DEFERRED_REQUEST_TIMEOUT_SEC,
+                    )
+                except Exception:
+                    pass
+            try:
+                self._drain_pending()
+            except Exception as exc:
+                if self._logger:
+                    try:
+                        self._logger.exception(
+                            "deferred_request_drain_failed", exc)
+                    except Exception:
+                        pass
+
+        try:
+            t = threading.Timer(self._DEFERRED_REQUEST_TIMEOUT_SEC, _fire)
+            t.daemon = True
+            self._deferred_request_watchdog = t
+            t.start()
+        except Exception as exc:
+            if self._logger:
+                try:
+                    self._logger.exception(
+                        "deferred_request_watchdog_arm_failed", exc)
+                except Exception:
+                    pass
+
+    def _cancel_deferred_request_watchdog(self) -> None:
+        """Disarm the deferred-request watchdog. Safe to call repeatedly."""
+        t = self._deferred_request_watchdog
+        self._deferred_request_watchdog = None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
 
     def _request_model_response(self) -> None:
         """Ask for a model turn. If a response is already active (e.g. this is
@@ -887,8 +2042,18 @@ class LiveApiManager(QObject):
         with self._lock:
             if self._response_active:
                 self._response_requested = True
-                return
-            self._response_active = True  # optimistic; cleared on response.done
+                deferred = True
+            else:
+                self._response_active = True  # optimistic; cleared on response.done
+                deferred = False
+        if deferred:
+            # Defense-in-depth: a deferred request has NO other escape
+            # timer (the 45s response watchdog only arms inside
+            # response.created, the pre-create watchdog only arms after a
+            # successful send). Without this, a stale True latch silently
+            # swallows every subsequent user turn forever.
+            self._arm_deferred_request_watchdog()
+            return
         if not self._fire_response_create():
             with self._lock:
                 self._response_active = False
@@ -897,6 +2062,10 @@ class LiveApiManager(QObject):
         """Called on response.done. Fire a single follow-up response.create if
         anything was deferred while the just-finished response was active —
         coalescing all queued notes and any deferred request into ONE turn."""
+        # A drain means whatever the deferred-request watchdog was guarding
+        # is now being handled — cancel it so it can't fire against the
+        # follow-up turn.
+        self._cancel_deferred_request_watchdog()
         with self._lock:
             notes = self._pending_notes
             requested = self._response_requested
@@ -906,8 +2075,14 @@ class LiveApiManager(QObject):
             self._response_requested = False
             self._response_active = True  # optimistic; cleared on next done
         if not self._fire_response_create(prefix_notes=notes):
+            # Delivery failed (client disconnected, state OFF, etc.).
+            # Re-queue the notes so a future drain can replay them
+            # instead of silently dropping reminders / nudges.
             with self._lock:
                 self._response_active = False
+                if notes:
+                    self._pending_notes = list(notes) + self._pending_notes
+                    self._response_requested = True
 
     # Phrases that mean the model considers the multi-step task finished — so
     # we stop nudging instead of pestering it after it's actually done.
@@ -1006,17 +2181,26 @@ class LiveApiManager(QObject):
                     if len(sv) > 120:
                         sv = sv[:120] + "..."
                     facts.append(f"{k}={sv}")
-        note = f'(iris planner handled: "{ut}". tools: {", ".join(tool_parts) or "none"}.'
-        if facts:
-            # Cap fact list so the note stays small.
-            note += f" facts: {'; '.join(facts[:6])}."
+        # Format as an explicit turn-pair so the realtime LLM treats
+        # this as part of the conversation history (e.g. for "what
+        # have I asked you?" recaps), not as background-only context.
+        # Previously wrapped in parens, which the LLM skipped from
+        # turn-counting answers.
         rep = (reply or "").strip()
-        if rep:
-            if len(rep) > 200:
-                rep = rep[:200] + "..."
-            note += f" reply to user: {rep}"
-        note += ")"
-        return note[:600]
+        if len(rep) > 200:
+            rep = rep[:200] + "..."
+        lines = [
+            f'PRIOR TURN — user asked: "{ut}"',
+            f'Iris answered: {rep or "(no spoken reply)"}',
+        ]
+        if tool_parts:
+            lines.append(
+                f"(tools that ran: {', '.join(tool_parts)})")
+        if facts:
+            lines.append(
+                f"(facts: {'; '.join(facts[:6])})")
+        note = "\n".join(lines)
+        return note[:800]
 
     def _maybe_send_memory_summary(self) -> None:
         """Inject a compact memory-context note into the realtime session
@@ -1055,6 +2239,19 @@ class LiveApiManager(QObject):
             if self._logger:
                 self._logger.event("memory_summary_skip_empty")
             return
+        # Anti-fabrication anchor: the summary above renders ONLY semantic
+        # facts (episodes are excluded by construction). Without this
+        # explicit gap-disclosure, the model treats absence-of-evidence as
+        # license to invent plausible details when asked to recap a prior
+        # conversation. Pair this note with the HARD RULE — NEVER
+        # FABRICATE PERSONAL / RECALL CONTEXT in SYSTEM_INSTRUCTIONS.
+        note = (note + "\n(SCOPE: the list above is the COMPLETE set of "
+                       "personal notes you have on this user from prior "
+                       "conversations. If the user asks about a topic, "
+                       "person, place, or event that is NOT in this list, "
+                       "you do NOT have notes on it — do NOT invent "
+                       "details; ask the user to remind you instead of "
+                       "guessing.)")
         try:
             client.send_session_note(note)
             self._memory_summary_sent = True
@@ -1132,10 +2329,16 @@ class LiveApiManager(QObject):
             if self._state == LiveApiState.OFF:
                 return
             self._teardown_in_progress = True
+            self._gui_alive = False
             self._response_active = False
             self._pending_notes = []
             self._response_requested = False
             self._multistep_active = False
+            # Cancel the response-cycle watchdog so a pending timer
+            # cannot fire against a torn-down session.
+            self._cancel_response_watchdog()
+            self._cancel_response_create_watchdog()
+            self._cancel_deferred_request_watchdog()
             audio = self._audio
             client = self._client
             screen_thread = self._screen_thread
@@ -1150,6 +2353,13 @@ class LiveApiManager(QObject):
             self._screen = None
             self._command_router = None
             self._audio_player = None
+            # Drop strong refs to the proactive engines so any late
+            # sentinel callback that does manage to slip through the
+            # unregister race below sees None and bails — also lets
+            # the next session start() build fresh engines.
+            self._anticipation_engine = None
+            self._vision_observer = None
+            self._standing_orders_evaluator = None
             # Don't drop the logger yet — we still want the stop events
             # written. Cleared once everything joined.
             self._screen_stop.set()
@@ -1166,6 +2376,68 @@ class LiveApiManager(QObject):
             self._set_state(LiveApiState.OFF, "Off")
 
         # Heavy/joining work outside the lock.
+        # Unregister every proactive watcher this manager wired into
+        # the process-global Sentinel. The Sentinel is a singleton
+        # with its own daemon thread; without this, its ticks keep
+        # invoking bound methods of `self` (calendar_briefing,
+        # standing_orders, anticipation, vision_observer,
+        # proactive_nudges, reliability_advisor, …) forever —
+        # pinning the manager, accumulating notes in _pending_notes,
+        # and racing into a torn-down Qt event dispatcher on
+        # subsequent reopens. The daemon itself is left running
+        # because the same instance is reused by the next session.
+        try:
+            from .sentinel import global_sentinel
+            _sent = global_sentinel()
+            # Snapshot + clear so a concurrent start() that begins
+            # re-registering watchers can't have its new entries
+            # yanked out from under it.
+            with self._lock:
+                _names = list(self._registered_watcher_names)
+                self._registered_watcher_names = []
+            _unregistered: list[str] = []
+            for _name in _names:
+                try:
+                    if _sent.unregister(_name):
+                        _unregistered.append(_name)
+                except Exception:
+                    pass
+            if logger is not None and _unregistered:
+                logger.event("sentinel_watchers_unregistered",
+                             watchers=_unregistered)
+        except Exception:
+            if logger is not None:
+                logger.warning("sentinel_teardown_exception")
+        # Detach bus subscribers we attached in _ensure_audit_log so
+        # the process-global InvocationBus does not accumulate dead
+        # subscribers (with their captured `self` references) across
+        # Iris reopens. Without this, every subsequent tool publish
+        # fans out to ALL stale managers; each tries to emit Qt
+        # signals on already-destroyed QObjects — the classic
+        # PySide6 "freeing memory of an object that still has
+        # receivers connected" crash signature.
+        try:
+            _audit = getattr(self, "_audit_log", None)
+            if _audit is not None:
+                try:
+                    _audit.close()  # close() also unsubscribes
+                except Exception:
+                    pass
+            for _sub_attr in ("_reauth_nudger", "_skill_consolidator"):
+                _sub = getattr(self, _sub_attr, None)
+                if _sub is not None and hasattr(_sub, "detach_from_bus"):
+                    try:
+                        _sub.detach_from_bus()
+                    except Exception:
+                        pass
+            # Drop the strong refs so the lambda/notifier captures
+            # release `self` and this manager can be GC'd.
+            self._audit_log = None
+            self._reauth_nudger = None
+            self._skill_consolidator = None
+        except Exception:
+            if logger is not None:
+                logger.warning("bus_subscriber_teardown_exception")
         # Tear down the audio output player so the Qt event loop can
         # drain its tail before subsequent work.
         if player is not None:
@@ -1556,6 +2828,7 @@ class LiveApiManager(QObject):
                 # the user sees actual traveling neurons at each hop
                 # instead of a single overlapping flash.
                 from PySide6.QtCore import QTimer as _QT_router
+                from PySide6.QtWidgets import QApplication as _QApp_router
                 def _router_path_pulses(label=action_label):
                     try:
                         cortex_emit.edge_pulse("core", "cap-tools",
@@ -1581,12 +2854,41 @@ class LiveApiManager(QObject):
                         except Exception:
                             pass
                     try:
-                        _QT_router.singleShot(300, _step2)
-                        _QT_router.singleShot(600, _step3)
-                        _QT_router.singleShot(1000, _step4)
+                        _app = _QApp_router.instance()
+                        if _app is not None and getattr(
+                                self, "_gui_alive", True):
+                            _QT_router.singleShot(300, _app, _step2)
+                            _QT_router.singleShot(600, _app, _step3)
+                            _QT_router.singleShot(1000, _app, _step4)
+                        else:
+                            _step2()
+                            _step3()
+                            _step4()
                     except Exception:
                         pass
-                _router_path_pulses()
+                # _worker runs on a planner worker thread; the
+                # QTimer.singleShot calls inside _router_path_pulses
+                # need the GUI thread's event dispatcher. Marshal the
+                # whole helper onto the manager's owning thread via a
+                # queued invokeMethod hop so timers are constructed
+                # under a live dispatcher; if torn down, no-op.
+                try:
+                    _own_thread = self.thread()
+                except Exception:
+                    _own_thread = None
+                if (_own_thread is not None
+                        and QThread.currentThread() is not _own_thread
+                        and getattr(self, "_gui_alive", True)):
+                    try:
+                        QMetaObject.invokeMethod(
+                            self, "_run_router_path_pulses_on_gui_thread",
+                            Qt.QueuedConnection,
+                            Q_ARG(str, action_label),
+                        )
+                    except Exception:
+                        pass
+                else:
+                    _router_path_pulses()
                 self.tool_event.emit("called", {"name": f"router/{action_label}", "info": routed.message, "source": "touchless"})
                 self.tool_event.emit("completed", {"name": f"router/{action_label}", "status": "ok", "source": "touchless"})
                 if self._logger:
@@ -1623,6 +2925,10 @@ class LiveApiManager(QObject):
         # docs/IRIS_PLANNER_DESIGN.md. Default on; disable with
         # TOUCHLESS_IRIS_PLANNER=0 to force the old LLM path for debugging.
         if os.environ.get("TOUCHLESS_IRIS_PLANNER", "1") != "0" and self._registry is not None:
+            # Watchdog-fired sentinel is hoisted out of the try so the
+            # post-except check can read it even when planner init /
+            # memory summary raised before the timer was armed.
+            _planner_watchdog_fired = {"v": False}
             try:
                 if self._iris_planner is None:
                     from .planner.orchestrator import IrisPlanner
@@ -1649,11 +2955,74 @@ class LiveApiManager(QObject):
                 # this session. Idempotent: _memory_summary_sent guards
                 # against re-firing on subsequent user turns.
                 self._maybe_send_memory_summary()
-                handled = self._iris_planner.try_handle(text)
+                # ---- planner-handle watchdog ----
+                # try_handle() runs the classifier + LLM planner +
+                # executor + orchestrator (which itself does SQLite +
+                # cot.db writes and a session-note WS send on the
+                # return path). None of those hops have their own
+                # timeout, and if any of them blocks the UI pill is
+                # pinned to THINKING forever (see the 12:09:44 →
+                # 12:12:57 stall after a successful sheets_create).
+                # The existing WS watchdogs (_response_watchdog /
+                # _deferred_request_watchdog / _response_create_
+                # watchdog) only guard the realtime response cycle
+                # and never arm on the planner path. Mirror them
+                # here so this path recovers too.
+                try:
+                    _planner_watchdog_sec = float(
+                        os.environ.get("TOUCHLESS_PLANNER_HANDLE_TIMEOUT",
+                                       "45"))
+                except Exception:
+                    _planner_watchdog_sec = 45.0
+
+                def _planner_watchdog_fire() -> None:
+                    _planner_watchdog_fired["v"] = True
+                    if self._logger:
+                        try:
+                            self._logger.event(
+                                "planner_handle_watchdog_timeout",
+                                sec=_planner_watchdog_sec,
+                                text=(text or "")[:60])
+                        except Exception:
+                            pass
+                    try:
+                        self.assistant_text.emit(
+                            "That one took longer than expected — "
+                            "give it another shot.")
+                    except Exception:
+                        pass
+                    try:
+                        self._set_state(LiveApiState.LISTENING,
+                                         "Ready (type a command)")
+                    except Exception:
+                        pass
+
+                _planner_watchdog: Optional[threading.Timer]
+                try:
+                    _planner_watchdog = threading.Timer(
+                        _planner_watchdog_sec, _planner_watchdog_fire)
+                    _planner_watchdog.daemon = True
+                    _planner_watchdog.start()
+                except Exception:
+                    _planner_watchdog = None
+                try:
+                    handled = self._iris_planner.try_handle(text)
+                finally:
+                    if _planner_watchdog is not None:
+                        try:
+                            _planner_watchdog.cancel()
+                        except Exception:
+                            pass
             except Exception as exc:
                 if self._logger:
                     self._logger.exception("iris_planner_unhandled", exc)
                 handled = None
+            # If the watchdog fired we already emitted a friendly reply
+            # and dropped back to LISTENING. Any late return from
+            # try_handle would double-emit and confuse the user, so
+            # swallow it here.
+            if _planner_watchdog_fired.get("v"):
+                return
             if handled is not None:
                 # Unified shape: Phase 1 (classifier) returns a 1-step list,
                 # Phase 2 (LLM plan + Executor) returns N steps. Either way we
@@ -1671,6 +3040,7 @@ class LiveApiManager(QObject):
                         "name": step.tool, "call_id": pid,
                         "status": out.get("status", sr.status or "ok"),
                         "source": source,
+                        "error": out.get("error") or "",
                     })
                     if self._logger:
                         self._logger.event("routing_decision", **cost_policy.decision_record(
@@ -1729,31 +3099,356 @@ class LiveApiManager(QObject):
             if ok:
                 self._request_model_response()
             return
+        # Refresh the model's clock before each turn — but ONLY when
+        # the turn is plausibly time-sensitive. Unconditional injection
+        # was costing input tokens every turn (the note is ~250 chars,
+        # billed per turn server-side) for prompts that don't need it.
+        # Gating on a tiny regex keeps "what time is it"/"how long
+        # until" accurate without per-turn bloat on e.g. "add a meeting
+        # at 3pm" (which already names the time the model needs).
+        try:
+            if self._looks_time_sensitive(text):
+                import datetime as _dt
+                _now = _dt.datetime.now().astimezone()
+                time_note = (
+                    f"Time check (use for any 'what time is it' / 'when' / "
+                    f"'how long until' question this turn — do NOT call a "
+                    f"tool to check the clock): "
+                    f"{_now.strftime('%A, %B %d, %Y at %I:%M %p %Z').strip()} "
+                    f"(ISO: {_now.isoformat(timespec='seconds')})."
+                )
+                client.send_session_note(time_note)
+        except Exception:
+            pass
+        # Per-turn calendar-rules hook: the verbose CALENDAR RULES block
+        # used to live in SYSTEM_INSTRUCTIONS and was paid for on EVERY
+        # turn even though most turns aren't calendar-related. Inject it
+        # only when the turn actually mentions a calendar verb.
+        try:
+            if self._looks_like_calendar(text):
+                self._send_calendar_context_note(client)
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("calendar_context_inject_failed", exc)
+        # Per-turn recall hook: when the user asks a recall-shaped
+        # question ("remind me what…", "what did we discuss…",
+        # "last time", "earlier"), the planner isn't invoked, so the
+        # realtime model has no visibility into episodic memory. Pull
+        # episodes here and inject them — OR explicitly inject an
+        # "empty context" signal — so the model can ground its answer
+        # or admit ignorance instead of fabricating. See HARD RULE —
+        # NEVER FABRICATE PERSONAL / RECALL CONTEXT in
+        # SYSTEM_INSTRUCTIONS.
+        try:
+            if self._looks_like_recall(text):
+                self._send_recall_context_note(client, text)
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("recall_context_inject_failed", exc)
         ok = bool(client.send_text_message(text))
         if ok:
             # Track for fact-extraction on response.done. Only capture turns
             # that ACTUALLY went to realtime — planner-handled requests
             # already record themselves via the orchestrator's _record_turn.
             self._last_user_text = text
+            self._last_input_was_voice = False
             self._record_convo_turn("user", text)
             self._request_model_response()
         return
+
+    # ---- recall-context injection ----------------------------------------
+    # Recall-shaped phrases that should trigger an episodic memory lookup
+    # before the realtime model gets the user's text. Pattern matched at
+    # word boundaries against the lowercased turn.
+    # Artifact noun list used by the retrieval-shaped patterns below.
+    # Kept narrow so phrases like "show me the weather" or "show me what's
+    # playing" do NOT trigger recall — only nouns naming a generated
+    # textual artifact (email/poem/draft/code/...) should match.
+    _ARTIFACT_NOUN_GROUP = (
+        r"(?:email|emails|message|messages|reply|replies|response|responses|"
+        r"draft|drafts|note|notes|memo|memos|letter|letters|"
+        r"poem|poems|haiku|haikus|song|songs|lyric|lyrics|"
+        r"essay|essays|article|articles|post|posts|tweet|tweets|"
+        r"caption|captions|speech|speeches|toast|toasts|"
+        r"story|stories|script|scripts|"
+        r"summary|summaries|outline|outlines|agenda|agendas|"
+        r"recipe|recipes|paragraph|paragraphs|sentence|sentences|"
+        r"code|snippet|snippets|function|functions|"
+        r"query|queries|regex|sql|text)"
+    )
+    _RECALL_TRIGGER_PATTERNS = (
+        r"\bremind me\b",
+        r"\bwhat did (?:we|i|you) (?:say|discuss|talk about|mention|do)\b",
+        r"\bwhat (?:was|were) (?:that|those|the) (?:thing|things)\b",
+        r"\bwhat was the (?:thing|leak|issue|problem|deal|story)\b",
+        r"\blast time\b",
+        r"\bearlier (?:we|i|you|today|this week)\b",
+        r"\bwe (?:talked|discussed|spoke|chatted) about\b",
+        r"\bdid (?:we|i) (?:talk|discuss|mention|cover)\b",
+        r"\b(?:do you|you) remember\b",
+        r"\brecall\b",
+        r"\bwho (?:is|was) [A-Z]?\w+\b",
+        # Artifact-retrieval verbs ("show me / pull up / read me / find that
+        # / where's that / read back / what did you write"). Noun-gated to
+        # the artifact list so non-artifact uses ("show me the weather",
+        # "show me what's playing") do NOT match.
+        (r"\b(?:show|read|pull up|pull|bring up|find|get|grab|open|display)"
+         r"\s+(?:me|us)?\s*(?:that|the|my|our)?\s*"
+         + _ARTIFACT_NOUN_GROUP + r"\b"),
+        r"\bread (?:it|that|them|the " + _ARTIFACT_NOUN_GROUP + r") back\b",
+        (r"\bwhere(?:'s| is| are)?\s+(?:that|the|my)\s+"
+         + _ARTIFACT_NOUN_GROUP + r"\b"),
+        (r"\bwhat did you (?:write|draft|compose|make|generate|produce|"
+         r"come up with)\b"),
+        (r"\bthe " + _ARTIFACT_NOUN_GROUP +
+         r"\s+(?:you|we)\s+(?:wrote|drafted|composed|made|generated)\b"),
+    )
+
+    def _looks_like_recall(self, text: str) -> bool:
+        """True when the user's turn looks like a recall/recap question
+        that needs episodic memory to answer faithfully."""
+        if not text:
+            return False
+        low = text.strip().lower()
+        if len(low) < 5:
+            return False
+        for pat in self._RECALL_TRIGGER_PATTERNS:
+            if re.search(pat, low):
+                return True
+        return False
+
+    # Per-turn time_note gating — only inject the clock when the turn
+    # plausibly needs it (avoid paying ~250 chars/turn server-side for
+    # turns that already name an explicit time, like "add a meeting at
+    # 3pm" or have no time component at all).
+    _TIME_SENSITIVE_PATTERNS = (
+        r"\bwhat (?:time|day|date)\b",
+        r"\bwhat'?s the (?:time|date|day)\b",
+        r"\b(?:when|how long)\b",
+        r"\b(?:today|tonight|tomorrow|yesterday)\b",
+        r"\b(?:this|next|last)\s+(?:morning|afternoon|evening|night|"
+        r"week|weekend|month|year|monday|tuesday|wednesday|thursday|"
+        r"friday|saturday|sunday)\b",
+        r"\b(?:in|after)\s+(?:an?\s+|\d+\s+)?(?:hour|minute|day|week)s?\b",
+        r"\b(?:o'?clock|noon|midnight)\b",
+    )
+
+    def _looks_time_sensitive(self, text: str) -> bool:
+        """True when the turn references relative time and might need
+        the current clock injected."""
+        if not text:
+            return False
+        low = text.strip().lower()
+        if len(low) < 3:
+            return False
+        for pat in self._TIME_SENSITIVE_PATTERNS:
+            if re.search(pat, low):
+                return True
+        return False
+
+    # Per-turn calendar-rules gating — the CALENDAR RULES block used to
+    # live in SYSTEM_INSTRUCTIONS (~1.8K chars). Now injected only when
+    # the turn actually mentions a calendar verb.
+    _CALENDAR_TRIGGER_PATTERNS = (
+        r"\bcalendar\b",
+        r"\bmeeting\b",
+        r"\bappointment\b",
+        r"\bevent\b",
+        r"\bschedule\b",
+        r"\b(?:reschedule|rescheduled)\b",
+        r"\b(?:remind me|reminder)\s+(?:to|at|on|about|that|of)\b",
+        r"\b(?:add|book|create|set up|put|stick)\s+(?:a |an )?"
+        r"(?:meeting|appointment|event|reminder|invite|invitation)\b",
+        r"\b(?:cancel|delete|move|reschedule)\s+(?:my |the |a |an )?"
+        r"(?:meeting|appointment|event)\b",
+        r"\b(?:what'?s on|do i have|anything on|what do i have)\b.*"
+        r"\b(?:calendar|schedule|today|tomorrow|this week)\b",
+    )
+
+    def _looks_like_calendar(self, text: str) -> bool:
+        """True when the turn looks like a calendar create/list/modify
+        request, gating the per-turn CALENDAR-context injection."""
+        if not text:
+            return False
+        low = text.strip().lower()
+        if len(low) < 5:
+            return False
+        for pat in self._CALENDAR_TRIGGER_PATTERNS:
+            if re.search(pat, low):
+                return True
+        return False
+
+    # Calendar tool-priority + override grammar — injected per-turn
+    # when _looks_like_calendar matches. Replaces the bulky CALENDAR
+    # RULES block that previously rode in SYSTEM_INSTRUCTIONS on every
+    # turn regardless of intent.
+    _CALENDAR_CONTEXT_NOTE = (
+        "Calendar context for this turn:\n"
+        "CREATE — pick the tool that lands the event in a calendar the "
+        "user actually views:\n"
+        "  1) EXPLICIT OVERRIDE WINS: 'in google'/'gcal' → "
+        "calendar_create_event. 'in outlook' → outlook_com_create_event. "
+        "'microsoft 365'/'work calendar' → ms_calendar_create.\n"
+        "  2) Otherwise default by toolset, in priority order:\n"
+        "     (a) calendar_create_event (Google) — PREFERRED when "
+        "available (syncs to phone + browser + New Outlook view).\n"
+        "     (b) ms_calendar_create — when (a) is missing.\n"
+        "     (c) outlook_com_create_event — last resort. On New "
+        "Outlook this may fall back to an .ics file; warn the user "
+        "it may not sync to their phone.\n"
+        "  3) If a tool returns requires_user_confirm=true (.ics "
+        "fallback), tell the user 'Outlook just opened a confirmation "
+        "— hit Save & Close to add it' instead of claiming success.\n"
+        "  4) ALWAYS mention WHICH calendar in your reply (use the "
+        "tool result's `calendar` field).\n"
+        "LIST/CHECK — when no platform is named, query BOTH "
+        "ms_calendar_list AND calendar_list_events (Google), merge by "
+        "start time, mention sources only if events come from both. "
+        "If the user names a specific calendar, query only that one."
+    )
+
+    def _send_calendar_context_note(self, client: Any) -> None:
+        """Inject the calendar tool-priority/override grammar as a
+        session note so the realtime model only pays for it on turns
+        that actually involve a calendar verb."""
+        if not hasattr(client, "send_session_note"):
+            return
+        try:
+            client.send_session_note(self._CALENDAR_CONTEXT_NOTE)
+            if self._logger:
+                self._logger.event("calendar_context_injected",
+                                   chars=len(self._CALENDAR_CONTEXT_NOTE))
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("calendar_context_send_failed", exc)
+
+    def _send_recall_context_note(self, client: Any, text: str) -> None:
+        """Pull episodes via MemoryManager.recall and inject them — or
+        an explicit 'NONE' signal — as a session note so the realtime
+        model can ground a recall answer (or admit it has nothing) per
+        the HARD RULE on personal/recall fabrication."""
+        planner = self._iris_planner
+        memory = getattr(planner, "_memory", None) if planner is not None else None
+        if memory is None or not hasattr(memory, "recall"):
+            return
+        if not hasattr(client, "send_session_note"):
+            return
+        try:
+            result = memory.recall(text, k=3) or {}
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("recall_context_lookup_failed", exc)
+            return
+        episodes = result.get("episodes") or []
+        context = (result.get("context") or "").strip()
+        # Weak-similarity hedge: even with episodes, a top sim near the
+        # floor (_RECALL_MIN_SIM ~ 0.1) usually means tangential matches,
+        # not a real memory of the topic the user is asking about. Tell
+        # the model so it hedges accordingly.
+        top_sim = 0.0
+        if episodes:
+            try:
+                top_sim = max(float(e.get("sim", 0.0) or 0.0) for e in episodes)
+            except (TypeError, ValueError):
+                top_sim = 0.0
+        if not episodes or not context:
+            note = ("Recall context for this turn: NONE. You have NO "
+                    "episodic notes matching the user's recall question. "
+                    "Per the HARD RULE on personal/recall fabrication, do "
+                    "NOT invent details, scenarios, or specifics. Ask the "
+                    "user to remind you (e.g. 'I don't have anything on "
+                    "that in my notes — can you walk me through it "
+                    "again?').")
+        else:
+            weak = top_sim < 0.25
+            hedge = ""
+            if weak:
+                hedge = (f" Recall is WEAK (top similarity {top_sim:.2f} "
+                         f"— likely tangential, not a real match). Treat "
+                         f"this as if context were empty unless the "
+                         f"snippets clearly cover the user's question. "
+                         f"When in doubt, ask the user to remind you.")
+            note = ("Recall context for this turn — use ONLY these "
+                    "snippets when answering the user's recall question; "
+                    "if they don't cover what was asked, say so plainly "
+                    "and ask the user to remind you (do NOT invent "
+                    "details to fill the gap):\n" + context + hedge)
+        # Artifact lookup: for retrieval-shaped turns ("show me the email
+        # we drafted", "pull up that poem"), the user wants the literal
+        # draft body — not a 120-char truncated outcome from the episodic
+        # context. Pull matching llm_draft semantic rows so the model can
+        # read them back verbatim. Bounded to drafts[:2] / 4000 chars each
+        # so the session note stays sane.
+        drafts: List[Any] = []
+        if hasattr(memory, "find_llm_drafts_matching"):
+            try:
+                drafts = memory.find_llm_drafts_matching(text, k=3) or []
+            except Exception as exc:  # pragma: no cover - defensive
+                if self._logger:
+                    self._logger.exception("recall_draft_lookup_failed", exc)
+                drafts = []
+        if drafts:
+            draft_lines = [
+                "",
+                "",
+                "Draft artifacts matching this request — read back "
+                "LITERALLY, do NOT paraphrase or invent a story about "
+                "whether it was finished:",
+            ]
+            for d in drafts[:2]:
+                key = getattr(d, "key", "") or ""
+                val = getattr(d, "value", "") or ""
+                draft_lines.append(f"[{key}]")
+                draft_lines.append(val)
+            note = note + "\n".join(draft_lines)
+        try:
+            client.send_session_note(note)
+            if self._logger:
+                self._logger.event("recall_context_injected",
+                                   episodes=len(episodes),
+                                   drafts=len(drafts),
+                                   top_sim=round(top_sim, 3),
+                                   chars=len(note))
+        except Exception as exc:  # pragma: no cover - defensive
+            if self._logger:
+                self._logger.exception("recall_context_send_failed", exc)
 
     def _record_convo_turn(self, role: str, text: str) -> None:
         """Append a turn to the rolling conversation buffer used by the
         Jarvis prose renderer for natural follow-up references. Trims
         to the most recent _CONVO_BUFFER_MAX entries. Safe to call from
-        any thread — list append is atomic in CPython."""
+        any thread — list append is atomic in CPython.
+
+        Phase-3: ALSO records into the global SessionBuffer so the
+        Tier-2 planner gets the same conversation context on its
+        next turn. Without this, voice/realtime-handled turns were
+        invisible to the planner's recall block."""
         if not text:
             return
         snip = text.strip().replace("\r", " ").replace("\n", " ")
-        if len(snip) > 280:
-            snip = snip[:277] + "..."
+        # 2000-char cap (raised from 280) so a chat-generated email /
+        # poem / code block survives the in-session 'show me what you
+        # just drafted' before durable memory has indexed it. The
+        # rolling buffer is itself length-capped by _CONVO_BUFFER_MAX
+        # entries downstream so this can't grow unbounded.
+        if len(snip) > 2000:
+            snip = snip[:1997] + "..."
         try:
             self._convo_buffer.append(f"{role}: {snip}")
             if len(self._convo_buffer) > self._CONVO_BUFFER_MAX:
                 # Trim from the front, keep the tail.
                 del self._convo_buffer[:-self._CONVO_BUFFER_MAX]
+        except Exception:
+            pass
+        # Mirror into the SessionBuffer so Tier-2 planner recalls
+        # see voice/realtime turns too. Incognito-honored inside.
+        try:
+            from .session_buffer import global_session_buffer
+            sb = global_session_buffer()
+            if role == "user":
+                sb.add_user(text)
+            else:
+                sb.add_assistant(text)
         except Exception:
             pass
 
@@ -1934,11 +3629,32 @@ class LiveApiManager(QObject):
     def _on_ws_closed(self, reason: Optional[str]) -> None:
         if self._logger:
             self._logger.event("session_ws_closed", reason=reason)
+        # Disarm the response-cycle watchdog so it can't fire against a
+        # closed/torn-down session.
+        self._cancel_response_watchdog()
+        self._cancel_response_create_watchdog()
+        self._cancel_deferred_request_watchdog()
+        # Clear the response-cycle latch so a reconnect that doesn't run
+        # through start()'s reset block (or a re-attempt that beats the
+        # state guard) can't inherit a stuck True flag and silently swallow
+        # every subsequent user turn. Same for queued notes — they belong
+        # to a torn-down session.
+        with self._lock:
+            self._response_active = False
+            self._response_requested = False
+            self._pending_notes = []
         if self._state != LiveApiState.OFF:
             # Spontaneous close — surface as error so user can retry.
             self._set_state(LiveApiState.ERROR, f"Connection closed ({reason or 'unknown'})")
 
     def _on_ws_error(self, message: str) -> None:
+        self._cancel_response_watchdog()
+        self._cancel_response_create_watchdog()
+        self._cancel_deferred_request_watchdog()
+        with self._lock:
+            self._response_active = False
+            self._response_requested = False
+            self._pending_notes = []
         self._emit_error(message)
 
     # ---- audio ----
@@ -2030,8 +3746,45 @@ class LiveApiManager(QObject):
         # Transcripts of the user's speech (audio in -> text).
         if kind == "conversation.item.input_audio_transcription.completed":
             transcript = str(event.get("transcript") or "")
+            # Flag the next tool dispatch as voice-sourced so safety
+            # gate runs the spoof-defense + surfaces the "[voice
+            # command]" warning banner.
+            self._last_input_was_voice = True
             if self._logger:
                 self._logger.text("transcript_user", transcript)
+            # Phase-4 wiring: pass the realtime transcript through
+            # the TranscriptionRouter. The realtime model doesn't
+            # expose a fast/accurate tier split — it returns one
+            # transcript per turn. But the router's escalation rules
+            # (email / URL / file path / digit-run / destructive
+            # verb) still spot AMBIGUOUS tokens the user should
+            # verify. Log it so the UI can surface a confirm chip.
+            try:
+                from .transcription_router import (
+                    TranscriptionRouter, TranscriptTier)
+                router = TranscriptionRouter()
+                decision = router.decide(
+                    audio_seconds=0.0,
+                    fast_text=transcript)
+                if decision.tier == TranscriptTier.ACCURATE \
+                        and self._logger:
+                    self._logger.event(
+                        "realtime_transcript_flagged",
+                        reason=decision.reason,
+                        transcript_len=len(transcript))
+                # Emit a flagged signal for the UI when the
+                # ambiguity reason was a typed-token risk
+                # (email/URL/path/digits) — those are the ones
+                # where the user really should verify.
+                risky = decision.reason and any(
+                    x in decision.reason for x in
+                    ("email", "URL", "path", "digit"))
+                if risky and self._logger:
+                    self._logger.event(
+                        "realtime_transcript_risky",
+                        reason=decision.reason)
+            except Exception:
+                pass
             self.transcript_received.emit(transcript)
             return
 
@@ -2077,6 +3830,7 @@ class LiveApiManager(QObject):
             override = self._pending_override_text
             self._pending_override_text = None
             self._last_override_tool = ""
+            self._override_armed_response_id = ""
             if override:
                 try:
                     import sys as _sys
@@ -2202,20 +3956,42 @@ class LiveApiManager(QObject):
         # right after their assistant_text.emit(...).
 
         if kind == "response.created":
+            # Disarm the pre-create watchdog FIRST so it can't race against
+            # the post-create handler / a later response in the same tick.
+            self._cancel_response_create_watchdog()
             self._response_active = True
             self._turn_text = ""  # reset per-response assistant text
-            # Defensive: clear any stale summary override that didn't get
-            # consumed on the prior response (shouldn't happen in normal
-            # flow, but a malformed event stream could leave one set).
-            self._pending_override_text = None
-            self._last_override_tool = ""
+            # Bump the turn counter so any _fire_override_inline queued
+            # against the PRIOR turn (WS reader thread already returned;
+            # queued GUI slot hasn't run yet) sees the mismatch and
+            # no-ops instead of flashing state onto this new turn.
+            self._turn_id += 1
+            new_resp_id = str((event.get("response") or {}).get("id") or "")
+            self._active_response_id_seen = new_resp_id
+            # Defensive: clear any STALE summary override left over from a
+            # prior response. An override armed inside the CURRENT dispatch
+            # (e.g. a confirm-gated deterministic-summary tool whose modal
+            # blocked the read thread across a response boundary) must
+            # survive this event so its consumer in response.text.done /
+            # response.done can fire it.
+            armed_id = self._override_armed_response_id
+            if self._pending_override_text is not None and armed_id and armed_id != new_resp_id:
+                self._pending_override_text = None
+                self._last_override_tool = ""
+                self._override_armed_response_id = ""
             # Each new response is a NEW reply — start a fresh chat bubble so
             # replies don't concatenate into one growing box.
             self.assistant_message_break.emit()
             self._set_state(LiveApiState.THINKING, "Thinking")
+            # Arm the response-cycle watchdog so a server-side stall
+            # between created and done can't leave the latch wedged.
+            self._arm_response_watchdog(new_resp_id)
             return
 
         if kind == "response.done":
+            # The response landed before our watchdog fired — disarm it
+            # so a delayed timer can't yank the next turn back to LISTENING.
+            self._cancel_response_watchdog()
             resp = event.get("response") or {}
             output = resp.get("output") or []
             output_kinds = [str(item.get("type") or "") for item in output if isinstance(item, dict)]
@@ -2233,6 +4009,7 @@ class LiveApiManager(QObject):
             if override and status in ("cancelled", "incomplete"):
                 self._pending_override_text = None
                 self._last_override_tool = ""
+                self._override_armed_response_id = ""
                 try:
                     import sys as _sys
                     print(f"[OVERRIDE] fired (cancelled) chars={len(override)}",
@@ -2282,6 +4059,24 @@ class LiveApiManager(QObject):
                     usage=resp.get("usage"),
                 )
             self._response_active = False
+            # Consume the intentional-cancel latch set on the safety-gate
+            # decline path. We already spoke a friendly "cancelled" message
+            # inline via _fire_override_inline; retrying here would spawn a
+            # phantom response.create and wedge the next user turn behind a
+            # stuck _response_active latch.
+            if self._intentional_cancel_pending:
+                self._intentional_cancel_pending = False
+                if status in ("cancelled", "failed", "incomplete"):
+                    if self._logger:
+                        try:
+                            self._logger.event(
+                                "intentional_cancel_absorbed", status=status)
+                        except Exception:
+                            pass
+                    self._failed_retries = 0
+                    self._set_state(LiveApiState.LISTENING, "Listening")
+                    self._drain_pending()
+                    return
             # A FAILED/empty response (server rejected, rate-limited, or
             # transient) is NOT a text-only yield — never nudge on it. Retry
             # with EXPONENTIAL BACKOFF (the realtime API fails rapid
@@ -2409,6 +4204,19 @@ class LiveApiManager(QObject):
                 "conversation_already_has_active_response",
             }
             if code in _benign_codes:
+                # `conversation_already_has_active_response` means our
+                # response.create was rejected — response.created will
+                # NEVER arrive, so the pre-create watchdog must be
+                # disarmed and the optimistically-latched
+                # _response_active flipped back, or Iris wedges on
+                # THINKING. Re-arm _response_requested so the next
+                # response.done from the existing in-flight turn drains
+                # the deferred work.
+                if code == "conversation_already_has_active_response":
+                    self._cancel_response_create_watchdog()
+                    with self._lock:
+                        self._response_active = False
+                        self._response_requested = True
                 return
             details = message
             if code:
@@ -2437,6 +4245,22 @@ class LiveApiManager(QObject):
     # then short-circuits the LLM text and emits/speaks the summary.
     _DETERMINISTIC_SUMMARY_TOOLS = {
         "weather_get", "gmail_list", "ms_mail_list", "email_summary",
+        "gmail_send", "ms_mail_send", "outlook_send", "teams_send",
+        "contacts_create", "tasks_add", "tasks_complete", "tasks_delete",
+        "tasks_list",
+        "forms_create", "photos_upload",
+        "calendar_create_event", "ms_calendar_create",
+        # Docs/Sheets/Slides append + update tools. Same latency pattern
+        # as gmail_send: connector returns fast, but the realtime reply
+        # cycle can wedge on conversation_already_has_active_response
+        # after successful tool completion. Short-circuit with the
+        # _format_message summary so the pill returns to LISTENING
+        # within ~50ms of tool return instead of hanging on THINKING.
+        "gdocs_create", "gdocs_append_text",
+        "sheets_create", "sheets_append_rows", "sheets_update_range",
+        "slides_create", "slides_add_slide",
+        "slides_set_slide_text", "slides_replace_text",
+        "drive_upload",
     }
 
     def _confirm_connector_action(self, name: str, args: Dict[str, Any]) -> bool:
@@ -2543,6 +4367,139 @@ class LiveApiManager(QObject):
                      + (f", e.g. {tool_names[0]}." if tool_names else ".")),
         }
 
+    def _fire_override_inline(self, text: str, name: str, call_id: str,
+                              actions: Optional[List[Any]] = None) -> None:
+        """Marshal the inline-override delivery onto the GUI thread.
+
+        The real body (now `_fire_override_inline_on_gui_thread`)
+        constructs QTimers via `_emit_reply_output_pulse` and emits Qt
+        signals. This method is invoked from the WS reader thread, which
+        has no Qt event dispatcher — calling singleShot from there logs
+        "Timers cannot be started from another thread" while the window
+        is open and, after the assistant window's dispatcher is torn
+        down, dereferences freed Qt internals and can crash the process.
+        Marshal everything onto self.thread() (the GUI thread that owns
+        LiveApiManager) via a queued invokeMethod hop. If the GUI side
+        has already been torn down, drop the call silently.
+
+        Snapshots `_turn_id` at queue time so the queued GUI slot can
+        detect a fresh user turn racing in and no-op instead of flashing
+        stale LISTENING state (and a stale bubble) on top of it.
+        """
+        if not getattr(self, "_gui_alive", True):
+            return
+        queued_turn_id = int(getattr(self, "_turn_id", 0))
+        try:
+            QMetaObject.invokeMethod(
+                self, "_fire_override_inline_on_gui_thread",
+                Qt.QueuedConnection,
+                Q_ARG(str, text), Q_ARG(str, name),
+                Q_ARG(str, call_id), Q_ARG(object, actions),
+                Q_ARG(int, queued_turn_id),
+            )
+        except Exception:
+            pass
+
+    @Slot(str, str, str, object, int)
+    def _fire_override_inline_on_gui_thread(
+            self, text: str, name: str, call_id: str,
+            actions: Optional[List[Any]] = None,
+            queued_turn_id: int = 0) -> None:
+        """Deliver a deterministic-summary override IMMEDIATELY instead of
+        arming it for the realtime text.done / response.done consumer.
+
+        Used when the confirm-gated dispatch path straddled a response
+        boundary — the normal arm-and-wait flow loses the override to the
+        `response.created` defensive wipe or to the orphaned-tool-result
+        race. Mirrors the consumer at the top of response.text.done:
+        emits a fresh assistant bubble, speaks via _speak_text, records
+        the turn, emits action chips, and returns the state pill to
+        LISTENING.
+
+        Always runs on the GUI thread (via `_fire_override_inline`'s
+        queued invokeMethod hop).
+
+        `queued_turn_id` is the `_turn_id` snapshot taken when the WS
+        reader thread queued this call. If the current `_turn_id` has
+        advanced (a new user turn's response.created landed between the
+        queue and now), the whole slot no-ops — otherwise the pill would
+        flash to LISTENING and a stale decline bubble would drop on top
+        of the fresh turn.
+        """
+        if not getattr(self, "_gui_alive", True):
+            return
+        current_turn_id = int(getattr(self, "_turn_id", 0))
+        if queued_turn_id and queued_turn_id != current_turn_id:
+            if self._logger:
+                try:
+                    self._logger.event(
+                        "override_inline_stale_skipped",
+                        tool=name, queued=queued_turn_id,
+                        current=current_turn_id)
+                except Exception:
+                    pass
+            return
+        try:
+            import sys as _sys
+            print(f"[OVERRIDE] inline tool={name} chars={len(text)}",
+                  file=_sys.stderr, flush=True)
+        except Exception:
+            pass
+        if self._logger:
+            try:
+                self._logger.event(
+                    "deterministic_summary_override_fired_inline",
+                    tool=name, chars=len(text))
+            except Exception:
+                pass
+        try:
+            self.tool_event.emit("override", {
+                "name": name, "call_id": call_id,
+                "chars": len(text), "reason": "confirm_gated_inline",
+            })
+        except Exception:
+            pass
+        # Clear any stale armed override so a future response.created
+        # wipe check stays correct.
+        self._pending_override_text = None
+        self._last_override_tool = ""
+        self._override_armed_response_id = ""
+        try:
+            self.assistant_message_break.emit()
+            self.assistant_text.emit(text)
+        except Exception:
+            pass
+        try:
+            self._emit_reply_output_pulse(text)
+        except Exception:
+            pass
+        if os.environ.get("TOUCHLESS_REALTIME_AUDIO", "0") != "1":
+            try:
+                self._speak_text(text)
+            except Exception as exc:
+                if self._logger:
+                    try:
+                        self._logger.exception(
+                            "override_inline_speak_failed", exc)
+                    except Exception:
+                        pass
+        try:
+            self._record_convo_turn("assistant", text)
+        except Exception:
+            pass
+        if actions:
+            try:
+                self.suggested_actions.emit(list(actions))
+            except Exception:
+                pass
+        elif self._pending_actions:
+            try:
+                self.suggested_actions.emit(list(self._pending_actions))
+            except Exception:
+                pass
+            self._pending_actions = []
+        self._set_state(LiveApiState.LISTENING, "Listening")
+
     def _dispatch_function_call(self, event: Dict[str, Any]) -> None:
         name = str(event.get("name") or "")
         call_id = str(event.get("call_id") or "")
@@ -2565,10 +4522,34 @@ class LiveApiManager(QObject):
         self.tool_event.emit("called", {"name": name, "call_id": call_id, "source": source})
         self._set_state(LiveApiState.EXECUTING, f"Executing tool: {name}")
 
+        # Phase-1 substrate: start a ToolInvocation observation so the
+        # audit log / activity pill / undo registry see every realtime
+        # tool dispatch through the same contract as the planner path.
+        # Best-effort; the dispatch must work even if the bus is down.
+        rt_inv: Optional[ToolInvocation] = None
+        try:
+            rt_inv = ToolInvocation.starting(
+                tool=name, args=args,
+                source=InvocationSource.REALTIME,
+                turn_id=(self._active_response_id
+                         if hasattr(self, "_active_response_id")
+                         else None),
+            )
+        except Exception:
+            rt_inv = None
+
         executor = self._executor
         client = self._client
         if executor is None or client is None:
             return
+
+        # Whether THIS dispatch went through a blocking confirm path
+        # (narrow _CONFIRM_BEFORE_TOOLS modal OR the universal safety_gate
+        # for DESTRUCTIVE/IRREVERSIBLE tools). The deterministic-summary
+        # override below uses this to fire INLINE for gated tools — the
+        # blocking modal would otherwise straddle a realtime response
+        # boundary and lose the override to the response.created wipe.
+        was_gated = False
 
         try:
             if name == "find_capability":
@@ -2587,15 +4568,41 @@ class LiveApiManager(QObject):
                 }
             elif name in self._CONFIRM_BEFORE_TOOLS and not self._confirm_connector_action(name, args):
                 # Irreversible action (e.g. sending email) the user declined.
+                was_gated = True
                 output = {"status": "cancelled", "code": "user_declined",
                           "error": "User declined; not sent."}
             else:
-                # Route through the registry so API connectors (Gmail, etc.)
-                # handle their own tools; everything else falls through to the
-                # GUI/built-in executor.
-                registry = self._registry
-                output = (registry.call(name, args) if registry is not None
-                          else executor.execute(name, args))
+                if name in self._CONFIRM_BEFORE_TOOLS:
+                    was_gated = True
+                # Phase-1 trust gate (universal): pre-invocation confirm
+                # for DESTRUCTIVE / IRREVERSIBLE tools the model picks.
+                # This catches tools NOT in the older narrow
+                # _CONFIRM_BEFORE_TOOLS list (which only covered email
+                # sends). Failure-open when no UI callback installed.
+                from .safety_gate import gate as _safety_gate, needs_confirmation as _needs_confirm
+                if _needs_confirm(name, args):
+                    was_gated = True
+                # Phase-1 source tagging: voice input gets the
+                # spoof-defense + "[voice command]" banner; typed
+                # input does NOT (it's the user's keyboard — no
+                # need to warn them they typed it). _last_input_was_voice
+                # is set in the audio-transcription event handler /
+                # cleared by send_user_text.
+                _source = ("voice" if self._last_input_was_voice
+                           else "typed")
+                _allowed, _decline = _safety_gate(name, args,
+                                                  source=_source)
+                if not _allowed:
+                    output = {"status": "cancelled",
+                              "code": "user_declined_speed_bump",
+                              "error": _decline or "user declined"}
+                else:
+                    # Route through the registry so API connectors (Gmail, etc.)
+                    # handle their own tools; everything else falls through to the
+                    # GUI/built-in executor.
+                    registry = self._registry
+                    output = (registry.call(name, args) if registry is not None
+                              else executor.execute(name, args))
         except Exception as exc:  # defensive — executor already catches
             output = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
         # On-demand vision: when the model explicitly asks to look at the
@@ -2627,7 +4634,38 @@ class LiveApiManager(QObject):
             self._logger.event("routing_decision", **cost_policy.decision_record(
                 tool=name, source=source, status=str(output.get("status", "")),
                 call_id=call_id))
-        self.tool_event.emit("completed", {"name": name, "call_id": call_id, "status": output.get("status"), "source": source})
+        self.tool_event.emit("completed", {"name": name, "call_id": call_id, "status": output.get("status"), "source": source, "error": (output.get("error") if isinstance(output, dict) else "") or ""})
+
+        # Mirror the realtime-created artifact (sheet/doc/slide/etc.) into
+        # the planner's _last_artifacts map so 'open it' / 'open the sheet'
+        # resolves regardless of which tier originally created the thing.
+        # Without this, only planner-handled creations populate the tracker
+        # and the realtime path leaves a stale prior artifact winning.
+        planner = self._iris_planner
+        if planner is not None and isinstance(output, dict) and output.get("link"):
+            recorder = getattr(planner, "record_artifact_from_result", None)
+            if callable(recorder):
+                try:
+                    recorder(name, output)
+                except Exception as exc:
+                    if self._logger:
+                        self._logger.exception(
+                            "realtime_artifact_record_failed", exc)
+
+        # Phase-1 substrate: complete + publish the realtime ToolInvocation
+        # observation. Audit log + activity pill subscribe to this; no-op
+        # if the observation failed to start.
+        if rt_inv is not None:
+            try:
+                rt_inv.complete(
+                    status=str((output or {}).get("status") or "ok"),
+                    output=output,
+                    error=(output or {}).get("error"),
+                )
+                _publish_invocation(rt_inv)
+            except Exception as exc:
+                if self._logger:
+                    self._logger.exception("realtime_invocation_publish_failed", exc)
 
         # ---- deterministic-summary override ----
         # Weather/email "summary" tools return a pre-formatted string that
@@ -2639,6 +4677,120 @@ class LiveApiManager(QObject):
         # a non-summary tool fired most recently — so 'send me an email
         # with today's weather' speaks the gmail_send result, not the
         # weather summary captured earlier.
+        # ---- universal connector-error short-circuit ----
+        # Connector error/cancelled results carry no `summary` field, so
+        # the deterministic-summary gate below would let them fall through
+        # to the realtime LLM — which then has to narrate the failure and
+        # often loops or stalls. Intercept here: compose a tiny, friendly
+        # line from `error`/`code`, arm the override, cancel any in-flight
+        # response, and return. We still send the tool result back so the
+        # model's conversation log stays consistent.
+        try:
+            if isinstance(output, dict) and str(
+                    output.get("status") or "").lower() in ("error", "cancelled"):
+                err_msg = str(output.get("error") or "").strip()
+                code = str(output.get("code") or "").strip()
+                friendly = _format_connector_error(name, code, err_msg)
+                # User declined a safety-gate modal? The WS reader thread
+                # was BLOCKED inside the modal across the prior response's
+                # lifecycle, so arming _pending_override_text and calling
+                # response.cancel + response.create leaves the session in
+                # the exact stalled state documented at the was_gated
+                # branch below (orphaned function_call_output +
+                # response.created never arrives -> pre-create watchdog
+                # fires on the NEXT user turn with "I didn't get a
+                # response back from the server"). Fire the friendly
+                # cancel inline on the GUI thread instead — clears state,
+                # returns to LISTENING, does not touch the deferred-
+                # request machinery.
+                gated_decline = (
+                    was_gated
+                    or code in ("user_declined", "user_declined_speed_bump")
+                )
+                if gated_decline:
+                    # latch first so a missing/raising cancel_fn can't leak a phantom retry
+                    self._intentional_cancel_pending = True
+                # Still cancel the in-flight response so the LLM doesn't
+                # burn tokens generating a reply we've already spoken.
+                # (For non-gated errors this is unchanged from before.)
+                if self._response_active:
+                    try:
+                        cancel_fn = getattr(client, "cancel_response", None)
+                        if callable(cancel_fn):
+                            cancel_fn()
+                    except Exception as exc:
+                        if self._logger:
+                            try:
+                                self._logger.exception(
+                                    "error_override_cancel_failed", exc)
+                            except Exception:
+                                pass
+                # Still submit the tool_result so the model's
+                # conversation log stays consistent.
+                try:
+                    client.send_tool_result(call_id, output)
+                except Exception:
+                    pass
+                try:
+                    self.tool_event.emit("override", {
+                        "name": name, "call_id": call_id,
+                        "chars": len(friendly),
+                        "reason": (
+                            "user_declined_inline" if gated_decline
+                            else "connector_error"
+                        ),
+                    })
+                except Exception:
+                    pass
+                if self._logger:
+                    try:
+                        self._logger.event(
+                            ("user_declined_override_inline" if gated_decline
+                             else "connector_error_override_armed"),
+                            tool=name, code=code, chars=len(friendly))
+                    except Exception:
+                        pass
+                if gated_decline:
+                    # Fire on GUI thread: clears _pending_override_text /
+                    # _override_armed_response_id / _last_override_tool,
+                    # emits the friendly message, speaks it, records the
+                    # turn, sets state to LISTENING. Skip
+                    # _request_model_response — no follow-up LLM reply is
+                    # needed; the next user turn drives its own
+                    # response.create.
+                    self._fire_override_inline(friendly, name, call_id)
+                    # Also proactively clear any stale response-cycle
+                    # latches left over from the cancel we just sent, so
+                    # a next user turn doesn't defer behind a phantom
+                    # _response_active.
+                    with self._lock:
+                        self._response_active = False
+                        self._response_requested = False
+                    self._cancel_response_create_watchdog()
+                    self._cancel_deferred_request_watchdog()
+                    return
+                # Non-gated connector error: keep the historical
+                # arm-and-wait behavior so those cases still flow through
+                # response.done -> override consumer -> drain, unchanged
+                # from before.
+                self._pending_override_text = friendly
+                self._last_override_tool = name
+                self._override_armed_response_id = self._active_response_id_seen
+                self._request_model_response()
+                self._set_state(LiveApiState.THINKING, "Thinking")
+                return
+        except Exception as exc:
+            if self._logger:
+                try:
+                    self._logger.exception("error_override_detect_failed", exc)
+                except Exception:
+                    pass
+
+        # If the deterministic-summary override fires inline below (gated
+        # path), we MUST NOT also ask the LLM for a follow-up reply — that
+        # would double-respond and trigger the orphaned-call_id race the
+        # confirm-gated path was losing to.
+        fired_inline = False
         try:
             if isinstance(output, dict) and name in self._DETERMINISTIC_SUMMARY_TOOLS:
                 summary_val = output.get("summary")
@@ -2660,55 +4812,74 @@ class LiveApiManager(QObject):
                         )
                     except Exception:
                         composed = base
-                    self._pending_override_text = composed or base
-                    self._last_override_tool = name
+                    composed_text = composed or base
                     # Stash any suggested action chips so the chat UI can
                     # render Connect buttons / read-screen prompts beneath
                     # the composed reply when it fires.
+                    actions: List[Any] = []
                     try:
-                        actions = output.get("suggested_actions") or []
-                        if isinstance(actions, list) and actions:
-                            self._pending_actions = list(actions)
+                        raw_actions = output.get("suggested_actions") or []
+                        if isinstance(raw_actions, list) and raw_actions:
+                            actions = list(raw_actions)
                     except Exception:
-                        pass
-                    try:
-                        import sys as _sys
-                        print(f"[OVERRIDE] tool={name} chars={len(self._pending_override_text)}",
-                              file=_sys.stderr, flush=True)
-                    except Exception:
-                        pass
-                    if self._logger:
+                        actions = []
+                    if was_gated:
+                        # Confirm gate (modal QMessageBox) blocked this
+                        # WS read thread across the prior response's
+                        # lifecycle. The armed-then-text.done consumer
+                        # path is unsafe here: the next response.created
+                        # would either wipe the override or the orphaned
+                        # function_call_output would stall the new
+                        # response. Fire the override INLINE — emit the
+                        # bubble + speak it + return to LISTENING — and
+                        # skip the follow-up response.create entirely.
+                        self._fire_override_inline(
+                            composed_text, name, call_id, actions)
+                        fired_inline = True
+                    else:
+                        self._pending_override_text = composed_text
+                        self._last_override_tool = name
+                        self._override_armed_response_id = self._active_response_id_seen
+                        if actions:
+                            self._pending_actions = actions
                         try:
-                            self._logger.event(
-                                "deterministic_summary_override_armed",
-                                tool=name, chars=len(self._pending_override_text))
+                            import sys as _sys
+                            print(f"[OVERRIDE] tool={name} chars={len(self._pending_override_text)}",
+                                  file=_sys.stderr, flush=True)
                         except Exception:
                             pass
-                    # Cancel the LLM's in-flight reply so we don't pay
-                    # tokens for text we'll discard. Only fire when a
-                    # response is actually active — calling cancel
-                    # otherwise produces a benign but user-visible
-                    # `response_cancel_not_active` error event.
-                    if self._response_active:
+                        if self._logger:
+                            try:
+                                self._logger.event(
+                                    "deterministic_summary_override_armed",
+                                    tool=name, chars=len(self._pending_override_text))
+                            except Exception:
+                                pass
+                        # Cancel the LLM's in-flight reply so we don't pay
+                        # tokens for text we'll discard. Only fire when a
+                        # response is actually active — calling cancel
+                        # otherwise produces a benign but user-visible
+                        # `response_cancel_not_active` error event.
+                        if self._response_active:
+                            try:
+                                cancel_fn = getattr(client, "cancel_response", None)
+                                if callable(cancel_fn):
+                                    cancel_fn()
+                            except Exception as exc:
+                                if self._logger:
+                                    try:
+                                        self._logger.exception(
+                                            "override_cancel_failed", exc)
+                                    except Exception:
+                                        pass
+                        # Surface override in the tool-event stream for UI/debug.
                         try:
-                            cancel_fn = getattr(client, "cancel_response", None)
-                            if callable(cancel_fn):
-                                cancel_fn()
-                        except Exception as exc:
-                            if self._logger:
-                                try:
-                                    self._logger.exception(
-                                        "override_cancel_failed", exc)
-                                except Exception:
-                                    pass
-                    # Surface override in the tool-event stream for UI/debug.
-                    try:
-                        self.tool_event.emit("override", {
-                            "name": name, "call_id": call_id,
-                            "chars": len(self._pending_override_text),
-                        })
-                    except Exception:
-                        pass
+                            self.tool_event.emit("override", {
+                                "name": name, "call_id": call_id,
+                                "chars": len(self._pending_override_text),
+                            })
+                        except Exception:
+                            pass
             elif name not in self._DETERMINISTIC_SUMMARY_TOOLS:
                 # A non-override tool ran AFTER (or instead of) a summary
                 # tool — its reply should NOT be hijacked by a stale
@@ -2722,6 +4893,7 @@ class LiveApiManager(QObject):
                         except Exception:
                             pass
                     self._pending_override_text = None
+                    self._override_armed_response_id = ""
                 self._last_override_tool = ""
         except Exception as exc:  # never let override logic break the loop
             if self._logger:
@@ -2738,7 +4910,8 @@ class LiveApiManager(QObject):
         # colliding response.create calls.
         client.send_tool_result(call_id, output)
         self._request_model_response()
-        self._set_state(LiveApiState.THINKING, "Thinking")
+        if not fired_inline:
+            self._set_state(LiveApiState.THINKING, "Thinking")
 
         # If the tool just changed something on screen, schedule a fresh
         # screenshot so the model sees the result of its own action.
@@ -3018,15 +5191,42 @@ class LiveApiManager(QObject):
         floor 1.5s, ceiling 30s). Without text, falls back to a fixed
         1.2s window.
         """
+        if not getattr(self, "_gui_alive", True):
+            return
+        try:
+            own_thread = self.thread()
+        except Exception:
+            own_thread = None
+        if own_thread is not None and QThread.currentThread() is not own_thread:
+            try:
+                QMetaObject.invokeMethod(
+                    self, "_emit_reply_output_pulse_on_gui_thread",
+                    Qt.QueuedConnection,
+                    Q_ARG(str, text),
+                )
+            except Exception:
+                pass
+            return
+        self._emit_reply_output_pulse_on_gui_thread(text)
+
+    @Slot(str)
+    def _emit_reply_output_pulse_on_gui_thread(self, text: str = "") -> None:
+        if not getattr(self, "_gui_alive", True):
+            return
         # Schedule each leg with a delay so the user sees neurons
         # TRAVELING through the path. Also flip core to SPEAKING
         # (purple) at the start, then back to LISTENING (blue) after
         # the path completes — so the core's color matches what's
         # actually happening (delivering output).
         from PySide6.QtCore import QTimer as _QT
+        from PySide6.QtWidgets import QApplication as _QApp
         def _later(ms, fn):
             try:
-                _QT.singleShot(ms, fn)
+                _app = _QApp.instance()
+                if _app is not None:
+                    _QT.singleShot(ms, _app, fn)
+                else:
+                    fn()
             except Exception:
                 pass
         def _safe_pulse(a, b, color="magenta", ms=300):
@@ -3090,6 +5290,55 @@ class LiveApiManager(QObject):
             except Exception:
                 pass
         _later(speak_ms, _return_to_listening)
+
+    @Slot(str)
+    def _run_router_path_pulses_on_gui_thread(self, label: str) -> None:
+        """GUI-thread executor for the router cortex-pulse path.
+
+        Mirrors the inline _router_path_pulses helper in
+        `_run_send_user_text_inner`: same staggered sequence using
+        QTimer.singleShot bound to the QApplication. Invoked via
+        QMetaObject.invokeMethod from the planner worker so the
+        timers are constructed under the GUI thread's live event
+        dispatcher rather than the worker's missing one.
+        """
+        if not getattr(self, "_gui_alive", True):
+            return
+        from PySide6.QtCore import QTimer as _QT_router
+        from PySide6.QtWidgets import QApplication as _QApp_router
+        try:
+            cortex_emit.edge_pulse("core", "cap-tools",
+                                    color="orange", duration_ms=280)
+        except Exception:
+            pass
+        def _step2():
+            try:
+                cortex_emit.edge_pulse("cap-tools", f"tool-{label}",
+                                        color="orange", duration_ms=280)
+            except Exception:
+                pass
+        def _step3():
+            try:
+                cortex_emit.node_activity(f"tool-{label}",
+                                           intensity=1.0, duration_ms=400)
+            except Exception:
+                pass
+        def _step4():
+            try:
+                cortex_emit.edge_pulse(f"tool-{label}", "core",
+                                        color="orange", duration_ms=280)
+            except Exception:
+                pass
+        try:
+            _app = _QApp_router.instance()
+            if _app is not None and getattr(self, "_gui_alive", True):
+                _QT_router.singleShot(300, _app, _step2)
+                _QT_router.singleShot(600, _app, _step3)
+                _QT_router.singleShot(1000, _app, _step4)
+            else:
+                _step2(); _step3(); _step4()
+        except Exception:
+            pass
 
     def _speak_text(self, text: str) -> None:
         """Synthesize `text` to speech via OpenAI TTS and queue it for
@@ -3161,14 +5410,67 @@ class LiveApiManager(QObject):
             # Voice may have been mutated by the picker UI since startup;
             # read it fresh each call.
             voice = (getattr(cfg, "voice", None) or "marin").strip() or "marin"
+            # The user picks ONE voice via the voice-picker UI and
+            # that voice is used for every reply, every persona.
+            # Personas customize TONE via TTS instructions, NOT voice
+            # ID. (Previous design swapped voice per persona; user
+            # explicitly asked for the one-voice model.) Tone variation
+            # comes from:
+            #   1. Persona base instructions (butler / playful / etc.)
+            #   2. Per-reply emotion hint from emotion_tagger
+            persona_instructions: Optional[str] = None
+            persona_name = "default"
+            try:
+                from . import persona_voice as _pv
+                _tts = _pv.tts_config()
+                persona_instructions = (_tts.get("instructions")
+                                         or None)
+                try:
+                    persona_name = _pv.active_preset().name
+                except Exception:
+                    persona_name = "default"
+            except Exception:
+                persona_instructions = None
+            # JARVIS-grade tonal adaptation: classify the EMOTION of
+            # this specific reply (LLM-first, heuristic fallback)
+            # and merge a delivery hint into the persona's base
+            # instructions. Same persona, different tone per moment
+            # — apologetic when something fails, dry when it's a
+            # quip, urgent for a warning, etc.
+            try:
+                from . import emotion_tagger as _et
+                tag = _et.classify(text, persona=persona_name)
+                if persona_instructions:
+                    persona_instructions = _et.combine_instructions(
+                        persona_instructions, tag.emotion)
+                else:
+                    persona_instructions = _et.delivery_hint(
+                        tag.emotion)
+                if self._logger:
+                    try:
+                        self._logger.event(
+                            "tts_emotion_tagged",
+                            emotion=tag.emotion.value,
+                            confidence=round(tag.confidence, 2),
+                            source=tag.source)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             # Rewrite into natural casual speech BEFORE synthesis. UI still
             # shows the original (assistant_text was emitted earlier); only
             # the audio path uses the humanized form. Falls back to the
             # original text on short input, timeout, or any error.
             speech_text = self._humanize_for_speech(text)
-            # Cache key uses the humanized text so repeat rewrites that
-            # collapse to the same spoken form reuse the same PCM bytes.
-            cache_key = f"{voice}|{speech_text}"
+            # Cache key includes voice + (truncated) instructions so a
+            # persona swap doesn't replay the prior preset's PCM.
+            instr_tag = ""
+            if persona_instructions:
+                import hashlib as _hl
+                instr_tag = _hl.sha1(
+                    persona_instructions.encode("utf-8")
+                ).hexdigest()[:8]
+            cache_key = f"{voice}|{instr_tag}|{speech_text}"
             pcm: Optional[bytes] = None
             with self._tts_lock:
                 pcm = self._tts_cache.get(cache_key)
@@ -3197,7 +5499,8 @@ class LiveApiManager(QObject):
                     except Exception:
                         pass
                 self._http_openai_tts(api_key, voice, speech_text,
-                                      on_chunk=_on_chunk)
+                                      on_chunk=_on_chunk,
+                                      instructions=persona_instructions)
                 if not buf:
                     return
                 pcm = bytes(buf)
@@ -3245,7 +5548,8 @@ class LiveApiManager(QObject):
     _TTS_MODEL_FALLBACK = "tts-1"
 
     def _http_openai_tts(self, api_key: str, voice: str, text: str,
-                          on_chunk: Optional[Callable[[bytes], None]] = None) -> bytes:
+                          on_chunk: Optional[Callable[[bytes], None]] = None,
+                          instructions: Optional[str] = None) -> bytes:
         """POST to /v1/audio/speech and return raw PCM16 24 kHz mono bytes.
         Returns b'' on any error so the caller can early-exit cleanly.
 
@@ -3296,22 +5600,32 @@ class LiveApiManager(QObject):
                     "response_format": "pcm",
                 }
                 # gpt-4o-mini-tts supports an `instructions` field that
-                # nudges delivery style. Push toward casual conversation
-                # — closer to how a person actually replies, less robotic.
+                # nudges delivery style. Persona-aware: when the caller
+                # passes per-preset instructions (Jarvis butler, playful,
+                # concise, etc.), use those — they're the actual TONE
+                # change that makes a persona swap audible. Falls back
+                # to a generic "smart friend" instruction otherwise.
                 if "gpt-4o-mini-tts" in model:
-                    payload_dict["instructions"] = (
-                        "Voice: Jarvis-style personal assistant — warm, "
-                        "intelligent, a touch witty. Speak the way a "
-                        "smart friend sitting next to the listener would "
-                        "read this aloud: natural sentences, contractions, "
-                        "small pauses at commas, slight smile when it fits, "
-                        "no flat monotone, no robotic list-reading. If "
-                        "the text contains a URL, do NOT read the URL — "
-                        "say 'I've got the link' or skip it entirely. "
-                        "Read dates as 'tomorrow' / 'Thursday', never "
-                        "spell digits. If two values are obviously the "
-                        "same ('65 feels like 65'), say it once."
-                    )
+                    if instructions:
+                        payload_dict["instructions"] = (
+                            instructions
+                            + " | Never read URLs aloud — say 'I've got "
+                            "the link' or skip the URL. Read dates as "
+                            "'tomorrow' / 'Thursday'. If two values are "
+                            "obviously the same ('65 feels like 65'), "
+                            "say it once."
+                        )
+                    else:
+                        payload_dict["instructions"] = (
+                            "Read like a smart friend sitting next to "
+                            "the listener — natural conversational "
+                            "pace, contractions, small pauses at "
+                            "commas. Never read URLs aloud — say "
+                            "'I've got the link' or skip the URL. "
+                            "Read dates as 'tomorrow' / 'Thursday'. "
+                            "If two values are obviously the same, "
+                            "say it once."
+                        )
                 payload = json.dumps(payload_dict).encode("utf-8")
                 req = urllib.request.Request(
                     "https://api.openai.com/v1/audio/speech",

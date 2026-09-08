@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -346,7 +347,8 @@ class Microsoft365Connector(Connector):
                 "ok", sent=True, to=to,
                 from_account=account_email or actual_from,
                 sender_address=actual_from, subject=subject,
-                message_id=sent_msg_id, web_link=web_link)
+                message_id=sent_msg_id, web_link=web_link,
+                summary=f"Sent to {to}.")
 
         if name == "ms_mail_list":
             max_n = max(1, min(50, int(args.get("max") or 10)))
@@ -510,11 +512,79 @@ class Microsoft365Connector(Connector):
             return connector_result("ok", count=len(events), events=events)
 
         if name == "ms_calendar_create":
+            # DIAG: log every pick so we can tell from the outlook_com.log
+            # file which calendar tool the LLM actually chose.
+            try:
+                from .outlook_com_connector import _diag as _ocl_diag
+                _ocl_diag(f"ms_calendar_create PICKED args={args!r}")
+            except Exception:
+                pass
+            # AUTO-REDIRECT to Google when available. For users on
+            # personal MS accounts (the common case), the MS Graph
+            # calendar is an Outlook.com calendar the user never
+            # looks at — events land but are invisible. If Google
+            # Calendar is connected AND working, write THERE instead
+            # so the event actually appears in the calendar the user
+            # views every day (incl. the Gmail-backed view inside
+            # New Outlook, since that reads via Google's APIs).
+            try:
+                from .calendar_connector import CalendarConnector
+                gc = CalendarConnector()
+                if gc.available():
+                    try:
+                        from .outlook_com_connector import (
+                            _diag as _ocl_diag)
+                        _ocl_diag("ms_calendar_create: Google "
+                                  "connected — auto-redirecting to "
+                                  "calendar_create_event so the event "
+                                  "lands in the calendar the user "
+                                  "actually views")
+                    except Exception:
+                        pass
+                    return gc.execute("calendar_create_event", {
+                        "summary": args.get("subject")
+                                   or args.get("title")
+                                   or args.get("summary"),
+                        "start": args.get("start"),
+                        "end": args.get("end"),
+                        "description": args.get("body")
+                                       or args.get("description"),
+                    })
+            except Exception:
+                # Google connector unavailable / errored — fall through
+                # to the original Graph write path below.
+                pass
             subject = str(args.get("subject") or "").strip()
             start = str(args.get("start") or "").strip()
             end = str(args.get("end") or "").strip()
             if not (subject and start and end):
                 return connector_result("error", error="subject, start, end are required")
+            # If we don't have a valid MS Graph token, transparently
+            # delegate to outlook_com_create_event — same intent, the
+            # one that actually writes to the user's classic Outlook
+            # calendar without OAuth. This prevents the LLM from
+            # claiming success on a 401-silent Graph write.
+            if sys.platform == "win32" and not self._client.ready():
+                try:
+                    from .outlook_com_connector import (
+                        OutlookComConnector, _diag as _ocl_diag)
+                    _ocl_diag("ms_calendar_create: no MS Graph token — "
+                              "delegating to outlook_com_create_event")
+                    oc = OutlookComConnector()
+                    return oc.execute("outlook_com_create_event", {
+                        "subject": subject,
+                        "start": start,
+                        "end": end,
+                        "location": args.get("location"),
+                        "body": args.get("body"),
+                    })
+                except Exception as exc:
+                    return connector_result(
+                        "error",
+                        error=(f"No MS Graph auth and Outlook COM "
+                               f"fallback failed: "
+                               f"{type(exc).__name__}: {exc}"),
+                        code="no_path")
             body = {"subject": subject,
                     "start": {"dateTime": start, "timeZone": "UTC"},
                     "end": {"dateTime": end, "timeZone": "UTC"}}
@@ -522,7 +592,11 @@ class Microsoft365Connector(Connector):
             if err:
                 return connector_result("error", error=err)
             return connector_result("ok", created=True, id=data.get("id"),
-                                    link=data.get("webLink"))
+                                    link=data.get("webLink"),
+                                    calendar="Outlook (via Microsoft Graph)",
+                                    summary=f"Added '{subject}' to your "
+                                            f"Microsoft 365 calendar on "
+                                            f"{start}.")
 
         if name == "onedrive_upload":
             path = str(args.get("path") or "").strip()
@@ -558,8 +632,11 @@ class Microsoft365Connector(Connector):
                 return connector_result("error", error=err, code="not_found")
             _, err = self._graph("POST", f"/chats/{cid}/messages",
                                  body={"body": {"content": text}})
-            return connector_result("error" if err else "ok", error=err,
-                                    sent=(err is None), to=to)
+            if err:
+                return connector_result("error", error=err,
+                                        sent=False, to=to)
+            return connector_result("ok", sent=True, to=to,
+                                    summary=f"Sent Teams message to {to}.")
 
         if name == "teams_channel_post":
             team = str(args.get("team") or "").strip()

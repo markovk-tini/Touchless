@@ -69,8 +69,9 @@ class PhoneCameraConnectDialog(QDialog):
 
     def __init__(self, config: AppConfig, parent=None, *, existing_server: Optional[PhoneCameraServer] = None) -> None:
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
+        self._body = install_indigo_chrome(self, "Connect Phone Camera")
         self.config = config
         self._server_status.connect(self._apply_server_status)
         # When the caller already has a running server (auto-started at
@@ -93,7 +94,7 @@ class PhoneCameraConnectDialog(QDialog):
         self.setMinimumWidth(460)
         self._apply_theme()
 
-        layout = QVBoxLayout(self)
+        layout = QVBoxLayout(self._body)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
 

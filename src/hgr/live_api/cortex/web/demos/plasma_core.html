@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Iris Cortex — Plasma Core demo</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #050a14; color: #C8E6FF; overflow: hidden; height: 100%; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+    #canvas { position: absolute; inset: 0; }
+    #panel {
+      position: absolute; top: 18px; left: 18px;
+      background: rgba(6, 16, 30, 0.75);
+      border: 1px solid rgba(88, 227, 255, 0.25);
+      border-radius: 10px; padding: 14px 18px;
+      color: #C8E6FF; font-size: 13px; min-width: 280px;
+      z-index: 10;
+    }
+    #panel h1 { font-size: 12px; letter-spacing: 3px; color: #58E3FF; margin: 0 0 10px 0; font-weight: 800; text-transform: uppercase; }
+    .row { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; }
+    .label { color: rgba(200, 230, 255, 0.7); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+    button {
+      background: rgba(88, 227, 255, 0.08);
+      border: 1px solid rgba(88, 227, 255, 0.35);
+      color: #C8E6FF; padding: 4px 10px; border-radius: 6px;
+      cursor: pointer; font-size: 11px; margin-right: 4px;
+    }
+    button.active { background: rgba(88, 227, 255, 0.25); border-color: #58E3FF; color: #fff; }
+    button:hover { background: rgba(88, 227, 255, 0.15); }
+    input[type=range] { width: 140px; }
+    #hint {
+      position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+      color: rgba(200, 230, 255, 0.5); font-size: 11px; letter-spacing: 2px;
+      text-transform: uppercase; pointer-events: none;
+    }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../vendor/three/build/three.module.js",
+        "three/addons/": "../vendor/three/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="panel">
+    <h1>Plasma Core — Demo</h1>
+    <div class="row">
+      <span class="label">State</span>
+      <div>
+        <button data-state="idle"      class="active">Idle</button>
+        <button data-state="listening">Listening</button>
+        <button data-state="thinking" >Thinking</button>
+        <button data-state="speaking" >Speaking</button>
+      </div>
+    </div>
+    <div class="row">
+      <span class="label">Voice level</span>
+      <input type="range" id="vol" min="0" max="100" value="0" />
+    </div>
+    <div class="row">
+      <span class="label">Auto voice</span>
+      <button id="auto-toggle">OFF</button>
+    </div>
+    <div class="row" style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08);">
+      <span class="label" style="font-size: 10px;">Drag to orbit · scroll to zoom</span>
+    </div>
+  </div>
+  <div id="hint">Plasma core driven by simulated voice RMS · noise-displaced ShaderMaterial · UnrealBloom</div>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+    // ─── scene setup ────────────────────────────────────────────────
+    const canvas = document.getElementById('canvas');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight, false);
+    renderer.setClearColor(0x050a14, 1);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 200);
+    camera.position.set(0, 4, 28);
+
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.target.set(0, 0, 0);
+    controls.minDistance = 9;
+    controls.maxDistance = 70;
+
+    scene.add(new THREE.AmbientLight(0x101830, 0.18));
+
+    // ─── starfield (just for ambience) ─────────────────────────────
+    (function stars() {
+      const N = 1200;
+      const pos = new Float32Array(N * 3);
+      for (let i = 0; i < N; i++) {
+        const r = 60 + Math.random() * 30;
+        const t = Math.random() * Math.PI * 2;
+        const p = Math.acos(2 * Math.random() - 1);
+        pos[i*3]   = r * Math.sin(p) * Math.cos(t);
+        pos[i*3+1] = r * Math.sin(p) * Math.sin(t);
+        pos[i*3+2] = r * Math.cos(p);
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      scene.add(new THREE.Points(g, new THREE.PointsMaterial({
+        color: 0xb6cee6, size: 0.5, transparent: true, opacity: 0.55,
+        sizeAttenuation: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      })));
+    })();
+
+    // ─── plasma core ────────────────────────────────────────────────
+    // Embedded simplex 3D noise (Ashima Arts, public domain).
+    const NOISE_3D_GLSL = `
+      vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x, 289.0);}
+      vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
+      float snoise(vec3 v){
+        const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+        const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+        vec3 i  = floor(v + dot(v, C.yyy));
+        vec3 x0 = v - i + dot(i, C.xxx);
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min(g.xyz, l.zxy);
+        vec3 i2 = max(g.xyz, l.zxy);
+        vec3 x1 = x0 - i1 + 1.0 * C.xxx;
+        vec3 x2 = x0 - i2 + 2.0 * C.xxx;
+        vec3 x3 = x0 - 1. + 3.0 * C.xxx;
+        i = mod(i, 289.0);
+        vec4 p = permute(permute(permute(
+                   i.z + vec4(0.0, i1.z, i2.z, 1.0))
+                 + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+                 + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+        float n_ = 1.0/7.0;
+        vec3 ns = n_ * D.wyz - D.xzx;
+        vec4 j = p - 49.0 * floor(p * ns.z *ns.z);
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_);
+        vec4 x = x_ *ns.x + ns.yyyy;
+        vec4 y = y_ *ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+        vec4 b0 = vec4(x.xy, y.xy);
+        vec4 b1 = vec4(x.zw, y.zw);
+        vec4 s0 = floor(b0)*2.0 + 1.0;
+        vec4 s1 = floor(b1)*2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+        vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+        vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+        vec3 p0 = vec3(a0.xy, h.x);
+        vec3 p1 = vec3(a0.zw, h.y);
+        vec3 p2 = vec3(a1.xy, h.z);
+        vec3 p3 = vec3(a1.zw, h.w);
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+        p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+        vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+      }
+    `;
+
+    const vertexShader = `
+      uniform float uTime;
+      uniform float uBodyAmp;
+      uniform float uSurfaceAmp;
+      varying vec3  vNormal;
+      varying float vNoise;
+      varying vec3  vViewPosition;
+
+      ${NOISE_3D_GLSL}
+
+      vec3 displace(vec3 p) {
+        float n1 = snoise(p * 0.35 + uTime * 0.25);
+        float n2 = snoise(p * 2.00 + uTime * 1.50);
+        return p + normalize(p) * (n1 * uBodyAmp + n2 * uSurfaceAmp);
+      }
+
+      vec3 orthogonal(vec3 v) {
+        return normalize(abs(v.x) > abs(v.z)
+          ? vec3(-v.y, v.x, 0.0)
+          : vec3(0.0, -v.z, v.y));
+      }
+
+      void main() {
+        // Recompute normals from a small epsilon neighbourhood so the
+        // displaced surface lights correctly.
+        vec3 displaced = displace(position);
+        float eps = 0.001;
+        vec3 t1 = orthogonal(normal);
+        vec3 t2 = normalize(cross(normal, t1));
+        vec3 d1 = displace(position + t1 * eps) - displaced;
+        vec3 d2 = displace(position + t2 * eps) - displaced;
+        vNormal = normalize(cross(d1, d2));
+
+        // Stash noise value for the fragment shader to use as a heat map.
+        vNoise = snoise(position * 2.0 + uTime * 1.5);
+
+        vec4 mv = modelViewMatrix * vec4(displaced, 1.0);
+        vViewPosition = -mv.xyz;
+        gl_Position = projectionMatrix * mv;
+      }
+    `;
+
+    const fragmentShader = `
+      uniform vec3 uBaseColor;
+      uniform vec3 uHotColor;
+      uniform float uIntensity;
+      uniform float uTime;
+      varying vec3  vNormal;
+      varying float vNoise;
+      varying vec3  vViewPosition;
+
+      void main() {
+        vec3 N = normalize(vNormal);
+        vec3 V = normalize(vViewPosition);
+        float fres = pow(1.0 - max(dot(N, V), 0.0), 2.0);
+
+        // Heat map along the noise: dim base color in valleys, hot
+        // color at peaks. Plus a Fresnel rim that brightens silhouettes.
+        float heat = smoothstep(-0.4, 0.7, vNoise);
+        vec3 col = mix(uBaseColor, uHotColor, heat);
+        col *= (0.45 + 0.55 * uIntensity);
+        col += vec3(0.25, 0.6, 1.0) * fres * 0.6 * uIntensity;
+
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    const STATE_COLORS = {
+      idle:      { base: new THREE.Color(0x1d6ea0), hot: new THREE.Color(0xb6f0ff) },
+      listening: { base: new THREE.Color(0x2497d6), hot: new THREE.Color(0xeaffff) },
+      thinking:  { base: new THREE.Color(0xc88a2a), hot: new THREE.Color(0xffe9a8) },
+      speaking:  { base: new THREE.Color(0x9c6cf5), hot: new THREE.Color(0xf5eaff) },
+    };
+
+    const coreGeom = new THREE.IcosahedronGeometry(5, 5);
+    const coreUniforms = {
+      uTime:       { value: 0 },
+      uBodyAmp:    { value: 0.05 },
+      uSurfaceAmp: { value: 0.0 },
+      uIntensity:  { value: 0.55 },
+      uBaseColor:  { value: STATE_COLORS.idle.base.clone() },
+      uHotColor:   { value: STATE_COLORS.idle.hot.clone() },
+    };
+    const coreMat = new THREE.ShaderMaterial({
+      vertexShader, fragmentShader,
+      uniforms: coreUniforms,
+    });
+    const core = new THREE.Mesh(coreGeom, coreMat);
+    scene.add(core);
+
+    // Soft sprite halo for the atmosphere (same trick as the real cortex)
+    const haloTex = (() => {
+      const RES = 128;
+      const cv = document.createElement('canvas');
+      cv.width = RES; cv.height = RES;
+      const ctx = cv.getContext('2d');
+      const g = ctx.createRadialGradient(RES/2, RES/2, 0, RES/2, RES/2, RES/2);
+      g.addColorStop(0, 'rgba(255,255,255,0.9)');
+      g.addColorStop(0.2, 'rgba(255,255,255,0.45)');
+      g.addColorStop(0.5, 'rgba(255,255,255,0.1)');
+      g.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, RES, RES);
+      const t = new THREE.CanvasTexture(cv);
+      t.needsUpdate = true;
+      return t;
+    })();
+    const haloMat = new THREE.SpriteMaterial({
+      map: haloTex, color: 0x6fc3ff,
+      transparent: true, depthWrite: false, opacity: 0.55,
+      blending: THREE.AdditiveBlending,
+    });
+    const halo = new THREE.Sprite(haloMat);
+    halo.scale.set(22, 22, 1);
+    scene.add(halo);
+
+    // ─── post-processing ────────────────────────────────────────────
+    const composer = new EffectComposer(renderer);
+    composer.setPixelRatio(renderer.getPixelRatio());
+    composer.setSize(window.innerWidth, window.innerHeight);
+    composer.addPass(new RenderPass(scene, camera));
+    const bloom = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      1.15, 0.4, 0.55);
+    composer.addPass(bloom);
+    composer.addPass(new OutputPass());
+
+    // ─── input simulation ──────────────────────────────────────────
+    let state = 'idle';
+    let manualVoice = 0;
+    let autoVoice = false;
+    let voiceRms = 0;
+    let voiceRmsSmoothed = 0;
+
+    document.querySelectorAll('[data-state]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('[data-state]').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        state = btn.dataset.state;
+        const c = STATE_COLORS[state];
+        coreUniforms.uBaseColor.value.copy(c.base);
+        coreUniforms.uHotColor.value.copy(c.hot);
+        haloMat.color.copy(c.base).lerp(c.hot, 0.4);
+      });
+    });
+
+    document.getElementById('vol').addEventListener('input', e => {
+      manualVoice = parseFloat(e.target.value) / 100;
+    });
+
+    const autoBtn = document.getElementById('auto-toggle');
+    autoBtn.addEventListener('click', () => {
+      autoVoice = !autoVoice;
+      autoBtn.textContent = autoVoice ? 'ON' : 'OFF';
+      autoBtn.classList.toggle('active', autoVoice);
+    });
+
+    // ─── animation ──────────────────────────────────────────────────
+    let last = performance.now();
+    function frame(now) {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      const t = now * 0.001;
+
+      // Simulate voice — sine wave with random spikes.
+      if (autoVoice) {
+        const base = Math.abs(Math.sin(t * 1.5)) * 0.4;
+        const spike = Math.random() < 0.05 ? Math.random() * 0.6 : 0;
+        voiceRms = Math.max(base, spike, manualVoice);
+      } else {
+        voiceRms = manualVoice;
+      }
+      voiceRmsSmoothed += (voiceRms - voiceRmsSmoothed) * Math.min(1, dt * 8);
+
+      // Drive the shader.
+      coreUniforms.uTime.value = t;
+      // Body amp: slow breathing baseline + voice contribution
+      const breath = 0.05 + 0.04 * Math.sin(t * 0.9);
+      coreUniforms.uBodyAmp.value = breath + voiceRmsSmoothed * 0.20;
+      // Surface amp: pure voice (with perceptual sqrt for loudness response)
+      coreUniforms.uSurfaceAmp.value = Math.sqrt(voiceRmsSmoothed) * 0.18;
+      // Intensity bumps with voice for bloom amplification
+      coreUniforms.uIntensity.value = 0.55 + voiceRmsSmoothed * 0.5;
+
+      // Halo follows
+      const haloScale = 22 * (1 + voiceRmsSmoothed * 0.15 + Math.sin(t * 0.9) * 0.02);
+      halo.scale.set(haloScale, haloScale, 1);
+      haloMat.opacity = 0.45 + voiceRmsSmoothed * 0.3;
+
+      controls.update();
+      composer.render();
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
+      composer.setSize(window.innerWidth, window.innerHeight);
+      bloom.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>

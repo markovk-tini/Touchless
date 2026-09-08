@@ -17,7 +17,7 @@ class SpotifyGestureRouter:
     def __init__(
         self,
         *,
-        static_hold_seconds: float = 0.5,
+        static_hold_seconds: float = 1.0,
         static_cooldown_seconds: float = 1.5,
         dynamic_cooldown_seconds: float = 0.9,
     ) -> None:
@@ -41,6 +41,39 @@ class SpotifyGestureRouter:
     def _set_action(self, label: str) -> None:
         self._last_action = label
         self._action_counter += 1
+
+    def _spotify_result_callback(self, verb: str):
+        """Return a callback for `controller.dispatch_async` that
+        overwrites the optimistic control_text with the REAL result
+        message from the async HTTP call.
+
+        v1.1.7 tester bug: the router used to set _control_text to
+        e.g. "spotify play/pause" BEFORE the HTTP call ran; when the
+        call failed (Premium user with no active device, wrong
+        Spotify account, transfer 202, etc.), the wheel silently
+        confirmed as if the action worked. This callback is fired
+        AFTER the request settles. On failure, we replace the
+        optimistic text with the controller's real message (which
+        now routes through `_format_error_message` so the user sees
+        e.g. "spotify play failed — no active Spotify device. Open
+        the Spotify app on your PC or phone…"). We also bump
+        _action_counter so noop_engine re-emits command_detected
+        with the corrected text.
+        """
+        def _on_complete(result: bool, message: str) -> None:
+            if result:
+                # Success — leave the optimistic text alone. Nothing
+                # to update; the user already saw the right label.
+                return
+            # Failure — overwrite with the real controller message.
+            self._control_text = (
+                message
+                if message
+                else f"spotify {verb} failed"
+            )
+            self._last_action = f"spotify_{verb.replace('/', '_').replace(' ', '_')}_failed"
+            self._action_counter += 1
+        return _on_complete
 
     def snapshot(self) -> SpotifyGestureSnapshot:
         return SpotifyGestureSnapshot(
@@ -87,23 +120,29 @@ class SpotifyGestureRouter:
 
         if now < self._static_cooldown_until:
             return
-        required_hold = 1.0 if stable_label == "two" else self.static_hold_seconds
+        required_hold = self.static_hold_seconds
         if now - self._static_candidate_since < required_hold:
             return
 
         self._static_cooldown_until = now + self.static_cooldown_seconds
         self._static_latched_label = stable_label
+        # Signal the controller that the user actively tried to use
+        # Spotify — MainWindow's reauth-toast gate keys off this so
+        # a cold launch with no tokens never popups until the user
+        # has actually gestured. Bounded to <2 flips/sec by the hold
+        # + cooldown gates above; a single bool write and safe if the
+        # method is missing on an older controller build.
+        try:
+            controller.record_command_attempt()
+        except Exception:
+            pass
         if stable_label == "two":
-            if controller.is_window_active():
-                self._control_text = "spotify already focused"
-                self._set_action("spotify_focus_idle")
-            else:
-                ready = controller.focus_or_open_window()
-                self._control_text = controller.message
-                self._set_action("spotify_focus" if ready else "spotify_focus_failed")
-                if ready and controller.is_active_device_available():
-                    details = controller.get_current_track_details()
-                    self._info_text = details.summary() if details is not None else "Spotify ready on device"
+            self._control_text = "opening spotify"
+            self._set_action("spotify_focus")
+            controller.dispatch_async(
+                controller.focus_or_open_window,
+                on_complete=self._spotify_result_callback("focus"),
+            )
         elif stable_label == "fist":
             if not self._can_control_without_focus(controller):
                 self._control_text = "spotify inactive on device"
@@ -111,10 +150,13 @@ class SpotifyGestureRouter:
                 return
             # Fire HTTP call on a background thread so the gesture
             # worker doesn't block on the 50-300 ms Spotify Web API
-            # roundtrip. Action label is set optimistically; the
-            # controller's `message` updates when the call completes
-            # and the next gesture frame picks it up.
-            controller.dispatch_async(controller.toggle_playback)
+            # roundtrip. Action label is set OPTIMISTICALLY; the
+            # `on_complete` callback overwrites _control_text with
+            # the real failure message if the HTTP call errors.
+            controller.dispatch_async(
+                controller.toggle_playback,
+                on_complete=self._spotify_result_callback("play/pause"),
+            )
             self._control_text = "spotify play/pause"
             self._set_action("spotify_toggle")
         elif stable_label == "ok":
@@ -122,7 +164,10 @@ class SpotifyGestureRouter:
                 self._control_text = "spotify inactive on device"
                 self._set_action("spotify_shuffle_idle")
                 return
-            controller.dispatch_async(controller.toggle_shuffle)
+            controller.dispatch_async(
+                controller.toggle_shuffle,
+                on_complete=self._spotify_result_callback("shuffle"),
+            )
             self._control_text = "spotify shuffle"
             self._set_action("spotify_shuffle")
 
@@ -152,21 +197,39 @@ class SpotifyGestureRouter:
 
         self._dynamic_cooldown_until = now + self.dynamic_cooldown_seconds
         self._dynamic_latched_label = dynamic_label
+        # Signal the controller that the user actively tried to use
+        # Spotify (swipe / repeat-circle). Same rationale as the
+        # static branch: bounded to <2 flips/sec by the 0.9 s dynamic
+        # cooldown, and the try/except keeps us safe against older
+        # controllers without the method.
+        try:
+            controller.record_command_attempt()
+        except Exception:
+            pass
         # Fire HTTP calls on a background thread — dynamic gestures
         # (swipes / repeat circle) used to spike the gesture
         # worker's frame to 200+ ms during the Spotify Web API
         # roundtrip. Cooldowns + latching above ensure we don't
         # double-fire while a dispatch is in flight.
         if dynamic_label == "swipe_left":
-            controller.dispatch_async(controller.previous_track)
+            controller.dispatch_async(
+                controller.previous_track,
+                on_complete=self._spotify_result_callback("previous"),
+            )
             self._control_text = "spotify previous track"
             self._set_action("spotify_previous")
         elif dynamic_label == "swipe_right":
-            controller.dispatch_async(controller.next_track)
+            controller.dispatch_async(
+                controller.next_track,
+                on_complete=self._spotify_result_callback("next"),
+            )
             self._control_text = "spotify next track"
             self._set_action("spotify_next")
         else:
-            controller.dispatch_async(controller.toggle_repeat_track)
+            controller.dispatch_async(
+                controller.toggle_repeat_track,
+                on_complete=self._spotify_result_callback("repeat"),
+            )
             self._control_text = "spotify repeat toggle"
             self._set_action("spotify_repeat")
 
@@ -180,13 +243,69 @@ class SpotifyGestureRouter:
         # actual Spotify window. Right-hand 'two' and the voice
         # 'open spotify' command remain the ONLY paths that may
         # launch Spotify when it isn't running.
-        if controller.is_active_device_available():
+        #
+        # r51 diag: log every branch decision so the next log tells
+        # us EXACTLY which check let a gesture through when user
+        # reported Spotify was fully closed. Small overhead — one
+        # stderr write per gesture commit at most.
+        import sys as _sys
+        active = False
+        try:
+            active = controller.is_active_device_available()
+        except Exception:
+            pass
+        if active:
+            try:
+                _sys.stderr.write("[r51-spotify-gate] pass: is_active_device_available=True\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
             return True
+        # r50: hard block for the "no live device AND no real Spotify"
+        # case. Dad reported skip/pause/swipe silently auto-launching
+        # Spotify. Root cause was is_window_open() / is_window_active()
+        # returning True for phantom windows created by Spotify's
+        # update-handler / protocol-handler helper processes even when
+        # the interactive Spotify.exe wasn't running. Adding this
+        # early-False when no Web API device AND no real Spotify.exe
+        # process short-circuits before those phantom-window paths.
+        # _has_real_spotify_process filters helper processes by
+        # requiring the executable path + a >1 MB image size — see
+        # spotify_controller.py. It carries a ~1 s TTL cache so this
+        # extra call does not spike gesture-commit latency when the
+        # real Spotify is running with its 10-20 helper procs.
+        try:
+            if not controller._has_real_spotify_process():
+                try:
+                    _sys.stderr.write("[r51-spotify-gate] block: is_active=False AND _has_real_spotify_process=False\n")
+                    _sys.stderr.flush()
+                except Exception:
+                    pass
+                return False
+        except Exception:
+            # Absent method on older controller stubs → fall through to
+            # the existing window checks (previous behavior).
+            pass
         is_window_open = getattr(controller, "is_window_open", None)
         if callable(is_window_open) and is_window_open():
+            try:
+                _sys.stderr.write("[r51-spotify-gate] pass: is_window_open=True (real process present)\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
             return True
         if controller.is_window_active():
+            try:
+                _sys.stderr.write("[r51-spotify-gate] pass: is_window_active=True (real process present)\n")
+                _sys.stderr.flush()
+            except Exception:
+                pass
             return True
+        try:
+            _sys.stderr.write("[r51-spotify-gate] block: fell through all checks\n")
+            _sys.stderr.flush()
+        except Exception:
+            pass
         return False
 
 # Author: Konstantin Markov

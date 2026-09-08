@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -31,22 +32,56 @@ from PySide6.QtWidgets import (
 
 from .release_checker import ReleaseInfo
 from ... import __version__ as RUNNING_VERSION
-from ..ui.window_chrome import apply_touchless_chrome
+from ..ui.window_chrome import apply_touchless_chrome, install_indigo_chrome
 
 
 class UpdateDialog(QDialog):
     """Modal-ish update prompt. Emits one of:
        - download_requested(ReleaseInfo): user clicked Download
-       - dismissed(): user clicked Later or closed the dialog
+       - dismissed(): user clicked Later — an explicit "stop asking
+         me about this version"
+       - deferred(): user closed the dialog with the title-bar X or
+         Esc without choosing anything
     The Updater listens for download_requested and drives the rest.
+
+    Why Later and X are two different signals: closing a window is not
+    an answer. Users reach for the X to get the prompt off screen right
+    now, so treating it as Later meant the update went quiet forever and
+    the only surviving cue was the Updates settings panel they had no
+    reason to open. Later suppresses re-prompting for this version; X
+    and Esc re-prompt on the next launch until the update is installed.
     """
 
     download_requested = Signal(object)   # ReleaseInfo
     dismissed = Signal()
+    deferred = Signal()
 
     def __init__(self, info: ReleaseInfo, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        apply_touchless_chrome(self)
+        # r51: replaced apply_touchless_chrome (Win11-only DWM) with
+        # install_indigo_chrome (frameless indigo bar, works on Win10 too).
+        body = install_indigo_chrome(self, "Touchless Update Available")
+        # v1.1.8.1 dialog-visibility fix. install_indigo_chrome sets
+        # Qt.FramelessWindowHint which on Windows causes the compositor
+        # to freeze the dialog behind its parent — .show() succeeds,
+        # .raise_() reports success, but the pixels never surface on
+        # screen. Force it to the front with WindowStaysOnTopHint AND
+        # a queued raise+activate on the next event-loop tick (Qt
+        # processes .show() and .raise_() in the wrong order for
+        # frameless windows). Users on 1.1.7 have a permanently
+        # invisible update dialog for exactly this reason.
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        # r51 fix: scope background to body only (see spotify_setup_wizard).
+        body.setObjectName("updateDialogBody")
+        body.setStyleSheet("QWidget#updateDialogBody { background: #0B3D91; }")
+        # Hardening: stash the indigo-chrome body widget so _build_ui can
+        # parent its QVBoxLayout to it. Previous revision referenced a
+        # bare `body` name inside _build_ui which raised NameError and
+        # prevented the dialog from constructing at all — meaning every
+        # z-order / topmost fix downstream was moot because the dialog
+        # never existed to be raised. (Adversarial finding: pre-existing
+        # bug that defeated every other fix.)
+        self._body = body
         self._info = info
         self._showing_changelog = False
         self.setWindowTitle("Touchless Update Available")
@@ -108,10 +143,16 @@ class UpdateDialog(QDialog):
             "  border-radius: 5px;"
             "}"
         )
+        # How the user answered the prompt: "none" until they act, then
+        # "download" / "later" / "deferred". Guards the dismissal
+        # signals so a single close can't emit twice — the chrome X
+        # calls close() and Qt turns that into a reject(), so both
+        # closeEvent() and reject() run for one user action.
+        self._resolution = "none"
         self._build_ui()
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        layout = QVBoxLayout(self._body)
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(10)
 
@@ -249,6 +290,7 @@ class UpdateDialog(QDialog):
         # Switch to "downloading" state — disable the buttons (so the
         # user doesn't double-tap), reveal the progress bar, emit
         # the signal that the Updater listens for.
+        self._resolution = "download"
         self.download_button.setEnabled(False)
         self.later_button.setEnabled(False)
         self.toggle_button.setEnabled(False)
@@ -258,14 +300,99 @@ class UpdateDialog(QDialog):
         self.download_requested.emit(self._info)
 
     def _on_later_clicked(self) -> None:
+        self._resolution = "later"
         self.dismissed.emit()
         self.reject()
 
+    def _emit_deferred_once(self) -> None:
+        """Fire deferred() for an unresolved close, at most once.
+
+        Skipped mid-download: the download disables the buttons, and
+        closing the window then must not look like the user declined
+        an update that is already being applied.
+        """
+        if self._resolution != "none":
+            return
+        if not self.download_button.isEnabled():
+            return
+        self._resolution = "deferred"
+        self.deferred.emit()
+
+    def reject(self) -> None:
+        # Esc routes here directly, and the chrome X arrives via
+        # close() -> closeEvent -> Qt's own reject(). _emit_deferred_once
+        # makes the duplicate harmless.
+        self._emit_deferred_once()
+        super().reject()
+
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt API name
-        # Treat window-X same as Later only when we're not mid-download.
-        if self.download_button.isEnabled():
-            self.dismissed.emit()
+        self._emit_deferred_once()
         super().closeEvent(event)
+
+    def showEvent(self, event) -> None:  # noqa: N802 — Qt API name
+        """v1.1.8.1 visibility fix. Frameless dialogs on Windows can
+        end up outside the compositor's z-order at .show() time. Two
+        remedies applied here:
+          1) Queue a raise+activate on the next event-loop tick so it
+             happens AFTER Qt has finished processing the show.
+          2) Recenter on the parent (or the primary screen) in case
+             the dialog opened at an off-screen coordinate.
+        """
+        super().showEvent(event)
+        QTimer.singleShot(0, self._force_to_front)
+
+    def _force_to_front(self) -> None:
+        try:
+            parent = self.parent()
+            rect = self.frameGeometry()
+            # Hardening: prefer the parent's center ONLY when it's on a
+            # real, currently-live screen. A minimized main window on
+            # Windows reports geometry at ~(-32000,-32000), and a
+            # secondary monitor that was unplugged since app-start still
+            # has a valid virtual coordinate that no display can show.
+            # Both cases used to leave the dialog off-screen and
+            # unreachable. Fall through to primaryScreen center on any
+            # such condition.
+            target_screen = None
+            parent_ok = False
+            if parent is not None:
+                try:
+                    if (
+                        hasattr(parent, "isVisible") and parent.isVisible()
+                        and not (hasattr(parent, "isMinimized") and parent.isMinimized())
+                    ):
+                        parent_rect = parent.frameGeometry()
+                        parent_center = parent_rect.center()
+                        target_screen = QGuiApplication.screenAt(parent_center)
+                        if target_screen is not None:
+                            rect.moveCenter(parent_center)
+                            parent_ok = True
+                except Exception:
+                    parent_ok = False
+            if not parent_ok:
+                screen = QGuiApplication.primaryScreen()
+                if screen is not None:
+                    target_screen = screen
+                    rect.moveCenter(screen.availableGeometry().center())
+            # Clamp the final rect back inside the chosen screen's
+            # availableGeometry so a large dialog on a small monitor
+            # can't overflow past the taskbar / screen edge.
+            if target_screen is not None:
+                try:
+                    avail = target_screen.availableGeometry()
+                    x = max(avail.left(), min(rect.left(), avail.right() - rect.width()))
+                    y = max(avail.top(), min(rect.top(), avail.bottom() - rect.height()))
+                    rect.moveTo(x, y)
+                except Exception:
+                    pass
+            self.move(rect.topLeft())
+        except Exception:
+            pass
+        try:
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Updater hooks

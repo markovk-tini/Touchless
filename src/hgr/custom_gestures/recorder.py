@@ -536,7 +536,12 @@ def landmarks_from_mediapipe(
     tuples) to the (21, 3) numpy array the recorder expects. Handles both
     the `.landmark` list from a HandLandmarkerResult (objects with attrs)
     and plain sequences of (x, y, z) tuples.
+
+    Also accepts a NormalizedLandmarkList / landmark container that
+    exposes `.landmark` — callers sometimes pass the whole hand object.
     """
+    if hasattr(mp_landmarks, "landmark"):
+        mp_landmarks = mp_landmarks.landmark  # type: ignore[assignment]
     rows: List[List[float]] = []
     for lm in mp_landmarks:
         if hasattr(lm, "x") and hasattr(lm, "y") and hasattr(lm, "z"):

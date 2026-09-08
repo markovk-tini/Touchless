@@ -49,9 +49,40 @@ class Synthesizer:
     def summarize(self, plan: Plan, results: List[StepResult]) -> Optional[str]:
         if not configured() or not results:
             return None
+        # Phase-3 wiring: consult ModelRouter. Falls through to None
+        # (caller uses deterministic summary) when over cost cap or
+        # forced to local — synthesizer is OpenAI-only today.
+        try:
+            from ..model_router import (LatencyBudget, TaskKind,
+                                         global_router)
+            decision = global_router().route(
+                kind=TaskKind.SYNTHESIS,
+                latency=LatencyBudget.FAST,
+            )
+            if decision.tier == "local":
+                if self._logger:
+                    self._logger.event(
+                        "synthesizer_routed_to_local",
+                        reason=decision.reason)
+                return None
+            if decision.provider == "openai" and decision.model_id:
+                self._model = decision.model_id
+        except Exception:
+            pass
         try:
             messages = self._build_messages(plan, results)
             text = self._call(messages)
+            # Record spend so the cost cap actually accumulates.
+            try:
+                from ..cost_meter import global_meter
+                tokens_in = sum(len(str(m.get("content") or ""))
+                                for m in messages) // 4
+                tokens_out = len(text or "") // 4
+                global_meter().record(self._model,
+                                      tokens_in=tokens_in,
+                                      tokens_out=tokens_out)
+            except Exception:
+                pass
             return (text or "").strip() or None
         except urllib.error.HTTPError as exc:
             # 429 → tell the scheduler so the next request can route around

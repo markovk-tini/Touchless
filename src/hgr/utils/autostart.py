@@ -153,6 +153,50 @@ def set_enabled(enabled: bool) -> bool:
         return False
 
 
+def heal() -> bool:
+    """If auto-start is ENABLED but its Run-key command points somewhere other
+    than the current executable, rewrite it to the current path.
+
+    This is the auto-start half of "re-home on launch": when a user moves the
+    install folder, the Run key still points at the OLD Touchless.exe, so
+    login-launch silently breaks (nothing appears at sign-in and there's no
+    error). On every frozen launch we detect the mismatch and repoint it.
+
+    No-op when auto-start is disabled (nothing to heal), when running from
+    source (don't rewrite a developer's own dev-path autostart), or when the
+    value already matches. Returns True only if it rewrote the value."""
+    if not is_supported():
+        return False
+    if not getattr(sys, "frozen", False):
+        return False
+    try:
+        import winreg  # type: ignore
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH, 0, winreg.KEY_READ
+        ) as key:
+            current, _ = winreg.QueryValueEx(key, _RUN_VALUE_NAME)
+    except FileNotFoundError:
+        return False  # auto-start not enabled -> nothing to heal
+    except Exception:
+        return False
+    desired = _resolve_launch_command()
+    if not desired:
+        return False
+    if str(current).strip().lower() == desired.strip().lower():
+        return False  # already correct
+    # Stale -> repoint to the current exe (set_enabled rebuilds the command).
+    if set_enabled(True):
+        try:
+            sys.stderr.write(
+                f"[autostart] healed stale login command {current!r} -> {desired!r}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return True
+    return False
+
+
 def is_enabled() -> bool:
     """Read the registry to confirm the Run-key value is present.
     Used by the Settings checkbox to recover from external removal

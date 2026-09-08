@@ -132,6 +132,37 @@ class GpuVideoWidget(QWidget):
         # diverge, paint events are coalescing somewhere.
         self._paint_count = 0
         self._paint_log_at = 0.0
+        # C1 (v1.1.7 diagnostic): per-section paintEvent timing +
+        # paint-to-paint wall-clock delta. Every paint measures
+        # drawImage cost + overlay cost + total wall time; the
+        # 2 s summary log emits averages so we can distinguish
+        # "paint is genuinely expensive" (delta ≈ paint duration)
+        # from "paint is cheap but events coalesce" (delta ≫ paint
+        # duration). Reset every log emission so the 2 s window is
+        # independent — no cross-window contamination.
+        self._paint_timing_total_us = 0
+        self._paint_timing_drawimage_us = 0
+        self._paint_timing_overlay_us = 0
+        self._paint_timing_max_us = 0
+        self._paint_delta_total_us = 0
+        self._paint_delta_max_us = 0
+        self._paint_delta_samples = 0
+        self._paint_last_end_monotonic = 0.0
+        # C3 (v1.1.7 diagnostic): slot-to-paint latency. When
+        # update_frame is called from _on_worker_raw_frame in the
+        # receiver, we timestamp it. The next paintEvent computes
+        # the delta from that timestamp to paint completion — this
+        # measures how quickly Qt actually services the update()
+        # request. A large slot→paint delta with a small paint
+        # duration indicates event-loop coalescing (main thread
+        # busy handling other queued work between slot-fire and
+        # paint). Reset to 0 after the paintEvent consumes it so a
+        # subsequent paint triggered by something other than
+        # update_frame (resize, expose) doesn't record a stale delta.
+        self._last_slot_fire_perf = 0.0
+        self._slot_to_paint_total_us = 0
+        self._slot_to_paint_max_us = 0
+        self._slot_to_paint_samples = 0
         # Fullscreen-aware lite paint mode. When True, paintEvent
         # skips _draw_landmarks entirely -- the skeleton, bbox,
         # banner, and mouse-overlay strokes are the expensive part
@@ -147,6 +178,24 @@ class GpuVideoWidget(QWidget):
         # with its fingertip cursor) is the top layer and the camera doesn't
         # visibly "read the hand". Set per-frame from the engine payload.
         self._hide_hand_overlay = False
+        # C8 (v1.1.7): explicit overlay-level tier for cheap paint-cost
+        # scaling per mode. Levels:
+        #   3 = full: skeleton + bbox + text banner (default; matches
+        #       Normal Mode behaviour)
+        #   2 = skeleton + bbox (banner text elided — saves per-hand
+        #       text metrics + drawText call chain per paint)
+        #   1 = skeleton only (matches the pre-C8 _lite_paint_mode
+        #       behaviour used during fullscreen games)
+        #   0 = no skeleton, no bbox, no banner (matches drawing-mode
+        #       behaviour when _hide_hand_overlay is True)
+        # Precedence at paint time is layered in _draw_landmarks:
+        #   drawing mode (_hide_hand_overlay=True) forces effective 0
+        #   fullscreen game (_lite_paint_mode=True) caps at 1
+        #   otherwise, this field controls what draws
+        # Set by the presentation-tier caller (see C9) — NOT plumbed
+        # through the engine payload to avoid a 1-frame lag race
+        # between the overlay-level change and the frame update.
+        self._overlay_level = 3
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(220, 140)
         # Disable Qt's automatic background fill — we paint the
@@ -166,6 +215,21 @@ class GpuVideoWidget(QWidget):
         # (otherwise the next paint waits for the next frame).
         self.update()
 
+    def set_overlay_level(self, level: int) -> None:
+        """Set the overlay-tier cap. See __init__ docstring for level
+        semantics. Called by the presentation-tier caller (live-view
+        receiver + engine mode-toggle handler); NOT plumbed through
+        the engine payload to avoid a 1-frame race between the level
+        change and the frame update. Clamped to [0, 3]. Idempotent."""
+        try:
+            new_level = max(0, min(3, int(level)))
+        except (TypeError, ValueError):
+            return
+        if new_level == self._overlay_level:
+            return
+        self._overlay_level = new_level
+        self.update()
+
     # ----- public API used by the receivers ------------------
 
     def update_frame(self, bgr_frame: np.ndarray) -> None:
@@ -173,6 +237,22 @@ class GpuVideoWidget(QWidget):
         it up on the next paintGL. We `.copy()` so the worker's
         reader thread can safely overwrite its source buffer."""
         if bgr_frame is None or bgr_frame.size == 0:
+            return
+        # v1.1.7 event-loop optimization (Step 4): skip the QImage
+        # construction + .copy() when the widget isn't currently
+        # visible. Camera frames arrive at ~30-60 fps regardless of
+        # whether the mini viewer is on screen — copying 2.76 MB of
+        # pixel data every frame for a widget the user can't see is
+        # pure waste. Qt's update() is a no-op on hidden widgets
+        # anyway, so nothing user-visible changes when we bail early.
+        # Restarts cleanly when the widget becomes visible again
+        # because the next raw_frame_ready emit runs this method
+        # with a fresh frame.
+        try:
+            visible = self.isVisible()
+        except Exception:
+            visible = True
+        if not visible:
             return
         try:
             h, w = bgr_frame.shape[:2]
@@ -209,6 +289,11 @@ class GpuVideoWidget(QWidget):
         self._image_w = w
         self._image_h = h
         self._idle_text = ""
+        # C3: stamp slot-fire time BEFORE update() so paintEvent's
+        # slot→paint delta measures from the moment this widget was
+        # asked for a new frame to the moment Qt got around to
+        # actually painting it.
+        self._last_slot_fire_perf = time.perf_counter()
         self.update()
 
     def update_landmarks(self, payload: Optional[object]) -> None:
@@ -317,7 +402,11 @@ class GpuVideoWidget(QWidget):
         # already GPU-accelerated. drawImage with Format_BGR888
         # uploads to a texture and samples on the GPU; no CPU
         # colour conversion needed.
-        _pt0 = time.perf_counter()
+        # C1 (v1.1.7 diagnostic): time each section so the 2 s log
+        # emission below can distinguish drawImage cost from overlay
+        # cost from total, and can compare paint duration vs paint-
+        # to-paint wall delta.
+        t_start = time.perf_counter()
         painter = QPainter(self)
         # macOS: the frame is pre-scaled to ~1:1 in update_frame, so smooth
         # transform buys nothing and the CPU raster engine makes it costly —
@@ -325,8 +414,13 @@ class GpuVideoWidget(QWidget):
         painter.setRenderHint(QPainter.SmoothPixmapTransform, sys.platform != "darwin")
         painter.fillRect(self.rect(), self._background)
         target = self._aspect_target()
+        drawimage_us = 0
+        overlay_us = 0
         if self._image is not None and not self._image.isNull():
+            t_before_drawimage = time.perf_counter()
             painter.drawImage(target, self._image)
+            t_after_drawimage = time.perf_counter()
+            drawimage_us = int((t_after_drawimage - t_before_drawimage) * 1_000_000)
             # In lite paint mode (a fullscreen game is foreground)
             # we keep the cheap parts of the overlay — the hand
             # skeleton + joint dots, which are 2 batched draw calls
@@ -343,7 +437,9 @@ class GpuVideoWidget(QWidget):
             # (baked into the frame, with its fingertip cursor) show — the
             # drawing is the top layer and the hand-reading graphics vanish.
             if not self._hide_hand_overlay:
+                t_before_overlay = time.perf_counter()
                 self._draw_landmarks(painter, target)
+                overlay_us = int((time.perf_counter() - t_before_overlay) * 1_000_000)
         elif self._idle_text:
             painter.setPen(QPen(self._idle_color, 1))
             painter.setFont(self._idle_font)
@@ -353,29 +449,84 @@ class GpuVideoWidget(QWidget):
                 self._idle_text,
             )
         painter.end()
+        t_end = time.perf_counter()
+        total_us = int((t_end - t_start) * 1_000_000)
         # Paint-rate diagnostic. Prints actual on-screen update
         # rate every 2 s so we can confirm whether the display is
         # tracking the worker's emit rate or coalescing. Also reports
         # avg paintEvent cost + widget/backing size + dpr so a slow
         # macOS paint can be attributed to destination size.
         self._paint_count += 1
-        self._paint_ms_accum = getattr(self, "_paint_ms_accum", 0.0) + (time.perf_counter() - _pt0) * 1000.0
+        # C1 accumulation for the 2 s summary. Paint-to-paint wall
+        # delta uses the interval between successive paintEvent
+        # completions — if that delta is close to `total_us` the cap
+        # is truly paint cost; if delta is much larger, event
+        # coalescing is happening between paints.
+        self._paint_timing_total_us += total_us
+        self._paint_timing_drawimage_us += drawimage_us
+        self._paint_timing_overlay_us += overlay_us
+        if total_us > self._paint_timing_max_us:
+            self._paint_timing_max_us = total_us
+        if self._paint_last_end_monotonic > 0.0:
+            delta_us = int((t_end - self._paint_last_end_monotonic) * 1_000_000)
+            self._paint_delta_total_us += delta_us
+            self._paint_delta_samples += 1
+            if delta_us > self._paint_delta_max_us:
+                self._paint_delta_max_us = delta_us
+        self._paint_last_end_monotonic = t_end
+        # C3: slot→paint delta from update_frame timestamp (if this
+        # paint was triggered by update_frame; resize / expose paints
+        # leave _last_slot_fire_perf==0 and are skipped).
+        if self._last_slot_fire_perf > 0.0:
+            slot_delta_us = int((t_end - self._last_slot_fire_perf) * 1_000_000)
+            self._slot_to_paint_total_us += slot_delta_us
+            self._slot_to_paint_samples += 1
+            if slot_delta_us > self._slot_to_paint_max_us:
+                self._slot_to_paint_max_us = slot_delta_us
+            self._last_slot_fire_perf = 0.0
         now = time.monotonic()
         if self._paint_log_at == 0.0:
             self._paint_log_at = now
         elif now - self._paint_log_at >= 2.0:
             rate = self._paint_count / (now - self._paint_log_at)
-            avg_ms = self._paint_ms_accum / max(1, self._paint_count)
-            try:
-                dpr = float(self.devicePixelRatioF() or 1.0)
-            except Exception:
-                dpr = 1.0
-            img_dims = f"{self._image_w}x{self._image_h}" if self._image is not None else "none"
+            avg_total_us = (
+                self._paint_timing_total_us // self._paint_count
+                if self._paint_count > 0 else 0
+            )
+            avg_drawimage_us = (
+                self._paint_timing_drawimage_us // self._paint_count
+                if self._paint_count > 0 else 0
+            )
+            avg_overlay_us = (
+                self._paint_timing_overlay_us // self._paint_count
+                if self._paint_count > 0 else 0
+            )
+            avg_delta_us = (
+                self._paint_delta_total_us // self._paint_delta_samples
+                if self._paint_delta_samples > 0 else 0
+            )
+            avg_slot_us = (
+                self._slot_to_paint_total_us // self._slot_to_paint_samples
+                if self._slot_to_paint_samples > 0 else 0
+            )
+            src_w = self._image_w if self._image is not None else 0
+            src_h = self._image_h if self._image is not None else 0
+            tgt_w = target.width() if self._image is not None else 0
+            tgt_h = target.height() if self._image is not None else 0
             try:
                 sys.stderr.write(
-                    f"[gpu_video] paint rate: {rate:.1f} fps avg={avg_ms:.1f}ms "
-                    f"widget={self.width()}x{self.height()} dpr={dpr:.1f} img={img_dims} "
-                    f"(name={self.objectName() or type(self).__name__})\n"
+                    f"[gpu_video] paint rate: {rate:.1f} fps "
+                    f"(widget={self.objectName() or type(self).__name__}) | "
+                    f"avg paint={avg_total_us / 1000:.2f}ms "
+                    f"(drawImage={avg_drawimage_us / 1000:.2f}ms, "
+                    f"overlay={avg_overlay_us / 1000:.2f}ms) "
+                    f"max={self._paint_timing_max_us / 1000:.2f}ms | "
+                    f"paint→paint delta avg={avg_delta_us / 1000:.2f}ms "
+                    f"max={self._paint_delta_max_us / 1000:.2f}ms | "
+                    f"slot→paint avg={avg_slot_us / 1000:.2f}ms "
+                    f"max={self._slot_to_paint_max_us / 1000:.2f}ms "
+                    f"(n={self._slot_to_paint_samples}) | "
+                    f"src={src_w}x{src_h} target={tgt_w}x{tgt_h}\n"
                 )
                 sys.stderr.flush()
             except Exception:
@@ -383,6 +534,16 @@ class GpuVideoWidget(QWidget):
             self._paint_count = 0
             self._paint_ms_accum = 0.0
             self._paint_log_at = now
+            self._paint_timing_total_us = 0
+            self._paint_timing_drawimage_us = 0
+            self._paint_timing_overlay_us = 0
+            self._paint_timing_max_us = 0
+            self._paint_delta_total_us = 0
+            self._paint_delta_max_us = 0
+            self._paint_delta_samples = 0
+            self._slot_to_paint_total_us = 0
+            self._slot_to_paint_max_us = 0
+            self._slot_to_paint_samples = 0
 
     def _aspect_target(self) -> QRect:
         if self._image_w <= 0 or self._image_h <= 0:
@@ -606,25 +767,43 @@ class GpuVideoWidget(QWidget):
         if not self._hands_info:
             return
 
-        # Per-hand bbox + banner. Drawn first so the skeleton +
-        # joints paint over them (avoids the bbox edge cutting
-        # through a fingertip).
-        # Heavy: per-hand text rendering (handedness + gesture
-        # label). Skipped in lite paint mode — the skeleton alone
-        # is enough to confirm tracking while gaming.
-        if not self._lite_paint_mode:
+        # C8 effective overlay level computed with layered precedence.
+        # See __init__ docstring for level semantics. Called after the
+        # mouse-overlay drawing above so mouse control-box overlay
+        # remains independent of the skeleton/bbox/banner level.
+        if self._lite_paint_mode:
+            # Fullscreen game: cap at 1 (skeleton only). Preserves the
+            # pre-C8 lite-paint behaviour (fullscreen games drop the
+            # bbox + banner cost).
+            effective_level = min(self._overlay_level, 1)
+        else:
+            effective_level = self._overlay_level
+
+        if effective_level == 0:
+            return
+
+        # Per-hand bbox + banner drawn at level 2 (bbox rects only,
+        # text banners elided) and level 3 (default: bbox + banner
+        # text). Drawn first so the skeleton + joints paint over
+        # them (avoids the bbox edge cutting through a fingertip).
+        if effective_level >= 2:
             painter.save()
             painter.setFont(self._banner_font)
             metrics = QFontMetrics(self._banner_font)
             banner_h = metrics.height()
-            self._draw_hand_banners(painter, tx, ty, tw, th, metrics, banner_h)
+            self._draw_hand_banners(
+                painter, tx, ty, tw, th, metrics, banner_h,
+                include_text=(effective_level >= 3),
+            )
             painter.restore()
 
-        # Skeleton + joints — cheap (2 batched paint ops total), drawn
-        # in BOTH normal and lite paint modes.
+        # Skeleton + joints — cheap (2 batched paint ops total),
+        # drawn at every level >= 1.
         self._draw_hand_skeleton(painter, tx, ty, tw, th)
 
-    def _draw_hand_banners(self, painter, tx, ty, tw, th, metrics, banner_h) -> None:
+    def _draw_hand_banners(
+        self, painter, tx, ty, tw, th, metrics, banner_h, include_text: bool = True,
+    ) -> None:
         for hand in self._hands_info:
             bbox = hand.get("bbox")
             if bbox is None:
@@ -639,6 +818,12 @@ class GpuVideoWidget(QWidget):
             painter.setPen(QPen(color, 2))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(rect)
+
+            # Text banner elided at overlay level 2 (bbox rect kept,
+            # text + text-background rect skipped). Saves the per-hand
+            # text-metrics + QPainter.drawText chain per paint.
+            if not include_text:
+                continue
 
             # Banner: "Right | gesture" when the hand has a
             # recognized gesture, "Right" when neutral. Empty

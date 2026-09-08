@@ -28,14 +28,12 @@ class YouTubeGestureRouter:
     """
 
     _CONSUMABLE_DYNAMIC = {"swipe_left", "swipe_right"}
-    # thumb_up / thumb_down drive like / dislike while forced YouTube
-    # mode is active. Plain three is reserved for open_chrome and is
-    # NOT consumed here — skip-ad as a gesture is replaced by the
-    # auto-skip-ads background timer in the Settings dialog. mute /
-    # wheel_pose are intentionally NOT consumed either — they keep
-    # their global handlers (system mute, gesture wheel) so volume
-    # control still works while watching YouTube.
-    _CONSUMABLE_STATIC = {"fist", "thumb_up", "thumb_down"}
+    # Fist toggles playback while forced YouTube mode is active.
+    # Like / dislike live on the YouTube wheel — thumb_up / thumb_down
+    # are not product gestures (they collided with snap / fist).
+    # Plain three is reserved for open_chrome. mute / wheel_pose keep
+    # their global handlers so volume control still works on YouTube.
+    _CONSUMABLE_STATIC = {"fist"}
     # Only four_together activates YT mode now — plain "four" is
     # reserved for the open_touchless action (handled in the engine,
     # not here). Without this restriction, plain four would race the
@@ -45,10 +43,10 @@ class YouTubeGestureRouter:
     def __init__(
         self,
         *,
-        static_hold_seconds: float = 0.5,
+        static_hold_seconds: float = 1.0,
         static_cooldown_seconds: float = 1.5,
         dynamic_cooldown_seconds: float = 0.9,
-        toggle_hold_seconds: float = 0.7,
+        toggle_hold_seconds: float = 1.0,
         toggle_cooldown_seconds: float = 1.5,
     ) -> None:
         self.static_hold_seconds = float(static_hold_seconds)
@@ -231,14 +229,6 @@ class YouTubeGestureRouter:
             ok = controller.toggle_playback()
             self._control_text = controller.message
             self._set_action("youtube_toggle" if ok else "youtube_toggle_failed")
-        elif stable_label == "thumb_up":
-            ok = controller.like_video()
-            self._control_text = controller.message
-            self._set_action("youtube_like" if ok else "youtube_like_failed")
-        elif stable_label == "thumb_down":
-            ok = controller.dislike_video()
-            self._control_text = controller.message
-            self._set_action("youtube_dislike" if ok else "youtube_dislike_failed")
 
     def _update_dynamic(self, dynamic_label: str, stable_label: str, controller: YouTubeController, now: float) -> None:
         actionable = self._CONSUMABLE_DYNAMIC

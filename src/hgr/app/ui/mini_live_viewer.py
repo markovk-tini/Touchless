@@ -235,6 +235,16 @@ class MiniLiveViewer(QWidget):
         self._diag_hud_show_latency = bool(getattr(self.config, "live_view_show_latency", False))
         # Per-paint EWMA state for the latency value.
         self._lag_ms_smoothed: float = 0.0
+        # C16 diagnostic: capture→slot latency + drop-reason counters
+        # so we can distinguish "Lite Mode adds real display latency"
+        # from "Lite Mode drops more frames than GPU Mode". Logged
+        # every ~2 s from the tick slot. Zero cost to painting.
+        self._c16_slot_calls: int = 0
+        self._c16_drops_backlog: int = 0
+        self._c16_drops_age: int = 0
+        self._c16_lag_sum_ms: float = 0.0
+        self._c16_lag_max_ms: float = 0.0
+        self._c16_last_log_monotonic: float = 0.0
 
         self.gesture_chip = QLabel("Gesture: neutral")
         self.gesture_chip.setObjectName("miniChip")
@@ -440,16 +450,26 @@ class MiniLiveViewer(QWidget):
         #       30 fps; tight enough to limit visible lag, loose
         #       enough that normal sub-100 ms pipeline jitter
         #       doesn't starve the display.
+        self._c16_slot_calls += 1
         if capture_ts > 0.0 and self._worker is not None:
             cap = getattr(self._worker, "_cap", None)
             if cap is not None:
                 latest_ts = float(getattr(cap, "_latest_frame_ts", 0.0) or 0.0)
                 if latest_ts > capture_ts + 0.05:
+                    self._c16_drops_backlog += 1
+                    self._c16_maybe_log_diag()
                     return
         if capture_ts > 0.0:
             import time as _time
             if (_time.monotonic() - capture_ts) > 0.12:
+                self._c16_drops_age += 1
+                self._c16_maybe_log_diag()
                 return
+            lag_ms = max(0.0, (_time.monotonic() - capture_ts) * 1000.0)
+            self._c16_lag_sum_ms += lag_ms
+            if lag_ms > self._c16_lag_max_ms:
+                self._c16_lag_max_ms = lag_ms
+        self._c16_maybe_log_diag()
         # Lite-paint switch: when a game / fullscreen app has
         # foreground, skip the overlay-drawing in the video widget
         # so each paint is cheap and DWM can actually composite us
@@ -460,6 +480,26 @@ class MiniLiveViewer(QWidget):
             fullscreen = bool(getattr(worker, "_fullscreen_foreground_active", False))
             try:
                 self.video_label.set_lite_paint_mode(fullscreen)
+            except Exception:
+                pass
+            # C9 (v1.1.7): thread the overlay-level tier from the
+            # perf-mode config down to the widget. Low-FPS Mode is
+            # the highest-priority hint (weakest hardware — reduce
+            # to skeleton only), then Lite Mode (skeleton + bbox
+            # only), then default full overlay. Kept in the same
+            # code path as set_lite_paint_mode so the raw-frame and
+            # overlay-level state stay frame-synchronised.
+            try:
+                cfg = getattr(worker, "config", None)
+                if cfg is None:
+                    overlay_level = 3
+                elif bool(getattr(cfg, "low_fps_mode", False)) or bool(getattr(worker, "_low_fps_auto_engaged", False)):
+                    overlay_level = 1
+                elif bool(getattr(cfg, "lite_mode", False)):
+                    overlay_level = 2
+                else:
+                    overlay_level = 3
+                self.video_label.set_overlay_level(overlay_level)
             except Exception:
                 pass
         self._last_frame = frame
@@ -475,6 +515,41 @@ class MiniLiveViewer(QWidget):
                 self._lag_ms_smoothed = 0.8 * self._lag_ms_smoothed + 0.2 * instant_ms
             self._diag_hud_lag_text = f"{self._lag_ms_smoothed:.0f}"
             self._update_diag_hud()
+
+    def _c16_maybe_log_diag(self) -> None:
+        """C16: emit capture→slot latency + drop counters every ~2 s so
+        we can distinguish real display latency from perceived. Latency
+        is measured from ffmpeg reader's decoded_at to slot entry (age
+        the two-stage drop uses). Called on EVERY slot invocation
+        including drops so we count drops even when we short-circuit.
+        Zero cost to painting; one time.monotonic() + a modulo check."""
+        import time as _time
+        now = _time.monotonic()
+        if self._c16_last_log_monotonic <= 0.0:
+            self._c16_last_log_monotonic = now
+            return
+        elapsed = now - self._c16_last_log_monotonic
+        if elapsed < 2.0:
+            return
+        kept = max(0, self._c16_slot_calls - self._c16_drops_backlog - self._c16_drops_age)
+        avg_lag = (self._c16_lag_sum_ms / kept) if kept > 0 else 0.0
+        try:
+            import sys as _sys
+            _sys.stderr.write(
+                f"[mini_viewer_c16] slot rate: {self._c16_slot_calls / elapsed:.1f} /s "
+                f"(kept={kept}, drop_backlog={self._c16_drops_backlog}, "
+                f"drop_age={self._c16_drops_age}) | "
+                f"capture→slot lag avg={avg_lag:.1f}ms max={self._c16_lag_max_ms:.1f}ms\n"
+            )
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        self._c16_slot_calls = 0
+        self._c16_drops_backlog = 0
+        self._c16_drops_age = 0
+        self._c16_lag_sum_ms = 0.0
+        self._c16_lag_max_ms = 0.0
+        self._c16_last_log_monotonic = now
 
     def _on_worker_landmarks(self, hands_xy_norm) -> None:
         # Engine-completed landmark overlay. Goes to the GPU widget

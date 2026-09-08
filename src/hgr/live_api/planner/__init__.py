@@ -23,10 +23,12 @@ from .planner_llm import LLMPlanner
 from .scheduler import RateScheduler, scheduler
 from .synthesizer import Synthesizer
 from .triggers import looks_multi_action, plan_needs_confirm, RISKY_TOOLS
-from .orchestrator import IrisPlanner
+from .orchestrator import (
+    IrisPlanner, current_planner_artifact_lookup,
+)
 
 __all__ = ["Step", "StepResult", "Plan", "PlanCache", "Classifier",
            "Executor", "LLMPlanner", "Synthesizer",
            "RateScheduler", "scheduler",
            "looks_multi_action", "plan_needs_confirm", "RISKY_TOOLS",
-           "IrisPlanner"]
+           "IrisPlanner", "current_planner_artifact_lookup"]

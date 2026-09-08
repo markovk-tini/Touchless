@@ -11,11 +11,15 @@ Author: Konstantin Markov
 """
 from __future__ import annotations
 
+import concurrent.futures
 import os
 from typing import Any, Dict, List
 
-from .base import Connector, connector_result
+from .base import Connector, connector_result, friendly_api_error
 from .google_client import GoogleClient
+
+_DRIVE_CALL_TIMEOUT_SEC = 25.0
+_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="drive")
 
 
 class DriveConnector(Connector):
@@ -64,7 +68,7 @@ class DriveConnector(Connector):
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "max": {"type": "integer", "description": "Max files (default 20)."},
+                        "max": {"type": "integer", "description": "Max files to return (default 100, up to 500)."},
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -73,6 +77,17 @@ class DriveConnector(Connector):
         ]
 
     def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return _pool.submit(self._execute_locked, name, args).result(
+                timeout=_DRIVE_CALL_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            return connector_result(
+                "error",
+                error=f"{name} timed out after {_DRIVE_CALL_TIMEOUT_SEC}s",
+                code="timeout",
+            )
+
+    def _execute_locked(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         svc = self._svc()
         if svc is None:
             return connector_result("error", error="Google Drive not authorized", code="not_ready")
@@ -93,12 +108,25 @@ class DriveConnector(Connector):
                 return connector_result("ok", uploaded=True, id=created.get("id"),
                                         name=created.get("name"), link=created.get("webViewLink"))
             if name == "drive_list":
-                max_n = max(1, min(100, int(args.get("max") or 20)))
-                listing = svc.files().list(
-                    pageSize=max_n, fields="files(id,name,webViewLink)").execute()
-                files = [{"id": f.get("id"), "name": f.get("name"), "link": f.get("webViewLink")}
-                         for f in (listing.get("files") or [])]
+                max_n = max(1, min(500, int(args.get("max") or 100)))
+                files: list[dict] = []
+                page_token: str | None = None
+                while len(files) < max_n:
+                    remaining = max_n - len(files)
+                    listing = svc.files().list(
+                        pageSize=min(remaining, 1000),
+                        fields="nextPageToken, files(id,name,webViewLink)",
+                        pageToken=page_token,
+                    ).execute()
+                    for f in (listing.get("files") or []):
+                        files.append({"id": f.get("id"), "name": f.get("name"),
+                                      "link": f.get("webViewLink")})
+                        if len(files) >= max_n:
+                            break
+                    page_token = listing.get("nextPageToken")
+                    if not page_token:
+                        break
                 return connector_result("ok", count=len(files), files=files)
         except Exception as exc:
-            return connector_result("error", error=f"{type(exc).__name__}: {exc}")
+            return connector_result("error", error=friendly_api_error(exc, api_label="Google Drive"))
         return connector_result("error", error=f"unknown drive tool: {name}", code="no_handler")

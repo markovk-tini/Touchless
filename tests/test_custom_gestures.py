@@ -29,7 +29,12 @@ _SRC = _REPO_ROOT / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-from hgr.custom_gestures.action import Action, describe  # noqa: E402
+from hgr.custom_gestures.action import (  # noqa: E402
+    Action,
+    _mistaken_https_plain_text,
+    describe,
+    execute_open_url,
+)
 from hgr.custom_gestures.classifier import GestureClassifier  # noqa: E402
 from hgr.custom_gestures.description import (  # noqa: E402
     CategoricalRange,
@@ -652,5 +657,34 @@ def test_action_describe_covers_all_kinds():
     for action in cases:
         s = describe(action)
         assert isinstance(s, str) and s
+
+
+def test_mistaken_https_plain_text_detects_spaced_host():
+    assert _mistaken_https_plain_text("https://my snap") == "my snap"
+    assert _mistaken_https_plain_text("http://ohhhhh snap") == "ohhhhh snap"
+    assert _mistaken_https_plain_text("https://example.com") is None
+    assert _mistaken_https_plain_text("https://example.com/my page") is None
+    assert _mistaken_https_plain_text("my snap") is None
+
+
+def test_open_url_spaced_host_types_literal_not_browser(monkeypatch):
+    typed: list[str] = []
+    opened: list[str] = []
+
+    monkeypatch.setattr(
+        "hgr.custom_gestures.action.execute_text",
+        lambda text: typed.append(text) or True,
+    )
+    monkeypatch.setattr(
+        "hgr.custom_gestures.action.webbrowser.open",
+        lambda url: opened.append(url) or True,
+    )
+
+    assert execute_open_url("https://my snap") is True
+    assert typed == ["my snap"]
+    assert opened == []
+
+    assert execute_open_url("https://example.com") is True
+    assert opened == ["https://example.com"]
 
 # Author: Konstantin Markov

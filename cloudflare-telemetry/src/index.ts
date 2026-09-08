@@ -742,6 +742,59 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
          FROM events WHERE event = 'error_caught' ${range.clause}`
     ).first<{ total: number; affected_installs: number }>();
 
+    // ---- WAITLIST ------------------------------------------------
+    // /waitlist signups from touchless-control.com. Each event carries
+    // properties.email plus optional .name and .use_case, with .source
+    // recording the channel (ig / x / downloads / direct / etc). We
+    // return the raw rows so the dashboard can list them, plus a
+    // by-source breakdown for the top stat strip.
+    const waitlistRows = await env.DB.prepare(
+        `SELECT received_at, properties
+         FROM events
+         WHERE event = 'waitlist_signup' ${range.clause}
+         ORDER BY received_at DESC
+         LIMIT 500`
+    ).all<{ received_at: string; properties: string }>();
+
+    const waitlistEntries: Array<{
+        email: string;
+        name: string | null;
+        use_case: string | null;
+        source: string | null;
+        campaign: string | null;
+        received_at: string;
+    }> = [];
+    const sourceCounts: Record<string, number> = {};
+    for (const r of waitlistRows.results ?? []) {
+        let props: Record<string, unknown> = {};
+        try { props = JSON.parse(r.properties || "{}") as Record<string, unknown>; } catch { /* skip bad json */ }
+        const email = typeof props.email === "string" ? props.email.trim() : "";
+        if (!email) continue;  // no email = useless row, skip
+        const source = typeof props.source === "string" ? props.source : null;
+        waitlistEntries.push({
+            email,
+            name: typeof props.name === "string" && props.name ? props.name : null,
+            use_case: typeof props.use_case === "string" && props.use_case ? props.use_case : null,
+            source,
+            campaign: typeof props.campaign === "string" && props.campaign ? props.campaign : null,
+            received_at: r.received_at,
+        });
+        const key = source || "direct";
+        sourceCounts[key] = (sourceCounts[key] || 0) + 1;
+    }
+    const waitlistBySource = Object.entries(sourceCounts)
+        .map(([source, n]) => ({ source, n }))
+        .sort((a, b) => b.n - a.n);
+
+    // Lifetime total (independent of range) — headline number on the tab.
+    const waitlistLifetime = await env.DB.prepare(
+        `SELECT COUNT(*) AS total,
+                COUNT(DISTINCT json_extract(properties, '$.email')) AS unique_emails
+         FROM events
+         WHERE event = 'waitlist_signup'
+           AND json_extract(properties, '$.email') IS NOT NULL`
+    ).first<{ total: number; unique_emails: number }>();
+
     return jsonResponse({
         range_key: range.key,
         range_label: range.label,
@@ -777,6 +830,11 @@ async function handleStats(request: Request, env: Env): Promise<Response> {
         errors: errorRows.results ?? [],
         errors_total: errorTotal?.total ?? 0,
         errors_affected_installs: errorTotal?.affected_installs ?? 0,
+        // Waitlist
+        waitlist_entries: waitlistEntries,
+        waitlist_by_source: waitlistBySource,
+        waitlist_lifetime_total: waitlistLifetime?.total ?? 0,
+        waitlist_lifetime_unique: waitlistLifetime?.unique_emails ?? 0,
     });
 }
 
@@ -963,6 +1021,7 @@ const DASHBOARD_HTML = `<!doctype html>
       <button class="pill" data-tab="users">Users</button>
       <button class="pill" data-tab="sessions">Sessions</button>
       <button class="pill" data-tab="errors">Errors</button>
+      <button class="pill" data-tab="waitlist">Waitlist</button>
     </div>
     <div class="pills" id="range-pills">
       <button class="pill" data-range="24h">24h</button>
@@ -1192,6 +1251,39 @@ const DASHBOARD_HTML = `<!doctype html>
         </table>
         <div class="total" id="sessions-list-tbl-total"></div>
         <button class="toggle" id="sessions-list-tbl-toggle" style="display:none"></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== WAITLIST ========== -->
+  <!-- Surfaces every waitlist_signup event collected from
+       touchless-control.com/waitlist. Each row carries the email
+       (required), plus optional name and use-case. The "source" tag
+       comes from the ?ref= / utm_source the link router stamped on
+       the inbound visit (ig / x / tt / downloads / direct). -->
+  <section class="tab-page" id="page-waitlist">
+    <div class="grid">
+      <div class="stat"><div class="lbl">Lifetime signups</div><div class="val" id="waitlist-total">—</div></div>
+      <div class="stat"><div class="lbl">Unique emails</div><div class="val" id="waitlist-unique">—</div></div>
+    </div>
+    <div class="row">
+      <div class="card" style="grid-column: 1 / -1">
+        <h2>Signups by source <span id="waitlist-source-range" class="sub" style="font-size:11px"></span></h2>
+        <p class="blurb"><code>ig</code> / <code>x</code> / <code>tt</code> = social bio link · <code>downloads</code> = Mac card on /downloads · <code>direct</code> = typed /waitlist URL or no ref captured.</p>
+        <table id="waitlist-source-tbl"><thead><tr><th>source</th><th>signups</th></tr></thead><tbody></tbody></table>
+        <div class="total" id="waitlist-source-total"></div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <div class="card" style="grid-column: 1 / -1">
+        <h2>All signups <span id="waitlist-range-lbl" class="sub" style="font-size:11px"></span></h2>
+        <p class="blurb">One row per /waitlist submission. Most-recent first. Hover a use-case cell to read the full text; click "Show all" below for the full list.</p>
+        <table id="waitlist-tbl">
+          <thead><tr><th>received</th><th>email</th><th>name</th><th>use case</th><th>source</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="total" id="waitlist-tbl-total"></div>
+        <button class="toggle" id="waitlist-tbl-toggle" style="display:none"></button>
       </div>
     </div>
   </section>
@@ -1823,6 +1915,30 @@ const DASHBOARD_HTML = `<!doctype html>
       r => '<td>' + esc(r.component ?? "(unknown)") + '</td>'
          + '<td>' + esc(r.exc_type ?? "(unknown)") + '</td>'
          + '<td class="num">' + fmt(r.n) + '</td>', 10);
+
+    // -- Waitlist --------------------------------------------------
+    document.getElementById("waitlist-total").textContent = fmt(data.waitlist_lifetime_total || 0);
+    document.getElementById("waitlist-unique").textContent = fmt(data.waitlist_lifetime_unique || 0);
+    document.getElementById("waitlist-source-range").textContent = lblShort;
+    document.getElementById("waitlist-range-lbl").textContent = lblShort;
+    fillTable("waitlist-source-tbl", data.waitlist_by_source,
+      r => '<td><span style="background:rgba(29,233,182,0.12);color:var(--accent);padding:2px 8px;border-radius:4px;font-size:12px;font-weight:600">'
+         + esc(r.source || "direct") + '</span></td>'
+         + '<td class="num">' + fmt(r.n) + '</td>', 10);
+    fillTable("waitlist-tbl", data.waitlist_entries, r => {
+      // Use-case cell: truncate visually with ellipsis but keep the
+      // full text in the title attribute so hover shows everything.
+      const useCaseCell = r.use_case
+        ? '<td title="' + esc(r.use_case) + '" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(r.use_case) + '</td>'
+        : '<td><span class="muted">—</span></td>';
+      const sourceTag = '<span style="background:rgba(29,233,182,0.12);color:var(--accent);padding:2px 6px;border-radius:4px;font-size:11px;font-weight:600">'
+        + esc(r.source || "direct") + '</span>';
+      return '<td class="muted">' + esc(fmtTime(r.received_at)) + '</td>'
+        + '<td><code style="font-size:12px">' + esc(r.email) + '</code></td>'
+        + '<td>' + (r.name ? esc(r.name) : '<span class="muted">—</span>') + '</td>'
+        + useCaseCell
+        + '<td>' + sourceTag + '</td>';
+    }, 25);
   }
 
   function renderFunnel(f) {

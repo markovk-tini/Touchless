@@ -156,7 +156,12 @@ class _OnnxPalmDetector:
         # silent DML-to-CPU per-op fallback inside an InferenceSession.
         self._last_inference_seconds: float = 0.0
 
-    def detect(self, rgb_frame: np.ndarray) -> list[dict[str, Any]]:
+    def detect(
+        self,
+        rgb_frame: np.ndarray,
+        *,
+        score_threshold: float | None = None,
+    ) -> list[dict[str, Any]]:
         h, w = rgb_frame.shape[:2]
         blob, pad_bias, ratio = self._preprocess(rgb_frame)
         _t0 = time.perf_counter()
@@ -164,7 +169,13 @@ class _OnnxPalmDetector:
         self._last_inference_seconds = time.perf_counter() - _t0
         # outputs ordering matches the ONNX model: Identity (boxes
         # + keypoint deltas), Identity_1 (scores).
-        return self._postprocess(outputs, np.array([w, h]), pad_bias, ratio)
+        return self._postprocess(
+            outputs,
+            np.array([w, h]),
+            pad_bias,
+            ratio,
+            score_threshold=score_threshold,
+        )
 
     def _preprocess(self, rgb_frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
         # Letterbox — preserve aspect ratio, pad shorter side with black.
@@ -199,7 +210,12 @@ class _OnnxPalmDetector:
         original_wh: np.ndarray,
         pad_bias: np.ndarray,
         ratio: float,
+        *,
+        score_threshold: float | None = None,
     ) -> list[dict[str, Any]]:
+        threshold = (
+            self._score_threshold if score_threshold is None else float(score_threshold)
+        )
         scores_raw = outputs[1][0, :, 0]
         deltas = outputs[0][0]
         # Sigmoid the logits.
@@ -230,7 +246,7 @@ class _OnnxPalmDetector:
         keep = cv2.dnn.NMSBoxes(
             nms_boxes.tolist(),
             scores.tolist(),
-            self._score_threshold,
+            threshold,
             self._nms_threshold,
             top_k=self._top_k,
         )
@@ -476,6 +492,34 @@ class _OnnxHands:
     # order MediaPipe documents.
     _PALM_LANDMARK_INDICES = (0, 5, 9, 13, 17, 1, 2)
 
+    # ---- Re-acquisition (see Stage 3 in _process_locked) ----------
+    # Losing a hand we were already tracking and finding a brand-new
+    # hand are different problems, but the pre-r55 code solved both
+    # with one strict palm-detect gate. A hand whose landmark
+    # presence dipped for a single frame (motion blur at the end of
+    # a swipe) was dropped outright, and re-entry then required the
+    # palm model to score >= min_detection_confidence (0.72) on a
+    # pose it scores poorly — a curled hand with one finger up
+    # measures ~0.45-0.50. The result was multi-second skeleton
+    # dropouts with the hand plainly in frame.
+    #
+    # So for a short window after losing a track we (a) retry the
+    # lost ROI with the cheap landmark pass, which is far better at
+    # re-finding a known hand than palm-detect is, and (b) relax the
+    # palm-detect floor. Discovering NEW hands still uses the strict
+    # threshold, so idle-frame false positives are unchanged.
+    #
+    # Cost control: a relaxed floor surfaces more palm candidates, and
+    # every candidate costs a landmark inference (~2-3 ms) to reject.
+    # Letting all of them through would turn each gap frame into a
+    # visible hitch, so only the single best sub-threshold candidate is
+    # ever tried per frame. Candidates are score-sorted, so that is the
+    # one most likely to be the hand we're chasing.
+    _REACQUIRE_SCORE_FLOOR = 0.50
+    _REACQUIRE_WINDOW_FRAMES = 20   # ~0.4 s at 50 fps
+    _STALE_ROI_RETRY_FRAMES = 5     # ~0.1 s of ROI retries
+    _MAX_RELAXED_CANDIDATES_PER_FRAME = 1
+
     def __init__(
         self,
         palm_session,
@@ -521,6 +565,15 @@ class _OnnxHands:
         # automatically — every frame is independent.
         self._tracking_threshold = float(min_tracking_confidence)
         self._tracking_disabled = bool(static_image_mode)
+        # Never let the re-acquire floor sit ABOVE the configured
+        # detection threshold — a caller that already runs loose
+        # (low-FPS mode uses 0.34) must not get stricter mid-gap.
+        self._palm_strict_threshold = float(min_detection_confidence)
+        self._reacquire_score_threshold = min(
+            float(min_detection_confidence), self._REACQUIRE_SCORE_FLOOR
+        )
+        self._reacquire_frames_left = 0
+        self._stale_roi_frames_left = 0
         self._lock = threading.Lock()
         # Cached tracks: each entry is a dict shaped exactly like
         # what `_OnnxHandLandmarker.detect` accepts for `palm`,
@@ -655,6 +708,8 @@ class _OnnxHands:
             tp0 = getattr(self, "_gate_fire_tp0", 0)
             tp1 = getattr(self, "_gate_fire_tp1", 0)
             tpN = getattr(self, "_gate_fire_tpN", 0)
+            reacq = getattr(self, "_gate_fire_reacquire", 0)
+            self._gate_fire_reacquire = 0
             self._gate_fire_scan_due = 0
             self._gate_fire_no_survivors = 0
             self._gate_fire_disabled = 0
@@ -669,7 +724,8 @@ class _OnnxHands:
                 f"track1[attempts={stage1_a} ok={stage1_ok} "
                 f"lost_crop_or_None={stage1_lc} lost_conf={stage1_lp}] "
                 f"gate[scan={gate_scan} no_surv={gate_nos} dis={gate_dis}] "
-                f"tp_at_fire[0={tp0} 1={tp1} N={tpN}]\n"
+                f"tp_at_fire[0={tp0} 1={tp1} N={tpN}] "
+                f"reacq={reacq}\n"
             )
             sys.stderr.flush()
         except Exception:
@@ -705,6 +761,10 @@ class _OnnxHands:
         stage1_lost_crop = 0
         stage1_lost_conf = 0
         stage1_ok = 0
+        # ROIs whose landmark pass failed this frame. Stage 3 may keep
+        # them for a few more frames so a momentary dip doesn't force a
+        # full palm-detect re-acquisition.
+        lost_rois: list[dict[str, Any]] = []
         if not self._tracking_disabled and self._tracked_palms:
             for prev in self._tracked_palms:
                 stage1_attempts += 1
@@ -716,9 +776,11 @@ class _OnnxHands:
                     # directly. Treat as crop-loss bucket — we'll
                     # widen the diagnostic if needed.
                     stage1_lost_crop += 1
+                    lost_rois.append(prev)
                     continue
                 if lm["presence_score"] < self._tracking_threshold:
                     stage1_lost_conf += 1
+                    lost_rois.append(prev)
                     continue
                 stage1_ok += 1
                 next_palm = self._derive_palm_from_landmarks(lm["landmarks"])
@@ -776,13 +838,37 @@ class _OnnxHands:
             self._gate_fire_tp0 = getattr(self, "_gate_fire_tp0", 0) + (1 if not self._tracked_palms else 0)
             self._gate_fire_tp1 = getattr(self, "_gate_fire_tp1", 0) + (1 if len(self._tracked_palms) == 1 else 0)
             self._gate_fire_tpN = getattr(self, "_gate_fire_tpN", 0) + (1 if len(self._tracked_palms) > 1 else 0)
+        # Relax the palm-detect floor while we're chasing a hand we
+        # just lost (see _REACQUIRE_SCORE_FLOOR). `lost_rois` covers
+        # the frame of the loss itself; the counters cover the frames
+        # after it.
+        reacquiring = bool(
+            lost_rois
+            or self._reacquire_frames_left > 0
+            or self._stale_roi_frames_left > 0
+        )
         if run_palm_detect:
             self._frames_since_last_scan = 0
-            palms = self._palm.detect(rgb_frame)
+            palms = self._palm.detect(
+                rgb_frame,
+                score_threshold=(
+                    self._reacquire_score_threshold if reacquiring else None
+                ),
+            )
+            if reacquiring:
+                self._gate_fire_reacquire = getattr(self, "_gate_fire_reacquire", 0) + 1
             palms = sorted(palms, key=lambda p: -p["score"])
+            relaxed_tried = 0
             for palm in palms:
                 if len(survivors) >= self._max_num_hands:
                     break
+                if float(palm["score"]) < self._palm_strict_threshold:
+                    # Sorted by score, so everything from here down is
+                    # sub-threshold too — spend one landmark inference
+                    # on the best of them and stop.
+                    if relaxed_tried >= self._MAX_RELAXED_CANDIDATES_PER_FRAME:
+                        break
+                    relaxed_tried += 1
                 # Skip palm candidates that overlap an existing
                 # tracked hand — those would just produce a duplicate
                 # landmark inference for the same hand.
@@ -801,7 +887,33 @@ class _OnnxHands:
         else:
             self._frames_since_last_scan += 1
 
-        self._tracked_palms = [] if self._tracking_disabled else survivors
+        # ----- Stage 3: re-acquisition bookkeeping --------------------
+        # Nothing survived and something was lost this frame: hold the
+        # lost ROI so next frame's Stage 1 gets another (cheap) shot at
+        # it, and keep the relaxed palm floor armed for a short window.
+        # Any survivor clears the whole thing — we're tracking again.
+        if self._tracking_disabled:
+            self._tracked_palms = []
+            self._reacquire_frames_left = 0
+            self._stale_roi_frames_left = 0
+        elif survivors:
+            self._tracked_palms = survivors
+            self._reacquire_frames_left = 0
+            self._stale_roi_frames_left = 0
+        elif lost_rois:
+            if self._stale_roi_frames_left <= 0:
+                self._stale_roi_frames_left = self._STALE_ROI_RETRY_FRAMES
+                self._reacquire_frames_left = self._REACQUIRE_WINDOW_FRAMES
+            else:
+                self._stale_roi_frames_left -= 1
+            self._tracked_palms = (
+                lost_rois if self._stale_roi_frames_left > 0 else []
+            )
+        else:
+            self._tracked_palms = []
+            self._stale_roi_frames_left = 0
+            if self._reacquire_frames_left > 0:
+                self._reacquire_frames_left -= 1
         # Snapshot Stage-1 counters for this frame so process() can
         # aggregate them across the 2-second log window.
         self._last_stage1_attempts = stage1_attempts

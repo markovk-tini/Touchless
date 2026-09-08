@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Iris Cortex — Neural Network demo</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #050a14; color: #C8E6FF; overflow: hidden; height: 100%; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+    #canvas { position: absolute; inset: 0; }
+    #panel { position: absolute; top: 18px; left: 18px; background: rgba(6,16,30,0.78); border: 1px solid rgba(88,227,255,0.30); border-radius: 10px; padding: 14px 18px; font-size: 13px; min-width: 320px; z-index: 10; }
+    #panel h1 { font-size: 12px; letter-spacing: 3px; color: #58E3FF; margin: 0 0 10px 0; font-weight: 800; text-transform: uppercase; }
+    .row { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; gap: 8px; }
+    .label { color: rgba(200,230,255,0.7); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+    button { background: rgba(88,227,255,0.10); border: 1px solid rgba(88,227,255,0.40); color: #C8E6FF; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-right: 4px; }
+    button.active { background: rgba(88,227,255,0.28); border-color: #58E3FF; color: #fff; }
+    button:hover { background: rgba(88,227,255,0.18); }
+    button.fire { background: rgba(245,181,66,0.14); border-color: rgba(245,181,66,0.45); }
+    button.fire:hover { background: rgba(245,181,66,0.24); }
+    #hint { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); color: rgba(200,230,255,0.5); font-size: 11px; letter-spacing: 2px; text-transform: uppercase; pointer-events: none; }
+    .back { position: absolute; top: 18px; right: 18px; color: rgba(200,230,255,0.6); text-decoration: none; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; border: 1px solid rgba(255,255,255,0.15); padding: 6px 12px; border-radius: 6px; z-index: 10; }
+    .back:hover { color: #fff; border-color: rgba(255,255,255,0.5); }
+    .value { color: #58E3FF; font-weight: 700; min-width: 28px; text-align: right; }
+  </style>
+  <script type="importmap">
+    { "imports": { "three": "../vendor/three/build/three.module.js", "three/addons/": "../vendor/three/examples/jsm/" } }
+  </script>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <a class="back" href="./index.html">← all demos</a>
+  <div id="panel">
+    <h1>Bonus · Neural firing network</h1>
+    <div class="row"><span class="label">Trigger node</span>
+      <div>
+        <button class="fire" data-fire="core">Core</button>
+        <button class="fire" data-fire="0">N1</button>
+        <button class="fire" data-fire="1">N2</button>
+        <button class="fire" data-fire="2">N3</button>
+        <button class="fire" data-fire="3">N4</button>
+        <button class="fire" data-fire="4">N5</button>
+      </div>
+    </div>
+    <div class="row"><span class="label">Idle firing</span>
+      <button id="idle" class="active">ON</button>
+    </div>
+    <div class="row"><span class="label">Cascade chance</span>
+      <input type="range" id="cascade" min="0" max="100" value="55" style="width:120px"/>
+      <span class="value" id="cascade-val">55%</span>
+    </div>
+    <div class="row"><span class="label">Active pulses</span>
+      <span class="value" id="pulse-count">0</span>
+    </div>
+    <div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 10px; color: rgba(200,230,255,0.55); line-height: 1.5;">
+      All nodes use the plasma shader from #1. Edges fire bright traveling pulses; arrivals flash the destination and may cascade. Idle = random background firings.
+    </div>
+  </div>
+  <div id="hint">Click N1–N5 or Core to fire that node · drag to orbit · scroll to zoom</div>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+    const canvas = document.getElementById('canvas');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(innerWidth, innerHeight, false);
+    renderer.setClearColor(0x050a14, 1);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 200);
+    camera.position.set(0, 8, 38);
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true; controls.dampingFactor = 0.08;
+
+    scene.add(new THREE.AmbientLight(0x101830, 0.18));
+
+    // ── Plasma shader (same as #1) ───────────────────────────────────
+    const NOISE = `
+      vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x, 289.0);}
+      vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
+      float snoise(vec3 v){
+        const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+        const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+        vec3 i  = floor(v + dot(v, C.yyy));
+        vec3 x0 = v - i + dot(i, C.xxx);
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min(g.xyz, l.zxy);
+        vec3 i2 = max(g.xyz, l.zxy);
+        vec3 x1 = x0 - i1 + 1.0 * C.xxx;
+        vec3 x2 = x0 - i2 + 2.0 * C.xxx;
+        vec3 x3 = x0 - 1. + 3.0 * C.xxx;
+        i = mod(i, 289.0);
+        vec4 p = permute(permute(permute(
+                   i.z + vec4(0.0, i1.z, i2.z, 1.0))
+                 + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+                 + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+        float n_ = 1.0/7.0;
+        vec3 ns = n_ * D.wyz - D.xzx;
+        vec4 j = p - 49.0 * floor(p * ns.z *ns.z);
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_);
+        vec4 x = x_ *ns.x + ns.yyyy;
+        vec4 y = y_ *ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+        vec4 b0 = vec4(x.xy, y.xy);
+        vec4 b1 = vec4(x.zw, y.zw);
+        vec4 s0 = floor(b0)*2.0 + 1.0;
+        vec4 s1 = floor(b1)*2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+        vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+        vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+        vec3 p0 = vec3(a0.xy, h.x);
+        vec3 p1 = vec3(a0.zw, h.y);
+        vec3 p2 = vec3(a1.xy, h.z);
+        vec3 p3 = vec3(a1.zw, h.w);
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+        p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+        vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+      }
+    `;
+    const VS = `
+      uniform float uTime, uBodyAmp, uSurfaceAmp, uSeed;
+      varying vec3 vNormal; varying float vNoise; varying vec3 vViewPosition;
+      ${NOISE}
+      vec3 displace(vec3 p) {
+        float n1 = snoise(p * 0.35 + vec3(uSeed) + uTime * 0.25);
+        float n2 = snoise(p * 2.00 + vec3(uSeed*2.7) + uTime * 1.50);
+        return p + normalize(p) * (n1 * uBodyAmp + n2 * uSurfaceAmp);
+      }
+      vec3 ortho(vec3 v){ return normalize(abs(v.x) > abs(v.z) ? vec3(-v.y, v.x, 0.0) : vec3(0.0, -v.z, v.y)); }
+      void main(){
+        vec3 d = displace(position);
+        float eps = 0.001;
+        vec3 t1 = ortho(normal); vec3 t2 = normalize(cross(normal, t1));
+        vec3 d1 = displace(position + t1 * eps) - d;
+        vec3 d2 = displace(position + t2 * eps) - d;
+        vNormal = normalize(cross(d1, d2));
+        vNoise = snoise(position * 2.0 + vec3(uSeed*2.7) + uTime * 1.5);
+        vec4 mv = modelViewMatrix * vec4(d, 1.0);
+        vViewPosition = -mv.xyz;
+        gl_Position = projectionMatrix * mv;
+      }
+    `;
+    const FS = `
+      uniform vec3 uBaseColor, uHotColor;
+      uniform float uIntensity;
+      varying vec3 vNormal; varying float vNoise; varying vec3 vViewPosition;
+      void main(){
+        vec3 N = normalize(vNormal); vec3 V = normalize(vViewPosition);
+        float fres = pow(1.0 - max(dot(N, V), 0.0), 2.0);
+        float heat = smoothstep(-0.4, 0.7, vNoise);
+        vec3 col = mix(uBaseColor, uHotColor, heat);
+        col *= (0.45 + 0.55 * uIntensity);
+        col += vec3(0.25, 0.6, 1.0) * fres * 0.6 * uIntensity;
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+    function makePlasmaMat(seed, base, hot){
+      return new THREE.ShaderMaterial({
+        vertexShader: VS, fragmentShader: FS,
+        uniforms: {
+          uTime: { value: 0 },
+          uBodyAmp: { value: 0.08 },
+          uSurfaceAmp: { value: 0.04 },
+          uIntensity: { value: 0.6 },
+          uBaseColor: { value: new THREE.Color(base) },
+          uHotColor:  { value: new THREE.Color(hot) },
+          uSeed: { value: seed },
+        },
+      });
+    }
+
+    // ── Halo sprite (shared) ────────────────────────────────────────
+    const haloTex = (() => {
+      const c = document.createElement('canvas'); c.width = 128; c.height = 128;
+      const g = c.getContext('2d').createRadialGradient(64,64,0,64,64,64);
+      g.addColorStop(0, 'rgba(255,255,255,0.85)');
+      g.addColorStop(0.2, 'rgba(255,255,255,0.42)');
+      g.addColorStop(0.5, 'rgba(255,255,255,0.10)');
+      g.addColorStop(1, 'rgba(255,255,255,0)');
+      const ctx = c.getContext('2d'); ctx.fillStyle = g; ctx.fillRect(0,0,128,128);
+      const t = new THREE.CanvasTexture(c); t.needsUpdate = true; return t;
+    })();
+    function makeHalo(color, size, opacity){
+      const m = new THREE.SpriteMaterial({
+        map: haloTex, color, transparent: true, opacity,
+        depthWrite: false, blending: THREE.AdditiveBlending,
+      });
+      const s = new THREE.Sprite(m);
+      s.scale.set(size, size, 1);
+      return s;
+    }
+
+    // ── Build the network ───────────────────────────────────────────
+    const NODES = [];   // each { mesh, halo, baseIntensity, position, seed, mat, lastFireAt }
+
+    function addNode(id, position, opts={}){
+      const radius = opts.radius ?? 1.6;
+      const detail = opts.detail ?? 4;
+      const mat = makePlasmaMat(opts.seed ?? Math.random()*100,
+                                 opts.base ?? 0x2497d6,
+                                 opts.hot  ?? 0xeaffff);
+      mat.uniforms.uBodyAmp.value = opts.bodyAmp ?? 0.06;
+      mat.uniforms.uSurfaceAmp.value = opts.surfAmp ?? 0.04;
+      mat.uniforms.uIntensity.value = opts.intensity ?? 0.55;
+      const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(radius, detail), mat);
+      mesh.position.copy(position);
+      scene.add(mesh);
+      const halo = makeHalo(opts.haloColor ?? 0x58e3ff,
+                             (radius * 3.5) + (opts.haloBonus ?? 0),
+                             opts.haloOpacity ?? 0.55);
+      halo.position.copy(position);
+      scene.add(halo);
+      NODES.push({ id, mesh, halo, mat, baseIntensity: mat.uniforms.uIntensity.value, position: position.clone(), lastFireAt: 0 });
+    }
+
+    // Core (bigger, brighter)
+    addNode('core', new THREE.Vector3(0, 0, 0), {
+      radius: 3.0, detail: 5, seed: 1.0,
+      base: 0x2497d6, hot: 0xeaffff, haloColor: 0x6fc3ff,
+      bodyAmp: 0.10, surfAmp: 0.05, intensity: 0.7,
+      haloBonus: 6, haloOpacity: 0.7,
+    });
+
+    // 5 ring nodes orbiting core. Different colors so firing is visually distinct.
+    const RING_COLORS = [
+      { base: 0x1de9b6, hot: 0xc8ffea, halo: 0x1de9b6 },   // teal
+      { base: 0xb388ff, hot: 0xede0ff, halo: 0xb388ff },   // violet
+      { base: 0xf5b542, hot: 0xfff0c0, halo: 0xf5b542 },   // amber
+      { base: 0x58e3ff, hot: 0xeaffff, halo: 0x58e3ff },   // cyan
+      { base: 0xef7fc7, hot: 0xffd2ec, halo: 0xef7fc7 },   // pink
+    ];
+    const RING_R = 14;
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2;
+      const p = new THREE.Vector3(Math.cos(a) * RING_R, Math.sin(a * 0.6) * 3, Math.sin(a) * RING_R);
+      addNode(String(i), p, {
+        radius: 1.5, detail: 4, seed: i * 1.7 + 0.3,
+        ...RING_COLORS[i].base !== undefined ? { base: RING_COLORS[i].base, hot: RING_COLORS[i].hot, haloColor: RING_COLORS[i].halo } : {},
+      });
+    }
+
+    function getNode(id) { return NODES.find(n => n.id === id); }
+
+    // ── Edges (TubeGeometry on a CatmullRomCurve3) ─────────────────
+    const EDGES = [];  // each { from, to, curve, points (Vec3[]), mesh }
+
+    function addEdge(fromId, toId, sag = 1.0) {
+      const a = getNode(fromId).position.clone();
+      const b = getNode(toId).position.clone();
+      const mid = a.clone().add(b).multiplyScalar(0.5);
+      // Push midpoint outward (away from origin) when sag > 0, so
+      // ring-to-ring edges arc around the core instead of through it.
+      const out = mid.clone();
+      if (out.lengthSq() > 1e-6) out.normalize().multiplyScalar(sag);
+      mid.add(out);
+      const curve = new THREE.CatmullRomCurve3([a, mid, b]);
+      const points = curve.getPoints(48);
+      // THREE.Line avoids TubeGeometry's computeFrenetFrames, which
+      // crashes on perfectly collinear control points (the case for
+      // core→ring edges where a, mid, b all sit on the same ray).
+      // Lines under additive bloom look basically identical to a thin
+      // tube anyway.
+      const geom = new THREE.BufferGeometry().setFromPoints(points);
+      const mesh = new THREE.Line(geom, new THREE.LineBasicMaterial({
+        color: 0x4a8db0, transparent: true, opacity: 0.28,
+        blending: THREE.AdditiveBlending, depthWrite: false,
+      }));
+      scene.add(mesh);
+      EDGES.push({ fromId, toId, curve, points, mesh });
+    }
+
+    // Core → each ring node
+    for (let i = 0; i < 5; i++) addEdge('core', String(i), 0);
+    // Ring lateral connections (i ↔ i+1) so cascades chain along the ring
+    for (let i = 0; i < 5; i++) addEdge(String(i), String((i + 1) % 5), 2.5);
+    // A couple of diagonal connections for richer cascades
+    addEdge('0', '2', 4);
+    addEdge('1', '3', 4);
+
+    // ── Firing pulses (the neuron-fire effect) ─────────────────────
+    const PULSE_SPEED = 18;   // world units / sec
+    const pulses = [];        // { edgeIdx, dir: 1 | -1, position (0..edgeLen), born, mesh, mat }
+    let cascadeChance = 0.55;
+
+    const pulseTex = (() => {
+      const c = document.createElement('canvas'); c.width = 64; c.height = 64;
+      const g = c.getContext('2d').createRadialGradient(32,32,0,32,32,32);
+      g.addColorStop(0, 'rgba(255,255,255,1)');
+      g.addColorStop(0.3, 'rgba(180,220,255,0.85)');
+      g.addColorStop(1, 'rgba(88,227,255,0)');
+      const ctx = c.getContext('2d'); ctx.fillStyle = g; ctx.fillRect(0,0,64,64);
+      const t = new THREE.CanvasTexture(c); t.needsUpdate = true; return t;
+    })();
+
+    function firePulse(edgeIdx, dir, color) {
+      const edge = EDGES[edgeIdx];
+      // Estimate edge length from sampled points
+      let len = 0;
+      for (let i = 1; i < edge.points.length; i++) len += edge.points[i].distanceTo(edge.points[i-1]);
+      const mat = new THREE.SpriteMaterial({
+        map: pulseTex, color, transparent: true, opacity: 0,
+        depthWrite: false, blending: THREE.AdditiveBlending,
+      });
+      const sprite = new THREE.Sprite(mat);
+      sprite.scale.set(1.6, 1.6, 1);
+      sprite.position.copy(dir === 1 ? edge.points[0] : edge.points[edge.points.length - 1]);
+      scene.add(sprite);
+      pulses.push({ edgeIdx, dir, traveled: 0, length: len, mesh: sprite, mat, color });
+      // Briefly brighten the edge it travels along
+      edge.mesh.material.opacity = 0.55;
+    }
+
+    function fireNode(id, depth = 0) {
+      const n = getNode(id);
+      if (!n) return;
+      const now = performance.now();
+      if (now - n.lastFireAt < 80) return;   // refractory period
+      n.lastFireAt = now;
+      // Spawn a brief flash via increased intensity
+      n.mat.uniforms.uIntensity.value = Math.min(2.2, n.baseIntensity + 1.4);
+      n.mat.uniforms.uSurfaceAmp.value = 0.14;
+      // For each edge connected to this node, send a pulse in the OUT direction.
+      const haloColor = n.halo.material.color.getHex();
+      EDGES.forEach((edge, i) => {
+        if (edge.fromId === id) firePulse(i, +1, haloColor);
+        else if (edge.toId === id) firePulse(i, -1, haloColor);
+      });
+    }
+
+    function pulseArrived(edge, pulse) {
+      const destId = pulse.dir === 1 ? edge.toId : edge.fromId;
+      const dest = getNode(destId);
+      if (!dest) return;
+      // Arrival flash on dest
+      dest.mat.uniforms.uIntensity.value = Math.min(2.0, dest.baseIntensity + 1.0);
+      dest.mat.uniforms.uSurfaceAmp.value = Math.max(dest.mat.uniforms.uSurfaceAmp.value, 0.10);
+      // Cascade
+      if (Math.random() < cascadeChance) {
+        setTimeout(() => fireNode(destId), 80 + Math.random() * 120);
+      }
+    }
+
+    function updatePulses(now, dt) {
+      for (let i = pulses.length - 1; i >= 0; i--) {
+        const p = pulses[i];
+        const edge = EDGES[p.edgeIdx];
+        p.traveled += PULSE_SPEED * dt;
+        const tRaw = (p.length > 0) ? (p.traveled / p.length) : 1;
+        const t = Math.max(0, Math.min(1, tRaw));
+        // Position along the curve. Strict-clamp u to [0, 1] because
+        // CatmullRomCurve3's extrapolation paths can hand undefined to
+        // distanceToSquared if u sneaks outside the segment range.
+        const u = Math.max(0, Math.min(1, p.dir === 1 ? t : 1 - t));
+        const pos = edge.curve.getPoint(u);
+        if (pos) p.mesh.position.copy(pos);
+        // Brighten in, hold, brighten out before arrival
+        p.mat.opacity = t < 0.1 ? (t / 0.1) : 1.0;
+        if (t >= 1) {
+          pulseArrived(edge, p);
+          scene.remove(p.mesh);
+          p.mat.dispose();
+          pulses.splice(i, 1);
+        }
+      }
+      document.getElementById('pulse-count').textContent = pulses.length.toString();
+    }
+
+    // ── Post-processing ─────────────────────────────────────────────
+    const composer = new EffectComposer(renderer);
+    composer.setPixelRatio(renderer.getPixelRatio());
+    composer.setSize(innerWidth, innerHeight);
+    composer.addPass(new RenderPass(scene, camera));
+    const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 1.25, 0.45, 0.55);
+    composer.addPass(bloom);
+    composer.addPass(new OutputPass());
+
+    // ── Idle firing + UI ────────────────────────────────────────────
+    let idleEnabled = true;
+    document.getElementById('idle').addEventListener('click', e => {
+      idleEnabled = !idleEnabled;
+      e.target.textContent = idleEnabled ? 'ON' : 'OFF';
+      e.target.classList.toggle('active', idleEnabled);
+    });
+    document.getElementById('cascade').addEventListener('input', e => {
+      cascadeChance = parseFloat(e.target.value) / 100;
+      document.getElementById('cascade-val').textContent = Math.round(cascadeChance * 100) + '%';
+    });
+    document.querySelectorAll('[data-fire]').forEach(b => {
+      b.addEventListener('click', () => fireNode(b.dataset.fire));
+    });
+
+    // ── Animation loop ──────────────────────────────────────────────
+    let last = performance.now();
+    let nextIdleFire = 0;
+    function frame(now) {
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      const t = now * 0.001;
+
+      // Update all plasma shaders' uTime; decay temporary firing intensity back to base.
+      for (const n of NODES) {
+        n.mat.uniforms.uTime.value = t;
+        const ui = n.mat.uniforms.uIntensity;
+        ui.value += (n.baseIntensity - ui.value) * Math.min(1, dt * 3.0);
+        const usa = n.mat.uniforms.uSurfaceAmp;
+        usa.value += (0.04 - usa.value) * Math.min(1, dt * 2.5);
+        n.halo.position.copy(n.mesh.position);
+      }
+
+      // Decay edge brightness back to ambient
+      for (const e of EDGES) {
+        e.mesh.material.opacity += (0.28 - e.mesh.material.opacity) * Math.min(1, dt * 2.0);
+      }
+
+      // Idle firings
+      if (idleEnabled && now > nextIdleFire) {
+        const pick = NODES[Math.floor(Math.random() * NODES.length)].id;
+        fireNode(pick);
+        nextIdleFire = now + 900 + Math.random() * 1500;
+      }
+
+      updatePulses(now, dt);
+      controls.update();
+      composer.render();
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight, false);
+      composer.setSize(innerWidth, innerHeight);
+      bloom.setSize(innerWidth, innerHeight);
+    });
+  </script>
+</body>
+</html>

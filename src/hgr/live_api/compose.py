@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict
 
-DEFAULT_MODEL = "gpt-5-mini"
+DEFAULT_MODEL = "gpt-4o-mini"
 API_URL = "https://api.openai.com/v1/chat/completions"
 # Sized for 'write a debrief about every unread email' patterns: a typical
 # inbox of 30-50 emails with 2KB bodies each fits inside 32K input chars

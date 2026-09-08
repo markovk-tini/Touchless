@@ -62,8 +62,18 @@ class HandDetector:
         self._last_primary_seen_at = 0.0
         self._last_secondary_hand: TrackedHand | None = None
         self._last_secondary_seen_at = 0.0
+        # MediaPipe SolutionBase.close() is not idempotent — a second
+        # call can raise or double-free. C17's engine-cache drain in
+        # _shutdown_runtime closes every cached engine plus (as a
+        # belt-and-suspenders) the currently active one, so close() can
+        # legitimately be called twice on the same instance. This guard
+        # makes the second call a no-op.
+        self._is_closed = False
 
     def close(self) -> None:
+        if self._is_closed:
+            return
+        self._is_closed = True
         self.hands.close()
         self._face_filter.close()
 

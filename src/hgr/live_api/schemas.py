@@ -390,12 +390,19 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "run_quick_command",
         "description": (
-            "Run a simple BUILT-IN Touchless command through its deterministic "
-            "processor — mainly Spotify / media control: 'play <song> on "
-            "spotify', 'next song', 'previous song', 'pause', 'resume', "
-            "'shuffle'. Use this for the media part of a multi-step request "
-            "(e.g. while also doing a web search) instead of scripting "
-            "Spotify's UI. `command` is the natural phrase."
+            "FALLBACK for built-in Touchless voice intents only. For "
+            "MEDIA / SPOTIFY actions, PREFER the dedicated connector "
+            "tools — spotify_play(query='<song or playlist or artist>') "
+            "for any 'play X' request, spotify_pause / spotify_next / "
+            "spotify_previous for transport, spotify_now_playing to "
+            "see what's on, media_play_pause for the OS-wide toggle "
+            "key. Use run_quick_command ONLY when none of those fit "
+            "AND you specifically need the Touchless natural-language "
+            "router (e.g. an obscure built-in voice intent). NEVER "
+            "use this for 'play <song>' / 'play <artist>' / "
+            "'play <playlist>' — call spotify_play(query=...) "
+            "directly so the search runs in Spotify, not a blind "
+            "media-key toggle."
         ),
         "parameters": {
             "type": "object",

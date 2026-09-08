@@ -4,7 +4,7 @@ import json
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 APP_NAME = "Touchless"
 CONFIG_DIR = Path.home() / ".touchless"
@@ -195,6 +195,17 @@ class AppConfig:
     # don't have to answer the monitor prompt every time on a
     # multi-monitor rig.
     clip_default_monitor_index: Optional[int] = None
+    # Master switch for the buffered clip cache. When True (default),
+    # start_engine spins up the ffmpeg rolling-buffer subprocess so
+    # 'clip that' voice / clipping-gesture triggers have footage to
+    # export. When False, no ffmpeg process is started — 'clip that'
+    # will have nothing to save. Default True preserves the historical
+    # unconditional-start behavior; missing-from-old-settings.json
+    # loads True via load_config's DEFAULT_CONFIG fallback. Toggle
+    # lives at the top of Settings → General → Clip Presets; flipping
+    # it while the engine is running starts/stops the cache in-place
+    # via _apply_general_runtime_changes.
+    clip_cache_enabled: bool = True
     # User's own Spotify Developer client_id. Optional — when empty,
     # Touchless uses its embedded default client_id which is capped
     # at 5 testers by Spotify's developer policy (Spotify killed the
@@ -226,6 +237,13 @@ class AppConfig:
     # entirely. Requires `diagnostic_overlay_enabled` to be on (the
     # pill is the host surface for both).
     show_recognizer_top_scores: bool = False
+    # v1.1.7 round-30: reserved for the follow-up Ctrl+Shift+D diagnostics
+    # HUD. Landed as a config field NOW so the round-30 read-model
+    # (NoopEngine tune/perf-swap stashes) has a persisted visibility flag
+    # to wire to when the HUD surface itself lands. Dataclass-managed so
+    # save/load handle it automatically; default False keeps the shipped
+    # UI unchanged.
+    diagnostics_hud_visible: bool = False
     # Clip-audio capture toggles. Streamer mode: when on, the clip cache's
     # ffmpeg subprocess additionally records WASAPI loopback (system audio
     # — game/music/app sounds) and/or the user's preferred microphone,
@@ -248,6 +266,41 @@ class AppConfig:
     # disable it there; the toggle is preserved.
     clip_capture_system_audio: bool = True
     clip_capture_microphone: bool = True
+    # v1.1.7 round-11..17 evolution — this flag protects the user's
+    # Bluetooth audio from a WASAPI-shared-mode-loopback-triggered
+    # A2DP→HFP renegotiation that silences BT endpoints for
+    # several seconds on many Win10 driver stacks. It ALSO
+    # prevents clips from capturing any system audio when the
+    # default output is Bluetooth (the sys-loopback bridge is
+    # skipped entirely). The round-17 diff-timer-defer fix removed
+    # the WORST audio-driver interaction (COM STA/MTA churn wedging
+    # all endpoints); with that mitigation shipped, the residual
+    # A2DP→HFP renegotiation risk is small and transient enough
+    # that DEFAULTING to False (capture system audio into clips)
+    # is the better UX for the user's dad who reported "clip has
+    # no audio at all". If a BT dip during clip capture becomes a
+    # real complaint, the flag can be enabled in Settings.
+    clip_audio_avoid_bluetooth: bool = False
+    # When True, the sys-loopback bridge multiplies captured PCM by
+    # the current Windows master-volume scalar before piping to
+    # ffmpeg -- so lowering the Windows volume slider mid-clip fades
+    # the SAVED clip's system-audio track too. Default False keeps
+    # byte-for-byte identical WASAPI-loopback behavior for every
+    # existing user AND new install (no migration marker needed;
+    # this is a pure opt-in). Users flip it via the "Match clip
+    # volume to my Windows volume slider" checkbox under the sys-
+    # audio toggle in Settings -> General -> Clip Presets -> Audio.
+    # Caveats surfaced in the tooltip: (1) on some onboard Realtek
+    # HDA drivers the loopback capture is ALREADY attenuated by the
+    # same mixer stage that drives the master slider, so enabling
+    # this can double-attenuate (perceptibly quiet clips); (2) only
+    # the CURRENT default render endpoint's scalar is applied --
+    # apps routed to a non-default endpoint via per-app volume in
+    # Windows Sound settings are not tracked. See OPEN_ISSUES.md
+    # for Option B (per-endpoint IMMDevice binding + IMMNotification-
+    # Client) as future work. Mic capture is NEVER scaled; the
+    # master slider governs playback, not capture.
+    clip_audio_follows_master_volume: bool = False
     # One-time migration marker: set to True the first time load_config
     # observes a missing-or-False clip_capture_system_audio under the
     # new default-True regime, after promoting it to True. Without
@@ -418,6 +471,23 @@ class AppConfig:
     # only the export pays for the higher preset. Allowed: "low",
     # "medium", "high". Default "high".
     clip_quality_preset: str = "high"
+    # Clip + rolling-cache quality TIER — the user-facing knob picked
+    # from Save Locations → Recording Quality. Controls cache fps,
+    # segment length (GOP cadence), and cache+export CQ/CRF via
+    # `_encoder_settings_for_tier`. Default "normal" is BYTE-
+    # IDENTICAL to shipped v1.1.7 behavior (fps=20, segment=10s,
+    # cache CQ 21 / CRF 20, export CQ 17 / CRF 17). "low" halves
+    # fps (15) and raises CQ/CRF for smaller files / faster upload.
+    # "high" bumps to 30 fps + 5 s segments + near-lossless CQ and
+    # REQUIRES a HW H.264 encoder (NVENC/QSV/AMF); the settings
+    # panel greys it out via `_clip_high_quality_capable` when the
+    # machine can't sustain it, and `_start_clip_cache_ffmpeg`
+    # auto-drops to "normal" at spawn if the preferred encoder is
+    # libx264 (missing or session-demoted). NOTE: the legacy
+    # `clip_quality_preset` field above has ZERO callers in the
+    # codebase (grep-verified) and is left in place only to avoid
+    # churning existing settings.json contents.
+    clip_quality_tier: str = "normal"
     # Maximum rolling buffer length in seconds. v1 was 65 s; bumped
     # to 305 s (5 min + 5 s slack) in MVP-fixup after the user
     # found 2 m / 5 m voice clips landed frozen frames where the
@@ -588,6 +658,90 @@ class AppConfig:
     # actually arrive.
     phone_camera_qr_use_mic: bool = False
     camera_source_is_mirrored: bool = False
+    # v1.1.7 fix: gamma + contrast brightness lift applied by the
+    # worker to every camera frame BEFORE it flows to both the live
+    # viewer AND MediaPipe. Under-lit frames (from either the C31
+    # motion-blur short-shutter on Default/Lite mode, or the
+    # driver's own auto-exposure default on GPU Mode) were dropping
+    # MediaPipe landmark confidence: skipped detections, berserk
+    # skeletons, gesture misclassification. Op is a cached cv2.LUT
+    # that combines gamma correction (preserves black point at 0
+    # and white point at 255 so midtones lift without the "gray
+    # veil" that pure additive brightness produces) with a mild
+    # contrast pull-out (helps MediaPipe see richer edges).
+    # Cost: ~0.3-0.6 ms at 720p — well under any frame budget.
+    # Range: 0-100. 0 = off (LUT skipped, zero cost); 60 = shipped
+    # default (gamma ~0.46 + contrast 1.24 — aggressive midtone
+    # lift tuned for dim indoor lighting where landmark confidence
+    # was collapsing); 100 = max (gamma ~0.30 + contrast 1.4 —
+    # very aggressive, highlights clip but useful in extremely
+    # dim rooms). Worker clamps defensively.
+    # v1.1.7 round-10: reverted default to 0 per user request —
+    # no LUT processing = original camera look. The prior tuning
+    # rounds (0 → 25 → 45 → 60) tried to push brightness/contrast
+    # server-side for detection quality, but that repeatedly
+    # produced unwanted side-effects (white-wash, warm cast,
+    # darker darks). Research-then-implement auto-adjust in a
+    # follow-up round: adaptive CLAHE + gamma triggered only
+    # when scene analysis shows the frame is outside MediaPipe's
+    # optimal range (dim / backlit / high-contrast). Zero
+    # processing when boost=0 restores the sensor's raw output.
+    camera_brightness_boost: int = 0
+    # One-time migration marker: v1.1.7 iterated the LUT default
+    # through 25 (v1 additive beta) → 45 (v2 gamma) → 60 (v3
+    # gamma+contrast, current) as we understood the failure mode.
+    # Users whose config.json was saved before an iteration inherit
+    # the old value even though they never touched the slider, so
+    # the newer default never takes effect. This flag promotes any
+    # saved value that exactly matches a PRIOR shipped default up
+    # to the current one — a deliberately-tuned custom value is
+    # preserved.
+    camera_brightness_boost_migrated_v3: bool = False
+    # Round-10 revert migration: users whose config carries the
+    # 60 or 45 or 25 default from prior migrations get bumped back
+    # to 0 so the fresh no-LUT behavior takes effect. Deliberately-
+    # tuned values (anything else) are preserved.
+    camera_brightness_boost_migrated_v4: bool = False
+    # r51: camera_auto_adjust / camera_prefer_native_resolution /
+    # camera_fast_tracking_mode fields removed. Audit found the
+    # docstrings + tooltips promised behavior (CLAHE + adaptive
+    # gamma, native-res clamp override, MediaPipe frame dim) but
+    # the engine never consumed the config values. The Settings >
+    # Camera checkboxes were deleted; users needing the accidental
+    # 'retune the camera' behavior that prefer-native's save handler
+    # provided should click the new 'Re-apply camera tuning' button
+    # in the same Settings pane. Any saved settings.json still
+    # containing these keys will silently drop them at load time
+    # because the config loader is tolerant to unknown fields.
+    # v1.1.7 r49: opt-in short-shutter hint for cheap UVC webcams.
+    # Some low-end USB webcam drivers (Realtek "FULL HD 1080P Webcam"
+    # and similar generic UVCs) hold auto-exposure open for 40-80 ms
+    # per frame in typical indoor lighting, which caps delivered fps
+    # around 15. Setting CAP_PROP_AUTO_EXPOSURE=1.0 (manual) with a
+    # short shutter (~15.6 ms via CAP_PROP_EXPOSURE=-6) frees the
+    # driver to hit its advertised fps. Default OFF because premium
+    # cameras (Razer Kiyo Pro, Logitech Brio) interpret the same
+    # hint as their OWN auto/HDR trigger and throttle 60 -> 25.
+    # Users flip it on in Settings -> General only if their camera
+    # is a generic UVC. Env var HGR_FORCE_SHORT_SHUTTER=0/1 overrides
+    # the config for A/B testing without touching settings.json.
+    camera_force_short_shutter: bool = False
+    # r53: True once the user has explicitly toggled the Force short
+    # shutter checkbox (Settings > Camera). When True, the config
+    # value is treated as authoritative and the r50 auto-classifier
+    # is skipped — so a user who explicitly turns FSS OFF for a
+    # generic UVC won't have the classifier silently re-enable it.
+    # Default False; UI toggle handler sets this to True.
+    camera_force_short_shutter_user_chose: bool = False
+    # r50: cameras (by lower-cased display_name) for which the
+    # short-shutter classifier's first-fire acknowledgement pill has
+    # already shown. Kept narrow -- just a set of name strings, NOT a
+    # full per-camera decision memory -- so the classifier's runtime-
+    # only guarantee still holds. Users can flip camera_force_short_
+    # shutter in Settings > Camera and that still wins over the
+    # classifier every launch. Persisted only so the pill fires once
+    # per camera, ever.
+    short_shutter_pill_shown_for_cameras: List[str] = field(default_factory=list)
     # The last update version the user dismissed via "Later". Set when
     # they click Later on the in-app update prompt. The next launch
     # only re-shows the prompt if a STRICTLY NEWER release is on
@@ -606,7 +760,16 @@ class AppConfig:
     # no Inno dialog) — full-installer and Store-fallback paths still
     # surface the dialog because they take noticeably longer and the
     # user deserves to know the app is about to disappear for ~30 sec.
-    auto_update_enabled: bool = False
+    # v1.1.8.1: flipped default False -> True. The 1.1.7 dialog was
+    # invisible on frameless-window Windows compositions (fixed in
+    # update_dialog.py this release), and even with the fix in place
+    # users benefit from silent app-zip updates that just relaunch
+    # into the new version. The auto path only fires for the small
+    # app-zip kind (no UAC, no full-installer dialog, no user
+    # interaction required); full-installer / store-fallback paths
+    # still surface the dialog. Users can opt back out via
+    # Settings > General > "Install updates automatically".
+    auto_update_enabled: bool = True
     # Rate-limiter sentinel for the auto-update path. Written before the
     # download starts, cleared on successful apply (in _on_installer_ready)
     # or on failure (in _on_auto_update_failed). If a launch starts and
@@ -1002,6 +1165,32 @@ def load_config() -> AppConfig:
             values["drawing_control_box_center_x"] = DEFAULT_CONFIG.drawing_control_box_center_x
         if abs(float(values.get("drawing_control_box_center_y", 0.0)) - 0.55) < 1e-6:
             values["drawing_control_box_center_y"] = DEFAULT_CONFIG.drawing_control_box_center_y
+
+        # One-time brightness-boost default promotion. v1.1.7 landed
+        # the LUT in three passes: v1 default=25 (additive beta,
+        # gray veil), v2 default=45 (gamma-only), v3 default=60
+        # (gamma+contrast, current). Users who ran the app after
+        # v1 or v2 have that value persisted, so the newer default
+        # never took effect for them. Promote any exact-prior-
+        # default match to the current default; deliberately-tuned
+        # values (anything else) are preserved. Gated on a marker
+        # so we run this exactly once per install.
+        if not data.get("camera_brightness_boost_migrated_v3", False):
+            _saved_boost = values.get("camera_brightness_boost")
+            if _saved_boost in (25, 45):
+                values["camera_brightness_boost"] = (
+                    DEFAULT_CONFIG.camera_brightness_boost
+                )
+            values["camera_brightness_boost_migrated_v3"] = True
+
+        # Round-10 revert: users saved with the round-6..9 default
+        # of 60 (or 45 / 25 via prior migration) get promoted to
+        # the new default of 0 — no LUT, original camera look.
+        if not data.get("camera_brightness_boost_migrated_v4", False):
+            _saved_boost = values.get("camera_brightness_boost")
+            if _saved_boost in (25, 45, 60):
+                values["camera_brightness_boost"] = 0
+            values["camera_brightness_boost_migrated_v4"] = True
 
         return AppConfig(**values)
     except Exception:

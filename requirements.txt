@@ -78,6 +78,8 @@ aiohttp
 google-api-python-client
 google-auth
 google-auth-oauthlib
+google-auth-httplib2
+httplib2
 
 # Optional — MCP bridge for the Live API agent (src/hgr/live_api/connectors/
 # mcp_bridge.py). Lets iris consume any MCP server's tools as connectors —
@@ -93,3 +95,17 @@ mcp
 # (public client + PKCE). Connect via the "Connect Microsoft" button.
 #   pip install msal
 msal
+
+# Windows UIA + WinRT (v1.1.7). Replaces the PowerShell shell-outs that
+# used to drive UI Automation + WinRT OCR / package enumeration. Those
+# `powershell.exe -EncodedCommand <base64>` byte patterns tripped Windows
+# Defender's ASR "malware dropper" heuristic and started auto-quarantining
+# the installed app for some users. Native Python bindings do the same
+# work in-process with no subprocess spawn, so no fingerprint.
+# - uiautomation: COM wrapper over UIAutomationClient (youtube_controller
+#   search-result finder, invoke/toggle patterns).
+# - winsdk: Python projection of WinRT APIs (youtube_controller captions
+#   OCR, media_connector SMTC media session, tool_executor toast
+#   notifications).
+uiautomation
+winsdk

@@ -59,7 +59,33 @@ from hgr.custom_gestures.dynamic_recorder import (
 from hgr.custom_gestures.dynamic_recording import palm_scale_from_landmarks
 from hgr.custom_gestures.registry import GestureRegistry
 from .custom_gestures_chrome import apply_touchless_titlebar
-from .window_chrome import apply_touchless_chrome, touchless_message_box
+from .custom_gestures_recording_help import (
+    ExpandableHelpPanel,
+    RecordingConsistencyTip,
+    durations_ms_from_timestamps,
+    save_motion_gif,
+)
+from .window_chrome import apply_touchless_chrome, install_indigo_chrome, touchless_message_box
+
+
+_DYNAMIC_SUMMARY = (
+    "Use <b>Dynamic</b> for continuous motion — swipes, circles, waves, or "
+    "any path where keypoint movement over time matters. Record several takes; "
+    "Touchless learns the moving landmarks and matches live motion to those paths."
+)
+_DYNAMIC_DETAILS = (
+    "<p style='margin:0 0 6px 0;'><b>Good for:</b> strokes and loops in space, "
+    "finger wiggles with clear motion, countdown-like motions if the hand "
+    "moves as one continuous gesture.</p>"
+    "<p style='margin:0 0 6px 0;'><b>Don’t use for:</b> a single held pose "
+    "(use <b>Static</b>) or an ordered chain of distinct held shapes with "
+    "pauses (use <b>Sequence</b>).</p>"
+    "<p style='margin:0 0 6px 0;'><b>How to record:</b> prefer <b>Until stopped</b> "
+    "for longer takes. Do the same motion ~10 times at a natural pace. Keep the "
+    "hand clearly in frame; vary speed a little across takes.</p>"
+    "<p style='margin:0;'><b>Limits:</b> one hand; needs visible motion; "
+    "very subtle pose-only changes without path may match poorly.</p>"
+)
 
 
 def _landmarks_array_from_mediapipe(mp_landmarks) -> np.ndarray:
@@ -74,11 +100,15 @@ def _landmarks_array_from_mediapipe(mp_landmarks) -> np.ndarray:
 
 def _duration_mode_from_string(value: str) -> DurationMode:
     v = (value or "").strip().lower()
-    if v == "fixed_long":
-        return DurationMode.FIXED_LONG
-    if v == "until_stopped":
-        return DurationMode.UNTIL_STOPPED
-    return DurationMode.FIXED_SHORT
+    mapping = {
+        "until_stopped": DurationMode.UNTIL_STOPPED,
+        "fixed_1s": DurationMode.FIXED_1S,
+        "fixed_2s": DurationMode.FIXED_2S,
+        "fixed_3s": DurationMode.FIXED_3S,
+        "fixed_short": DurationMode.FIXED_SHORT,
+        "fixed_long": DurationMode.FIXED_LONG,
+    }
+    return mapping.get(v, DurationMode.UNTIL_STOPPED)
 
 
 class DynamicGestureRecorderWindow(QDialog):
@@ -95,15 +125,16 @@ class DynamicGestureRecorderWindow(QDialog):
         name: str,
         description: str,
         action: Action,
-        duration_mode: str = "fixed_short",
+        duration_mode: str = "until_stopped",
         parent: Optional[QWidget] = None,
         config=None,
     ) -> None:
         super().__init__(parent)
-        apply_touchless_chrome(self)
         self.setWindowTitle(f"Recording: {name}")
         self.setModal(True)
         self.setMinimumSize(820, 560)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        self._body = install_indigo_chrome(self, f"Recording: {name}")
 
         self._worker = worker
         self._accent_color = accent_color or "#1DE9B6"
@@ -127,12 +158,10 @@ class DynamicGestureRecorderWindow(QDialog):
         self._latest_handedness: Optional[str] = None
         self._handedness_votes: List[str] = []
 
-        # Per-take frame capture. Each entry of `_take_clips` is the
-        # full BGR frame sequence captured for one take — the
-        # post-save clip-picker plays each one back so the user can
-        # pick which take becomes the canonical motion clip on disk.
-        self._active_take_frames: list[np.ndarray] = []
-        self._take_clips: list[list[np.ndarray]] = []
+        # Per-take frame capture as (bgr, timestamp) for real-speed GIF /
+        # clip-picker playback.
+        self._active_take_frames: list = []
+        self._take_clips: list = []
 
         # Deferred camera open (see static recorder for the same
         # pattern — prevents the dialog from freezing on a slow phone
@@ -170,6 +199,11 @@ class DynamicGestureRecorderWindow(QDialog):
         if not self._camera_connect_attempted:
             self._camera_connect_attempted = True
             QTimer.singleShot(0, self._deferred_connect)
+        if not getattr(self, "_consistency_tip_shown", False):
+            self._consistency_tip_shown = True
+            tip = getattr(self, "_consistency_tip", None)
+            if tip is not None:
+                QTimer.singleShot(0, lambda: tip.attach(self._video_label))
 
     def _deferred_connect(self) -> None:
         self._video_label.setText("Connecting to camera...")
@@ -216,7 +250,7 @@ class DynamicGestureRecorderWindow(QDialog):
             """
         )
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
 
@@ -225,12 +259,18 @@ class DynamicGestureRecorderWindow(QDialog):
             cap_hint = "press <b>Stop</b> to finish a take"
         else:
             cap_hint = f"each take auto-stops after <b>{cap:g} s</b>"
-        self._instructions = QLabel(
-            f"Perform the gesture {DEFAULT_TARGET_TAKES} times — "
-            f"{cap_hint}. Click <b>Begin Recording</b> or press "
-            f"<b>Spacebar</b> to start each take."
+        self._help = ExpandableHelpPanel(
+            summary_html=(
+                f"{_DYNAMIC_SUMMARY} Perform the gesture "
+                f"<b>{DEFAULT_TARGET_TAKES}</b> times — {cap_hint}. "
+                f"Click <b>Begin Recording</b> or press <b>Spacebar</b>."
+            ),
+            details_html=_DYNAMIC_DETAILS,
         )
-        self._instructions.setWordWrap(True)
+        root.addWidget(self._help)
+
+        self._instructions = QLabel("")
+        self._instructions.hide()
         root.addWidget(self._instructions)
 
         self._video_label = QLabel("Waiting for camera frames...")
@@ -259,6 +299,8 @@ class DynamicGestureRecorderWindow(QDialog):
             "}"
         )
         self._complete_overlay.hide()
+
+        self._consistency_tip = RecordingConsistencyTip(self._video_label)
 
         self._progress_label = QLabel(
             f"Take 0 / {DEFAULT_TARGET_TAKES}"
@@ -432,7 +474,14 @@ class DynamicGestureRecorderWindow(QDialog):
                     # can pick a representative thumbnail when the
                     # take ends. Copy because OpenCV may reuse buffers.
                     try:
-                        self._active_take_frames.append(display_bgr.copy())
+                        now = time.monotonic()
+                        if (
+                            not self._active_take_frames
+                            or (now - self._active_take_frames[-1][1]) >= 0.04
+                        ):
+                            self._active_take_frames.append(
+                                (display_bgr.copy(), now)
+                            )
                     except Exception:
                         pass
             else:
@@ -466,17 +515,17 @@ class DynamicGestureRecorderWindow(QDialog):
             done = self._recorder.completed_takes
             total = self._recorder.target_takes
             if done == 0:
-                badge = "Ready — click Begin Recording or press Spacebar"
+                badge = "Click Begin Recording or press Spacebar"
             else:
                 badge = (
-                    f"Take {done}/{total} captured — Begin next take "
-                    f"or press Spacebar"
+                    f"Take {done}/{total} captured — "
+                    "Click Begin Recording or press Spacebar"
                 )
-            color = (220, 220, 220)
+            color = (40, 220, 40)  # bold green prompt
         try:
             cv2.putText(
                 frame, badge, (16, 32),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
             )
         except Exception:
             pass
@@ -651,7 +700,7 @@ class DynamicGestureRecorderWindow(QDialog):
             picker.exec()
             chosen_idx = picker.selected_clip_index
             if chosen_idx is not None:
-                chosen_image_filename = _save_clip_as_gif(
+                chosen_image_filename = save_motion_gif(
                     registry, self._take_clips[chosen_idx], self._name
                 )
 
@@ -668,6 +717,35 @@ class DynamicGestureRecorderWindow(QDialog):
                 name=self._name,
                 key_point_indices=artifacts.key_points.indices,
                 sample_trajectories=artifacts.template.sample_trajectories,
+                # Persist the wrist channel + auto-computed strength so
+                # the runtime classifier can do its weighted DTW without
+                # rebuilding the template from raw takes. Critical for
+                # swipes (high strength → wrist trajectory disambiguates
+                # from "hand entered view") and pure-finger gestures
+                # (strength ≈ 0 → finger-only matching, no false reject).
+                wrist_trajectories=artifacts.template.wrist_trajectories,
+                wrist_motion_strength=artifacts.template.wrist_motion_strength,
+                # v1.1.8.1: the template's per-gesture match_threshold
+                # (derived from intra-take pairwise DTW) rides along
+                # so the runtime doesn't have to re-derive it on every
+                # startup. wrist_schema=2 marks displacement semantics
+                # (the recorder's build_template_from_takes stored
+                # displacement, not absolute position).
+                match_threshold=artifacts.template.match_threshold,
+                wrist_schema=2,
+                # v1.1.8.2: SPRING streaming features so the new
+                # template fires at motion peak instead of settle.
+                sample_features=artifacts.template.sample_features,
+                # v1.1.8.2 (post-audit r2) intent signature — "the
+                # essential motion" (direction + magnitude across all
+                # keypoints). Fires reliably when SPRING's exact-shape
+                # matching is too strict.
+                intent_direction=artifacts.template.intent_direction,
+                intent_magnitude=artifacts.template.intent_magnitude,
+                intent_window_seconds=artifacts.template.intent_window_seconds,
+                intent_fingertip_extension=(
+                    artifacts.template.intent_fingertip_extension
+                ),
                 action=self._action,
                 description=self._description,
                 handedness=handedness,
@@ -712,68 +790,39 @@ class DynamicGestureRecorderWindow(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Clip picker + GIF writer for the post-save flow.
-
-def _save_clip_as_gif(registry, frames_bgr: list, gesture_name: str) -> str:
-    """Persist the chosen take's frame sequence as an animated GIF in
-    <registry_dir>/gesture_thumbnails/. Returns the relative filename
-    to store on the gesture record (or empty on failure).
-
-    GIF chosen because Qt's QMovie has native support for it, so the
-    gesture card can play the motion preview without an extra video
-    decoder dependency. PIL handles the encoding — already a transitive
-    dep via mediapipe.
-    """
-    if not frames_bgr:
-        return ""
-    try:
-        from PIL import Image
-        safe = "".join(
-            ch if ch.isalnum() or ch in ("-", "_") else "_"
-            for ch in gesture_name
-        ).strip("_") or "gesture"
-        filename = f"{safe}.gif"
-        target = registry.thumbnails_dir() / filename
-        # Convert to PIL RGB images.
-        pil_frames = []
-        for f in frames_bgr:
-            try:
-                rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-                pil_frames.append(Image.fromarray(rgb))
-            except Exception:
-                continue
-        if not pil_frames:
-            return ""
-        # ~30 fps capture → ~33 ms per frame. Match real timing so
-        # the playback duration mirrors the recorded gesture.
-        pil_frames[0].save(
-            str(target),
-            save_all=True,
-            append_images=pil_frames[1:],
-            duration=33,
-            loop=0,
-            optimize=False,
-            disposal=2,
-        )
-        return filename
-    except Exception as exc:
-        print(f"[dynamic-recorder] gif save failed: {exc}")
-        return ""
+# Clip picker for the post-save flow.
 
 
 class _ClipTile(QWidget):
-    """One clip-picker tile. Cycles through its take's BGR frames
-    via a QTimer so the user sees each take playing while choosing."""
+    """One clip-picker tile. Plays take frames at real capture speed,
+    freezes 2s on the last frame, then loops (no blank flash)."""
 
     clicked = Signal(int)  # emits the tile index
 
     _SIZE = 200
-    _FRAME_INTERVAL_MS = 60  # ~16 fps preview — light on CPU
+    _FREEZE_END_MS = 1500
 
-    def __init__(self, index: int, frames_bgr: list, accent: str, parent=None) -> None:
+    def __init__(self, index: int, frames, accent: str, parent=None) -> None:
         super().__init__(parent)
         self._index = index
-        self._frames = list(frames_bgr)
+        # Accept raw BGR or (bgr, ts) pairs.
+        self._frames_bgr = []
+        stamps = []
+        for item in frames or []:
+            if isinstance(item, tuple) and len(item) == 2:
+                self._frames_bgr.append(item[0])
+                stamps.append(float(item[1]))
+            else:
+                self._frames_bgr.append(item)
+        if len(stamps) == len(self._frames_bgr) and len(stamps) >= 2:
+            self._durations = durations_ms_from_timestamps(
+                stamps, freeze_end_ms=self._FREEZE_END_MS,
+            )
+        else:
+            n = len(self._frames_bgr)
+            self._durations = (
+                [33] * max(0, n - 1) + [self._FREEZE_END_MS]
+            ) if n else []
         self._accent = accent
         self._frame_idx = 0
         self._selected = False
@@ -795,10 +844,10 @@ class _ClipTile(QWidget):
         self._caption.setStyleSheet("color: #94A3B8; font-size: 11px;")
 
         self._timer = QTimer(self)
-        self._timer.setInterval(self._FRAME_INTERVAL_MS)
-        self._timer.timeout.connect(self._tick)
-        self._timer.start()
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._advance)
         self._render_current_frame()
+        self._schedule_next()
 
     def set_selected(self, value: bool) -> None:
         if value == self._selected:
@@ -835,17 +884,24 @@ class _ClipTile(QWidget):
         else:
             super().mousePressEvent(event)
 
-    def _tick(self) -> None:
-        if not self._frames:
+    def _schedule_next(self) -> None:
+        if not self._frames_bgr or not self._durations:
             return
-        self._frame_idx = (self._frame_idx + 1) % len(self._frames)
+        ms = self._durations[min(self._frame_idx, len(self._durations) - 1)]
+        self._timer.start(max(20, int(ms)))
+
+    def _advance(self) -> None:
+        if not self._frames_bgr:
+            return
+        self._frame_idx = (self._frame_idx + 1) % len(self._frames_bgr)
         self._render_current_frame()
+        self._schedule_next()
 
     def _render_current_frame(self) -> None:
-        if not self._frames:
+        if not self._frames_bgr:
             return
         try:
-            bgr = self._frames[self._frame_idx]
+            bgr = self._frames_bgr[self._frame_idx]
             h, w = bgr.shape[:2]
             scale = min((self._SIZE - 8) / float(w), (self._SIZE - 8) / float(h))
             new_w = max(1, int(w * scale))
@@ -877,11 +933,12 @@ class DynamicClipPickerDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        apply_touchless_chrome(self)
         self.setWindowTitle("Pick a clip for this gesture")
         self.setObjectName("dynamicClipPicker")
         self.setModal(True)
         self.setMinimumWidth(720)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        self._body = install_indigo_chrome(self, "Pick a clip for this gesture")
         self._clips = list(clips)
         self._accent = accent_color or "#1DE9B6"
         self._text = text_color or "#E5F6FF"
@@ -898,7 +955,7 @@ class DynamicClipPickerDialog(QDialog):
     def _build(self, gesture_name: str, description: str) -> None:
         from PySide6.QtWidgets import QGridLayout
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(20, 18, 20, 16)
         root.setSpacing(12)
 

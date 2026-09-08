@@ -4,6 +4,13 @@ This file is the consolidated memory for any AI agent (Claude, Codex,
 ChatGPT, etc.) working on Touchless. Read this first, then dive into
 the relevant subsystem doc under `docs/`.
 
+**Before ANY release, updater, installer, or Store-submission work:
+read `PUBLISHING_POLICY.md` at the repo root, then walk
+`docs/UPDATE_RELEASE_CHECKLIST.md` item by item.** Every stop-ship
+rule in the policy exists because a previous version shipped without
+it. Report green/red per line before running `git push`,
+`rclone copyto`, or any Partner Center action.
+
 ## Project identity
 
 **Touchless** is a hand-gesture + voice desktop control application
@@ -30,6 +37,55 @@ pipeline. The product goal is **polished, stable, end-user behavior**
 5. **High-risk areas** that need extra care: event loops, worker
    threads, timers, gesture gating, mouse control, drawing mode,
    modal windows, voice follow-up flows, packaging/runtime paths.
+6. **Zero-setup-by-default for end users.** This is a shipping
+   product, not a dev kit. Every new feature must work in the Inno
+   installer build WITHOUT the user running `pip install`, pasting
+   tokens, installing Node, editing JSON, or knowing what a shell
+   is. Specifically:
+   - Any new Python dep gets added to
+     [builder/windows/hgr_app.spec](builder/windows/hgr_app.spec)
+     `hiddenimports` (and `collect_submodules` if it has dynamic
+     imports) so it ships in the installer.
+   - Any new optional-import in code (`try: import foo`) MUST also
+     be listed in the spec so frozen users get it.
+   - Auth-requiring features need OAuth (browser flow) or get
+     gated behind a clearly-marked "advanced" tier; never paste-a-
+     token as the only path.
+   - External binaries (Node, uvx, git) MUST be detected with a
+     friendly install link, NEVER assumed present. Auto-disable
+     features that need them in the shipped app unless the binary
+     is also bundled.
+   - First-launch UX should produce value with no clicks: seed
+     sensible defaults (see `mcp_bridge._seed_default_config_if_missing`
+     for the pattern).
+   - In picker / settings UIs, detect `sys.frozen` and HIDE
+     developer-only actions (pip install buttons, "edit config
+     file") that don't apply to end users.
+
+7. **Iris backend tiering — three engines, one auto-resolver.** Iris
+   has three backends, picked at session start by `resolve_backend()`
+   in [src/hgr/live_api/config.py](src/hgr/live_api/config.py). The
+   default `backend = "auto"` resolves in this priority order:
+   - **cloud** — OpenAI Realtime when `OPENAI_API_KEY` is set. Best
+     quality / latency. Costs per request. Today the dev default.
+   - **subscription** — hosted Touchless proxy (currently STUB —
+     manager surfaces "subscription not yet available" error if it
+     ever gets picked). The shipped commercial path. User logs in
+     with a Touchless account; the proxy pays + rate-limits OpenAI /
+     Anthropic. When you build the proxy, swap the stub for a real
+     RealtimeClient pointed at the Touchless WebSocket endpoint.
+   - **local** — bundled `whisper.cpp` + `llama-server`. The GGUF
+     model itself is NOT in the installer (would balloon size to
+     ~3 GB). Instead, the chat panel's `_preflight_local_model_check`
+     offers a one-click download of **Qwen 2.5 3B Instruct (~2 GB)**
+     to `~/Documents/TouchlessVoiceModels/` on first Iris start when
+     no GGUF is found. The same dir is used by the dictation grammar
+     corrector, so one download serves both features. Iris cascades
+     through `PREFERRED_MODEL_FILES` (3B → 7B → Llama 3.2) so a user
+     who already has the 7B installed for dictation reuses it.
+   Every backend exposes the same shape as `RealtimeClient`
+   (`start/stop/join/send_audio_chunk/send_tool_result/...`) so
+   `LiveApiManager` treats them interchangeably.
 
 ## Priority system (when in doubt)
 

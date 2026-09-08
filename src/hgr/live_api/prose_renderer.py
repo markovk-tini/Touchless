@@ -50,6 +50,44 @@ _CACHE_LIMIT = 200
 # Volume/Discord/mute confirmations etc. — keep them snappy.
 _SKIP_RENDER_BELOW_CHARS = 25
 
+# Tools that ALREADY produce conversational, fact-correct prose —
+# running render_jarvis on them HURTS (the model embellishes with
+# hallucinated detail like fake URLs or "feels like X" lines that
+# weren't in source data). Their pre-rendered `summary` is the
+# canonical reply.
+_SKIP_RENDER_TOOLS = frozenset({
+    "weather_get",          # weather.py builds conversational summary
+    "ollama_generate",      # text IS the response
+    "gmail_read",           # email body should not be rewritten
+    "ms_mail_read",         # same
+    "gmail_send",
+    "ms_mail_send",
+    "outlook_send",
+    "teams_send",
+    "contacts_create",
+    "tasks_add",
+    "tasks_complete",
+    "tasks_delete",
+    "forms_create",
+    "photos_upload",
+    "calendar_create_event",
+    "ms_calendar_create",
+    "gdocs_create", "gdocs_append_text",
+    "sheets_create", "sheets_append_rows", "sheets_update_range",
+    "sheets_read_range", "sheets_clear_range",
+    "slides_create", "slides_add_slide",
+    "slides_set_slide_text", "slides_replace_text",
+    "drive_upload",
+    "iris_remember_contact",
+    "contacts_list",
+    "iris_set_preference",
+})
+
+# NOTE: the empty-data anti-fabrication rule below is the TOOL-RESULT
+# counterpart to the HARD RULE — NEVER FABRICATE PERSONAL / RECALL
+# CONTEXT rule in live_api_manager.SYSTEM_INSTRUCTIONS. If you edit one,
+# revisit the other so realtime-chat answers and tool-render answers
+# both refuse to invent details when grounding data is missing.
 _SYSTEM_PROMPT = (
     "You are Iris — a Jarvis-style personal assistant. The user just "
     "asked something and a tool returned data. Compose ONE flowing, "
@@ -65,6 +103,15 @@ _SYSTEM_PROMPT = (
     "not 'Vesko' or 'a colleague'.\n"
     "• If the data is empty (count=0, messages=[], results=[]), say so "
     "plainly. Do NOT fill the gap with made-up examples.\n"
+    "• Empty per-contact / per-record fields NEVER become inventions: "
+    "if a returned record has emails=[] say 'no email on file', if "
+    "phones=[] say 'no phone on file', if a returned event has no "
+    "location say 'no location set', if a task has no due date say "
+    "'no due date'. NEVER generate a plausible substitute from the "
+    "person's name or company (no 'john@example.com', no "
+    "'jsmith@company.com', no '<firstname>@<lastname>.com', no "
+    "'555-0123'). The name being present in the record does NOT "
+    "license inventing the other fields — the absence IS the answer.\n"
     "• Speak dates naturally: 'tomorrow' / 'Thursday' / 'this Friday', "
     "NEVER 'June 3rd' or '2026-06-03'.\n"
     "• Do NOT read URLs aloud — EVER. No 'visit wttr.in slash...', "
@@ -103,11 +150,17 @@ _SYSTEM_PROMPT = (
 def should_render(tool_name: str, fallback: str) -> bool:
     """Whether this tool's reply benefits from prose rendering.
 
-    Skip for very short status confirmations ('Volume set to 30.') —
-    they're already concise and the LLM round-trip would add latency
-    without value. Everything else gets composed.
+    Skip for:
+      * Very short status confirmations ('Volume set to 30.') — already
+        snappy + LLM round-trip is wasted latency.
+      * Tools in _SKIP_RENDER_TOOLS — their connectors / handlers
+        already produce conversational fact-correct prose; rewriting
+        them invites hallucinated detail.
+    Everything else gets composed.
     """
     if not fallback or len(fallback.strip()) < _SKIP_RENDER_BELOW_CHARS:
+        return False
+    if tool_name in _SKIP_RENDER_TOOLS:
         return False
     return True
 
@@ -119,6 +172,7 @@ def render_jarvis(
     fallback: str,
     timeout: float = _TIMEOUT_S,
     context: str = "",
+    callback_hint: str = "",
 ) -> str:
     """Compose `tool_result` as a Jarvis-voice reply.
 
@@ -139,6 +193,13 @@ def render_jarvis(
         return fallback
     if not should_render(tool_name, fallback):
         return fallback
+    # Defense-in-depth: NEVER LLM-rewrite an error/cancelled tool result.
+    # The dispatcher already short-circuits these via the universal error
+    # override, but a stray caller must not pay tokens to "interpret" a
+    # failure message.
+    if isinstance(tool_result, dict) and str(
+            tool_result.get("status") or "").lower() in ("error", "cancelled"):
+        return fallback
     api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
     if not api_key:
         return fallback
@@ -156,8 +217,16 @@ def render_jarvis(
     result_blob = result_blob[:8000]  # bound prompt size
 
     context_tail = (context or "")[-400:]
+    # Phase-7: include active preset in cache key so switching
+    # voices doesn't reuse the prior preset's phrasing.
+    try:
+        from . import persona_voice
+        _preset_tag = persona_voice.active_preset().name
+    except Exception:
+        _preset_tag = "default"
     cache_key = hashlib.sha256(
-        f"{question}::{tool_name}::{result_blob}::{context_tail}"
+        f"{question}::{tool_name}::{result_blob}::"
+        f"{context_tail}::{_preset_tag}"
         .encode("utf-8")
     ).hexdigest()
     if cache_key in _CACHE:
@@ -180,16 +249,36 @@ def render_jarvis(
     ])
     user_msg = "\n\n".join(user_msg_parts)
 
+    # Phase-7: active persona preset injects style anchor + tunes
+    # temperature. When no preset is loaded the defaults still apply.
+    try:
+        from . import persona_voice
+        preset_block = persona_voice.style_block(
+            with_examples=True, max_examples=3)
+        preset_temp = persona_voice.temperature()
+    except Exception:
+        preset_block = ""
+        preset_temp = 0.6
+
+    sys_prompt = _SYSTEM_PROMPT
+    if preset_block:
+        sys_prompt = (
+            _SYSTEM_PROMPT
+            + "\n\nACTIVE VOICE PRESET — follow this VOICE while "
+            "keeping every fact verbatim:\n" + preset_block)
+    # Phase-7 callback hint — synthesizer can weave a one-clause
+    # reference when natural.
+    if callback_hint:
+        sys_prompt = (sys_prompt + "\n\n" + callback_hint)
+
     try:
         body = json.dumps({
             "model": _MODEL,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": user_msg},
             ],
-            # Some creative variation; high enough for natural phrasing,
-            # low enough that the model stays anchored to the data.
-            "temperature": 0.6,
+            "temperature": float(preset_temp),
             "max_tokens": _MAX_TOKENS,
         }).encode("utf-8")
     except Exception:
@@ -248,6 +337,11 @@ def _facts_preserved(source: Dict[str, Any], output: str) -> bool:
     the count (digit or number word) or use a vague-but-honest
     quantifier ('a few', 'a handful', 'several'). count=0 must say so.
 
+    URL-hallucination check (universal): ANY URL in the output that
+    isn't in the source data is fabricated. Reject. This catches the
+    weather rewrite's tendency to add 'more details at wttr.in/...'
+    even when the source has no such URL.
+
     Permissive on purpose: we don't require EVERY sender to appear
     (the LLM may rightly say 'a few' for 8 emails), but we do require
     at least one anchor to real data.
@@ -255,6 +349,20 @@ def _facts_preserved(source: Dict[str, Any], output: str) -> bool:
     if not output:
         return False
     lower_out = output.lower()
+    # ---- URL-hallucination guard (universal) ----------------------
+    # Find any URL the model spoke and verify it appears in source.
+    output_urls = set(re.findall(
+        r"https?://[\w./\-?=&%:#]+", output, re.IGNORECASE))
+    if output_urls:
+        try:
+            source_blob = json.dumps(source, default=str)
+        except Exception:
+            source_blob = ""
+        for url in output_urls:
+            # Strip trailing punctuation that often hitches a ride.
+            clean = url.rstrip(".,;:!?)")
+            if clean.lower() not in source_blob.lower():
+                return False  # hallucinated URL → reject rewrite
 
     # ---- email-style: messages with from_name / from --------------
     msgs = source.get("messages") or []

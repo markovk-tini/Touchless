@@ -7,6 +7,11 @@ release tag, and the installer writes the same string into the
 Add/Remove Programs entry.
 """
 
-__version__ = "1.1.6"
+__version__ = "1.1.9.1"
+
+# v1.1.7 build-round marker. Bump on each shipped-source polish round so
+# the build_marker_label in Settings → About (and any future diagnostics
+# HUD) pull from one source of truth instead of a scattered literal.
+BUILD_ROUND = 57
 
 # Author: Konstantin Markov

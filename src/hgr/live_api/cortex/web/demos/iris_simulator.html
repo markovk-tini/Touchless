@@ -1,0 +1,4097 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Iris Cortex — Live Simulator</title>
+  <!-- Embedded-mode marker. Runs BEFORE <style> + <body> are parsed so
+       the embedded CSS rules below match on first paint (no test-prompt
+       flash). window.IRIS_EMBEDDED is injected at DocumentCreation by
+       the launcher / assistant window when the page is hosted inside a
+       Qt window. Standalone browser loads leave the class unset. -->
+  <script>
+    try {
+      if (window.IRIS_EMBEDDED) {
+        document.documentElement.classList.add('iris-embedded');
+      }
+    } catch (e) { /* no-op */ }
+  </script>
+  <style>
+    html, body { margin: 0; padding: 0; background: #050a14 !important; color: #C8E6FF; overflow: hidden; height: 100%; font-family: -apple-system, Segoe UI, Roboto, sans-serif; }
+    /* Defensive: paint the GL canvas surface dark-blue at the CSS level
+       so the GPU framebuffer never flashes black on focus-loss/regain
+       cycles before Three.js's renderer.setClearColor fires. */
+    #canvas { position: absolute; inset: 0; background: #050a14 !important; }
+    html, body, #canvas { background-color: #050a14 !important; }
+    #panel { position: absolute; top: 18px; left: 18px; background: rgba(6,16,30,0.78); border: 1px solid rgba(88,227,255,0.30); border-radius: 10px; padding: 14px 18px; font-size: 13px; min-width: 320px; max-width: 360px; z-index: 10; }
+    #panel h1 { font-size: 12px; letter-spacing: 3px; color: #58E3FF; margin: 0 0 4px 0; font-weight: 800; text-transform: uppercase; }
+    #panel .sub { color: rgba(200,230,255,0.55); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; margin-bottom: 10px; }
+    .prompt-btn { display: block; width: 100%; text-align: left; background: rgba(88,227,255,0.08); border: 1px solid rgba(88,227,255,0.30); color: #C8E6FF; padding: 9px 12px; border-radius: 7px; cursor: pointer; font-size: 12px; margin-bottom: 6px; transition: background 120ms, border 120ms; }
+    .prompt-btn:hover { background: rgba(88,227,255,0.18); border-color: rgba(88,227,255,0.55); }
+    .prompt-btn:disabled { opacity: 0.4; cursor: wait; }
+    .prompt-btn .resp { display: block; color: rgba(200,230,255,0.55); font-size: 10px; margin-top: 4px; font-style: italic; }
+    #status { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.08); font-size: 11px; color: rgba(200,230,255,0.6); min-height: 20px; }
+    #status.speaking { color: #B388FF; }
+    #status.firing { color: #58E3FF; }
+    #status.error { color: #EF7F7F; }
+    label.row { display: flex; align-items: center; justify-content: space-between; margin: 6px 0 0; font-size: 11px; color: rgba(200,230,255,0.7); }
+    label.row input { transform: scale(1.1); margin-left: 8px; }
+    .back { position: absolute; top: 18px; right: 18px; color: rgba(200,230,255,0.6); text-decoration: none; font-size: 11px; letter-spacing: 2px; text-transform: uppercase; border: 1px solid rgba(255,255,255,0.15); padding: 6px 12px; border-radius: 6px; z-index: 10; }
+    .back:hover { color: #fff; border-color: rgba(255,255,255,0.5); }
+    #hint { position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%); color: rgba(200,230,255,0.45); font-size: 11px; letter-spacing: 1.5px; text-transform: uppercase; pointer-events: none; }
+
+    /* Breadcrumb — appears when a node is focused.
+       IRIS chip is clickable to return to overview. */
+    #breadcrumb {
+      position: absolute;
+      top: 18px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: rgba(200, 230, 255, 0.55);
+      font-size: 12px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      z-index: 11;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 260ms ease-out;
+      user-select: none;
+    }
+    #breadcrumb.visible { opacity: 1; pointer-events: auto; }
+    #breadcrumb .bc-crumb {
+      display: inline-block;
+      padding: 4px 10px;
+      border: 1px solid rgba(88, 227, 255, 0.25);
+      border-radius: 12px;
+      color: rgba(200, 230, 255, 0.85);
+      background: rgba(8, 16, 28, 0.55);
+      cursor: pointer;
+      transition: background 120ms ease-out, border 120ms ease-out, color 120ms ease-out;
+    }
+    #breadcrumb .bc-crumb:hover {
+      background: rgba(88, 227, 255, 0.12);
+      border-color: rgba(88, 227, 255, 0.55);
+      color: #d8f4ff;
+    }
+    #breadcrumb #bc-current {
+      cursor: default;
+      background: rgba(88, 227, 255, 0.08);
+      border-color: rgba(88, 227, 255, 0.35);
+      color: #58e3ff;
+    }
+    #breadcrumb .bc-sep {
+      color: rgba(200, 230, 255, 0.35);
+      padding: 0 2px;
+    }
+
+    /* Hover label (follows mouse). */
+    #hover-label {
+      position: absolute;
+      pointer-events: none;
+      background: rgba(8, 16, 28, 0.85);
+      border: 1px solid rgba(88, 227, 255, 0.35);
+      color: #d8f4ff;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      z-index: 12;
+      opacity: 0;
+      transition: opacity 100ms ease-out;
+    }
+    #hover-label.visible { opacity: 1; }
+
+    /* Suggestions panel — top-right overlay listing IRIS proactive
+       suggestions. Hidden when window.IRIS_WORLD.suggestions is empty.
+       Toggle with 's' key (mirrors 'b' bubble debug toggle). */
+    #suggestions-panel {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      width: 280px;
+      max-height: 60vh;
+      overflow-y: auto;
+      background: rgba(8, 14, 26, 0.82);
+      border: 1px solid rgba(180, 140, 255, 0.25);
+      border-radius: 10px;
+      padding: 12px 14px;
+      color: #d8e6ff;
+      font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+      font-size: 12px;
+      z-index: 9;
+      pointer-events: auto;
+      -webkit-backdrop-filter: blur(6px);
+      backdrop-filter: blur(6px);
+      display: none;
+    }
+    #suggestions-panel.visible { display: block; }
+    #suggestions-panel .hdr {
+      font-size: 11px;
+      letter-spacing: 2.5px;
+      color: #b388ff;
+      margin: 0 0 10px 0;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    #suggestions-panel .items { display: flex; flex-direction: column; gap: 6px; }
+    #suggestions-panel .sug {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      background: rgba(180, 140, 255, 0.08);
+      border: 1px solid rgba(180, 140, 255, 0.22);
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 120ms, border 120ms;
+    }
+    #suggestions-panel .sug:hover {
+      background: rgba(180, 140, 255, 0.18);
+      border-color: rgba(180, 140, 255, 0.50);
+    }
+    #suggestions-panel .sug .glyph { font-size: 16px; flex-shrink: 0; line-height: 1; }
+    #suggestions-panel .sug .label {
+      flex: 1;
+      font-size: 12px;
+      color: #d8e6ff;
+      line-height: 1.25;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #suggestions-panel .sug .why {
+      font-size: 10px;
+      color: rgba(200, 220, 255, 0.55);
+      cursor: help;
+      flex-shrink: 0;
+      padding: 1px 6px;
+      border: 1px solid rgba(180, 140, 255, 0.25);
+      border-radius: 8px;
+    }
+    #suggestions-panel .sug .why:hover { color: #d8e6ff; border-color: rgba(180, 140, 255, 0.55); }
+    /* Subtle scrollbar to fit the cortex aesthetic. */
+    #suggestions-panel::-webkit-scrollbar { width: 6px; }
+    #suggestions-panel::-webkit-scrollbar-track { background: transparent; }
+    #suggestions-panel::-webkit-scrollbar-thumb {
+      background: rgba(180, 140, 255, 0.25);
+      border-radius: 3px;
+    }
+
+    /* Embedded mode — the page is hosted inside the Touchless / Cortex
+       Qt window (run_iris_simulator.py injects window.IRIS_EMBEDDED=true
+       at DocumentCreation). Hide all interactive UI chrome so the canvas
+       reads as a pure visualization surface; the live bridge drives all
+       activity instead of the test-prompt buttons. Standalone (browser)
+       loads have IRIS_EMBEDDED undefined and remain fully interactive. */
+    /* Both selectors (html.iris-embedded set in <head> inline script
+       BEFORE first paint; body.embedded set later by the module script
+       for any legacy entry point) so the rules always apply. */
+    html.iris-embedded #panel,
+    body.embedded #panel { display: none !important; }
+    html.iris-embedded #suggestions-panel,
+    body.embedded #suggestions-panel { display: none !important; }
+    html.iris-embedded #breadcrumb,
+    body.embedded #breadcrumb { display: none !important; }
+    html.iris-embedded #hint,
+    body.embedded #hint { display: none !important; }
+    html.iris-embedded .back,
+    body.embedded .back { display: none !important; }
+  </style>
+  <script type="importmap">
+    { "imports": { "three": "../vendor/three/build/three.module.js", "three/addons/": "../vendor/three/examples/jsm/" } }
+  </script>
+  <!-- QWebChannel transport. Bundled by Qt; loaded via qrc:// when the
+       page is running under run_iris_simulator.py / CortexWindow. The
+       launcher (run_iris_simulator.py) ALSO inlines the same source at
+       DocumentCreation so the module script below can reference
+       `QWebChannel` synchronously without waiting for this <script>
+       to resolve. Either path is sufficient — if both succeed the
+       second definition is harmlessly identical. -->
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <a class="back" href="./index.html">← all demos</a>
+  <div id="breadcrumb">
+    <span class="bc-crumb" data-bc-home>IRIS</span><span class="bc-sep"> › </span><span class="bc-crumb" id="bc-current"></span>
+  </div>
+  <div id="hover-label"></div>
+  <div id="suggestions-panel">
+    <div class="hdr">✦ IRIS SUGGESTS</div>
+    <div class="items"></div>
+  </div>
+  <div id="panel">
+    <h1>Iris Live Simulator</h1>
+    <div id="data-badge" style="font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase; color: rgba(200,230,255,0.55); margin: 2px 0 8px 0;">Demo data</div>
+    <div class="sub">Click a test prompt to fire the path</div>
+    <button class="prompt-btn" data-prompt="0">
+      What's the weather?
+      <span class="resp">→ tools/weather · no memory (changes)</span>
+    </button>
+    <button class="prompt-btn" data-prompt="1">
+      Send the weather to Vesko
+      <span class="resp">→ weather + memory/contacts + messages · caches Vesko</span>
+    </button>
+    <button class="prompt-btn" data-prompt="2">
+      Open Chrome
+      <span class="resp">→ Layer-0 router (fast path, no LLM)</span>
+    </button>
+    <button class="prompt-btn" data-prompt="3">
+      Remember my dog's name is Rex
+      <span class="resp">→ memory/write · caches "Rex"</span>
+    </button>
+    <button class="prompt-btn" data-prompt="4">
+      What's my dog's name?
+      <span class="resp">→ memory/recall</span>
+    </button>
+    <button class="prompt-btn" data-prompt="5">
+      Schedule meeting tomorrow at 3
+      <span class="resp">→ tools/calendar (Microsoft connector)</span>
+    </button>
+    <label class="row">Voice replies
+      <input type="checkbox" id="tts-on" checked />
+    </label>
+    <label class="row" style="margin-top: 6px; align-items: stretch; flex-direction: column;">
+      <span style="margin-bottom: 4px;">Voice</span>
+      <select id="voice-select" style="background: rgba(8,16,28,0.85); color: #C8E6FF; border: 1px solid rgba(88,227,255,0.3); padding: 5px 6px; border-radius: 5px; font-size: 11px;"></select>
+    </label>
+    <div id="status">Idle.</div>
+  </div>
+  <div id="hint">Drag to orbit · scroll to zoom · click a node to focus · Esc to return</div>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+    // ─── embedded mode ─────────────────────────────────────────────
+    // run_iris_simulator.py (CortexWindow) injects
+    //   window.IRIS_EMBEDDED = true
+    // at DocumentCreation when the page is hosted inside the Qt
+    // window. We toggle a body class so the embedding CSS rules (see
+    // <style>) can hide the test-prompts panel, suggestions overlay,
+    // breadcrumb, hint, and back-link — leaving a clean visualization
+    // surface driven entirely by the live cortex bridge. Standalone
+    // (browser) loads see undefined and keep the full UI for testing.
+    if (window.IRIS_EMBEDDED) {
+      try { document.body.classList.add('embedded'); } catch (_) { /* non-fatal */ }
+    }
+
+    // ─── renderer + scene ──────────────────────────────────────────
+    const canvas = document.getElementById('canvas');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(innerWidth, innerHeight, false);
+    renderer.setClearColor(0x050a14, 1);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const scene = new THREE.Scene();
+    // Match page CSS background (#050a14) so any render-target reset flashes the
+    // surrounding UI color instead of pure black (anti-flash on resize / composer realloc).
+    scene.background = new THREE.Color(0x050a14);
+    const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.1, 250);
+    camera.position.set(0, 14, 56);
+    const controls = new OrbitControls(camera, canvas);
+    controls.enableDamping = true; controls.dampingFactor = 0.08;
+    controls.target.set(0, 0, 0);
+
+    scene.add(new THREE.AmbientLight(0x101830, 0.16));
+    const sun = new THREE.PointLight(0xb6dcff, 2.6, 260, 1.3);
+    sun.position.set(0, 0, 0);
+    scene.add(sun);
+
+    // ─── plasma shader (same as plasma_core demo, reused) ──────────
+    const NOISE = `
+      vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x, 289.0);}
+      vec4 taylorInvSqrt(vec4 r){return 1.79284291400159 - 0.85373472095314 * r;}
+      float snoise(vec3 v){
+        const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+        const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+        vec3 i  = floor(v + dot(v, C.yyy));
+        vec3 x0 = v - i + dot(i, C.xxx);
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min(g.xyz, l.zxy);
+        vec3 i2 = max(g.xyz, l.zxy);
+        vec3 x1 = x0 - i1 + 1.0 * C.xxx;
+        vec3 x2 = x0 - i2 + 2.0 * C.xxx;
+        vec3 x3 = x0 - 1. + 3.0 * C.xxx;
+        i = mod(i, 289.0);
+        vec4 p = permute(permute(permute(
+                   i.z + vec4(0.0, i1.z, i2.z, 1.0))
+                 + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+                 + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+        float n_ = 1.0/7.0;
+        vec3 ns = n_ * D.wyz - D.xzx;
+        vec4 j = p - 49.0 * floor(p * ns.z *ns.z);
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_);
+        vec4 x = x_ *ns.x + ns.yyyy;
+        vec4 y = y_ *ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+        vec4 b0 = vec4(x.xy, y.xy);
+        vec4 b1 = vec4(x.zw, y.zw);
+        vec4 s0 = floor(b0)*2.0 + 1.0;
+        vec4 s1 = floor(b1)*2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+        vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy;
+        vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww;
+        vec3 p0 = vec3(a0.xy, h.x);
+        vec3 p1 = vec3(a0.zw, h.y);
+        vec3 p2 = vec3(a1.xy, h.z);
+        vec3 p3 = vec3(a1.zw, h.w);
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+        p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+        vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+      }
+    `;
+    const PLASMA_VS = `
+      uniform float uTime, uBodyAmp, uSurfaceAmp, uSeed;
+      varying vec3 vNormal; varying float vNoise; varying vec3 vViewPosition;
+      ${NOISE}
+      vec3 displace(vec3 p) {
+        float n1 = snoise(p * 0.35 + vec3(uSeed) + uTime * 0.25);
+        float n2 = snoise(p * 2.00 + vec3(uSeed*2.7) + uTime * 1.50);
+        return p + normalize(p) * (n1 * uBodyAmp + n2 * uSurfaceAmp);
+      }
+      vec3 ortho(vec3 v){ return normalize(abs(v.x) > abs(v.z) ? vec3(-v.y, v.x, 0.0) : vec3(0.0, -v.z, v.y)); }
+      void main(){
+        vec3 d = displace(position);
+        float eps = 0.001;
+        vec3 t1 = ortho(normal); vec3 t2 = normalize(cross(normal, t1));
+        vec3 d1 = displace(position + t1 * eps) - d;
+        vec3 d2 = displace(position + t2 * eps) - d;
+        vNormal = normalize(cross(d1, d2));
+        vNoise = snoise(position * 2.0 + vec3(uSeed*2.7) + uTime * 1.5);
+        vec4 mv = modelViewMatrix * vec4(d, 1.0);
+        vViewPosition = -mv.xyz;
+        gl_Position = projectionMatrix * mv;
+      }
+    `;
+    const PLASMA_FS = `
+      uniform vec3 uBaseColor, uHotColor;
+      uniform float uIntensity;
+      uniform float uAlpha;
+      varying vec3 vNormal; varying float vNoise; varying vec3 vViewPosition;
+      void main(){
+        vec3 N = normalize(vNormal); vec3 V = normalize(vViewPosition);
+        float fres = pow(1.0 - max(dot(N, V), 0.0), 2.0);
+        float heat = smoothstep(-0.4, 0.7, vNoise);
+        vec3 col = mix(uBaseColor, uHotColor, heat);
+        col *= (0.45 + 0.55 * uIntensity);
+        col += vec3(0.25, 0.6, 1.0) * fres * 0.6 * uIntensity;
+        // uAlpha is a dedicated fade channel driven by the project-removal
+        // tween. Normal display keeps it at 1.0; the fade-out path drops
+        // it toward 0 so the sphere goes genuinely translucent (not just
+        // dimmer-colored — uIntensity already dimmed color, but a fixed
+        // alpha=1.0 made the sphere stay fully opaque, producing the
+        // "snap disappear" symptom when teardown finally ran).
+        gl_FragColor = vec4(col, clamp(uAlpha, 0.0, 1.0));
+      }
+    `;
+    function makePlasmaMat(seed, base, hot) {
+      return new THREE.ShaderMaterial({
+        vertexShader: PLASMA_VS, fragmentShader: PLASMA_FS,
+        // transparent=true is required for the uAlpha fade to actually
+        // composite against the scene; without it the fragment's alpha
+        // is ignored and the sphere snaps off when we tear it down.
+        transparent: true,
+        uniforms: {
+          uTime:       { value: 0 },
+          uBodyAmp:    { value: 0.07 },
+          uSurfaceAmp: { value: 0.04 },
+          uIntensity:  { value: 0.6 },
+          uAlpha:      { value: 1.0 },
+          uBaseColor:  { value: new THREE.Color(base) },
+          uHotColor:   { value: new THREE.Color(hot) },
+          uSeed:       { value: seed },
+        },
+      });
+    }
+
+    // ─── halo sprite (shared) ──────────────────────────────────────
+    const haloTex = (() => {
+      const c = document.createElement('canvas'); c.width = 128; c.height = 128;
+      const g = c.getContext('2d').createRadialGradient(64,64,0,64,64,64);
+      g.addColorStop(0, 'rgba(255,255,255,0.85)');
+      g.addColorStop(0.2, 'rgba(255,255,255,0.42)');
+      g.addColorStop(0.5, 'rgba(255,255,255,0.10)');
+      g.addColorStop(1, 'rgba(255,255,255,0)');
+      const ctx = c.getContext('2d'); ctx.fillStyle = g; ctx.fillRect(0,0,128,128);
+      const t = new THREE.CanvasTexture(c); t.needsUpdate = true; return t;
+    })();
+    function makeHalo(color, size, opacity = 0.6) {
+      const m = new THREE.SpriteMaterial({
+        map: haloTex, color, transparent: true, opacity,
+        depthWrite: false, blending: THREE.AdditiveBlending,
+      });
+      const s = new THREE.Sprite(m);
+      s.scale.set(size, size, 1);
+      return s;
+    }
+
+    function makeLabel(text, opacity = 0.92, scale = 1.0, sizeHint = 'large') {
+      // High-DPI label: 2x resolution + max anisotropy = crisp text
+      // even at glancing angles. Was 512x128 + 44px font (fuzzy at
+      // anything past mid-distance).
+      //
+      // sizeHint: 'large' (default, 1024x256 — tier 0/1/2 readable from
+      // distance) or 'small' (256x64 — tier-3 leaves, tiny + only ever
+      // visible when their parent is the focused node so reduced
+      // resolution is unnoticed and saves ~16x GPU VRAM per sprite).
+      const small = (sizeHint === 'small');
+      const BASE_W = small ? 256 : 1024;
+      const H = small ? 64  : 256;
+      const FONT = small ? 40 : 92;
+      const STROKE = small ? 4 : 14;
+      const PAD = 16; // padding on each side of the text inside the canvas
+
+      // Measure text on a throwaway ctx so we can grow the canvas width
+      // to fit long labels (e.g. tier-1 project names) instead of letting
+      // them clip silently against the fixed sprite bounds.
+      const measureCtx = document.createElement('canvas').getContext('2d');
+      measureCtx.font = `bold ${FONT}px -apple-system, Segoe UI, Roboto, sans-serif`;
+      const textW = measureCtx.measureText(text).width;
+      const needed = Math.ceil(textW + STROKE * 2 + PAD * 2);
+      const W = Math.max(BASE_W, needed);
+      const cx = W / 2, cy = H / 2;
+
+      const c = document.createElement('canvas');
+      c.width = W; c.height = H;
+      const ctx = c.getContext('2d');
+      ctx.font = `bold ${FONT}px -apple-system, Segoe UI, Roboto, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.lineWidth = STROKE;
+      ctx.strokeStyle = 'rgba(2,6,14,0.98)';
+      ctx.strokeText(text, cx, cy);
+      // Muted fill — luminance ~0.50, below the 0.70 bloom threshold
+      // so labels stay sharp instead of glowing.
+      ctx.fillStyle = 'rgba(135, 155, 178, 1.0)';
+      ctx.fillText(text, cx, cy);
+      const tex = new THREE.CanvasTexture(c);
+      tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      tex.generateMipmaps = false;
+      tex.needsUpdate = true;
+      const s = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: tex, transparent: true, depthWrite: false, opacity,
+      }));
+      // Scale sprite width proportional to canvas growth so the on-screen
+      // text height stays constant — only the sprite gets wider for long
+      // labels. Default base scale is 7 (large) / 1.75 (height).
+      const widthRatio = W / BASE_W;
+      s.scale.set(7 * widthRatio * scale, 1.75 * scale, 1);
+      return s;
+    }
+
+    // ─── node hierarchy (tiered: core > caps/projects > subs > leaves) ──
+    //
+    // Each tier dims progressively: tier 0 = core (full plasma + glow),
+    // tier 1 = capabilities + top-level projects (60% intensity), tier 2
+    // = sub-categories (35% intensity, smaller halo), tier 3 = leaves
+    // (15% intensity, no plasma animation, no halo).
+    //
+    // Per-tier visual settings driven by TIER_LOOK.
+    const TIER_LOOK = {
+      // Tier 1 (caps + projects) gets a real glow + visible plasma now
+      // — was reading as flat discs against the void. Body / surface
+      // amp at ~0.95 makes the noise displacement obvious, so each
+      // sphere has clear 3D surface motion instead of looking 2D.
+      0: { intensityMul: 1.20, bodyAmpMul: 1.00, surfAmpMul: 1.00, haloMul: 3.6, haloOpacity: 0.74 },
+      1: { intensityMul: 0.95, bodyAmpMul: 0.95, surfAmpMul: 0.95, haloMul: 3.1, haloOpacity: 0.55 },
+      2: { intensityMul: 0.45, bodyAmpMul: 0.30, surfAmpMul: 0.40, haloMul: 2.1, haloOpacity: 0.22 },
+      // Tier 3 leaves — PERF: no halo sprite (was haloMul=1.6, which
+      // spawned ~166 sprites each rendering as a full-screen-blend draw
+      // call and feeding UnrealBloomPass). haloMul=0 short-circuits the
+      // spawn loop below (`if (look.haloMul > 0)`). Visually
+      // imperceptible at overview zoom — leaves are sub-pixel dots.
+      3: { intensityMul: 0.32, bodyAmpMul: 0.00, surfAmpMul: 0.00, haloMul: 0, haloOpacity: 0.22 },
+    };
+
+    // NODE_DEFS — keeps original [x,y,z] in `pos` so we can derive a
+    // familiar starting orbit angle from it. `parent` was added so
+    // every node orbits its semantic parent each frame (core at the
+    // origin, caps + top-level projects orbit core, sub-nodes orbit
+    // their cap/project, leaves orbit their sub-node).
+    const HARDCODED_NODE_DEFS = [
+      // id, parent, pos (initial / for angle derivation), radius, base, hot, halo color, label, tier
+      { id: 'core',          parent: null,         pos: [ 0,   0,   0], r: 3.4, base: 0x2497d6, hot: 0xeaffff, halo: 0x6fc3ff, label: 'IRIS', tier: 0 },
+
+      // capabilities — tier 1 (orbit core)
+      { id: 'cap-memory',    parent: 'core',       pos: [-14,  4,  -2], r: 1.6, base: 0xb388ff, hot: 0xede0ff, halo: 0xb388ff, label: 'Memory',   tier: 1 },
+      { id: 'cap-voice',     parent: 'core',       pos: [-14, -3,   6], r: 1.6, base: 0x58e3ff, hot: 0xeaffff, halo: 0x58e3ff, label: 'Voice',    tier: 1 },
+      { id: 'cap-tools',     parent: 'core',       pos: [ 14, -2,  -2], r: 1.6, base: 0xf5b542, hot: 0xfff0c0, halo: 0xf5b542, label: 'Tools',    tier: 1 },
+      { id: 'cap-realtime',  parent: 'core',       pos: [ 14,  4,   6], r: 1.6, base: 0xef7fc7, hot: 0xffd2ec, halo: 0xef7fc7, label: 'Realtime', tier: 1 },
+
+      // memory sub-nodes — tier 2
+      { id: 'mem-contacts',  parent: 'cap-memory', pos: [-22,  7,  -6], r: 0.55, base: 0xb388ff, hot: 0xede0ff, halo: 0xb388ff, label: 'Contacts',  tier: 2 },
+      { id: 'mem-inbox',     parent: 'cap-memory', pos: [-22,  9,  -2], r: 0.55, base: 0xb388ff, hot: 0xede0ff, halo: 0xb388ff, label: 'Inbox',     tier: 2 },
+      { id: 'mem-personal',  parent: 'cap-memory', pos: [-22,  3,  -2], r: 0.55, base: 0xb388ff, hot: 0xede0ff, halo: 0xb388ff, label: 'Personal',  tier: 2 },
+      { id: 'mem-facts',     parent: 'cap-memory', pos: [-22,  6,   2], r: 0.55, base: 0xb388ff, hot: 0xede0ff, halo: 0xb388ff, label: 'Facts',     tier: 2 },
+
+      // tools sub-nodes — tier 2
+      { id: 'tool-router',   parent: 'cap-tools',  pos: [ 22, -5,  -6], r: 0.55, base: 0x1de9b6, hot: 0xc8ffea, halo: 0x1de9b6, label: 'Layer-0 router', tier: 2 },
+      { id: 'tool-weather',  parent: 'cap-tools',  pos: [ 22, -1,  -7], r: 0.55, base: 0xf5b542, hot: 0xfff0c0, halo: 0xf5b542, label: 'Weather',   tier: 2 },
+      { id: 'tool-open',     parent: 'cap-tools',  pos: [ 22, -4,   3], r: 0.55, base: 0xf5b542, hot: 0xfff0c0, halo: 0xf5b542, label: 'Open app',  tier: 2 },
+      { id: 'tool-msg',      parent: 'cap-tools',  pos: [ 22,  1,   1], r: 0.55, base: 0xf5b542, hot: 0xfff0c0, halo: 0xf5b542, label: 'Messages',  tier: 2 },
+      { id: 'tool-cal',      parent: 'cap-tools',  pos: [ 22,  4,  -3], r: 0.55, base: 0xf5b542, hot: 0xfff0c0, halo: 0xf5b542, label: 'Calendar',  tier: 2 },
+
+      // realtime sub-nodes — tier 2
+      { id: 'rt-planner',    parent: 'cap-realtime', pos: [ 22,  7,   7], r: 0.55, base: 0xef7fc7, hot: 0xffd2ec, halo: 0xef7fc7, label: 'Planner', tier: 2 },
+      { id: 'rt-output',     parent: 'cap-realtime', pos: [ 22,  2,  11], r: 0.55, base: 0xef7fc7, hot: 0xffd2ec, halo: 0xef7fc7, label: 'Output',  tier: 2 },
+
+      // voice sub-nodes — tier 2 (still visible even though click-prompts skip the chain)
+      { id: 'voice-mic',     parent: 'cap-voice',  pos: [-22, -7,  10], r: 0.55, base: 0x58e3ff, hot: 0xeaffff, halo: 0x58e3ff, label: 'Mic', tier: 2 },
+      { id: 'voice-tts',     parent: 'cap-voice',  pos: [-22, -1,   12], r: 0.55, base: 0x58e3ff, hot: 0xeaffff, halo: 0x58e3ff, label: 'TTS', tier: 2 },
+
+      // ─── PROJECTS — tier 1 ────────────────────────────────────────
+      // Four real projects, lower shelf y = -9, spread around in a
+      // wider ring of radius ~16 so their sub-trees have room.
+      { id: 'proj-touchless-dev',   parent: 'core', pos: [-16, -9, -10], r: 1.0, base: 0x1de9b6, hot: 0xc8ffea, halo: 0x1de9b6, label: 'Touchless dev',      tier: 1 },
+      { id: 'proj-touchless-web',   parent: 'core', pos: [ 16, -9, -10], r: 0.9, base: 0x4be0d4, hot: 0xcdf6f0, halo: 0x4be0d4, label: 'Touchless website', tier: 1 },
+      { id: 'proj-touchless-track', parent: 'core', pos: [-16, -9,  10], r: 0.9, base: 0x6ed8a9, hot: 0xd3f4dd, halo: 0x6ed8a9, label: 'Touchless tracking', tier: 1 },
+      { id: 'proj-touchless-soc',   parent: 'core', pos: [ 16, -9,  10], r: 0.9, base: 0x33c39b, hot: 0xc4f0d8, halo: 0x33c39b, label: 'Touchless socials',  tier: 1 },
+
+      // ─── Touchless dev sub-nodes — tier 2 ──────────────────────────
+      { id: 'td-features', parent: 'proj-touchless-dev', pos: [-21, -9, -14], r: 0.45, base: 0x1de9b6, hot: 0xc8ffea, halo: 0x1de9b6, label: 'Features', tier: 2 },
+      { id: 'td-bugs',     parent: 'proj-touchless-dev', pos: [-22, -9, -11], r: 0.45, base: 0x1de9b6, hot: 0xc8ffea, halo: 0x1de9b6, label: 'Bugs',     tier: 2 },
+      { id: 'td-docs',     parent: 'proj-touchless-dev', pos: [-21, -9,  -8], r: 0.45, base: 0x1de9b6, hot: 0xc8ffea, halo: 0x1de9b6, label: 'Docs',     tier: 2 },
+      { id: 'td-code',     parent: 'proj-touchless-dev', pos: [-19, -9,  -6], r: 0.45, base: 0x1de9b6, hot: 0xc8ffea, halo: 0x1de9b6, label: 'Code',     tier: 2 },
+      // leaves under each (tier 3)
+      { id: 'td-f-gest',   parent: 'td-features', pos: [-24, -9, -16], r: 0.22, base: 0x1de9b6, hot: 0xeaffea, halo: 0,        label: 'gesture',    tier: 3 },
+      { id: 'td-f-voice',  parent: 'td-features', pos: [-22, -9, -17], r: 0.22, base: 0x1de9b6, hot: 0xeaffea, halo: 0,        label: 'voice',      tier: 3 },
+      { id: 'td-f-iris',   parent: 'td-features', pos: [-20, -9, -16], r: 0.22, base: 0x1de9b6, hot: 0xeaffea, halo: 0,        label: 'iris',       tier: 3 },
+      { id: 'td-b-open',   parent: 'td-bugs',     pos: [-25, -9, -11], r: 0.22, base: 0x1de9b6, hot: 0xeaffea, halo: 0,        label: 'OPEN_ISSUES',tier: 3 },
+      { id: 'td-b-todo',   parent: 'td-bugs',     pos: [-24, -9, -13], r: 0.22, base: 0x1de9b6, hot: 0xeaffea, halo: 0,        label: 'to-do',      tier: 3 },
+      { id: 'td-d-subs',   parent: 'td-docs',     pos: [-24, -9,  -8], r: 0.22, base: 0x1de9b6, hot: 0xeaffea, halo: 0,        label: 'subsystem',  tier: 3 },
+      { id: 'td-d-iris',   parent: 'td-docs',     pos: [-23, -9,  -6], r: 0.22, base: 0x1de9b6, hot: 0xeaffea, halo: 0,        label: 'IRIS_VIZ',   tier: 3 },
+      { id: 'td-c-src',    parent: 'td-code',     pos: [-21, -9,  -4], r: 0.22, base: 0x1de9b6, hot: 0xeaffea, halo: 0,        label: 'src/hgr',    tier: 3 },
+      { id: 'td-c-live',   parent: 'td-code',     pos: [-18, -9,  -4], r: 0.22, base: 0x1de9b6, hot: 0xeaffea, halo: 0,        label: 'live_api',   tier: 3 },
+
+      // ─── Touchless website sub-nodes ───────────────────────────────
+      { id: 'tw-pages',    parent: 'proj-touchless-web', pos: [ 21, -9, -14], r: 0.45, base: 0x4be0d4, hot: 0xcdf6f0, halo: 0x4be0d4, label: 'Pages',  tier: 2 },
+      { id: 'tw-deploy',   parent: 'proj-touchless-web', pos: [ 22, -9, -11], r: 0.45, base: 0x4be0d4, hot: 0xcdf6f0, halo: 0x4be0d4, label: 'Deploy', tier: 2 },
+      { id: 'tw-content',  parent: 'proj-touchless-web', pos: [ 19, -9,  -8], r: 0.45, base: 0x4be0d4, hot: 0xcdf6f0, halo: 0x4be0d4, label: 'Content', tier: 2 },
+      { id: 'tw-p-home',   parent: 'tw-pages',   pos: [ 24, -9, -16], r: 0.22, base: 0x4be0d4, hot: 0xeafff8, halo: 0,        label: 'home',     tier: 3 },
+      { id: 'tw-p-dl',     parent: 'tw-pages',   pos: [ 23, -9, -17], r: 0.22, base: 0x4be0d4, hot: 0xeafff8, halo: 0,        label: 'download', tier: 3 },
+      { id: 'tw-p-feat',   parent: 'tw-pages',   pos: [ 25, -9, -14], r: 0.22, base: 0x4be0d4, hot: 0xeafff8, halo: 0,        label: 'features', tier: 3 },
+      { id: 'tw-d-cf',     parent: 'tw-deploy',  pos: [ 25, -9, -11], r: 0.22, base: 0x4be0d4, hot: 0xeafff8, halo: 0,        label: 'cloudflare', tier: 3 },
+      { id: 'tw-d-gh',     parent: 'tw-deploy',  pos: [ 24, -9, -13], r: 0.22, base: 0x4be0d4, hot: 0xeafff8, halo: 0,        label: 'github',   tier: 3 },
+      { id: 'tw-c-blog',   parent: 'tw-content', pos: [ 22, -9,  -7], r: 0.22, base: 0x4be0d4, hot: 0xeafff8, halo: 0,        label: 'blog',     tier: 3 },
+      { id: 'tw-c-ann',    parent: 'tw-content', pos: [ 20, -9,  -6], r: 0.22, base: 0x4be0d4, hot: 0xeafff8, halo: 0,        label: 'announcements', tier: 3 },
+
+      // ─── Touchless tracking sub-nodes (usage analytics) ────────────
+      { id: 'tk-downloads', parent: 'proj-touchless-track', pos: [-21, -9,  14], r: 0.45, base: 0x6ed8a9, hot: 0xd3f4dd, halo: 0x6ed8a9, label: 'Downloads', tier: 2 },
+      { id: 'tk-sessions',  parent: 'proj-touchless-track', pos: [-22, -9,  11], r: 0.45, base: 0x6ed8a9, hot: 0xd3f4dd, halo: 0x6ed8a9, label: 'Sessions',  tier: 2 },
+      { id: 'tk-errors',    parent: 'proj-touchless-track', pos: [-19, -9,   8], r: 0.45, base: 0x6ed8a9, hot: 0xd3f4dd, halo: 0x6ed8a9, label: 'Errors',    tier: 2 },
+      { id: 'tk-d-stable',  parent: 'tk-downloads', pos: [-24, -9,  16], r: 0.22, base: 0x6ed8a9, hot: 0xeafff8, halo: 0,        label: 'stable',     tier: 3 },
+      { id: 'tk-d-beta',    parent: 'tk-downloads', pos: [-22, -9,  17], r: 0.22, base: 0x6ed8a9, hot: 0xeafff8, halo: 0,        label: 'beta',       tier: 3 },
+      { id: 'tk-d-store',   parent: 'tk-downloads', pos: [-20, -9,  16], r: 0.22, base: 0x6ed8a9, hot: 0xeafff8, halo: 0,        label: 'MS store',   tier: 3 },
+      { id: 'tk-s-active',  parent: 'tk-sessions',  pos: [-25, -9,  12], r: 0.22, base: 0x6ed8a9, hot: 0xeafff8, halo: 0,        label: 'active',     tier: 3 },
+      { id: 'tk-s-retain',  parent: 'tk-sessions',  pos: [-24, -9,  10], r: 0.22, base: 0x6ed8a9, hot: 0xeafff8, halo: 0,        label: 'retention',  tier: 3 },
+      { id: 'tk-e-crash',   parent: 'tk-errors',    pos: [-21, -9,   6], r: 0.22, base: 0x6ed8a9, hot: 0xeafff8, halo: 0,        label: 'crash',      tier: 3 },
+      { id: 'tk-e-warn',    parent: 'tk-errors',    pos: [-18, -9,   6], r: 0.22, base: 0x6ed8a9, hot: 0xeafff8, halo: 0,        label: 'warnings',   tier: 3 },
+
+      // ─── Touchless socials sub-nodes (marketing + social media) ────
+      { id: 'ts-instagram', parent: 'proj-touchless-soc', pos: [ 21, -9,  14], r: 0.45, base: 0x33c39b, hot: 0xc4f0d8, halo: 0x33c39b, label: 'Instagram', tier: 2 },
+      { id: 'ts-x',         parent: 'proj-touchless-soc', pos: [ 22, -9,  11], r: 0.45, base: 0x33c39b, hot: 0xc4f0d8, halo: 0x33c39b, label: 'X (Twitter)', tier: 2 },
+      { id: 'ts-content',   parent: 'proj-touchless-soc', pos: [ 19, -9,   8], r: 0.45, base: 0x33c39b, hot: 0xc4f0d8, halo: 0x33c39b, label: 'Content',   tier: 2 },
+      { id: 'ts-plans',     parent: 'proj-touchless-soc', pos: [ 17, -9,  10], r: 0.45, base: 0x33c39b, hot: 0xc4f0d8, halo: 0x33c39b, label: 'Plans',     tier: 2 },
+      { id: 'ts-i-posts',   parent: 'ts-instagram', pos: [ 24, -9,  16], r: 0.22, base: 0x33c39b, hot: 0xeafff8, halo: 0,        label: 'posts',      tier: 3 },
+      { id: 'ts-i-story',   parent: 'ts-instagram', pos: [ 22, -9,  17], r: 0.22, base: 0x33c39b, hot: 0xeafff8, halo: 0,        label: 'stories',    tier: 3 },
+      { id: 'ts-x-posts',   parent: 'ts-x',         pos: [ 25, -9,  11], r: 0.22, base: 0x33c39b, hot: 0xeafff8, halo: 0,        label: 'posts',      tier: 3 },
+      { id: 'ts-c-reels',   parent: 'ts-content',   pos: [ 21, -9,   6], r: 0.22, base: 0x33c39b, hot: 0xeafff8, halo: 0,        label: 'reels',      tier: 3 },
+      { id: 'ts-c-pipe',    parent: 'ts-content',   pos: [ 18, -9,   6], r: 0.22, base: 0x33c39b, hot: 0xeafff8, halo: 0,        label: 'pipeline',   tier: 3 },
+      { id: 'ts-p-strat',   parent: 'ts-plans',     pos: [ 16, -9,  12], r: 0.22, base: 0x33c39b, hot: 0xeafff8, halo: 0,        label: 'strategy',   tier: 3 },
+      { id: 'ts-p-hooks',   parent: 'ts-plans',     pos: [ 15, -9,  10], r: 0.22, base: 0x33c39b, hot: 0xeafff8, halo: 0,        label: 'hooks',      tier: 3 },
+    ];
+
+    // ── World data injection (set by run_iris_simulator.py before
+    // this module loads). Shape:
+    //   window.IRIS_WORLD = {
+    //     source: '<path>',
+    //     project_count: N,
+    //     projects: [{ id, label, color: {base, hot, halo}, touch_count, branches: [...] }],
+    //     memory: {
+    //       facts: [{id, label, text}],
+    //       episodes: [{id, label, text}],
+    //       active_context: [{id, label, text}],
+    //     }
+    //   }
+    // If absent or empty, fall back to the hardcoded demo projects.
+    function worldToProjectNodeDefs(world) {
+      const out = [];
+      for (const proj of (world.projects || [])) {
+        const col = proj.color || { base: 0x1de9b6, hot: 0xc8ffea, halo: 0x1de9b6 };
+        out.push({
+          id: proj.id, parent: 'core', pos: [0, 0, 0], r: 1.0,
+          base: col.base, hot: col.hot, halo: col.halo,
+          label: proj.label, tier: 1,
+        });
+        for (const branch of (proj.branches || [])) {
+          out.push({
+            id: branch.id, parent: proj.id, pos: [0, 0, 0], r: 0.45,
+            base: col.base, hot: col.hot, halo: col.halo,
+            label: branch.label, tier: 2,
+          });
+          for (const leaf of (branch.leaves || [])) {
+            out.push({
+              id: leaf.id, parent: branch.id, pos: [0, 0, 0], r: 0.30,
+              base: col.base, hot: 0xeafff8, halo: 0x9cc8e0,
+              label: leaf.label, tier: 3,
+              path: leaf.path || null,
+            });
+          }
+        }
+      }
+      return out;
+    }
+
+    // ── Memory data injection. Hangs the live MemoryStore content as
+    // tier-3 leaves under existing 'mem-facts' (already hardcoded) and
+    // brand-new 'mem-episodes' + 'mem-active' tier-2 sub-nodes (which
+    // we also create here, parented to cap-memory). Uses the same
+    // purple memory tint as the rest of cap-memory's subtree.
+    function worldToMemoryNodeDefs(world) {
+      const out = [];
+      const mem = world && world.memory ? world.memory : null;
+      if (!mem) return out;
+      const MEM_BASE = 0xb388ff;
+      const MEM_HOT  = 0xede0ff;
+      // mem-facts already exists in HARDCODED_NODE_DEFS as a tier-2
+      // sub-node of cap-memory — just hang leaves under it.
+      // If facts span multiple source_kinds, annotate each leaf label
+      // with a small provenance glyph so the user can see at-a-glance
+      // where the fact came from. If all facts share one source (or
+      // none have source_kind), labels render flat as before.
+      const FACT_SRC_GLYPHS = {
+        conversation: '💬 ',
+        project_file: '📄 ',
+        email:        '✉️ ',
+        calendar:     '📅 ',
+        tool_pattern: '🔧 ',
+        git_config:   '⚙️ ',
+      };
+      const facts = Array.isArray(mem.facts) ? mem.facts : [];
+      const factSrcSet = new Set();
+      for (const f of facts) {
+        if (f && typeof f.source_kind === 'string' && f.source_kind) {
+          factSrcSet.add(f.source_kind);
+        }
+      }
+      const annotateFactSrc = factSrcSet.size > 1;
+      for (const f of facts) {
+        const baseLabel = f.label || '';
+        let lbl = baseLabel;
+        if (annotateFactSrc && f && typeof f.source_kind === 'string') {
+          const g = FACT_SRC_GLYPHS[f.source_kind];
+          if (g) lbl = `${g}${baseLabel}`;
+        }
+        out.push({
+          id: f.id, parent: 'mem-facts', pos: [0, 0, 0], r: 0.30,
+          base: MEM_BASE, hot: MEM_HOT, halo: 0,
+          label: lbl.slice(0, 56), tier: 3,
+          text: f.text || null,
+        });
+      }
+      // mem-episodes: new tier-2 branch under cap-memory.
+      const eps = Array.isArray(mem.episodes) ? mem.episodes : [];
+      if (eps.length > 0) {
+        out.push({
+          id: 'mem-episodes', parent: 'cap-memory', pos: [-22, 1, 4], r: 0.55,
+          base: MEM_BASE, hot: MEM_HOT, halo: MEM_BASE,
+          label: 'Episodes', tier: 2,
+        });
+        for (const e of eps) {
+          out.push({
+            id: e.id, parent: 'mem-episodes', pos: [0, 0, 0], r: 0.30,
+            base: MEM_BASE, hot: MEM_HOT, halo: 0,
+            label: e.label || '', tier: 3,
+            text: e.text || null,
+          });
+        }
+      }
+      // mem-active: new tier-2 branch under cap-memory.
+      const active = Array.isArray(mem.active_context) ? mem.active_context : [];
+      if (active.length > 0) {
+        out.push({
+          id: 'mem-active', parent: 'cap-memory', pos: [-22, -2, 0], r: 0.55,
+          base: MEM_BASE, hot: MEM_HOT, halo: MEM_BASE,
+          label: 'Active Context', tier: 2,
+        });
+        for (const a of active) {
+          out.push({
+            id: a.id, parent: 'mem-active', pos: [0, 0, 0], r: 0.30,
+            base: MEM_BASE, hot: MEM_HOT, halo: 0,
+            label: a.label || '', tier: 3,
+            text: a.text || null,
+          });
+        }
+      }
+      // mem-patterns: new tier-2 branch surfacing repeated query habits
+      // + recurring tool-pair sequences. Cap-memory's purple tint.
+      // Capped at 30 leaves by the launcher (gather_patterns()) so
+      // this branch can't blow out the constellation. Hidden entirely
+      // when no patterns were detected (cold start or empty memory).
+      const patterns = Array.isArray(mem.patterns) ? mem.patterns : [];
+      if (patterns.length > 0) {
+        out.push({
+          id: 'mem-patterns', parent: 'cap-memory', pos: [-22, -5, 4], r: 0.55,
+          base: MEM_BASE, hot: MEM_HOT, halo: MEM_BASE,
+          label: 'Patterns', tier: 2,
+        });
+        // Cap defensively in case the launcher returned more than 30.
+        for (const p of patterns.slice(0, 30)) {
+          if (!p || !p.id) continue;
+          const count = Number(p.count || 0);
+          const kindTag = p.kind === 'tool_seq' ? '⇄ ' : '↻ ';
+          const lbl = `${kindTag}${p.label || ''} ×${count}`;
+          out.push({
+            id: p.id, parent: 'mem-patterns', pos: [0, 0, 0], r: 0.30,
+            base: MEM_BASE, hot: MEM_HOT, halo: 0,
+            label: lbl.slice(0, 56), tier: 3,
+            text: `${p.kind || 'pattern'} · seen ${count}×`,
+          });
+        }
+      }
+      // mem-contacts: tier-2 node already exists in HARDCODED_NODE_DEFS
+      // as an empty placeholder under cap-memory. Here we populate it
+      // with tier-3 leaves — one per learned contact — drawn from
+      // memory.contacts (provided by the cortex launcher).
+      //
+      // Each contact may carry `sources: [{kind, source_id}, ...]` and
+      // a `confidence` score (0..1). Glyph prefix is picked from the
+      // FIRST source kind for label brevity; the hover tooltip lists
+      // every source. Capped at 60 leaves so the bubble can't explode.
+      const CONTACT_SRC_GLYPHS = {
+        factual:      '📇 ',
+        email:        '✉️ ',
+        calendar:     '📅 ',
+        mention:      '💬 ',
+        git:          '⚡ ',
+        conversation: '💬 ',
+        project:      '📁 ',
+      };
+      const contacts = Array.isArray(mem.contacts) ? mem.contacts : [];
+      if (contacts.length > 0) {
+        // Sort by confidence desc (stable for equal scores); items
+        // without a numeric confidence get treated as 0.
+        const sorted = contacts.slice().sort((a, b) => {
+          const ca = Number((a && a.confidence) || 0);
+          const cb = Number((b && b.confidence) || 0);
+          return cb - ca;
+        });
+        for (const c of sorted.slice(0, 60)) {
+          if (!c || !c.id) continue;
+          const sources = Array.isArray(c.sources) ? c.sources : [];
+          const firstKind = sources.length > 0
+            ? (sources[0].kind || sources[0].type || 'unknown')
+            : 'unknown';
+          const glyph = CONTACT_SRC_GLYPHS[firstKind] || '👤 ';
+          const name = (c.name || c.id || '').toString();
+          const lbl = `${glyph}${name}`.slice(0, 56);
+          const srcTooltip = sources.length > 0
+            ? sources.map(s => `${s.kind || s.type || '?'}${s.source_id ? `:${s.source_id}` : ''}`).join(' / ')
+            : 'unknown source';
+          const conf = Number(c.confidence || 0);
+          const confStr = conf > 0 ? ` · conf ${conf.toFixed(2)}` : '';
+          out.push({
+            id: c.id, parent: 'mem-contacts', pos: [0, 0, 0], r: 0.30,
+            base: MEM_BASE, hot: MEM_HOT, halo: 0,
+            label: lbl, tier: 3,
+            text: `${name} · ${srcTooltip}${confStr}`,
+          });
+        }
+      }
+
+      // mem-inbox: tier-2 sibling of mem-contacts that holds the
+      // transactional / marketing / brand senders (newsletters,
+      // notifications, order receipts, etc). Same render pattern as
+      // contacts above, just a different glyph and cap so the bubble
+      // doesn't blow up — gmail tends to have hundreds of these.
+      const transactional = Array.isArray(mem.transactional) ? mem.transactional : [];
+      if (transactional.length > 0) {
+        const sortedTx = transactional.slice().sort((a, b) => {
+          const ca = Number((a && a.confidence) || 0);
+          const cb = Number((b && b.confidence) || 0);
+          return cb - ca;
+        });
+        for (const c of sortedTx.slice(0, 40)) {
+          if (!c || !c.id) continue;
+          const sources = Array.isArray(c.sources) ? c.sources : [];
+          const name = (c.name || c.id || '').toString();
+          const lbl = `📨 ${name}`.slice(0, 56);
+          const srcTooltip = sources.length > 0
+            ? sources.map(s => typeof s === 'string'
+                ? s
+                : `${s.kind || s.type || '?'}${s.source_id ? `:${s.source_id}` : ''}`).join(' / ')
+            : 'unknown source';
+          out.push({
+            id: c.id, parent: 'mem-inbox', pos: [0, 0, 0], r: 0.30,
+            base: MEM_BASE, hot: MEM_HOT, halo: 0,
+            label: lbl, tier: 3,
+            text: `${name} · ${srcTooltip}`,
+          });
+        }
+      }
+
+      return out;
+    }
+
+    // ── Tool registry injection. Replaces the 5 hardcoded tier-2 tool
+    // sub-nodes under cap-tools (tool-router/weather/open/msg/cal) with
+    // the REAL list pulled from the live ToolRegistry by the launcher.
+    // Tier-2 sub-nodes, orange tint matching cap-tools. Capped at 30
+    // by the launcher (most-used first). If world.tools is empty we
+    // return [] and the original hardcoded 5 stay in place.
+    function worldToToolNodeDefs(world) {
+      const out = [];
+      const tools = world && Array.isArray(world.tools) ? world.tools : [];
+      if (tools.length === 0) return out;
+      const TOOL_BASE = 0xf5b542;
+      const TOOL_HOT  = 0xfff0c0;
+      for (const t of tools) {
+        if (!t || !t.id) continue;
+        out.push({
+          id: `tool-${String(t.id).replace(/[^a-z0-9_-]/gi, '-')}`,
+          parent: 'cap-tools', pos: [0, 0, 0], r: 0.55,
+          base: TOOL_BASE, hot: TOOL_HOT, halo: TOOL_BASE,
+          label: t.label || t.id, tier: 2,
+          text: t.description || null,
+        });
+      }
+      return out;
+    }
+
+    function applyWorldToNodeDefs(hardcoded, world) {
+      // Collect hardcoded project roots + every descendant so we can
+      // remove the whole demo subtree before splicing in the world's.
+      const HARDCODED_PROJECT_ROOTS = new Set([
+        'proj-touchless-dev', 'proj-touchless-web',
+        'proj-touchless-track', 'proj-touchless-soc',
+      ]);
+      const removeIds = new Set(HARDCODED_PROJECT_ROOTS);
+
+      // If the real tool registry is present, also strip the 5 hardcoded
+      // tool sub-nodes under cap-tools so worldToToolNodeDefs() owns
+      // that subtree. We do NOT remove cap-tools itself (still the tier-1
+      // anchor); just its immediate hardcoded tier-2 children.
+      const _toolsAvail = world && Array.isArray(world.tools) && world.tools.length > 0;
+      if (_toolsAvail) {
+        for (const id of ['tool-router', 'tool-weather', 'tool-open', 'tool-msg', 'tool-cal']) {
+          removeIds.add(id);
+        }
+      }
+
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const d of hardcoded) {
+          if (d.parent && removeIds.has(d.parent) && !removeIds.has(d.id)) {
+            removeIds.add(d.id);
+            changed = true;
+          }
+        }
+      }
+      const kept = hardcoded.filter(d => !removeIds.has(d.id));
+      // Memory leaves are spliced in alongside the project subtrees;
+      // edge auto-creation (every def.parent → addEdgeOnce) picks them
+      // up for free, so each new mem-* tier-2 sub-node gets a wire to
+      // cap-memory and each leaf gets a wire to its sub-node.
+      return [
+        ...kept,
+        ...worldToProjectNodeDefs(world),
+        ...worldToMemoryNodeDefs(world),
+        ...worldToToolNodeDefs(world),
+      ];
+    }
+
+    const _W = window.IRIS_WORLD;
+    const _HAS_PROJECTS = !!(_W && _W.projects && _W.projects.length > 0);
+    const _HAS_MEMORY = !!(_W && _W.memory && (
+      (Array.isArray(_W.memory.facts) && _W.memory.facts.length > 0) ||
+      (Array.isArray(_W.memory.episodes) && _W.memory.episodes.length > 0) ||
+      (Array.isArray(_W.memory.active_context) && _W.memory.active_context.length > 0) ||
+      (Array.isArray(_W.memory.patterns) && _W.memory.patterns.length > 0)
+    ));
+    const _HAS_TOOLS = !!(_W && Array.isArray(_W.tools) && _W.tools.length > 0);
+    const _USE_WORLD = _HAS_PROJECTS || _HAS_MEMORY || _HAS_TOOLS;
+    const NODE_DEFS = _USE_WORLD
+      ? applyWorldToNodeDefs(HARDCODED_NODE_DEFS, _W)
+      : HARDCODED_NODE_DEFS;
+
+    // Reflect data source in the panel badge.
+    try {
+      const badge = document.getElementById('data-badge');
+      if (badge) {
+        if (_USE_WORLD) {
+          badge.textContent = `🌐 Real world data · ${_W.project_count} project(s)`;
+          badge.style.color = '#1de9b6';
+        } else {
+          badge.textContent = 'Demo data (no cortex_world.json found)';
+        }
+      }
+    } catch (e) { /* badge optional */ }
+
+    // ── Tier-1 dynamic sizing ─────────────────────────────────────
+    // Each tier-1 node (caps + projects) scales with the total number
+    // of descendants (tier-2 + tier-3) under it. A cap/project with
+    // many sub-nodes + leaves visibly grows; sparse ones stay near
+    // their original radius. Formula: r_final = clamp(r_base * (1 +
+    // 0.15 * log2(1 + descendant_count)), r_base, 2.5). Must run BEFORE
+    // the spawn loop reads def.r — mesh geometry, halo size, and label
+    // y-offset all derive from def.r. Tier-2 orbit also gets a small
+    // bump (descendantBump) so leaves don't end up nested inside the
+    // bigger parent sphere.
+    (function applyTier1DescendantSizing() {
+      // Index direct children by parent id (one pass over NODE_DEFS).
+      const childrenByParent = new Map();
+      for (const d of NODE_DEFS) {
+        if (!d.parent) continue;
+        if (!childrenByParent.has(d.parent)) childrenByParent.set(d.parent, []);
+        childrenByParent.get(d.parent).push(d.id);
+      }
+      // BFS to count all descendants (tier-2 + tier-3) under a node.
+      function descendantCount(id) {
+        let total = 0;
+        const stack = [id];
+        while (stack.length) {
+          const cur = stack.pop();
+          const kids = childrenByParent.get(cur) || [];
+          for (const k of kids) { total += 1; stack.push(k); }
+        }
+        return total;
+      }
+      // Split descendant count into direct (tier-2) children vs
+      // grandchildren (tier-3 leaves). The orbit bump consumed by
+      // updateOrbits below uses BOTH so we don't have to recompute,
+      // but weights them very differently — siblings need to sit
+      // farther apart, grandchildren only nudge the radius a bit so
+      // each sub-cloud has breathing room.
+      for (const d of NODE_DEFS) {
+        if ((d.tier ?? 1) !== 1) continue;
+        const direct = (childrenByParent.get(d.id) || []).length;
+        let grand = 0;
+        for (const cid of (childrenByParent.get(d.id) || [])) {
+          grand += (childrenByParent.get(cid) || []).length;
+        }
+        const total = direct + grand;
+        const rBase = d.r;
+        const rTarget = rBase * (1 + 0.15 * Math.log2(1 + total));
+        d.r = Math.min(2.5, Math.max(rBase, rTarget));
+        d._descendantCount = total;       // legacy field, still read
+        d._tier2ChildCount = direct;
+        d._tier3GrandchildCount = grand;
+      }
+    })();
+
+    // ── Bubble packing ────────────────────────────────────────────
+    // Each tier-1 node "owns" a bubble of space containing all of its
+    // descendants (tier-2 sub-cloud + tier-3 leaves). Sibling bubbles
+    // must not overlap, or the visual hierarchy breaks down. We do
+    // this by computing each tier-1's bubble radius and then choosing
+    // an orbital distance from core that's far enough to fit the two
+    // largest bubbles side-by-side at the worst plausible angular
+    // separation.
+    // Bubble-packing pass. Was an IIFE; named so the live-update
+    // hook (OPEN_ISSUES #10) can re-run it after a new live project
+    // node has been spliced into NODE_DEFS at runtime. Initial call
+    // happens immediately below so the cold-start behavior is unchanged.
+    function applyTier1BubblePacking() {
+      // Tier-1 children of core (the only ones that orbit the core
+      // directly — exclude any orphan tier-1 with a different parent).
+      // Sort by id to MATCH the SIB_INDEX assignment downstream, which
+      // also sorts by id. If the orderings don't match, the prediction
+      // doesn't match the rendered position and pairs slip past us.
+      const tier1Defs = NODE_DEFS
+        .filter(d => (d.tier ?? 1) === 1 && d.parent === 'core')
+        .slice()
+        .sort((a, b) => (a.id < b.id ? -1 : (a.id > b.id ? 1 : 0)));
+      if (tier1Defs.length < 1) return;
+
+      // Bubble radius for a tier-1: distance from its center out to the
+      // farthest possible point in its subtree, plus a safety margin.
+      // Mirrors the descBump formula in updateOrbits so the prediction
+      // matches what the orbit layout actually produces.
+      const T2_BASE   = 2.5;   // tierRadius(2) — orbit of sub-nodes around tier-1
+      const T3_BASE   = 1.0;   // tierRadius(3) — orbit of leaves around tier-2
+      const T2_R      = 0.55;  // tier-2 sphere radius
+      const T2_HALO   = 2.1;   // tier-2 haloMul (from TIER_LOOK[2])
+      const LEAF_R    = 0.22;  // typical tier-3 sphere radius
+      const MARGIN    = 3.5;   // breathing room between adjacent bubbles
+      const SAFETY    = 1.10;  // small conservative buffer over the exact math
+      function bubbleFor(d) {
+        const kids  = d._tier2ChildCount || 0;
+        const grand = d._tier3GrandchildCount || 0;
+        let descBump = 1.0;
+        if (kids > 0) {
+          // KEEP IN SYNC with updateOrbits descBump (see updateOrbits @ ~line 1796).
+          descBump = 1 + 0.09 * Math.log2(1 + kids) + 0.02 * Math.log2(1 + grand);
+          if (descBump > 1.7) descBump = 1.7;
+        }
+        // Mirror updateOrbits' EXACT tier-2 orbital distance formula:
+        //   baseRing2 = tierRadius(2)
+        //   fit = autoFitRadius(centerR=d.r, siblings=kids-1)
+        //   t2_orbit = (baseRing2 + max(0, fit - baseRing2*0.4)) * descBump
+        // Previously this was just T2_BASE*descBump, which omitted the
+        // autoFit contribution — for parents with many kids, autoFit added
+        // ~1 unit of orbital distance that bubbleFor didn't see. Adjacent
+        // bubbles meshed because of it.
+        const baseRing2 = T2_BASE;
+        const sibs2 = Math.max(0, kids - 1);
+        const autoFit = Math.max(d.r * 1.35, 1.4 + Math.sqrt(Math.max(1, sibs2)) * 0.35);
+        const t2_orbit = (baseRing2 + Math.max(0, autoFit - baseRing2 * 0.4)) * descBump;
+        // Outer extent of a sub-cloud past the tier-2 center.
+        const halo_extent = T2_R * T2_HALO;
+        const leaf_extent = (grand > 0 ? T3_BASE + LEAF_R : T2_R);
+        const t2_outer = Math.max(halo_extent, leaf_extent);
+        // Bubble must enclose tier-1 sphere itself AND its sub-cloud.
+        const subtreeExtent = t2_orbit + t2_outer;
+        return Math.max(d.r, subtreeExtent) * SAFETY;
+      }
+
+      for (const d of tier1Defs) d._bubbleR = bubbleFor(d);
+
+      // Seed: full-sphere Fibonacci spread, NO hemisphere bias (mixing
+      // caps and projects evenly around the core looks more "spread
+      // around the core" than hemisphere-segregated). Small id-hash
+      // jitter so reload doesn't reshuffle but tied pairs differ.
+      const N = tier1Defs.length;
+      const positions = tier1Defs.map((d, i) => {
+        const orb = fibonacciSphere(i, N);
+        const [ja, jp] = idHash01(d.id);
+        const a = (orb.angle + (ja - 0.5) * Math.PI * 0.30) % (Math.PI * 2);
+        const p = Math.max(-Math.PI * 0.45, Math.min(Math.PI * 0.45,
+                  orb.polar + (jp - 0.5) * Math.PI * 0.18));
+        return {
+          x: Math.cos(a) * Math.cos(p),
+          y: Math.sin(p),
+          z: Math.sin(a) * Math.cos(p),
+        };
+      });
+
+      // Iterative angular repulsion. Each iter, find every too-close
+      // pair (bubbles overlap at the current orbit radius) and push
+      // them apart along the great-circle tangent. After convergence,
+      // recompute the orbit radius from the still-tightest pair.
+      let orbitR = 16.0;
+      for (const d of tier1Defs) {
+        orbitR = Math.max(orbitR, d._bubbleR * 2.2);   // initial guess
+      }
+      const STEP = 0.06;
+      const ITERS = 200;   // was 120 — more headroom to reach tighter tolerance
+      for (let iter = 0; iter < ITERS; iter++) {
+        let maxOverlap = 0;
+        for (let i = 0; i < N; i++) {
+          for (let j = i + 1; j < N; j++) {
+            const p1 = positions[i], p2 = positions[j];
+            const dot = Math.max(-1, Math.min(1, p1.x*p2.x + p1.y*p2.y + p1.z*p2.z));
+            const angle = Math.acos(dot);
+            if (angle < 0.001) {
+              // Coincident — nudge j by a tiny random tangent (id-hash
+              // derived so it's deterministic).
+              const [jx] = idHash01(tier1Defs[j].id + '!');
+              const eps = 0.05 * (jx - 0.5);
+              positions[j].x += eps; positions[j].z += eps;
+            } else {
+              const chord = 2 * orbitR * Math.sin(angle / 2);
+              const needed = tier1Defs[i]._bubbleR + tier1Defs[j]._bubbleR + MARGIN;
+              const overlap = needed - chord;
+              if (overlap > 0) {
+                if (overlap > maxOverlap) maxOverlap = overlap;
+                // Tangent direction from i toward j (project p2-p1 onto
+                // the tangent plane of p1, normalize). Then move both
+                // along it in opposite directions.
+                let dx = p2.x - p1.x, dy = p2.y - p1.y, dz = p2.z - p1.z;
+                const len = Math.hypot(dx, dy, dz) || 1;
+                dx /= len; dy /= len; dz /= len;
+                const push = STEP * Math.min(1, overlap / orbitR + 0.05);
+                positions[i].x -= dx * push; positions[i].y -= dy * push; positions[i].z -= dz * push;
+                positions[j].x += dx * push; positions[j].y += dy * push; positions[j].z += dz * push;
+              }
+            }
+            // Re-normalize to unit sphere.
+            const n1 = Math.hypot(positions[i].x, positions[i].y, positions[i].z) || 1;
+            positions[i].x /= n1; positions[i].y /= n1; positions[i].z /= n1;
+            const n2 = Math.hypot(positions[j].x, positions[j].y, positions[j].z) || 1;
+            positions[j].x /= n2; positions[j].y /= n2; positions[j].z /= n2;
+          }
+        }
+        if (maxOverlap < 0.005) break;   // converged (was 0.02 — tighter)
+      }
+
+      // Final orbit radius — the tightest still-close pair after
+      // repulsion dictates the minimum. Hard floor at 16.
+      let requiredR = 16.0;
+      for (let i = 0; i < N; i++) {
+        for (let j = i + 1; j < N; j++) {
+          const p1 = positions[i], p2 = positions[j];
+          const dot = Math.max(-1, Math.min(1, p1.x*p2.x + p1.y*p2.y + p1.z*p2.z));
+          const angle = Math.acos(dot);
+          if (angle < 0.01) continue;
+          const chord = tier1Defs[i]._bubbleR + tier1Defs[j]._bubbleR + MARGIN;
+          const need = chord / (2 * Math.sin(angle / 2));
+          if (need > requiredR) requiredR = need;
+        }
+      }
+      let orbitR_final = requiredR;
+
+      // Overlap-buster: one final O(N²) pass at orbitR_final. If any pair
+      // STILL has a positive chord deficit (chord < needed), scale orbitR
+      // up by (1 + worst_deficit / orbitR_final). This is a non-linear
+      // last-resort correction that guarantees no residual overlap from
+      // the iterative repulsion settling early. Loop up to 8 times in case
+      // a single scale-up doesn't completely resolve a tight cluster.
+      for (let bust = 0; bust < 8; bust++) {
+        let worstDeficit = 0;
+        for (let i = 0; i < N; i++) {
+          for (let j = i + 1; j < N; j++) {
+            const p1 = positions[i], p2 = positions[j];
+            const dot = Math.max(-1, Math.min(1, p1.x*p2.x + p1.y*p2.y + p1.z*p2.z));
+            const angle = Math.acos(dot);
+            if (angle < 0.01) continue;
+            const chord = 2 * orbitR_final * Math.sin(angle / 2);
+            const needed = tier1Defs[i]._bubbleR + tier1Defs[j]._bubbleR + MARGIN;
+            const deficit = needed - chord;
+            if (deficit > worstDeficit) worstDeficit = deficit;
+          }
+        }
+        if (worstDeficit <= 0.0001) break;   // no overlap left
+        orbitR_final *= (1 + worstDeficit / orbitR_final);
+      }
+
+      // Cache the converged unit positions + final orbit radius on each
+      // tier-1 def. deriveOrbit reads these directly so the rendered
+      // position EXACTLY matches what the packing math optimized for.
+      for (let i = 0; i < N; i++) {
+        const p = positions[i];
+        tier1Defs[i]._fixedAngle = Math.atan2(p.z, p.x);
+        tier1Defs[i]._fixedPolar = Math.asin(Math.max(-1, Math.min(1, p.y)));
+        tier1Defs[i]._orbitFromCoreR = orbitR_final;
+      }
+    }
+    applyTier1BubblePacking();
+
+    // Capability IDs (pinned-ring, not draggable, not part of the
+    // free-floating tree).
+    const CAPABILITY_IDS = new Set(['cap-memory', 'cap-voice', 'cap-tools', 'cap-realtime']);
+
+    // Pre-group nodes by parent so we can give each sibling group
+    // an even spread on the unit sphere via the Fibonacci-sphere
+    // algorithm. Result: equidistant sibling spacing — no clumping,
+    // no two nodes occupying the same latitude+longitude.
+    const SIBS_BY_PARENT = {};
+    for (const def of NODE_DEFS) {
+      const pkey = def.parent || '__root__';
+      (SIBS_BY_PARENT[pkey] ||= []).push(def);
+    }
+    // Stable order within each group so reload doesn't reshuffle.
+    for (const pkey in SIBS_BY_PARENT) {
+      SIBS_BY_PARENT[pkey].sort((a, b) => a.id.localeCompare(b.id));
+    }
+    const SIB_INDEX = {};   // id -> { i, n } sibling index within its parent group
+    for (const pkey in SIBS_BY_PARENT) {
+      const sibs = SIBS_BY_PARENT[pkey];
+      for (let i = 0; i < sibs.length; i++) SIB_INDEX[sibs[i].id] = { i, n: sibs.length };
+    }
+
+    // Fibonacci-sphere distribution: returns (angle, polar) such that
+    // siblings of the same parent occupy quasi-uniform points on their
+    // shared orbital sphere. Even spacing in all directions = clean
+    // satellite layout, no two nodes overlapping. n=1 collapses to the
+    // pole (single child has no siblings to space against).
+    function fibonacciSphere(i, n) {
+      if (n <= 1) return { angle: 0, polar: 0 };
+      const goldenAngle = Math.PI * (3.0 - Math.sqrt(5.0));
+      const y = 1 - (i / (n - 1)) * 2;     // -1 .. +1
+      const polar = Math.asin(Math.max(-1, Math.min(1, y)));
+      const angle = (goldenAngle * i) % (Math.PI * 2);
+      return { angle, polar };
+    }
+
+    // Deterministic per-id hash → two floats in [0,1). Used to jitter
+    // every orbital position so n=1 children don't all collapse to
+    // (angle:0, polar:0) — which made single-child chains render as
+    // perfect collinear stacks (tier-1 → tier-2 → tier-3 all on the
+    // +X axis from the core).
+    function idHash01(id) {
+      let h = 2166136261 >>> 0;
+      for (let i = 0; i < (id || '').length; i++) {
+        h ^= id.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+      const a = (h & 0xffff) / 0x10000;
+      const b = ((h >>> 16) & 0xffff) / 0x10000;
+      return [a, b];
+    }
+
+    function deriveOrbit(def, parentDef) {
+      void parentDef; // unused — orbit is now purely sibling-index-driven
+      // Tier-1 children of core: use the cached position from the
+      // bubble-packing pass (iterative repulsion already optimized
+      // spacing). Skips Fibonacci+jitter for them entirely.
+      if (def._fixedAngle !== undefined && def._fixedPolar !== undefined) {
+        return { angle: def._fixedAngle, polar: def._fixedPolar };
+      }
+      const sib = SIB_INDEX[def.id] || { i: 0, n: 1 };
+      const orb = fibonacciSphere(sib.i, sib.n);
+      // Per-id jitter so siblings (and especially single-child chains)
+      // never share an axis with their parent. Wider azimuthal jitter
+      // than polar so the cloud reads as a sphere not a ring.
+      const [ja, jp] = idHash01(def.id);
+      orb.angle = (orb.angle + ja * Math.PI * 2) % (Math.PI * 2);
+      orb.polar = orb.polar + (jp - 0.5) * (Math.PI * 0.45);     // ±~40°
+      // Clamp polar to ±~80° so jitter never pushes nodes onto the
+      // parent's pole (looks like they vanish from view).
+      const maxP = Math.PI * 0.45;
+      if (orb.polar >  maxP) orb.polar =  maxP;
+      if (orb.polar < -maxP) orb.polar = -maxP;
+      return orb;
+    }
+
+    const NODES = {};
+    const NODE_LIST = [];   // iteration order for orbit recompute (parent-first guaranteed by NODE_DEFS order)
+    const NODE_DEF_BY_ID = {};
+    for (const d of NODE_DEFS) NODE_DEF_BY_ID[d.id] = d;
+
+    for (const def of NODE_DEFS) {
+      const tier = def.tier ?? 1;
+      const look = TIER_LOOK[tier] || TIER_LOOK[1];
+
+      // Tier 3 leaves use a plain MeshBasicMaterial — unlabeled
+      // icy-light dots scattered in the satellite cloud. PERF: was
+      // MeshStandardMaterial (PBR roughness/metalness + IBL sampling
+      // per pixel); leaves are sub-pixel at overview zoom so the
+      // shading difference is imperceptible, but the shader cost adds
+      // up over ~166 spheres. Basic = flat unlit, single-fetch.
+      let mat;
+      if (tier >= 3) {
+        mat = new THREE.MeshBasicMaterial({
+          color: 0xd6e8f5, transparent: true, opacity: 0.85,
+        });
+      } else {
+        mat = makePlasmaMat(Math.random() * 100, def.base, def.hot);
+        mat.uniforms.uIntensity.value = 0.6 * look.intensityMul;
+        mat.uniforms.uBodyAmp.value = 0.07 * look.bodyAmpMul;
+        mat.uniforms.uSurfaceAmp.value = 0.04 * look.surfAmpMul;
+      }
+
+      // PERF: tier-3 icosahedron detail dropped from 2 (80 tris) to 1
+      // (20 tris). At overview zoom each leaf is a few pixels; the
+      // faceting is invisible. Saves ~10k triangles scene-wide.
+      const detail = tier === 0 ? 5 : tier === 1 ? 4 : tier === 2 ? 3 : 1;
+      const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(def.r, detail), mat);
+      mesh.position.set(...def.pos);
+      mesh.userData.nodeId = def.id;
+      scene.add(mesh);
+
+      let halo = null;
+      if (look.haloMul > 0) {
+        halo = makeHalo(def.halo || def.base, def.r * look.haloMul, look.haloOpacity);
+        halo.position.set(...def.pos);
+        scene.add(halo);
+      }
+
+      // Tier 2 sub-nodes get a dimmer label so they don't dominate the
+      // satellite cloud at rest — they brighten on focus via the
+      // applyFocusVisibility pass. Tier 3 leaf labels are LAZILY
+      // created on first reveal (when their parent becomes focused)
+      // — keeps the cloud uncluttered AND saves ~220 canvas-texture
+      // GPU allocations + invisible per-frame draw calls until needed.
+      // See applyFocusVisibility() for the lazy-create path.
+      let label = null;
+      let labelBaseOpacity = 0.92;
+      if (tier <= 2) {
+        const labelScale = tier === 0 ? 1.4
+                          : tier === 1 ? 0.95
+                          : 0.45;
+        const labelOpacity = tier === 0 ? 0.92
+                            : tier === 1 ? 0.92
+                            : 0.55;
+        labelBaseOpacity = labelOpacity;
+        label = makeLabel(def.label, labelOpacity, labelScale);
+        const yOff = tier === 0 ? 1.6 : 0.9;
+        label.position.set(def.pos[0], def.pos[1] + def.r + yOff, def.pos[2]);
+        scene.add(label);
+      } else if (tier === 3) {
+        // Defer creation — sprite stays null until applyFocusVisibility
+        // detects this leaf's parent is the focused node for the first
+        // time. labelBaseOpacity stays 0.0 so the legacy code path that
+        // checks node.labelBaseOpacity continues to mean "hidden at rest".
+        labelBaseOpacity = 0.0;
+      }
+
+      // Orbit init: derive starting angle/polar from the static
+      // position (relative to parent), so the constellation starts
+      // familiar then drifts.
+      const parentDef = def.parent ? NODE_DEF_BY_ID[def.parent] : null;
+      const orb = deriveOrbit(def, parentDef);
+
+      const node = {
+        id: def.id,
+        parent: def.parent,
+        label: def.label,
+        tier,
+        mesh, halo,
+        labelSprite: label,
+        labelBaseOpacity: labelBaseOpacity,
+        mat,
+        basePos: new THREE.Vector3(...def.pos),
+        baseR: def.r,
+        baseIntensity: (tier >= 3) ? 0.12 : mat.uniforms.uIntensity.value,
+        baseBodyAmp:   (tier >= 3) ? 0 : mat.uniforms.uBodyAmp.value,
+        baseSurfAmp:   (tier >= 3) ? 0 : mat.uniforms.uSurfaceAmp.value,
+        lastFireAt: 0,
+        baseColor: def.base, hotColor: def.hot,
+        isCapability: CAPABILITY_IDS.has(def.id),
+        // Tier-1 only: how many descendants this node has (set above
+        // in applyTier1DescendantSizing). Used to push tier-2 children
+        // outward proportionally so they don't end up inside the bigger
+        // parent sphere. 0 for tier-0/2/3.
+        descendantCount: (tier === 1 ? (def._descendantCount || 0) : 0),
+        tier2ChildCount: (tier === 1 ? (def._tier2ChildCount || 0) : 0),
+        tier3GrandchildCount: (tier === 1 ? (def._tier3GrandchildCount || 0) : 0),
+        bubbleR: (tier === 1 ? (def._bubbleR || 0) : 0),
+        orbitFromCoreR: (tier === 1 ? (def._orbitFromCoreR || 0) : 0),
+
+        // ── orbit state ───────────────────────────────────────────
+        orbitAngle: orb.angle,
+        orbitPolar: orb.polar,
+        // Slow drift (per-node randomized speed). Tier 0 doesn't drift
+        // (it's the anchor). Tier 1 ALL drift at the SAME fixed rate so
+        // sibling angular distance is preserved — different per-node
+        // speeds would gradually push tier-1 nodes toward each other
+        // and break bubble-packing over time. Tier 2/3 randomize for
+        // liveliness; they orbit WITHIN their tier-1's bubble so even
+        // sibling collisions stay inside the bubble.
+        orbitSpeed: (tier === 0) ? 0
+                   : (tier === 1) ? 0.04
+                   : (0.03 + Math.random() * 0.05) * 1.2,
+        // EQUIDISTANT — every sibling sits at the EXACT same distance
+        // from its parent. Fibonacci-sphere distribution above already
+        // spreads them out angularly, so siblings differ in direction
+        // not altitude. Cleaner satellite-ring look.
+        orbitRadiusMul: 1.0,
+
+        // Per-mesh rotation — tiny per-axis spin gives bodies real 3D
+        // motion. Tier 0 spins slowest (anchor); tier ≥ 2 doesn't spin
+        // at all (those are tiny, would just look jittery).
+        spinX: (tier === 0) ? 0.04 : (tier === 1 ? 0.08 + Math.random() * 0.10 : 0),
+        spinY: (tier === 0) ? 0.06 : (tier === 1 ? 0.10 + Math.random() * 0.14 : 0),
+        spinZ: (tier === 0) ? 0.02 : (tier === 1 ? 0.04 + Math.random() * 0.06 : 0),
+
+        // Spring physics state (tier-1 only; tier ≥ 2 follow rigidly).
+        target: new THREE.Vector3(...def.pos),
+        velocity: new THREE.Vector3(),
+
+        // Drag state.
+        dragged: false,
+      };
+      NODES[def.id] = node;
+      NODE_LIST.push(node);
+    }
+
+    // Helper: count direct children (used for camera distance + auto-fit).
+    const childrenById = new Map();
+    for (const n of NODE_LIST) {
+      if (!n.parent) continue;
+      if (!childrenById.has(n.parent)) childrenById.set(n.parent, []);
+      childrenById.get(n.parent).push(n);
+    }
+    function childCount(id) {
+      const list = childrenById.get(id);
+      return list ? list.length : 0;
+    }
+
+    // PERF: precomputed sibling-count-by-orbit-center. Since
+    // orbitCenterId(node) just returns node.parent || null and node
+    // parentage doesn't change at runtime, this map is static for the
+    // life of the scene. Used by updateOrbits() to replace an O(N²)
+    // double loop (~31k iterations/frame at 178 nodes) with an O(1)
+    // map lookup per node. If runtime add/remove ever happens, update
+    // this map alongside NODES/NODE_LIST.
+    const SIBLING_COUNT_BY_CENTER = new Map();
+    for (const n of NODE_LIST) {
+      const centerId = n.parent || null;
+      if (centerId === null) continue;
+      // We want "other nodes that share this center", so for each node
+      // the sibling count is (group size - 1). Build group sizes first,
+      // then subtract 1 at lookup time.
+      SIBLING_COUNT_BY_CENTER.set(centerId, (SIBLING_COUNT_BY_CENTER.get(centerId) || 0) + 1);
+    }
+
+    // ─── edges (with peristaltic shader) ──────────────────────────
+    // Each edge is a TubeGeometry whose ShaderMaterial accepts an
+    // array of pulse positions + amplitudes. The vertex shader
+    // displaces along the normal where pulses are — making the wire
+    // visibly BULGE around each traveling pulse like a peristaltic
+    // wave. The fragment shader colors the bulge brighter.
+    const MAX_PULSES_PER_EDGE = 6;
+
+    const EDGE_VS = `
+      uniform float uPulses[${MAX_PULSES_PER_EDGE}];
+      uniform float uPulseAmps[${MAX_PULSES_PER_EDGE}];
+      uniform vec3  uPulseColors[${MAX_PULSES_PER_EDGE}];
+      uniform int   uPulseCount;
+      uniform float uBumpWidth;
+      uniform float uMaxBump;
+
+      varying vec3 vColorMix;
+      varying float vBump;
+
+      void main(){
+        float u = uv.x;            // 0..1 along the tube length
+        float totalBump = 0.0;
+        vec3  colMix = vec3(0.0);
+        float colWeight = 0.0;
+        for (int i = 0; i < ${MAX_PULSES_PER_EDGE}; i++) {
+          if (i >= uPulseCount) break;
+          float d = u - uPulses[i];
+          float w = uBumpWidth;
+          float k = exp(-(d*d) / (w*w));
+          float amp = uPulseAmps[i] * k;
+          totalBump += amp;
+          colMix += uPulseColors[i] * amp;
+          colWeight += amp;
+        }
+        vBump = clamp(totalBump, 0.0, 1.0);
+        vColorMix = colWeight > 1e-4 ? (colMix / colWeight) : vec3(0.29, 0.55, 0.69);
+        vec3 displaced = position + normal * vBump * uMaxBump;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(displaced, 1.0);
+      }
+    `;
+    const EDGE_FS = `
+      uniform vec3 uBaseColor;
+      uniform float uOpacity;
+      varying vec3 vColorMix;
+      varying float vBump;
+      void main(){
+        // Base color when no bump; lerp toward pulse color as it travels.
+        vec3 col = mix(uBaseColor, vColorMix, smoothstep(0.0, 0.6, vBump));
+        col *= (0.85 + vBump * 2.2);
+        // Slight glow even at rest so the wire is visible
+        gl_FragColor = vec4(col + vec3(0.02, 0.04, 0.06), uOpacity);
+        if (uOpacity <= 0.001) discard;
+      }
+    `;
+
+    const EDGES = [];   // each: { fromId, toId, material, mesh, pulses: [], curve, _tubeSegs, _tubeRadius }
+
+    // Rebuild a tube geometry between two live node positions. Called
+    // both on initial creation and once per frame to keep edges glued
+    // to nodes as they orbit / are dragged.
+    function buildEdgeGeometry(edge) {
+      const fromNode = NODES[edge.fromId];
+      const toNode = NODES[edge.toId];
+      if (!fromNode || !toNode) return null;
+      const a = fromNode.mesh.position.clone();
+      const b = toNode.mesh.position.clone();
+      const chord = b.clone().sub(a);
+      const len = chord.length();
+      if (len < 0.001) return null;
+      const mid = a.clone().add(b).multiplyScalar(0.5);
+      const axis = Math.abs(chord.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+      const perp = new THREE.Vector3().crossVectors(chord, axis).normalize();
+      const outward = mid.clone().normalize();
+      const bowAmount = 0.05 * len + 0.3;
+      mid.addScaledVector(perp, bowAmount * 0.4);
+      if (mid.lengthSq() > 0.01) mid.addScaledVector(outward, bowAmount * 0.6);
+      const curve = new THREE.CatmullRomCurve3([a, mid, b]);
+      return new THREE.TubeGeometry(curve, edge._tubeSegs, edge._tubeRadius, 8, false);
+    }
+
+    // Edge thickness tiered by deepest endpoint — wires get thinner
+    // as you go further down the tree. core ↔ tier 1 = thickest;
+    // tier 2 ↔ tier 3 = barely visible thread.
+    function edgeTubeRadius(fromNode, toNode) {
+      const deepestTier = Math.max(fromNode.tier ?? 1, toNode.tier ?? 1);
+      if (deepestTier <= 1) return 0.13;   // core → caps/projects (slightly thicker)
+      if (deepestTier === 2) return 0.05;   // cap/project → sub-nodes (slightly thinner)
+      return 0.018;                         // sub-node → leaves (slightly thinner, still visible)
+    }
+
+    function addEdge(fromId, toId) {
+      const fromNode = NODES[fromId];
+      const toNode = NODES[toId];
+      if (!fromNode || !toNode) { console.warn('addEdge: missing node', fromId, toId); return; }
+
+      const deepestTier = Math.max(fromNode.tier ?? 1, toNode.tier ?? 1);
+      const isLeafEdge = deepestTier >= 3;
+
+      // ── Leaf edges: thin always-visible THREE.Line, NOT a Tube ────
+      // PERF: leaves now have ~166 wires in the cloud; spawning each as
+      // a TubeGeometry + ShaderMaterial blew the budget on idle render +
+      // per-frame rebuild. Lines use a 2-vertex BufferGeometry and a
+      // single LineBasicMaterial draw call. The pulse system skips leaf
+      // edges (Lines have no peristaltic shader uniforms).
+      if (isLeafEdge) {
+        // Use the tier-2 parent's color so the leaf wires read as
+        // "satellites of THIS sub-node" — color cohesion within each
+        // cluster instead of a uniform muted-blue everywhere.
+        const tier2Node = (fromNode.tier === 2) ? fromNode : (toNode.tier === 2 ? toNode : null);
+        const lineColor = tier2Node ? (tier2Node.baseColor || 0x9cc8e0) : 0x9cc8e0;
+        const lineMat = new THREE.LineBasicMaterial({
+          color: lineColor,
+          transparent: true,
+          opacity: 0.25,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        });
+        const lineGeom = new THREE.BufferGeometry();
+        const positions = new Float32Array(6);
+        positions[0] = fromNode.mesh.position.x;
+        positions[1] = fromNode.mesh.position.y;
+        positions[2] = fromNode.mesh.position.z;
+        positions[3] = toNode.mesh.position.x;
+        positions[4] = toNode.mesh.position.y;
+        positions[5] = toNode.mesh.position.z;
+        lineGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const lineMesh = new THREE.Line(lineGeom, lineMat);
+        scene.add(lineMesh);
+        EDGES.push({
+          fromId, toId,
+          material: lineMat,
+          mesh: lineMesh,
+          pulses: [],
+          _isLeafEdge: true,
+          _isLine: true,                    // distinguishes from tube edges
+          _linePositions: positions,        // referenced each frame for in-place updates
+          _opacityCurrent: 0.25,
+        });
+        return;
+      }
+
+      const tubeRadius = edgeTubeRadius(fromNode, toNode);
+      // Deeper edges also get a slightly tighter pulse-bump amplitude
+      // so the peristaltic wave is proportional to the wire diameter.
+      const bumpAmp = tubeRadius < 0.04 ? 0.18 : tubeRadius < 0.08 ? 0.32 : 0.5;
+
+      const mat = new THREE.ShaderMaterial({
+        vertexShader: EDGE_VS, fragmentShader: EDGE_FS,
+        uniforms: {
+          uPulses:      { value: new Array(MAX_PULSES_PER_EDGE).fill(0) },
+          uPulseAmps:   { value: new Array(MAX_PULSES_PER_EDGE).fill(0) },
+          uPulseColors: { value: Array.from({length: MAX_PULSES_PER_EDGE}, () => new THREE.Color(0xffffff)) },
+          uPulseCount:  { value: 0 },
+          uBumpWidth:   { value: 0.06 },
+          uMaxBump:     { value: bumpAmp },
+          uBaseColor:   { value: new THREE.Color(0x2a4f73) },
+          uOpacity:     { value: 1.0 },
+        },
+        transparent: true,
+      });
+
+      const edge = {
+        fromId, toId,
+        material: mat,
+        mesh: null,
+        pulses: [],
+        _tubeSegs: 80,
+        _tubeRadius: tubeRadius,
+        _isLeafEdge: false,
+        _isLine: false,
+        _opacityCurrent: 1.0,
+      };
+      const geom = buildEdgeGeometry(edge);
+      const mesh = new THREE.Mesh(geom || new THREE.BufferGeometry(), mat);
+      edge.mesh = mesh;
+      scene.add(mesh);
+      EDGES.push(edge);
+    }
+
+    // Wire up the network — generic parent edges first (every node
+    // with a parent gets one edge to that parent), then add the few
+    // non-parent semantic links (user→mic input, realtime↔voice
+    // cross-link) that aren't expressible as parent relationships.
+    //
+    // Dedup by sorted "a|b" key so we never double-wire an edge if a
+    // semantic link happens to coincide with a parent edge.
+    const _edgeKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
+    const _edgeSeen = new Set();
+    function addEdgeOnce(fromId, toId) {
+      const k = _edgeKey(fromId, toId);
+      if (_edgeSeen.has(k)) return;
+      _edgeSeen.add(k);
+      addEdge(fromId, toId);
+    }
+
+    // Parent edges for EVERY node (world-derived or hardcoded). This
+    // is the fix for the old bug where world projects (proj-hgr-app-...,
+    // proj-touchless-website, …) had nodes but no edge to core because
+    // the previous PROJECT_TREE loop only knew the 4 hardcoded ids.
+    for (const def of NODE_DEFS) {
+      if (def.parent) addEdgeOnce(def.parent, def.id);
+    }
+
+    // Non-parent semantic links — user input chain + the realtime↔voice
+    // cross-wire that lets cap-realtime route output through cap-voice's
+    // TTS sub-node.
+    addEdgeOnce('user', 'voice-mic');
+    addEdgeOnce('rt-output', 'voice-tts');
+
+    // ── Tool co-occurrence cross-edges (#7) ───────────────────────────
+    // Purely additive: dashed THREE.Line between tier-3 tool nodes that
+    // historically co-occur in the same session (from tool_call_log.db,
+    // aggregated by run_iris_simulator.gather_tool_cooccurrence()).
+    //
+    // Does NOT touch the existing tier-3 leaf edges (solid LineBasic,
+    // opacity 0.25) or the tier-1/2 TubeGeometry edges. New cross-edges
+    // are stored in a separate array (TOOL_LINK_LINES) so the existing
+    // rebuildAllEdgeGeometries() / pulse system can ignore them and so
+    // the only per-frame cost is one position write per cross-edge.
+    //
+    // Color = midpoint of the two endpoints' base colors. Opacity scales
+    // with weight (clamped to 0.15..0.5). LineDashedMaterial requires
+    // computeLineDistances() per geometry for the dash pattern to render.
+    const TOOL_LINK_LINES = [];
+    (function buildToolLinkCrossEdges() {
+      try {
+        const links = (_W && Array.isArray(_W.tool_links)) ? _W.tool_links : [];
+        if (links.length === 0) return;
+        const _toolSlug = (s) => `tool-${String(s).replace(/[^a-z0-9_-]/gi, '-')}`;
+        // Weight range for opacity mapping.
+        let wMax = 1;
+        for (const lk of links) { if ((lk.weight || 0) > wMax) wMax = lk.weight; }
+        for (const lk of links) {
+          const fromId = _toolSlug(lk.from);
+          const toId   = _toolSlug(lk.to);
+          const a = NODES[fromId];
+          const b = NODES[toId];
+          if (!a || !b) continue;
+          // Skip self-loops (defensive — shouldn't happen).
+          if (fromId === toId) continue;
+          // Blend the two endpoint base colors for cohesion with both
+          // clusters. Fallback to amber (tools default) if either side
+          // is missing a baseColor.
+          const cA = new THREE.Color(a.baseColor != null ? a.baseColor : 0xf5b542);
+          const cB = new THREE.Color(b.baseColor != null ? b.baseColor : 0xf5b542);
+          const blended = new THREE.Color(
+            (cA.r + cB.r) * 0.5,
+            (cA.g + cB.g) * 0.5,
+            (cA.b + cB.b) * 0.5,
+          );
+          // Opacity ramps with weight: 0.15 at the floor, 0.5 at the
+          // strongest pair this run. Keeps weak pairs whisper-thin so
+          // strong correlations stand out.
+          const wNorm = wMax > 1 ? (lk.weight - 1) / (wMax - 1) : 1;
+          const opacity = 0.15 + (0.50 - 0.15) * Math.max(0, Math.min(1, wNorm));
+          const lineMat = new THREE.LineDashedMaterial({
+            color: blended,
+            transparent: true,
+            opacity: opacity,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+            dashSize: 0.5,
+            gapSize: 0.3,
+            linewidth: 1,
+          });
+          const positions = new Float32Array(6);
+          positions[0] = a.mesh.position.x;
+          positions[1] = a.mesh.position.y;
+          positions[2] = a.mesh.position.z;
+          positions[3] = b.mesh.position.x;
+          positions[4] = b.mesh.position.y;
+          positions[5] = b.mesh.position.z;
+          const lineGeom = new THREE.BufferGeometry();
+          lineGeom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+          const lineMesh = new THREE.Line(lineGeom, lineMat);
+          // REQUIRED for LineDashedMaterial — without this the line
+          // renders solid (or invisible on some drivers).
+          lineMesh.computeLineDistances();
+          scene.add(lineMesh);
+          TOOL_LINK_LINES.push({
+            fromId, toId,
+            mesh: lineMesh,
+            material: lineMat,
+            _positions: positions,
+            weight: lk.weight || 1,
+          });
+        }
+        if (TOOL_LINK_LINES.length > 0) {
+          console.log(`[cortex] tool-link cross-edges: ${TOOL_LINK_LINES.length} dashed wires`);
+        }
+      } catch (e) {
+        console.warn('[cortex] tool-link cross-edge build failed (non-fatal):', e);
+      }
+    })();
+
+    function findEdge(fromId, toId) {
+      for (const e of EDGES) {
+        if ((e.fromId === fromId && e.toId === toId) ||
+            (e.fromId === toId && e.toId === fromId)) return e;
+      }
+      return null;
+    }
+
+    // ─── pulse system (peristaltic) ────────────────────────────────
+    const PULSE_DURATION = 180;      // ms per traversal
+    // Bumped 1.0 → 1.8 because short pulses (180ms) need higher peak
+    // brightness to stay visibly perceptible — at the old amp the
+    // pulse traveled past too dim to spot.
+    const PULSE_PEAK_AMP = 1.8;
+    const COLORS = {
+      cyan: new THREE.Color(0x58e3ff),
+      amber: new THREE.Color(0xf5b542),
+      magenta: new THREE.Color(0xb388ff),
+      teal: new THREE.Color(0x1de9b6),
+      pink: new THREE.Color(0xef7fc7),
+      white: new THREE.Color(0xeaffff),
+    };
+
+    function firePulse(fromId, toId, colorName = 'cyan') {
+      const edge = findEdge(fromId, toId);
+      if (!edge) return null;
+      // Leaf-edge Lines have no peristaltic shader — pulses can't
+      // render along them. Silently skip; the prompt sequences only
+      // ever fire on tier 0/1/2 edges anyway.
+      if (edge._isLine) return null;
+      // Direction along the edge: tube U=0 is at fromIdInEdge, U=1 at toIdInEdge.
+      const dir = (edge.fromId === fromId) ? +1 : -1;
+      const color = COLORS[colorName] || COLORS.cyan;
+      const pulse = {
+        dir, color, born: performance.now(),
+        amp: 0, peakAmp: PULSE_PEAK_AMP,
+        arrivedCb: null, arrived: false,
+      };
+      edge.pulses.push(pulse);
+      // Brief flare on the SOURCE node (only for plasma nodes).
+      const srcNode = NODES[fromId];
+      if (srcNode && srcNode.mat.uniforms && srcNode.mat.uniforms.uIntensity) {
+        srcNode.mat.uniforms.uIntensity.value = Math.min(2.2, srcNode.baseIntensity + 1.0);
+        srcNode.mat.uniforms.uSurfaceAmp.value = Math.max(srcNode.baseSurfAmp, 0.10);
+      }
+      return pulse;
+    }
+
+    function updateEdgesAndPulses(now, dt) {
+      const lerpK = Math.min(1, dt * 4);
+      for (const edge of EDGES) {
+        // Leaf-edge Lines have no shader uniforms and no pulse system.
+        // Their opacity is fixed at construction (0.25) and their
+        // positions are updated in rebuildAllEdgeGeometries(). Nothing
+        // to do here — they're always visible.
+        if (edge._isLine) continue;
+
+        const u = edge.material.uniforms;
+
+        // Non-leaf edges always target full opacity (their fade is
+        // handled elsewhere by the existing per-node visibility system).
+        u.uOpacity.value = 1.0;
+        edge._opacityCurrent = 1.0;
+
+        let count = 0;
+        for (let i = edge.pulses.length - 1; i >= 0; i--) {
+          const p = edge.pulses[i];
+          const age = now - p.born;
+          const t = Math.max(0, Math.min(1, age / PULSE_DURATION));
+          const pos = (p.dir === 1) ? t : (1 - t);
+          // Bell-curve amplitude — ramps up at the start, sustains, fades at the end.
+          let envelope;
+          if (t < 0.15) envelope = t / 0.15;
+          else if (t < 0.85) envelope = 1.0;
+          else envelope = 1.0 - (t - 0.85) / 0.15;
+          const amp = p.peakAmp * envelope;
+
+          if (t >= 1) {
+            // Arrived — flare the dest, run the callback (for sequence chaining).
+            const destId = (p.dir === 1) ? edge.toId : edge.fromId;
+            const dest = NODES[destId];
+            if (dest && dest.mat.uniforms && dest.mat.uniforms.uIntensity) {
+              dest.mat.uniforms.uIntensity.value = Math.min(2.3, dest.baseIntensity + 1.0);
+              dest.mat.uniforms.uSurfaceAmp.value = Math.max(dest.baseSurfAmp, 0.12);
+            }
+            if (p.arrivedCb && !p.arrived) { p.arrived = true; try { p.arrivedCb(); } catch (e) { console.error(e); } }
+            edge.pulses.splice(i, 1);
+            continue;
+          }
+
+          if (count < MAX_PULSES_PER_EDGE) {
+            u.uPulses.value[count] = pos;
+            u.uPulseAmps.value[count] = amp;
+            u.uPulseColors.value[count].copy(p.color);
+            count++;
+          }
+        }
+        u.uPulseCount.value = count;
+      }
+    }
+
+    // Rebuild every edge's TubeGeometry (or update Line positions) so
+    // wires stay glued to nodes as they orbit / drag.
+    //
+    // Leaf edges are THREE.Line with a 2-vertex BufferGeometry; their
+    // positions are updated in-place (no dispose/reassign) by writing
+    // into the existing Float32Array + flipping needsUpdate. This is
+    // the cheap path that lets us render all ~166 leaf wires every
+    // frame at always-on low opacity without blowing the budget.
+    //
+    // Non-leaf (tube) edges still get a full TubeGeometry rebuild —
+    // they're few in number and their peristaltic shader needs the
+    // tube vertex normals.
+    function rebuildAllEdgeGeometries() {
+      for (const edge of EDGES) {
+        if (edge._isLine) {
+          const fromNode = NODES[edge.fromId];
+          const toNode = NODES[edge.toId];
+          if (!fromNode || !toNode) continue;
+          const p = edge._linePositions;
+          p[0] = fromNode.mesh.position.x;
+          p[1] = fromNode.mesh.position.y;
+          p[2] = fromNode.mesh.position.z;
+          p[3] = toNode.mesh.position.x;
+          p[4] = toNode.mesh.position.y;
+          p[5] = toNode.mesh.position.z;
+          edge.mesh.geometry.attributes.position.needsUpdate = true;
+          continue;
+        }
+        const geom = buildEdgeGeometry(edge);
+        if (!geom) continue;
+        edge.mesh.geometry.dispose();
+        edge.mesh.geometry = geom;
+      }
+      // Tool co-occurrence cross-edges (dashed). In-place position
+      // write + computeLineDistances() — needed every frame so the
+      // dash pattern reflows as endpoints drift. Cheap: 2 vertices,
+      // typical edge count <= 60.
+      for (const ce of TOOL_LINK_LINES) {
+        const fromNode = NODES[ce.fromId];
+        const toNode = NODES[ce.toId];
+        if (!fromNode || !toNode) continue;
+        const p = ce._positions;
+        p[0] = fromNode.mesh.position.x;
+        p[1] = fromNode.mesh.position.y;
+        p[2] = fromNode.mesh.position.z;
+        p[3] = toNode.mesh.position.x;
+        p[4] = toNode.mesh.position.y;
+        p[5] = toNode.mesh.position.z;
+        ce.mesh.geometry.attributes.position.needsUpdate = true;
+        ce.mesh.computeLineDistances();
+      }
+    }
+
+    // ─── core state (idle / thinking / listening / speaking) ──────
+    // Plasma shader uses uBaseColor + uHotColor for body + heat-map.
+    // State changes re-tint both, which the user reads as Iris's
+    // current activity.
+    //
+    // Intensities bumped from the original tuning so the core reads
+    // as glowing-bright at all times (idle: 0.55 → 0.85; the active
+    // states each got a +0.15 lift on top of their previous values).
+    const CORE_STATES = {
+      // Per UX spec:
+      //   idle      = white glow
+      //   listening = blue glow
+      //   thinking  = orange/yellow glow (matches the orange thinking
+      //               neuron pulses fired by the assistant window)
+      //   speaking  = purple glow (matches the magenta core→output
+      //               pulse fired on reply)
+      // idle = dim white (session OFF / app sitting). Bumped DOWN
+      // from 0.95 — was glowing too bright when nothing's happening.
+      idle:      { base: 0xc8d2e0, hot: 0xeaf0ff, intensity: 0.35 },
+      listening: { base: 0x58e3ff, hot: 0xc8f4ff, intensity: 1.00 },
+      thinking:  { base: 0xf5b542, hot: 0xfff0c0, intensity: 1.05 },
+      speaking:  { base: 0xb388ff, hot: 0xede0ff, intensity: 1.20 },
+    };
+    function setCoreState(name) {
+      const c = CORE_STATES[name] || CORE_STATES.idle;
+      const core = NODES['core'];
+      if (!core) return;
+      core.mat.uniforms.uBaseColor.value.setHex(c.base);
+      core.mat.uniforms.uHotColor.value.setHex(c.hot);
+      core.baseIntensity = c.intensity;
+      core.mat.uniforms.uIntensity.value = c.intensity;
+      core.halo.material.color.setHex(c.base);
+    }
+    // Apply the new idle intensity right away (the original ran at
+    // uIntensity=0.6 until the first state change).
+    setCoreState('idle');
+
+    // ─── focus state machine ──────────────────────────────────────
+    // Overview is the default: every node sits in its orbital
+    // position. Clicking a parent enters focus mode: camera flies in,
+    // that node's direct children grow + show labels, siblings dim.
+    // Esc / dbl-click empty / IRIS breadcrumb returns to overview.
+    let focusedNodeId = null;
+    let cameraState = 'overview';        // overview | focusing | focused | unfocusing
+    let cameraAnimStart = 0;
+    const CAMERA_ANIM_MS = 1100;
+    let cameraStartPos = null;
+    let cameraStartTarget = null;
+    let cameraEndPos = null;
+    let cameraEndTarget = null;
+    const cameraRestPos = new THREE.Vector3(0, 14, 56);
+    const cameraRestTarget = new THREE.Vector3(0, 0, 0);
+
+    function showBreadcrumb(label) {
+      const el = document.getElementById('breadcrumb');
+      const cur = document.getElementById('bc-current');
+      if (el && cur) {
+        cur.textContent = label;
+        el.classList.add('visible');
+      }
+    }
+    function hideBreadcrumb() {
+      const el = document.getElementById('breadcrumb');
+      if (el) el.classList.remove('visible');
+    }
+
+    function focusNode(id) {
+      const node = NODES[id];
+      if (!node) return;
+      const kids = childCount(id);
+      if (kids === 0) return;     // no children to expand
+      focusedNodeId = id;
+      cameraState = 'focusing';
+      cameraAnimStart = performance.now();
+      cameraStartPos = camera.position.clone();
+      cameraStartTarget = controls.target.clone();
+      const viewDir = new THREE.Vector3()
+        .subVectors(camera.position, controls.target)
+        .normalize();
+      cameraEndTarget = node.mesh.position.clone();
+      // Match the orbit auto-fit math, leave grandchild envelope room.
+      const kidCount = kids;
+      const expectedKidR = Math.max(3.0, 1.6 + Math.sqrt(Math.max(1, kidCount)) * 0.65) + 10.0;
+      const grandchildEnvelope = 6.0;
+      const camDistance = Math.max(36, (expectedKidR + grandchildEnvelope) * 2.4);
+      cameraEndPos = cameraEndTarget.clone().addScaledVector(viewDir, camDistance);
+      controls.enabled = false;
+      showBreadcrumb(node.label);
+    }
+
+    function unfocusNode() {
+      if (focusedNodeId === null && cameraState === 'overview') return;
+      cameraState = 'unfocusing';
+      cameraAnimStart = performance.now();
+      cameraStartPos = camera.position.clone();
+      cameraStartTarget = controls.target.clone();
+      cameraEndPos = cameraRestPos.clone();
+      cameraEndTarget = cameraRestTarget.clone();
+      controls.enabled = false;
+      hideBreadcrumb();
+      focusedNodeId = null;
+    }
+
+    function topLevelAncestorId(node) {
+      let cur = node.parent ? NODES[node.parent] : null;
+      while (cur && cur.parent && cur.parent !== 'core') {
+        cur = NODES[cur.parent];
+      }
+      return cur ? cur.id : null;
+    }
+
+    // Where should this node orbit RIGHT NOW?
+    // Every level orbits its IMMEDIATE parent — tier 3 leaves orbit
+    // their tier-2 sub-node, tier 2 sub-nodes orbit the project / cap,
+    // tier 1 caps + projects orbit the core. With tight per-tier radii
+    // this produces clusters-within-clusters (a moon system around
+    // each sub-node), instead of leaves wandering loose around the
+    // project on the far side of their actual semantic parent.
+    function orbitCenterId(node) {
+      return node.parent || null;
+    }
+
+    // Graded focus visibility: 0..1 for how prominently to show each
+    // node. Overview = everything at 1.0; focus = focused subtree at
+    // 1.0, parent at 0.70, siblings at 0.55, same-top-level cousins at
+    // 0.50, unrelated top-levels at 0.18–0.20.
+    function focusVisibility(node) {
+      if (focusedNodeId === null) return 1.0;
+      if (node.id === focusedNodeId) return 1.0;
+      if (node.parent === focusedNodeId) return 1.0;
+
+      const focused = NODES[focusedNodeId];
+      if (focused) {
+        const focusedParent = focused.parent;
+        if (focusedParent && node.id === focusedParent) return 0.70;
+        if (focusedParent && node.parent === focusedParent) return 0.55;
+      }
+
+      // Same top-level ancestor cousins stay at half visibility.
+      const myTop = topLevelAncestorId(node);
+      if (focused) {
+        const focusedTop = focused.isCapability || !focused.parent
+          ? focused.id
+          : topLevelAncestorId(focused);
+        if (myTop && myTop === focusedTop) return 0.50;
+      }
+
+      if (node.isCapability) return 0.20;
+      if (!node.parent) return 0.22;
+      return 0.20;
+    }
+
+    // ─── orbital layout ────────────────────────────────────────────
+    // Each frame, compute a TARGET position for every node from its
+    // parent's current position + (orbitAngle, orbitPolar, radius).
+    // Tier ≥ 2 nodes snap rigidly to that target; tier 1 nodes use
+    // a spring so they can be dragged.
+    function tierRadius(tier) {
+      // Tight per-tier radii so each level looks like satellites of
+      // their parent: tier-2 sub-nodes ride ~2.5 from the project/cap
+      // (≈ 2-3× parent radius); tier-3 leaves ride ~1.0 from their
+      // tier-2 sub-node (≈ 2× tier-2's tiny radius). Whole tier-2
+      // cluster including its tier-3 entourage orbits the project as
+      // a coherent moon-system.
+      if (tier === 1) return 16.0;
+      if (tier === 2) return 2.5;
+      if (tier >= 3) return 1.0;
+      return 0;
+    }
+
+    // Auto-fit: more siblings → slightly wider ring so they don't
+    // overlap. Coefficient dropped (was 0.65 → 0.35) so the auto-fit
+    // doesn't blow out the cloud when a project has 11 descendants.
+    function autoFitRadius(centerEffR, siblingCount) {
+      const minClearance = centerEffR * 1.35;
+      const autoFit = 1.4 + Math.sqrt(Math.max(1, siblingCount)) * 0.35;
+      return Math.max(minClearance, autoFit);
+    }
+
+    function updateOrbits(now, dt) {
+      for (const node of NODE_LIST) {
+        // Core stays at the origin always.
+        if (!node.parent) {
+          node.mesh.position.set(0, 0, 0);
+          node.target.set(0, 0, 0);
+          continue;
+        }
+
+        // Drift the orbit angle (unless this node is currently
+        // being dragged or it's the focused node — we want focus
+        // to feel "anchored" while you study it).
+        if (!node.dragged && node.id !== focusedNodeId) {
+          node.orbitAngle += node.orbitSpeed * dt;
+        }
+
+        // Orbit center: in overview, tier 2/3 orbit their TOP-LEVEL
+        // ancestor (cap or project) so the cloud forms around it
+        // instead of branching out as a chain.
+        const centerId = orbitCenterId(node);
+        const center = centerId ? NODES[centerId] : null;
+        if (!center) continue;
+        const base = center.mesh.position;
+
+        // Sibling count for auto-fit. PERF: O(1) map lookup (was an
+        // O(N²) inner scan — ~31k iterations/frame at 178 nodes).
+        // SIBLING_COUNT_BY_CENTER stores group size keyed by center
+        // (parent) id; "siblings" excludes the node itself, hence -1.
+        // Since orbitCenterId(node) === node.parent, this is exact.
+        const siblings = Math.max(0, (SIBLING_COUNT_BY_CENTER.get(centerId) || 0) - 1);
+
+        // Tier-1 nodes use the bubble-packed orbit radius (computed in
+        // applyTier1BubblePacking) so sibling subtrees never overlap.
+        // Other tiers use the default per-tier ring.
+        const baseRing = (node.tier === 1 && node.orbitFromCoreR > 0)
+          ? node.orbitFromCoreR
+          : tierRadius(node.tier);
+        const centerR = center.baseR || 1.0;
+        const fit = autoFitRadius(centerR, siblings);
+        // When the orbit center is the focused node, push direct kids
+        // out so they read as distinct (smaller bonus now that the
+        // baseline is tighter — was +10, scene-blowing at zoom).
+        const focusBonus = (centerId === focusedNodeId) ? 5.0 : 0;
+        // Tier-2 children of a content-heavy tier-1 parent get pushed
+        // outward so they don't nest inside the bigger parent sphere
+        // AND so siblings don't overlap each other. Log-based so a
+        // 30-child cap (e.g. tools) doesn't fling kids to the moon:
+        //   bump = 1 + 0.06 * log2(1 + tier2_children)
+        //              + 0.015 * log2(1 + tier3_grandchildren)
+        // For reference:
+        //   3 kids,  0 leaves  → 1.12×
+        //   6 kids, 145 leaves → 1.27×
+        //   30 kids, 0 leaves  → 1.30×  (was 2.20× before — too far)
+        // Clamped at 1.5× as a hard ceiling.
+        let descBump = 1.0;
+        if (node.tier === 2) {
+          const kids = center.tier2ChildCount || 0;
+          const grand = center.tier3GrandchildCount || 0;
+          if (kids > 0) {
+            // KEEP IN SYNC with bubbleFor descBump (see applyTier1BubblePacking).
+            // Any change here MUST be mirrored there or bubble-packing predictions
+            // diverge from the actual layout and tier-1 subtrees start overlapping.
+            descBump = 1 + 0.09 * Math.log2(1 + kids) + 0.02 * Math.log2(1 + grand);
+            if (descBump > 1.7) descBump = 1.7;
+          }
+        }
+        const r = (baseRing + Math.max(0, fit - baseRing * 0.4) + focusBonus) * node.orbitRadiusMul * descBump;
+
+        node.target.set(
+          base.x + Math.cos(node.orbitAngle) * Math.cos(node.orbitPolar) * r,
+          base.y + Math.sin(node.orbitPolar) * r,
+          base.z + Math.sin(node.orbitAngle) * Math.cos(node.orbitPolar) * r,
+        );
+
+        if (node.dragged) continue;   // mouse owns the position
+
+        // Tier 1: spring physics so drag feels weighted + bouncy.
+        // Tier ≥ 2: snap rigidly to target so sub-clusters move as a
+        // unit with their parent (no jiggle cascade).
+        if (node.tier === 1) {
+          const k = 6.0;       // spring stiffness
+          const d = 4.0;       // damping
+          const dx = node.target.x - node.mesh.position.x;
+          const dy = node.target.y - node.mesh.position.y;
+          const dz = node.target.z - node.mesh.position.z;
+          node.velocity.x += (dx * k - node.velocity.x * d) * dt;
+          node.velocity.y += (dy * k - node.velocity.y * d) * dt;
+          node.velocity.z += (dz * k - node.velocity.z * d) * dt;
+          node.mesh.position.x += node.velocity.x * dt;
+          node.mesh.position.y += node.velocity.y * dt;
+          node.mesh.position.z += node.velocity.z * dt;
+        } else {
+          node.mesh.position.copy(node.target);
+        }
+      }
+
+      // After mesh positions settle, glue halos + labels back on top.
+      // Skip position sync for invisible labels (Three.js short-circuits
+      // them in render anyway, but the position.set() calls were the
+      // single biggest CPU hot path with 220+ tier-3 sprites). The
+      // lazy-create path in applyFocusVisibility seeds the sprite's
+      // position before flipping visible=true, so first-frame snap is
+      // avoided.
+      for (const node of NODE_LIST) {
+        if (node.halo) node.halo.position.copy(node.mesh.position);
+        if (!node.labelSprite || !node.labelSprite.visible) continue;
+        const yOff = node.baseR + (
+          node.tier === 0 ? 1.6
+          : node.tier === 3 ? 0.5
+          : 0.9
+        );
+        node.labelSprite.position.set(
+          node.mesh.position.x,
+          node.mesh.position.y + yOff,
+          node.mesh.position.z,
+        );
+      }
+    }
+
+    function applyFocusVisibility() {
+      // Fade opacity + scale subtly based on focusVisibility.
+      // Direct children of focus also temporarily reveal their labels
+      // (tier-3 leaves don't have one, so they just brighten).
+      for (const node of NODE_LIST) {
+        const v = focusVisibility(node);
+        // Plasma intensity scales with v; halos fade out for hidden.
+        if (node.mat.uniforms && node.mat.uniforms.uIntensity) {
+          // Scale the baseline (the per-frame decay in `frame` will
+          // lerp toward this).
+          // Note: we don't touch baseIntensity (state-machine owns it),
+          // just modulate via halo + label opacity below.
+        }
+        if (node.halo) {
+          const tierBase = (TIER_LOOK[node.tier] || TIER_LOOK[1]).haloOpacity;
+          node.halo.material.opacity = tierBase * Math.max(0.05, v);
+        }
+        // Compute what the target opacity WOULD be for this node's
+        // label, regardless of whether the sprite exists yet. We use
+        // this to decide whether to lazily create a tier-3 sprite.
+        let targetOpacity;
+        if (node.tier === 3) {
+          targetOpacity = (focusedNodeId !== null && node.parent === focusedNodeId)
+            ? 0.85
+            : 0.0;
+        } else {
+          targetOpacity = node.labelBaseOpacity * Math.max(0.05, v);
+        }
+
+        // ── lazy tier-3 sprite creation ────────────────────────────
+        // Tier-3 leaves don't get a label sprite at spawn (saves ~220
+        // canvas-texture allocations + GPU memory). Create on first
+        // reveal — when this leaf's direct parent becomes the focused
+        // node. Seed the sprite position from the current mesh pos so
+        // it doesn't snap from origin on first render.
+        if (node.tier === 3 && !node.labelSprite && targetOpacity > 0.01) {
+          const sprite = makeLabel(node.label, 0.0, 0.32, 'small');
+          const yOff = node.baseR + 0.5;
+          sprite.position.set(
+            node.mesh.position.x,
+            node.mesh.position.y + yOff,
+            node.mesh.position.z,
+          );
+          // Seed scale baselines so focus-bump code reads them correctly
+          // the first time it touches this sprite.
+          node.labelSprite = sprite;
+          scene.add(sprite);
+        }
+
+        if (node.labelSprite) {
+          // Tier-3 leaf labels start invisible (labelBaseOpacity = 0) and
+          // only reveal when their direct parent is the focused node.
+          // Smoothly lerp toward the target opacity so the transition
+          // doesn't snap when focus changes.
+          const curOpacity = node.labelSprite.material.opacity;
+          const newOpacity = curOpacity + (targetOpacity - curOpacity) * 0.12;
+          node.labelSprite.material.opacity = newOpacity;
+          // Toggle .visible so Three.js skips render + traversal entirely
+          // for off-screen labels. Threshold 0.02 prevents flicker as the
+          // lerp settles. Applied to ALL tiers so tier-2 sub-labels also
+          // skip render when their branch is hidden.
+          const shouldShow = newOpacity > 0.02;
+          if (node.labelSprite.visible !== shouldShow) {
+            if (shouldShow) {
+              // About to reveal — sync position BEFORE marking visible
+              // so the next frame's render uses the correct location
+              // (per-frame position-sync loop now skips invisible sprites).
+              const yOff = node.baseR + (
+                node.tier === 0 ? 1.6
+                : node.tier === 3 ? 0.5
+                : 0.9
+              );
+              node.labelSprite.position.set(
+                node.mesh.position.x,
+                node.mesh.position.y + yOff,
+                node.mesh.position.z,
+              );
+            }
+            node.labelSprite.visible = shouldShow;
+          }
+        }
+        // Direct children of focus pop slightly larger (visual lift).
+        let targetScale = 1.0;
+        if (focusedNodeId !== null && node.parent === focusedNodeId) targetScale = 1.25;
+        if (focusedNodeId === node.id) targetScale = 1.10;
+        const cs = node.mesh.scale.x;
+        const ns = cs + (targetScale - cs) * 0.15;
+        node.mesh.scale.setScalar(ns);
+      }
+    }
+
+    // ─── sequence player ────────────────────────────────────────────
+    let sequenceRunning = false;
+
+    function setStatus(msg, cls = '') {
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = cls;
+    }
+
+    function playSequence(steps, onComplete) {
+      sequenceRunning = true;
+      document.querySelectorAll('.prompt-btn').forEach(b => b.disabled = true);
+      let i = 0;
+      const next = () => {
+        if (i >= steps.length) {
+          sequenceRunning = false;
+          document.querySelectorAll('.prompt-btn').forEach(b => b.disabled = false);
+          if (onComplete) onComplete();
+          return;
+        }
+        const step = steps[i++];
+        setTimeout(() => {
+          const pulse = firePulse(step.from, step.to, step.color || 'cyan');
+          if (pulse) {
+            pulse.arrivedCb = next;
+          } else {
+            // Edge not found — skip and continue
+            console.warn('skip step', step);
+            next();
+          }
+        }, step.delay || 0);
+      };
+      next();
+    }
+
+    // ─── test prompts ───────────────────────────────────────────────
+    // Each prompt: scripted firing path + optional memory cache + response text.
+    // Sequences start AT the core (input is text/click, not voice).
+    // The user / mic / voice-tts chain is only used when speech input
+    // arrives — these clicked prompts originate from the core itself.
+    // Output still routes through rt-output → voice-tts so the user
+    // hears the reply.
+    const PROMPTS = [
+      {
+        label: "What's the weather?",
+        response: "It's 72 and sunny in Boston right now.",
+        steps: [
+          { from: 'core', to: 'cap-realtime',       color: 'amber' },
+          { from: 'cap-realtime', to: 'rt-planner', color: 'amber' },
+          { from: 'rt-planner', to: 'cap-realtime', color: 'amber', delay: 250 },
+          { from: 'cap-realtime', to: 'core',       color: 'amber' },
+          { from: 'core', to: 'cap-tools',          color: 'amber' },
+          { from: 'cap-tools', to: 'tool-weather',  color: 'amber' },
+          { from: 'tool-weather', to: 'cap-tools',  color: 'amber', delay: 400 },
+          { from: 'cap-tools', to: 'core',          color: 'amber' },
+          { from: 'core', to: 'cap-realtime',       color: 'magenta' },
+          { from: 'cap-realtime', to: 'rt-output',  color: 'magenta' },
+          { from: 'rt-output', to: 'voice-tts',     color: 'magenta' },
+        ],
+        // No cache — weather changes
+      },
+      {
+        label: "Send the weather to Vesko",
+        response: "Sent. Vesko got the forecast.",
+        steps: [
+          { from: 'core', to: 'cap-realtime',       color: 'amber' },
+          { from: 'cap-realtime', to: 'rt-planner', color: 'amber' },
+          { from: 'rt-planner', to: 'cap-realtime', color: 'amber', delay: 200 },
+          { from: 'cap-realtime', to: 'core',       color: 'amber' },
+          { from: 'core', to: 'cap-memory',         color: 'magenta' },
+          { from: 'cap-memory', to: 'mem-contacts', color: 'magenta' },
+          { from: 'mem-contacts', to: 'cap-memory', color: 'magenta', delay: 200 },
+          { from: 'cap-memory', to: 'core',         color: 'magenta' },
+          { from: 'core', to: 'cap-tools',          color: 'amber' },
+          { from: 'cap-tools', to: 'tool-weather',  color: 'amber' },
+          { from: 'tool-weather', to: 'cap-tools',  color: 'amber', delay: 350 },
+          { from: 'cap-tools', to: 'tool-msg',      color: 'amber' },
+          { from: 'tool-msg', to: 'cap-tools',      color: 'amber', delay: 300 },
+          { from: 'cap-tools', to: 'core',          color: 'amber' },
+          { from: 'core', to: 'cap-memory',         color: 'magenta' },  // cache the path
+          { from: 'cap-memory', to: 'mem-contacts', color: 'magenta' },
+          { from: 'core', to: 'cap-realtime',       color: 'magenta', delay: 100 },
+          { from: 'cap-realtime', to: 'rt-output',  color: 'magenta' },
+          { from: 'rt-output', to: 'voice-tts',     color: 'magenta' },
+        ],
+        memoryFlare: 'mem-contacts',
+        cacheLabel: 'Vesko · contact',
+      },
+      {
+        label: "Open Chrome",
+        response: "Chrome is open.",
+        steps: [
+          { from: 'core', to: 'cap-tools',          color: 'teal' },     // Layer-0 skips planner
+          { from: 'cap-tools', to: 'tool-router',   color: 'teal' },
+          { from: 'tool-router', to: 'cap-tools',   color: 'teal' },
+          { from: 'cap-tools', to: 'tool-open',     color: 'teal' },
+          { from: 'tool-open', to: 'cap-tools',     color: 'teal', delay: 250 },
+          { from: 'cap-tools', to: 'core',          color: 'teal' },
+          { from: 'core', to: 'cap-realtime',       color: 'magenta' },
+          { from: 'cap-realtime', to: 'rt-output',  color: 'magenta' },
+          { from: 'rt-output', to: 'voice-tts',     color: 'magenta' },
+        ],
+      },
+      {
+        label: "Remember my dog's name is Rex",
+        response: "Got it. Rex.",
+        steps: [
+          { from: 'core', to: 'cap-realtime',       color: 'amber' },
+          { from: 'cap-realtime', to: 'rt-planner', color: 'amber' },
+          { from: 'rt-planner', to: 'cap-realtime', color: 'amber', delay: 200 },
+          { from: 'cap-realtime', to: 'core',       color: 'amber' },
+          { from: 'core', to: 'cap-memory',         color: 'magenta' },
+          { from: 'cap-memory', to: 'mem-personal', color: 'magenta' },
+          { from: 'mem-personal', to: 'cap-memory', color: 'magenta', delay: 280 },
+          { from: 'cap-memory', to: 'core',         color: 'magenta' },
+          { from: 'core', to: 'cap-realtime',       color: 'magenta' },
+          { from: 'cap-realtime', to: 'rt-output',  color: 'magenta' },
+          { from: 'rt-output', to: 'voice-tts',     color: 'magenta' },
+        ],
+        memoryFlare: 'mem-personal',
+        cacheLabel: 'dog · Rex',
+      },
+      {
+        label: "What's my dog's name?",
+        response: "Your dog's name is Rex.",
+        steps: [
+          { from: 'core', to: 'cap-memory',         color: 'magenta' },  // cached path skips planner
+          { from: 'cap-memory', to: 'mem-personal', color: 'magenta' },
+          { from: 'mem-personal', to: 'cap-memory', color: 'magenta', delay: 200 },
+          { from: 'cap-memory', to: 'core',         color: 'magenta' },
+          { from: 'core', to: 'cap-realtime',       color: 'magenta' },
+          { from: 'cap-realtime', to: 'rt-output',  color: 'magenta' },
+          { from: 'rt-output', to: 'voice-tts',     color: 'magenta' },
+        ],
+      },
+      {
+        label: "Schedule meeting tomorrow at 3",
+        response: "Done. Meeting tomorrow at 3.",
+        steps: [
+          { from: 'core', to: 'cap-realtime',       color: 'amber' },
+          { from: 'cap-realtime', to: 'rt-planner', color: 'amber' },
+          { from: 'rt-planner', to: 'cap-realtime', color: 'amber', delay: 250 },
+          { from: 'cap-realtime', to: 'core',       color: 'amber' },
+          { from: 'core', to: 'cap-tools',          color: 'amber' },
+          { from: 'cap-tools', to: 'tool-cal',      color: 'amber' },
+          { from: 'tool-cal', to: 'cap-tools',      color: 'amber', delay: 450 },
+          { from: 'cap-tools', to: 'core',          color: 'amber' },
+          { from: 'core', to: 'cap-realtime',       color: 'magenta' },
+          { from: 'cap-realtime', to: 'rt-output',  color: 'magenta' },
+          { from: 'rt-output', to: 'voice-tts',     color: 'magenta' },
+        ],
+      },
+    ];
+
+    // TTS-aware sequence trimming. Every prompt currently ends with
+    // a `rt-output → voice-tts` step that animates a magenta pulse
+    // into TTS. When TTS is disabled, *nothing actually speaks*, so
+    // that final hop is misleading. This helper trims that trailing
+    // step (and only that one — preserves any earlier `voice-tts`
+    // refs, of which there are none today, but future-proof).
+    function ttsActiveNow() {
+      const cb = document.getElementById('tts-on');
+      const checked = cb ? cb.checked : true;
+      const haveSynth = !!window.speechSynthesis;
+      return checked && haveSynth;
+    }
+    function activeStepsFor(prompt) {
+      if (ttsActiveNow()) return prompt.steps;
+      // Drop trailing steps that target voice-tts so the sequence
+      // ends at rt-output instead.
+      const out = prompt.steps.slice();
+      while (out.length && out[out.length - 1].to === 'voice-tts') out.pop();
+      return out;
+    }
+
+    // ─── memory cache leaf (transient) ──────────────────────────────
+    const cacheLeaves = [];
+    function spawnCacheLeaf(parentId, label) {
+      const parent = NODES[parentId];
+      if (!parent) return;
+      const offset = new THREE.Vector3(
+        (Math.random() - 0.5) * 2.4,
+        1.4 + Math.random() * 0.5,
+        (Math.random() - 0.5) * 2.4,
+      );
+      // Anchor cache leaves to the parent's CURRENT (orbital) position
+      // — basePos is now just the seed, not the live spot.
+      const pos = parent.mesh.position.clone().add(offset);
+      const small = makeLabel(label, 0.95, 0.7);
+      small.scale.multiplyScalar(0.7);
+      small.position.copy(pos);
+      scene.add(small);
+
+      // Tiny glowing dot
+      const dot = new THREE.Mesh(
+        new THREE.SphereGeometry(0.2, 12, 8),
+        new THREE.MeshBasicMaterial({ color: 0xb388ff, transparent: true, opacity: 1.0,
+          blending: THREE.AdditiveBlending }),
+      );
+      dot.position.copy(pos);
+      dot.position.y -= 0.55;
+      scene.add(dot);
+
+      cacheLeaves.push({ label: small, dot, born: performance.now(), ttl: 8000 });
+    }
+    function updateCacheLeaves(now) {
+      for (let i = cacheLeaves.length - 1; i >= 0; i--) {
+        const l = cacheLeaves[i];
+        const t = (now - l.born) / l.ttl;
+        if (t >= 1) {
+          scene.remove(l.label); scene.remove(l.dot);
+          l.label.material.map?.dispose(); l.label.material.dispose();
+          l.dot.geometry.dispose(); l.dot.material.dispose();
+          cacheLeaves.splice(i, 1);
+          continue;
+        }
+        // Fade out in the last 25%
+        const alpha = t < 0.75 ? 1.0 : 1.0 - (t - 0.75) / 0.25;
+        l.label.material.opacity = 0.95 * alpha;
+        l.dot.material.opacity = 1.0 * alpha;
+      }
+    }
+
+    // ─── TTS via Web Speech API (free, no API key) ─────────────────
+    let ttsEnabled = true;
+    document.getElementById('tts-on').addEventListener('change', e => {
+      ttsEnabled = e.target.checked;
+    });
+
+    let preferredVoice = null;
+    const voiceSelect = document.getElementById('voice-select');
+
+    function rankVoice(v) {
+      let s = 0;
+      const n = (v.name || '').toLowerCase();
+      const l = (v.lang || '').toLowerCase();
+      if (l.startsWith('en')) s += 5;
+      if (n.includes('zira') || n.includes('aria') || n.includes('jenny') || n.includes('female')) s += 4;
+      if (n.includes('online') || n.includes('natural') || n.includes('neural')) s += 3;
+      if (n.includes('david') || n.includes('mark') || n.includes('male')) s -= 1;
+      return s;
+    }
+
+    function refreshVoiceList() {
+      const voices = window.speechSynthesis.getVoices();
+      if (!voices.length) return;
+      // Sort with best matches first; show name + lang.
+      const sorted = voices.slice().sort((a, b) => rankVoice(b) - rankVoice(a));
+      const previous = voiceSelect.value;
+      voiceSelect.innerHTML = '';
+      for (const v of sorted) {
+        const opt = document.createElement('option');
+        opt.value = v.voiceURI || v.name;
+        opt.textContent = `${v.name} · ${v.lang}`;
+        voiceSelect.appendChild(opt);
+      }
+      // Restore prior pick if it still exists, else top-ranked.
+      if (previous && [...voiceSelect.options].some(o => o.value === previous)) {
+        voiceSelect.value = previous;
+      }
+      preferredVoice = voices.find(v => (v.voiceURI || v.name) === voiceSelect.value) || sorted[0];
+    }
+    voiceSelect.addEventListener('change', () => {
+      const voices = window.speechSynthesis.getVoices();
+      preferredVoice = voices.find(v => (v.voiceURI || v.name) === voiceSelect.value) || voices[0];
+    });
+
+    if (window.speechSynthesis) {
+      window.speechSynthesis.onvoiceschanged = refreshVoiceList;
+      refreshVoiceList();
+    }
+
+    function speak(text, onEnd) {
+      if (!ttsEnabled || !text || !window.speechSynthesis) {
+        if (onEnd) onEnd();
+        return;
+      }
+      try {
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(text);
+        if (preferredVoice) u.voice = preferredVoice;
+        u.rate = 1.02;
+        u.pitch = 1.0;
+        u.volume = 0.95;
+        u.onstart = () => setStatus(`Speaking · "${text}"`, 'speaking');
+        u.onend = () => { setStatus('Idle.'); if (onEnd) onEnd(); };
+        u.onerror = () => { setStatus('Idle.'); if (onEnd) onEnd(); };
+        window.speechSynthesis.speak(u);
+      } catch (e) {
+        console.error('tts failed', e);
+        if (onEnd) onEnd();
+      }
+    }
+
+    // ─── prompt button wiring ──────────────────────────────────────
+    document.querySelectorAll('.prompt-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (sequenceRunning) return;
+        const idx = parseInt(btn.dataset.prompt, 10);
+        const prompt = PROMPTS[idx];
+        if (!prompt) return;
+        setStatus(`Firing · "${prompt.label}"`, 'firing');
+        // Core enters THINKING the moment the prompt fires.
+        setCoreState('thinking');
+        const steps = activeStepsFor(prompt);
+        playSequence(steps, () => {
+          if (prompt.memoryFlare && prompt.cacheLabel) {
+            spawnCacheLeaf(prompt.memoryFlare, prompt.cacheLabel);
+          }
+          // Core transitions to SPEAKING for the duration of the
+          // spoken response, then back to IDLE.
+          setCoreState('speaking');
+          if (ttsEnabled) {
+            speak(prompt.response, () => setCoreState('idle'));
+          } else {
+            setStatus(`"${prompt.response}"`);
+            // Without TTS, give the speaking color ~1.2s before idling.
+            setTimeout(() => setCoreState('idle'), 1200);
+          }
+        });
+      });
+    });
+
+    // ─── picking + interaction (hover, drag, click-to-focus) ──────
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    let hoveredId = null;
+    let draggingRef = null;
+    const dragPlane = new THREE.Plane();
+    const dragOffset = new THREE.Vector3();
+    const dragLast = new THREE.Vector3();
+    let pressTime = 0;
+    let clickCandidate = null;
+    const hoverLabel = document.getElementById('hover-label');
+
+    function pickNodeUnderMouse() {
+      raycaster.setFromCamera(mouse, camera);
+      const meshes = NODE_LIST.map(n => n.mesh);
+      const hits = raycaster.intersectObjects(meshes, false);
+      return hits.length ? hits[0] : null;
+    }
+
+    canvas.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
+      if (cameraState === 'focusing' || cameraState === 'unfocusing') return;
+      const hit = pickNodeUnderMouse();
+      if (!hit) return;
+      const ref = NODES[hit.object.userData.nodeId];
+      if (!ref) return;
+      clickCandidate = ref;
+      pressTime = performance.now();
+      // Drag eligibility:
+      //   - core (tier 0) is never draggable
+      //   - the currently-focused node yields to OrbitControls so the
+      //     user can rotate camera around it
+      //   - any tier ≥ 1 node (including capabilities) → draggable;
+      //     capabilities spring back to their ring position via the
+      //     existing physics when released
+      const isFocusedNode = ref.id === focusedNodeId;
+      const draggable = ref.tier >= 1 && !isFocusedNode;
+      if (draggable) {
+        draggingRef = ref;
+        ref.dragged = true;
+        const normal = new THREE.Vector3().subVectors(camera.position, ref.mesh.position).normalize();
+        dragPlane.setFromNormalAndCoplanarPoint(normal, ref.mesh.position);
+        dragOffset.subVectors(hit.point, ref.mesh.position);
+        dragLast.copy(ref.mesh.position);
+        controls.enabled = false;
+      }
+    });
+
+    canvas.addEventListener('mousemove', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+      if (draggingRef) {
+        raycaster.setFromCamera(mouse, camera);
+        const newPoint = new THREE.Vector3();
+        if (raycaster.ray.intersectPlane(dragPlane, newPoint)) {
+          newPoint.sub(dragOffset);
+          // Clamp the drag so the node can't fly off into deep space.
+          // Soft bubble around the orbital target, hard cap from origin.
+          const target = draggingRef.target;
+          const maxDragR = 40;
+          const offset = new THREE.Vector3().subVectors(newPoint, target);
+          if (offset.length() > maxDragR) {
+            offset.setLength(maxDragR);
+            newPoint.copy(target).add(offset);
+          }
+          if (newPoint.length() > 120) newPoint.setLength(120);
+          draggingRef.mesh.position.copy(newPoint);
+          draggingRef.velocity.set(0, 0, 0);
+          dragLast.copy(newPoint);
+        }
+        return;
+      }
+
+      const hit = pickNodeUnderMouse();
+      const id = hit ? hit.object.userData.nodeId : null;
+      if (id !== hoveredId) {
+        hoveredId = id;
+        if (id) {
+          const ref = NODES[id];
+          hoverLabel.textContent = ref?.label ?? id;
+          hoverLabel.classList.add('visible');
+        } else {
+          hoverLabel.classList.remove('visible');
+        }
+      }
+      if (id) {
+        hoverLabel.style.left = (e.clientX + 12) + 'px';
+        hoverLabel.style.top = (e.clientY + 14) + 'px';
+      }
+    });
+
+    canvas.addEventListener('mouseup', (e) => {
+      const held = performance.now() - pressTime;
+      let moved = false;
+      let releasedDrag = false;
+      if (draggingRef) {
+        moved = draggingRef.mesh.position.distanceTo(dragLast) > 0.01;
+        draggingRef.dragged = false;
+        draggingRef = null;
+        releasedDrag = true;
+      }
+      const quickClick = clickCandidate && held < 240 && !moved;
+      if (quickClick) {
+        if (clickCandidate.id === focusedNodeId) {
+          unfocusNode();
+        } else {
+          focusNode(clickCandidate.id);
+          // focusNode disables controls; don't re-enable here.
+        }
+      } else if (releasedDrag) {
+        controls.enabled = true;
+      }
+      clickCandidate = null;
+    });
+
+    canvas.addEventListener('dblclick', () => {
+      const hit = pickNodeUnderMouse();
+      if (!hit) {
+        if (focusedNodeId !== null) unfocusNode();
+      }
+    });
+
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (focusedNodeId !== null) unfocusNode();
+      } else if (e.key === 'b' || e.key === 'B') {
+        // Toggle bubble-packing debug wireframes (off by default).
+        if (typeof BUBBLE_DEBUG !== 'undefined' && BUBBLE_DEBUG) {
+          BUBBLE_DEBUG.visible = !BUBBLE_DEBUG.visible;
+        }
+      } else if (e.key === 's' || e.key === 'S') {
+        // Toggle suggestions panel (mirrors 'b' bubble debug toggle).
+        const sp = document.getElementById('suggestions-panel');
+        if (sp) sp.classList.toggle('visible');
+      }
+    });
+
+    // ─── bubble-packing debug wireframes ───────────────────────────
+    // One dim wireframe icosahedron per tier-1 node, drawn at bubbleR.
+    // Default OFF. Toggle with 'b'. Useful for visually confirming the
+    // packing prediction matches actual rendered subtree extent. Wireframes
+    // are children of BUBBLE_DEBUG (a THREE.Group) — toggling its visibility
+    // hides them all in one shot without touching individual meshes.
+    const BUBBLE_DEBUG = new THREE.Group();
+    BUBBLE_DEBUG.name = 'BUBBLE_DEBUG';
+    BUBBLE_DEBUG.visible = false;   // off by default
+    scene.add(BUBBLE_DEBUG);
+    for (const n of NODE_LIST) {
+      if (n.tier !== 1 || !n.bubbleR) continue;
+      const geo = new THREE.IcosahedronGeometry(n.bubbleR, 2);
+      const mat = new THREE.MeshBasicMaterial({
+        color: (n.baseColor != null ? n.baseColor : 0x9cc8e0),
+        wireframe: true,
+        transparent: true,
+        opacity: 0.08,
+        depthWrite: false,
+      });
+      const wire = new THREE.Mesh(geo, mat);
+      wire.userData.bubbleOwnerId = n.id;
+      wire.position.copy(n.mesh.position);
+      BUBBLE_DEBUG.add(wire);
+    }
+    function updateBubbleDebug() {
+      if (!BUBBLE_DEBUG.visible) return;   // skip work when hidden
+      for (const wire of BUBBLE_DEBUG.children) {
+        const owner = NODES[wire.userData.bubbleOwnerId];
+        if (owner && owner.mesh) wire.position.copy(owner.mesh.position);
+      }
+    }
+
+    // Breadcrumb IRIS chip → unfocus.
+    const _bcHome = document.querySelector('#breadcrumb [data-bc-home]');
+    if (_bcHome) {
+      _bcHome.addEventListener('click', () => unfocusNode());
+    }
+
+    // ─── suggestions overlay ───────────────────────────────────────
+    // Top-right panel showing proactive suggestions from IRIS_WORLD.
+    // Shape per item: {kind, target_node_id, label, why, confidence}.
+    // Clicking a row flashes the target node and focusNode()s if it has
+    // children. Toggle visibility with 's' key. Hidden when 0 items.
+    const SUG_GLYPHS = {
+      open_app: '🚀',
+      continue_task: '▶️',
+      follow_up_person: '👤',
+      project_focus: '📁',
+      idea: '💡',
+      reminder: '⏰',
+    };
+    function _sugEscape(s) {
+      if (s == null) return '';
+      return String(s)
+        .replace(/[\n\r\t]+/g, ' ')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+    function flashNode(nodeId) {
+      const node = NODES[nodeId];
+      if (!node || !node.mat || !node.mat.uniforms || !node.mat.uniforms.uIntensity) return;
+      // Tier-3 leaves use MeshBasicMaterial (no uIntensity) — silently skip.
+      const baseI = node.baseIntensity != null ? node.baseIntensity : 0.6;
+      const baseS = node.baseSurfAmp != null ? node.baseSurfAmp : 0.04;
+      node.mat.uniforms.uIntensity.value = Math.min(2.5, baseI + 1.5);
+      node.mat.uniforms.uSurfaceAmp.value = Math.max(baseS, 0.15);
+      // The frame() loop already lerps uIntensity/uSurfaceAmp back to
+      // baseIntensity/baseSurfAmp every tick (see ~line 2733), so we
+      // don't need an extra rAF decay — the existing relaxation handles it.
+    }
+    function renderSuggestions(suggestions) {
+      const panel = document.getElementById('suggestions-panel');
+      const items = panel ? panel.querySelector('.items') : null;
+      if (!panel || !items) return;
+      // Empty state: do not show panel at all (constraint).
+      if (!suggestions || suggestions.length === 0) {
+        items.innerHTML = '';
+        panel.classList.remove('visible');
+        return;
+      }
+      const topN = suggestions.slice(0, 5);
+      items.innerHTML = topN.map(s => {
+        const glyph = s.glyph || SUG_GLYPHS[s.kind] || '💡';
+        const label = _sugEscape(s.label || '(unnamed)');
+        const why = _sugEscape(s.why || '');
+        const target = _sugEscape(s.target_node_id || '');
+        return `<div class="sug" data-target="${target}">`
+             + `<span class="glyph">${_sugEscape(glyph)}</span>`
+             + `<span class="label">${label}</span>`
+             + (why ? `<span class="why" title="${why}">?</span>` : '')
+             + `</div>`;
+      }).join('');
+      items.querySelectorAll('.sug').forEach(row => {
+        row.addEventListener('click', () => {
+          // Debounce during camera animation — picks/focus are disabled
+          // while focusing/unfocusing (see frame() camera state machine).
+          if (cameraState === 'focusing' || cameraState === 'unfocusing') return;
+          const targetId = row.dataset.target;
+          if (!targetId || !NODES[targetId]) return;   // unknown node — no-op
+          flashNode(targetId);
+          if (childCount(targetId) > 0) focusNode(targetId);
+        });
+      });
+      panel.classList.add('visible');
+    }
+    (function initSuggestions() {
+      const sugg = (window.IRIS_WORLD && Array.isArray(window.IRIS_WORLD.suggestions))
+        ? window.IRIS_WORLD.suggestions
+        : [];
+      renderSuggestions(sugg);
+      // Polling hook — nothing to refresh from yet, but keep the interval
+      // so a future live-bridge event can replace this with a push model.
+      setInterval(() => {
+        if (window.IRIS_WORLD && Array.isArray(window.IRIS_WORLD.suggestions)) {
+          renderSuggestions(window.IRIS_WORLD.suggestions);
+        }
+      }, 60000);
+    })();
+
+    // ─── post-processing ───────────────────────────────────────────
+    const composer = new EffectComposer(renderer);
+    composer.setPixelRatio(renderer.getPixelRatio());
+    composer.setSize(innerWidth, innerHeight);
+    // Match renderer clear color (0x050a14) so reallocated composer render targets
+    // flash dark blue instead of black during resize / target reallocation.
+    if (typeof composer.setClearColor === 'function') {
+      composer.setClearColor(0x050a14, 1);
+    }
+    composer.addPass(new RenderPass(scene, camera));
+    const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.65, 0.38, 0.70);
+    composer.addPass(bloom);
+    composer.addPass(new OutputPass());
+
+    // ─── starfield ────────────────────────────────────────────────
+    (function stars() {
+      const N = 1400;
+      const pos = new Float32Array(N * 3);
+      for (let i = 0; i < N; i++) {
+        const r = 80 + Math.random() * 60;
+        const t = Math.random() * Math.PI * 2;
+        const p = Math.acos(2 * Math.random() - 1);
+        pos[i*3]   = r * Math.sin(p) * Math.cos(t);
+        pos[i*3+1] = r * Math.sin(p) * Math.sin(t);
+        pos[i*3+2] = r * Math.cos(p);
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      scene.add(new THREE.Points(g, new THREE.PointsMaterial({
+        color: 0xb6cee6, size: 0.45, transparent: true, opacity: 0.5,
+        sizeAttenuation: true, depthWrite: false, blending: THREE.AdditiveBlending,
+      })));
+    })();
+
+    // ─── animation ─────────────────────────────────────────────────
+    let last = performance.now();
+    function frame(now) {
+      // Pause expensive per-frame work when the document is hidden
+      // (window minimized, tab in background, parent webview occluded).
+      // Saves CPU AND avoids browser-throttled rAF stutter on regain
+      // focus — we keep the loop alive with a cheap reschedule so that
+      // when visibility returns, the next real frame fires immediately.
+      if (document.hidden) {
+        last = now; // reset dt baseline so we don't compute a huge step on return
+        requestAnimationFrame(frame);
+        return;
+      }
+      // Belt-and-suspenders: re-assert clear color every frame so any
+      // per-frame render-target swap (composer realloc, bloom MRT bind)
+      // paints dark blue instead of pure black on focus regain / resize.
+      renderer.setClearColor(0x050a14, 1);
+      const dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      const t = now * 0.001;
+
+      // Camera animation (focus mode fly-in / fly-out). Runs before
+      // any other update so controls.target is correct when
+      // OrbitControls resumes at the end of the animation.
+      if (cameraState === 'focusing' || cameraState === 'unfocusing') {
+        const tt = Math.min(1, (now - cameraAnimStart) / CAMERA_ANIM_MS);
+        const eased = 1 - Math.pow(1 - tt, 3);
+        if (cameraStartPos && cameraEndPos) {
+          camera.position.lerpVectors(cameraStartPos, cameraEndPos, eased);
+        }
+        if (cameraStartTarget && cameraEndTarget) {
+          controls.target.lerpVectors(cameraStartTarget, cameraEndTarget, eased);
+        }
+        if (tt >= 1) {
+          cameraState = cameraState === 'focusing' ? 'focused' : 'overview';
+          controls.enabled = true;
+        }
+      } else if (cameraState === 'focused' && focusedNodeId !== null) {
+        // Stay locked to the focused node so drag-orbit always rotates
+        // around it cleanly, even as it nudges.
+        const fNode = NODES[focusedNodeId];
+        if (fNode) controls.target.copy(fNode.mesh.position);
+      }
+
+      // Update orbital layout (positions for every node).
+      updateOrbits(now, dt);
+      applyFocusVisibility();
+      updateBubbleDebug();
+
+      // Plasma shader animation + intensity decay (only for nodes
+      // that actually use the plasma shader — tier-3 leaves use a
+      // plain MeshStandardMaterial without these uniforms).
+      // Also: focused-bump scale — the focused node and its direct
+      // children grow slightly when in focus, smoothly lerping toward
+      // the target scale. Halos scale with them so the glow tracks.
+      // PERF: precompute focus-affected tier-3 parent once. Tier-3
+      // leaves only need the focus-bump / shader-uniform passes when
+      // their direct parent is focused (then they're "direct children
+      // of focus"). At rest (no focus) or when focus is elsewhere, we
+      // can skip the entire body for tier-3 — ~166 nodes × 0 work.
+      const _focusParentForLeaves = focusedNodeId;
+      for (const id in NODES) {
+        const n = NODES[id];
+
+        // Tier-3 fast path: spin is always 0, halo is null, material
+        // has no uniforms (MeshBasicMaterial), and focus-bump only
+        // applies if their direct parent is the focused node. Skip the
+        // entire per-frame block in the common (idle / unrelated-focus)
+        // case. The labelSprite scale path also skips, but lazy tier-3
+        // sprites only exist when revealed (focus on their parent), so
+        // when we skip they aren't onscreen anyway.
+        if (n.tier === 3 && n.parent !== _focusParentForLeaves && n.id !== _focusParentForLeaves) {
+          continue;
+        }
+
+        // Per-mesh slow spin so spheres read as real 3D bodies.
+        // Tier 0 + tier 1 spin; tier ≥ 2 is too small for spin to add value.
+        if (n.spinX || n.spinY || n.spinZ) {
+          n.mesh.rotation.x += dt * n.spinX;
+          n.mesh.rotation.y += dt * n.spinY;
+          n.mesh.rotation.z += dt * n.spinZ;
+        }
+
+        // Focus-bump scale — focused node + its direct children grow.
+        try {
+          let scaleTarget = 1.0;
+          if (focusedNodeId !== null) {
+            if (n.id === focusedNodeId)            scaleTarget = 1.55;
+            else if (n.parent === focusedNodeId)   scaleTarget = 1.32;
+          }
+          if (n._focusScale === undefined) n._focusScale = 1.0;
+          n._focusScale += (scaleTarget - n._focusScale) * Math.min(1, dt * 4.0);
+          if (n.mesh && n.mesh.scale) n.mesh.scale.setScalar(n._focusScale);
+          if (n.halo && n.halo.scale) {
+            if (n._haloBaseScale === undefined) n._haloBaseScale = n.halo.scale.x || 1.0;
+            const s = n._haloBaseScale * n._focusScale;
+            n.halo.scale.set(s, s, 1);
+          }
+          // NB: node.label is the text STRING; the Sprite lives at
+          // node.labelSprite. Use the sprite for scale.
+          if (n.labelSprite && n.labelSprite.scale) {
+            if (n._labelBaseScaleX === undefined) {
+              n._labelBaseScaleX = n.labelSprite.scale.x || 1.0;
+              n._labelBaseScaleY = n.labelSprite.scale.y || 1.0;
+            }
+            // Labels grow a bit too — but not as much as the node so
+            // they don't end up oversized when zoomed in.
+            const lf = 1.0 + (n._focusScale - 1.0) * 0.6;
+            n.labelSprite.scale.set(n._labelBaseScaleX * lf, n._labelBaseScaleY * lf, 1);
+          }
+        } catch (_) { /* defensive: never break the render loop */ }
+
+        if (!n.mat.uniforms || !n.mat.uniforms.uTime) continue;
+        n.mat.uniforms.uTime.value = t;
+        // While a node is mid-fade (project-removal tween), do NOT lerp
+        // uIntensity back toward baseIntensity — that lerp was silently
+        // overwriting the fade's per-frame writes, so the sphere stayed
+        // bright until the tween finished and the node was deleted in a
+        // single frame ("snap disappear"). The fade tween owns both
+        // uIntensity and uAlpha while _fading is set.
+        if (!n._fading) {
+          n.mat.uniforms.uIntensity.value += (n.baseIntensity - n.mat.uniforms.uIntensity.value) * Math.min(1, dt * 3);
+          n.mat.uniforms.uSurfaceAmp.value += (n.baseSurfAmp - n.mat.uniforms.uSurfaceAmp.value) * Math.min(1, dt * 2.5);
+        }
+      }
+
+      updateEdgesAndPulses(now, dt);
+      // Edges need to follow the new node positions every frame.
+      rebuildAllEdgeGeometries();
+      updateCacheLeaves(now);
+
+      controls.update();
+      composer.render();
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+
+    addEventListener('resize', () => {
+      // Guard against zero-sized renders during minimize / collapsed parent.
+      const w = Math.max(1, innerWidth);
+      const h = Math.max(1, innerHeight);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h, false);
+      composer.setSize(w, h);
+      // Re-apply clear color so freshly reallocated targets don't flash black.
+      if (typeof composer.setClearColor === 'function') {
+        composer.setClearColor(0x050a14, 1);
+      }
+      bloom.setSize(w, h);
+    });
+
+    // ─── visibility change — refresh GPU state on focus regain ────────
+    // When the window/tab becomes hidden, the browser may release or
+    // throttle GPU state; on return we can get a single black flash
+    // and/or a stale composer target. Re-size + force a render to
+    // re-bind clear color and post-processing targets cleanly.
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) return;
+      try {
+        const w = Math.max(1, innerWidth);
+        const h = Math.max(1, innerHeight);
+        renderer.setSize(w, h, false);
+        composer.setSize(w, h);
+        renderer.setClearColor(0x050a14, 1);
+        if (typeof composer.setClearColor === 'function') {
+          composer.setClearColor(0x050a14, 1);
+        }
+        bloom.setSize(w, h);
+        // Force one full render so the framebuffer is repainted with
+        // the proper clear color + bloom output before rAF resumes.
+        composer.render();
+        // Schedule a second frame on the next rAF tick so the GPU
+        // surface is fully re-bound + cleared before the user sees
+        // it — closes a 1-frame window where a stale (black) buffer
+        // could otherwise bleed through.
+        if (typeof frame === 'function') {
+          requestAnimationFrame(frame);
+        }
+      } catch (_) { /* defensive: never break on focus regain */ }
+    });
+
+    // ─── live update bridge (OPEN_ISSUES #10) ─────────────────────────
+    //
+    // Two-way pipe between the Python world_state and this scene. When
+    // Iris touches a new file or auto-detects a new project root, the
+    // observer registered in run_iris_simulator.py fires
+    // CortexBridge.emit_{project,leaf}_added(...), which marshals through
+    // QWebChannel into the discrete signals connected below.
+    //
+    // Cold-start race: the launcher inlines qwebchannel.js at
+    // DocumentCreation, so the QWebChannel constructor is available
+    // synchronously — but the bridge object itself only lands once the
+    // handshake completes. We wrap the connect in a try/catch and degrade
+    // silently if anything is missing (page still works from the static
+    // window.IRIS_WORLD injection).
+    //
+    // Page reload: setting up the bridge again on `loadFinished` is the
+    // Python side's responsibility; this JS block re-runs from scratch
+    // every time the module re-loads, so once the channel re-handshakes
+    // the connections re-bind cleanly.
+
+    // ----- transient live-leaf overlay (similar to spawnCacheLeaf) -----
+    // Live leaves are short-lived decorative sprites/dots anchored to a
+    // parent node's CURRENT position. They re-use the cacheLeaves render
+    // pipeline (already updated each frame by updateCacheLeaves) so we
+    // don't add a second per-frame pass.
+    function liveSpawnLeafNear(parentId, label, ttlMs) {
+      try {
+        const parent = NODES[parentId] || NODES['cap-tools'] || NODES['core'];
+        if (!parent) return;
+        const offset = new THREE.Vector3(
+          (Math.random() - 0.5) * 2.8,
+          1.6 + Math.random() * 0.6,
+          (Math.random() - 0.5) * 2.8,
+        );
+        const pos = parent.mesh.position.clone().add(offset);
+
+        const small = makeLabel(label, 0.95, 0.7);
+        small.scale.multiplyScalar(0.72);
+        small.position.copy(pos);
+        scene.add(small);
+
+        const dot = new THREE.Mesh(
+          new THREE.SphereGeometry(0.22, 12, 8),
+          new THREE.MeshBasicMaterial({
+            color: 0x58e3ff, transparent: true, opacity: 0.0,
+            blending: THREE.AdditiveBlending,
+          }),
+        );
+        dot.position.copy(pos);
+        dot.position.y -= 0.6;
+        scene.add(dot);
+
+        // Brief fade-in over ~1s, then standard cacheLeaves TTL handles
+        // the slow fade-out. We hijack born+ttl so the existing updater
+        // does the right thing: setting `born = now + fadeInMs` makes
+        // the alpha math start at -fadeIn/ttl (negative t), which the
+        // updater clamps to alpha=1.0 — so the first ~1s reads as
+        // intentional fade-in, then the standard fade-out kicks in.
+        const FADE_IN_MS = 1000;
+        const ttl = Math.max(2500, Number(ttlMs) || 8000);
+        cacheLeaves.push({
+          label: small, dot,
+          born: performance.now() + FADE_IN_MS,
+          ttl: ttl,
+        });
+
+        // Manual fade-in (cacheLeaves updater clamps t<0 to alpha=1, but
+        // we want a real ramp). One-shot rAF; cheap and self-contained.
+        const t0 = performance.now();
+        function rampIn() {
+          const t = (performance.now() - t0) / FADE_IN_MS;
+          if (t >= 1) {
+            small.material.opacity = 0.95;
+            dot.material.opacity = 1.0;
+            return;
+          }
+          const eased = t * t * (3 - 2 * t);  // smoothstep
+          small.material.opacity = 0.95 * eased;
+          dot.material.opacity = 1.0 * eased;
+          requestAnimationFrame(rampIn);
+        }
+        rampIn();
+
+        // Visual feedback on the parent node too: nudge plasma intensity
+        // briefly so the user sees "this node just got a new leaf."
+        if (parent.mat && parent.mat.uniforms && parent.mat.uniforms.uIntensity) {
+          parent.mat.uniforms.uIntensity.value = Math.min(
+            2.0, (parent.baseIntensity || 0.5) + 0.85
+          );
+          if (parent.mat.uniforms.uSurfaceAmp) {
+            parent.mat.uniforms.uSurfaceAmp.value = Math.max(
+              parent.baseSurfAmp || 0.04, 0.10
+            );
+          }
+        }
+      } catch (e) {
+        console.warn('[iris-sim] liveSpawnLeafNear failed:', e);
+      }
+    }
+
+    // ----- live project marker (full tier-1 sphere) -----
+    // A live "project added" event splices a new tier-1 project node
+    // into NODE_DEFS, re-runs applyTier1BubblePacking() so the new
+    // sphere lands in a non-overlapping orbital slot computed by the
+    // packing math, then builds the full node (mesh + halo + label +
+    // orbit state + spring physics + spin + edge-to-core) so it
+    // behaves indistinguishably from a hardcoded tier-1 project.
+    //
+    // Palette: cycle through teal/cyan-family tints so successive live
+    // projects don't all share the same color. Indexed by live-project
+    // count so the order is stable across reloads.
+    const _LIVE_PROJECT_PALETTE = [
+      { base: 0x4be0d4, hot: 0xcdf6f0, halo: 0x4be0d4 },
+      { base: 0x1de9b6, hot: 0xc8ffea, halo: 0x1de9b6 },
+      { base: 0x6ed8a9, hot: 0xd3f4dd, halo: 0x6ed8a9 },
+      { base: 0x33c39b, hot: 0xc4f0d8, halo: 0x33c39b },
+      { base: 0x58e3ff, hot: 0xeaffff, halo: 0x58e3ff },
+      { base: 0xb388ff, hot: 0xede0ff, halo: 0xb388ff },
+      { base: 0xef7fc7, hot: 0xffd2ec, halo: 0xef7fc7 },
+      { base: 0xf5b542, hot: 0xfff0c0, halo: 0xf5b542 },
+    ];
+    const _liveProjectIds = new Set();
+    function liveAddProject(projectId, label) {
+      try {
+        if (!projectId) return;
+        // If the project sphere already exists (e.g. it was in the
+        // initial world payload), just flash it + re-pack to make room
+        // for any new descendants picked up later.
+        const existing = NODES[`proj-${projectId.toLowerCase().replace(/[^a-z0-9_-]/gi, '-')}`] || NODES[projectId];
+        if (existing) {
+          if (existing.mat && existing.mat.uniforms && existing.mat.uniforms.uIntensity) {
+            existing.mat.uniforms.uIntensity.value = Math.min(
+              2.2, (existing.baseIntensity || 0.6) + 1.0
+            );
+          }
+          try { applyTier1BubblePacking(); } catch (_) { /* non-fatal */ }
+          return;
+        }
+
+        if (_liveProjectIds.has(projectId)) return;
+        _liveProjectIds.add(projectId);
+
+        const slug = String(projectId).toLowerCase().replace(/[^a-z0-9_-]/gi, '-');
+        const nodeId = `proj-${slug}`;
+        const palette = _LIVE_PROJECT_PALETTE[
+          (_liveProjectIds.size - 1) % _LIVE_PROJECT_PALETTE.length
+        ];
+        const r = 1.0;   // matches tier-1 project base radius (see HARDCODED_NODE_DEFS)
+
+        // ── Step 1: splice a tier-1 def into NODE_DEFS so packing sees it ──
+        // pos is a placeholder — bubble packing will set _fixedAngle /
+        // _fixedPolar / _orbitFromCoreR below.
+        //
+        // IMPORTANT: We seed _tier2ChildCount / _tier3GrandchildCount with
+        // conservative non-zero estimates so bubbleFor() reserves enough
+        // orbital room for the descendants that will be added later via
+        // liveAddBranch / liveAddCapability. The bubble-packing pass
+        // freezes _orbitFromCoreR / _fixedAngle / _fixedPolar on the def
+        // and does NOT re-run when sub-nodes arrive — so if we under-
+        // estimate the footprint here, late-arriving children will
+        // protrude into sibling project bubbles (see OPEN_ISSUES #10).
+        // Values chosen to match a "typical project" descBump ≈ 1.3 in
+        // bubbleFor (kids=4, grand=6 → 1 + 0.09*log2(5) + 0.02*log2(7) ≈ 1.27).
+        const def = {
+          id: nodeId, parent: 'core', pos: [0, 0, 0], r: r,
+          base: palette.base, hot: palette.hot, halo: palette.halo,
+          label: label || projectId, tier: 1,
+          _descendantCount: 10,
+          _tier2ChildCount: 4,
+          _tier3GrandchildCount: 6,
+        };
+        NODE_DEFS.push(def);
+        NODE_DEF_BY_ID[nodeId] = def;
+
+        // ── Step 2: re-run packing to assign _fixedAngle/_fixedPolar/_orbitFromCoreR ──
+        // This may also nudge existing tier-1 _orbitFromCoreR up if the new
+        // bubble forces a larger ring; sync back to existing node.orbitFromCoreR
+        // immediately so updateOrbits picks up the new ring this frame and
+        // siblings drift to the new packed distance via their spring physics.
+        try { applyTier1BubblePacking(); } catch (_) { /* non-fatal */ }
+        for (const d of NODE_DEFS) {
+          if ((d.tier ?? 1) !== 1 || d.parent !== 'core') continue;
+          const n = NODES[d.id];
+          if (n && d._orbitFromCoreR != null) {
+            n.orbitFromCoreR = d._orbitFromCoreR;
+          }
+        }
+
+        // ── Step 3: build the mesh at the bubble-packed position ──
+        const orbitR = def._orbitFromCoreR || 16.0;
+        const orbitAngle = (def._fixedAngle != null) ? def._fixedAngle : 0;
+        const orbitPolar = (def._fixedPolar != null) ? def._fixedPolar : 0;
+        const pos = new THREE.Vector3(
+          Math.cos(orbitAngle) * Math.cos(orbitPolar) * orbitR,
+          Math.sin(orbitPolar) * orbitR,
+          Math.sin(orbitAngle) * Math.cos(orbitPolar) * orbitR,
+        );
+
+        // Tier-1 look (matches TIER_LOOK[1] used in the initial spawn loop).
+        const look = TIER_LOOK[1];
+        const mat = makePlasmaMat(Math.random() * 100, palette.base, palette.hot);
+        mat.uniforms.uIntensity.value = 0.0;     // fade in via ramp() below
+        mat.uniforms.uBodyAmp.value = 0.07 * look.bodyAmpMul;
+        mat.uniforms.uSurfaceAmp.value = 0.04 * look.surfAmpMul;
+        const baseIntensity = 0.6 * look.intensityMul;
+
+        const mesh = new THREE.Mesh(new THREE.IcosahedronGeometry(r, 4), mat);
+        mesh.position.copy(pos);
+        mesh.userData.nodeId = nodeId;
+        // Start near full size so the sphere reads as a real tier-1 body
+        // immediately; ramp() animates intensity + halo + label opacity
+        // (mesh only does a small 0.9 → 1.0 pop so it visibly "blooms").
+        mesh.scale.setScalar(0.9);
+        scene.add(mesh);
+
+        const halo = makeHalo(palette.halo, r * look.haloMul, 0.0);
+        halo.position.copy(pos);
+        scene.add(halo);
+
+        const lbl = makeLabel(label || projectId, 0.0, 0.95);
+        lbl.position.set(pos.x, pos.y + r + 0.9, pos.z);
+        scene.add(lbl);
+
+        // ── Step 4: build the canonical node object (mirrors the
+        // initial spawn loop around line 1312 — every field updateOrbits,
+        // applyFocusVisibility, and the spring physics actually read).
+        const node = {
+          id: nodeId,
+          parent: 'core',
+          label: label || projectId,
+          tier: 1,
+          mesh, halo,
+          labelSprite: lbl,
+          labelBaseOpacity: 0.92,
+          mat,
+          basePos: pos.clone(),
+          baseR: r,
+          baseIntensity: baseIntensity,
+          baseBodyAmp: mat.uniforms.uBodyAmp.value,
+          baseSurfAmp: mat.uniforms.uSurfaceAmp.value,
+          lastFireAt: 0,
+          baseColor: palette.base,
+          hotColor:  palette.hot,
+          isCapability: false,
+
+          descendantCount: 0,
+          tier2ChildCount: 0,
+          tier3GrandchildCount: 0,
+          bubbleR: def._bubbleR || 0,
+          orbitFromCoreR: orbitR,
+
+          // ── orbit state (matches tier-1 in the initial spawn loop) ──
+          orbitAngle: orbitAngle,
+          orbitPolar: orbitPolar,
+          orbitSpeed: 0.04,        // tier-1 fixed rate — same as hardcoded tier-1
+          orbitRadiusMul: 1.0,     // equidistant from parent
+
+          // Per-axis spin for visual liveliness (tier-1 values).
+          spinX: 0.08 + Math.random() * 0.10,
+          spinY: 0.10 + Math.random() * 0.14,
+          spinZ: 0.04 + Math.random() * 0.06,
+
+          // Spring physics — updateOrbits drifts target then springs
+          // mesh.position toward it.
+          target: pos.clone(),
+          velocity: new THREE.Vector3(),
+
+          dragged: false,
+        };
+        NODES[nodeId] = node;
+        NODE_LIST.push(node);
+
+        // updateOrbits subtracts 1 from this map for the sibling count,
+        // so include the new node by incrementing core's bucket.
+        SIBLING_COUNT_BY_CENTER.set(
+          'core',
+          (SIBLING_COUNT_BY_CENTER.get('core') || 0) + 1
+        );
+
+        // ── Step 5: wire the edge from core to the new project ──
+        addEdgeOnce('core', nodeId);
+
+        // ~1s fade-in for intensity + halo + label opacity.
+        const FADE_MS = 1000;
+        const t0 = performance.now();
+        function ramp() {
+          const t = Math.min(1, (performance.now() - t0) / FADE_MS);
+          const eased = t * t * (3 - 2 * t);
+          mat.uniforms.uIntensity.value = baseIntensity * eased;
+          halo.material.opacity = look.haloOpacity * eased;
+          lbl.material.opacity = 0.92 * eased;
+          mesh.scale.setScalar(0.9 + 0.1 * eased);
+          if (t < 1) requestAnimationFrame(ramp);
+        }
+        ramp();
+      } catch (e) {
+        console.warn('[iris-sim] liveAddProject failed:', e);
+      }
+    }
+
+    // ----- live project removal (symmetric to liveAddProject) -----
+    // Reacts to the projectRemoved signal fired by iris_remove_project
+    // (Python side: cortex_emit.project_remove → bridge.emit_project_removed).
+    // We fade the project's sphere + halo + label over ~600ms, then remove
+    // it from the scene, recursively dispose its tier-2 sub-nodes / tier-3
+    // leaves, and remove every edge that referenced any of those nodes
+    // (TOOL_LINK_LINES + the EDGES array — tube + line edges alike).
+    //
+    // Idempotent and best-effort: if the node isn't in NODES (e.g.
+    // protected hardcoded root that the Python tool rejected with an
+    // error and never actually removed; or a node that was never on
+    // screen) we silently no-op.
+    //
+    // Bubble packing is INTENTIONALLY not re-run — the orbit physics
+    // keeps siblings spaced and removed nodes leave their slot empty
+    // (acceptable per the OPEN_ISSUES #10 plan; user-visible "hole" is
+    // a known tradeoff vs. the cost of repacking on every removal).
+    function _disposeMesh(mesh) {
+      if (!mesh) return;
+      try { scene.remove(mesh); } catch (_) {}
+      try { if (mesh.geometry && mesh.geometry.dispose) mesh.geometry.dispose(); } catch (_) {}
+      try {
+        if (mesh.material) {
+          if (Array.isArray(mesh.material)) {
+            for (const m of mesh.material) { if (m && m.dispose) m.dispose(); }
+          } else if (mesh.material.dispose) {
+            mesh.material.dispose();
+          }
+        }
+      } catch (_) {}
+    }
+
+    function _removeNodeFromScene(node) {
+      if (!node) return;
+      _disposeMesh(node.mesh);
+      if (node.halo) _disposeMesh(node.halo);
+      if (node.labelSprite) _disposeMesh(node.labelSprite);
+    }
+
+    function _collectDescendantIds(rootId) {
+      // BFS over NODES looking at `parent` links. Returns descendants
+      // only (not the root itself).
+      const out = [];
+      const queue = [rootId];
+      while (queue.length) {
+        const pid = queue.shift();
+        for (const id of Object.keys(NODES)) {
+          const n = NODES[id];
+          if (!n || n.parent !== pid) continue;
+          out.push(id);
+          queue.push(id);
+        }
+      }
+      return out;
+    }
+
+    // Tracks nodeIds currently mid-fade so duplicate projectRemoved
+    // emits (Python now sends both 'pid' and 'proj-pid' forms back-to-
+    // back to dodge id-format mismatches) don't kick off a second
+    // tween or trigger the "node not found" warning after we've
+    // already started teardown.
+    const _projectRemovalInFlight = new Set();
+
+    function handleProjectRemoved(projectId) {
+      try {
+        // INSTRUMENTATION: log every entry so we can confirm Python's
+        // remove path actually crossed the bridge.
+        console.log('[iris-sim] handleProjectRemoved called with:', projectId);
+        if (!projectId) {
+          console.warn('[iris-sim] handleProjectRemoved: empty projectId');
+          return;
+        }
+        // Extra debug: enumerate the tier-1 project nodes currently in
+        // the scene + the slug forms we're about to try, so any id-
+        // format mismatch (bare slug vs proj-prefixed, casing,
+        // hyphenation) is obvious in the console instead of "the fade
+        // just didn't run." Best-effort — logging must never break
+        // the handler.
+        try {
+          const _projKeysDbg = Object.keys(NODES).filter(
+            (k) => NODES[k] && NODES[k].tier === 1 && !NODES[k].isCapability
+          );
+          const _slugDbg = String(projectId).toLowerCase().replace(/[^a-z0-9_-]/gi, '-');
+          console.log(
+            '[iris-sim] handleProjectRemoved lookup:',
+            'projectId=', projectId,
+            'slug=', _slugDbg,
+            'proj-slug=', `proj-${_slugDbg}`,
+            'tier-1 candidates=', _projKeysDbg
+          );
+        } catch (_) { /* logging is best-effort */ }
+        // Resolve the visual node id — projectRemoved payloads carry
+        // the raw slug (e.g. 'vcpkg-master'); the sphere is stored
+        // under 'proj-<slug>' (matching liveAddProject's convention).
+        // We try multiple id formats so we tolerate Python sending
+        // either the raw pid ('vcpkg-master') or the already-prefixed
+        // node id ('proj-vcpkg-master'), and so user-typed labels with
+        // odd casing/spaces still resolve. Order matters: more-specific
+        // first, then fallbacks, then substring rescue.
+        const slug = String(projectId).toLowerCase().replace(/[^a-z0-9_-]/gi, '-');
+        const stripped = slug.replace(/^proj-/, '');  // tolerate double-prefix
+        let nodeId = null;
+        if (NODES[`proj-${slug}`]) {
+          nodeId = `proj-${slug}`;
+        } else if (NODES[projectId]) {
+          nodeId = projectId;
+        } else if (NODES[`proj-${stripped}`]) {
+          nodeId = `proj-${stripped}`;
+        } else if (NODES[slug]) {
+          nodeId = slug;
+        } else {
+          // Last-resort: scan NODES for a tier-1 project node whose id
+          // contains the slug (covers label/id slug-mismatch like user
+          // typing 'vcpkg' when the node is 'proj-vcpkg-master').
+          const needle = stripped;
+          if (needle && needle.length >= 3) {
+            for (const k of Object.keys(NODES)) {
+              const n = NODES[k];
+              if (!n || n.tier !== 1 || n.isCapability) continue;
+              if (k.toLowerCase().indexOf(needle) !== -1) {
+                nodeId = k;
+                break;
+              }
+            }
+          }
+        }
+        if (!nodeId) {
+          // If we're already fading the matching project (Python sends
+          // both 'pid' and 'proj-pid' forms — the second one arrives
+          // here after the first already started teardown), stay
+          // silent. Otherwise surface the miss so id-format drifts
+          // are debuggable instead of "nothing happens, no error".
+          const alreadyFading =
+            _projectRemovalInFlight.has(`proj-${slug}`) ||
+            _projectRemovalInFlight.has(`proj-${stripped}`) ||
+            _projectRemovalInFlight.has(projectId) ||
+            _projectRemovalInFlight.has(slug);
+          if (alreadyFading) return;
+          try {
+            const projKeys = Object.keys(NODES).filter(
+              (k) => NODES[k] && NODES[k].tier === 1 && !NODES[k].isCapability
+            );
+            console.warn(
+              '[iris-sim] handleProjectRemoved: no node for',
+              JSON.stringify(projectId),
+              'slug=', slug,
+              'candidates=', projKeys
+            );
+          } catch (_) { /* logging is best-effort */ }
+          return;
+        }
+
+        // Idempotency: a fade already in progress for this nodeId
+        // (duplicate emit while the prior tween is still running)
+        // should be a no-op, not a second overlapping tween.
+        // Idempotency: if a tween is already running for this nodeId
+        // (e.g. Python emitted projectRemoved *and* node.fade for the
+        // same project, or sent both 'pid' and 'proj-pid' forms), the
+        // second entry must be a silent no-op. Without this, a second
+        // tween would race the first and the late one would snap the
+        // sphere off at the end of its own (shorter) timeline.
+        if (_projectRemovalInFlight.has(nodeId)) {
+          console.log('[iris-sim] handleProjectRemoved: duplicate for', nodeId, '— fade already in flight, ignoring');
+          return;
+        }
+        _projectRemovalInFlight.add(nodeId);
+
+        const node = NODES[nodeId];
+        if (!node || !node.mesh || !node.mesh.material) {
+          // node.mesh.material is what every later fade frame reads
+          // for opacity; bailing early here (instead of letting the
+          // rAF tween hit a TypeError mid-step and silently die)
+          // keeps the in-flight guard honest and surfaces the
+          // anomaly in the console.
+          console.warn(
+            '[iris-sim] handleProjectRemoved: node invalid (missing mesh/material)',
+            nodeId, node
+          );
+          _projectRemovalInFlight.delete(nodeId);
+          return;
+        }
+
+        // Belt-and-braces guard: refuse to remove a hardcoded capability
+        // anchor even if Python somehow emits its id (the Python tool
+        // already blocks KNOWN_PROJECT_ROOTS, but the simulator should
+        // never tear down core scaffolding regardless of the sender).
+        if (node.isCapability) {
+          console.warn('[iris-sim] refusing to remove capability node:', nodeId);
+          _projectRemovalInFlight.delete(nodeId);
+          return;
+        }
+
+        // Tier-0 (core) is sacred — same guard, separate check.
+        if (node.tier === 0) {
+          console.warn('[iris-sim] refusing to remove tier-0 core node:', nodeId);
+          _projectRemovalInFlight.delete(nodeId);
+          return;
+        }
+
+        // Schedule removal for the next frame boundary so we never tear
+        // down a mesh mid-render (would cause one-frame artifact).
+        requestAnimationFrame(() => {
+          // _collectDescendantIds is defined earlier in the same
+          // <script>, but if a future refactor accidentally drops or
+          // renames it (or it throws while walking a malformed NODES
+          // entry), the previous version silently aborted the tween
+          // here and the in-flight guard kept the nodeId locked
+          // forever. Catch + release so the next remove attempt can
+          // still run.
+          if (typeof _collectDescendantIds !== 'function') {
+            console.error('[iris-sim] _collectDescendantIds is not defined');
+            _projectRemovalInFlight.delete(nodeId);
+            return;
+          }
+          let descendantIds = [];
+          try {
+            descendantIds = _collectDescendantIds(nodeId);
+          } catch (err) {
+            console.error('[iris-sim] _collectDescendantIds failed for', nodeId, err);
+            _projectRemovalInFlight.delete(nodeId);
+            return;
+          }
+          const allIds = [nodeId, ...descendantIds];
+          const idSet = new Set(allIds);
+
+          // Mark every node about to fade so the per-frame render loop
+          // skips its baseIntensity lerp (otherwise that lerp would
+          // overwrite uIntensity every frame and the sphere would never
+          // visibly dim before being torn down).
+          for (const id of allIds) {
+            const n = NODES[id];
+            if (n) n._fading = true;
+          }
+
+          // Capture starting opacities so the tween eases from "wherever
+          // they currently sit" rather than snapping to 1.0. We also
+          // record whether the mesh material is a ShaderMaterial — its
+          // .opacity property is ignored by Three.js for shader pipelines,
+          // so we must drive the uAlpha uniform instead.
+          const startStates = allIds.map((id) => {
+            const n = NODES[id];
+            if (!n) return null;
+            const mm = (n.mesh && n.mesh.material) || null;
+            const isShader = !!(mm && mm.isShaderMaterial);
+            const meshOpacity = (mm && !isShader && typeof mm.opacity === 'number')
+              ? mm.opacity : 1.0;
+            const meshAlpha = (mm && mm.uniforms && mm.uniforms.uAlpha)
+              ? (mm.uniforms.uAlpha.value != null ? mm.uniforms.uAlpha.value : 1.0)
+              : 1.0;
+            const haloOpacity = (n.halo && n.halo.material && typeof n.halo.material.opacity === 'number')
+              ? n.halo.material.opacity : 0.0;
+            const labelOpacity = (n.labelSprite && n.labelSprite.material && typeof n.labelSprite.material.opacity === 'number')
+              ? n.labelSprite.material.opacity : 0.0;
+            return { id, isShader, meshOpacity, meshAlpha, haloOpacity, labelOpacity };
+          }).filter(Boolean);
+
+          // Plasma shaders don't have a `material.opacity` knob — they
+          // use uIntensity (color brightness) and uAlpha (true
+          // transparency). Drive both so the sphere dims AND becomes
+          // see-through, matching how a "fading" body should read.
+          const startIntensities = allIds.map((id) => {
+            const n = NODES[id];
+            if (!n || !n.mat || !n.mat.uniforms || !n.mat.uniforms.uIntensity) return null;
+            return { id, intensity: n.mat.uniforms.uIntensity.value };
+          }).filter(Boolean);
+
+          // Also fade edges that reference any removed node so they
+          // don't dangle to empty space during the tween. We mutate
+          // material.opacity (works on both LineBasic/LineDashed AND
+          // the ShaderMaterial via the uOpacity uniform).
+          const affectedEdges = [];
+          for (const e of EDGES) {
+            if (!e) continue;
+            if (idSet.has(e.fromId) || idSet.has(e.toId)) {
+              affectedEdges.push(e);
+            }
+          }
+          const affectedToolLinks = [];
+          if (typeof TOOL_LINK_LINES !== 'undefined' && Array.isArray(TOOL_LINK_LINES)) {
+            for (const tl of TOOL_LINK_LINES) {
+              if (!tl) continue;
+              if (idSet.has(tl.fromId) || idSet.has(tl.toId)) {
+                affectedToolLinks.push(tl);
+              }
+            }
+          }
+
+          const FADE_MS = 600;
+          const t0 = performance.now();
+          function step() {
+            const t = Math.min(1, (performance.now() - t0) / FADE_MS);
+            const eased = 1 - (t * t * (3 - 2 * t));  // smoothstep, inverted
+
+            for (const s of startStates) {
+              const n = NODES[s.id];
+              if (!n) continue;
+              const mm = n.mesh && n.mesh.material;
+              if (mm) {
+                if (s.isShader) {
+                  // ShaderMaterial ignores .opacity — write uAlpha
+                  // instead. The plasma FS reads uAlpha as its output
+                  // alpha channel, so eased=0 → fully transparent.
+                  if (mm.uniforms && mm.uniforms.uAlpha) {
+                    mm.uniforms.uAlpha.value = s.meshAlpha * eased;
+                  }
+                } else {
+                  // Tier-3 leaves are MeshBasicMaterial — opacity works.
+                  mm.transparent = true;
+                  mm.opacity = s.meshOpacity * eased;
+                }
+              }
+              if (n.halo && n.halo.material) {
+                n.halo.material.opacity = s.haloOpacity * eased;
+              }
+              if (n.labelSprite && n.labelSprite.material) {
+                n.labelSprite.material.opacity = s.labelOpacity * eased;
+              }
+            }
+            for (const s of startIntensities) {
+              const n = NODES[s.id];
+              if (!n || !n.mat || !n.mat.uniforms || !n.mat.uniforms.uIntensity) continue;
+              n.mat.uniforms.uIntensity.value = s.intensity * eased;
+            }
+            for (const e of affectedEdges) {
+              if (e.material) {
+                if (e.material.uniforms && e.material.uniforms.uOpacity) {
+                  e.material.uniforms.uOpacity.value = (e._opacityCurrent != null ? e._opacityCurrent : 1.0) * eased;
+                } else if (typeof e.material.opacity === 'number') {
+                  e.material.transparent = true;
+                  e.material.opacity = (e._opacityCurrent != null ? e._opacityCurrent : 1.0) * eased;
+                }
+              }
+            }
+            for (const tl of affectedToolLinks) {
+              if (tl.material && typeof tl.material.opacity === 'number') {
+                tl.material.opacity = (tl._baseOpacity != null ? tl._baseOpacity : tl.material.opacity) * eased;
+              }
+            }
+
+            if (t < 1) {
+              requestAnimationFrame(step);
+              return;
+            }
+
+            // Tween done — actually tear down resources.
+            for (const id of allIds) {
+              const n = NODES[id];
+              if (n) _removeNodeFromScene(n);
+              delete NODES[id];
+            }
+
+            // Drop affected edges from the EDGES array + scene.
+            for (const e of affectedEdges) {
+              try { if (e.mesh) scene.remove(e.mesh); } catch (_) {}
+              try { if (e.mesh && e.mesh.geometry && e.mesh.geometry.dispose) e.mesh.geometry.dispose(); } catch (_) {}
+              try { if (e.material && e.material.dispose) e.material.dispose(); } catch (_) {}
+            }
+            if (affectedEdges.length) {
+              const drop = new Set(affectedEdges);
+              for (let i = EDGES.length - 1; i >= 0; i--) {
+                if (drop.has(EDGES[i])) EDGES.splice(i, 1);
+              }
+            }
+            for (const tl of affectedToolLinks) {
+              try { if (tl.mesh) scene.remove(tl.mesh); } catch (_) {}
+              try { if (tl.mesh && tl.mesh.geometry && tl.mesh.geometry.dispose) tl.mesh.geometry.dispose(); } catch (_) {}
+              try { if (tl.material && tl.material.dispose) tl.material.dispose(); } catch (_) {}
+            }
+            if (typeof TOOL_LINK_LINES !== 'undefined' && Array.isArray(TOOL_LINK_LINES) && affectedToolLinks.length) {
+              const drop = new Set(affectedToolLinks);
+              for (let i = TOOL_LINK_LINES.length - 1; i >= 0; i--) {
+                if (drop.has(TOOL_LINK_LINES[i])) TOOL_LINK_LINES.splice(i, 1);
+              }
+            }
+
+            // Forget the live-project marker (so a same-id add later
+            // takes the fresh-spawn path instead of the "already present"
+            // flash branch in liveAddProject).
+            try { _liveProjectIds.delete(projectId); _liveProjectIds.delete(slug); } catch (_) {}
+            // Release the in-flight guard now that teardown is done;
+            // a subsequent re-add + remove of the same id should be
+            // able to run its own tween cleanly.
+            try { _projectRemovalInFlight.delete(nodeId); } catch (_) {}
+          }
+          requestAnimationFrame(step);
+        });
+      } catch (e) {
+        // Upgraded from console.warn → console.error: this catch
+        // sits at the OUTER boundary of the handler, so anything
+        // landing here means the fade did NOT run. Silent warns let
+        // those failures hide in the noise; errors surface them.
+        console.error('[iris-sim] handleProjectRemoved fatal:', e, 'projectId=', projectId);
+        // Clear the in-flight marker on outer error so a retry isn't
+        // permanently blocked by a stale guard entry.
+        try {
+          const slugErr = String(projectId || '').toLowerCase().replace(/[^a-z0-9_-]/gi, '-');
+          _projectRemovalInFlight.delete(projectId);
+          _projectRemovalInFlight.delete(slugErr);
+          _projectRemovalInFlight.delete(`proj-${slugErr}`);
+        } catch (_) {}
+      }
+    }
+
+    // ----- node-activity helper (used by handleCortexEvent) -----
+    // Briefly flares a plasma node's intensity + surface displacement
+    // so a generic "this node is doing something" event produces
+    // visible feedback without firing a full pulse. The flare ramps
+    // up instantly (the next render reads the boosted uniforms) and
+    // decays back to base over ~600ms. Idempotent and cheap — re-
+    // triggering during the decay just resets the peak.
+    function liveNodeActivity(nodeId, intensityBoost) {
+      try {
+        const node = NODES[nodeId];
+        if (!node || !node.mat || !node.mat.uniforms) return;
+        const u = node.mat.uniforms;
+        if (!u.uIntensity) return;
+        const base = (typeof node.baseIntensity === 'number') ? node.baseIntensity : 0.6;
+        const baseSurf = (typeof node.baseSurfAmp === 'number') ? node.baseSurfAmp : 0.04;
+        const boost = (typeof intensityBoost === 'number' && isFinite(intensityBoost))
+          ? Math.max(0.1, Math.min(1.8, intensityBoost))
+          : 0.6;
+        const peak = Math.min(2.3, base + boost);
+        u.uIntensity.value = peak;
+        if (u.uSurfaceAmp) u.uSurfaceAmp.value = Math.max(baseSurf, 0.12);
+
+        // Decay back to base intensity over ~600ms. The standard
+        // per-frame plasma updater doesn't reset uIntensity on its
+        // own (firePulse and liveSpawnLeafNear rely on edge-arrival
+        // callbacks or natural overwrite), so we explicitly ramp it.
+        const DECAY_MS = 600;
+        const t0 = performance.now();
+        function decay() {
+          const t = (performance.now() - t0) / DECAY_MS;
+          if (t >= 1) {
+            u.uIntensity.value = base;
+            if (u.uSurfaceAmp) u.uSurfaceAmp.value = baseSurf;
+            return;
+          }
+          const eased = 1 - (t * t * (3 - 2 * t));  // smoothstep, inverted
+          u.uIntensity.value = base + (peak - base) * eased;
+          if (u.uSurfaceAmp) {
+            u.uSurfaceAmp.value = baseSurf + (0.12 - baseSurf) * eased;
+          }
+          requestAnimationFrame(decay);
+        }
+        requestAnimationFrame(decay);
+      } catch (e) {
+        console.warn('[iris-sim] liveNodeActivity failed:', e);
+      }
+    }
+
+    // ----- generic event dispatcher (bridge.event payloads) -----
+    // CortexBridge.event is the primary transport for the new
+    // CortexEventBus flow on the Python side. Each payload is a JSON
+    // object with a `kind` discriminator. We rate-limit per-kind so
+    // a runaway producer can't saturate the renderer (the pulse
+    // system caps at MAX_PULSES_PER_EDGE per edge anyway, but we
+    // also throttle the dispatch loop itself).
+    const _eventRateLimit = Object.create(null);
+    // Counter so we can see at-a-glance in the devtools console whether
+    // events are arriving at all. Logged on first arrival + every 50th.
+    let _cortexEventCount = 0;
+    function handleCortexEvent(evt) {
+      if (!evt || typeof evt !== 'object') return;
+      const kind = evt.kind || evt.type || 'unknown';
+
+      // INSTRUMENTATION: log every incoming event so we can debug
+      // whether the Python emit chain is actually reaching JS. First few
+      // are always logged; afterwards we sample at 1/50 to avoid spam.
+      _cortexEventCount += 1;
+      if (_cortexEventCount <= 20 || _cortexEventCount % 50 === 0) {
+        console.log(
+          '[iris-sim] handleCortexEvent #' + _cortexEventCount +
+          ' kind=' + kind, evt
+        );
+      }
+
+      // Per-kind throttle: max one dispatch per 20ms (50 Hz). Status
+      // changes are infrequent so we exempt them from the throttle.
+      // node.activity and edge.pulse from the Python bus are ALREADY
+      // coalesced server-side; throttling them again here was eating
+      // every other neuron-fire when bursts arrived close together.
+      const _throttleExempt = (
+        kind === 'status_change' || kind === 'state' ||
+        kind === 'core.state' ||
+        kind === 'node.activity' || kind === 'node_activity' ||
+        kind === 'edge.pulse' || kind === 'edge_pulse' ||
+        kind === 'leaf.add' || kind === 'leaf_add'
+      );
+      if (!_throttleExempt) {
+        const now = performance.now();
+        const last = _eventRateLimit[kind] || 0;
+        if (now - last < 20) return;
+        _eventRateLimit[kind] = now;
+      }
+
+      try {
+        // Accept BOTH dotted ('edge.pulse' — what CortexEventBus emits)
+        // and underscored ('edge_pulse' — legacy/test fixtures) forms
+        // so we don't silently drop events when one side renames first.
+        if (kind === 'edge.pulse' || kind === 'edge_pulse') {
+          const from = evt.from || evt.from_id;
+          const to = evt.to || evt.to_id;
+          const color = evt.color || 'cyan';
+          if (from && to) {
+            console.log('[iris-sim] firePulse', from, '→', to, color);
+            firePulse(from, to, color);
+          } else {
+            console.warn('[iris-sim] edge.pulse missing from/to:', evt);
+          }
+        } else if (kind === 'node.activity' || kind === 'node_activity') {
+          const id = evt.node_id || evt.id;
+          // Python's CortexEventBus emits `intensity` (not
+          // `intensity_boost`). Accept either so old callers still work.
+          const intensity = Number(
+            evt.intensity != null ? evt.intensity : evt.intensity_boost
+          );
+          if (id) {
+            console.log('[iris-sim] liveNodeActivity', id, 'intensity=', intensity);
+            liveNodeActivity(id, intensity);
+          } else {
+            console.warn('[iris-sim] node.activity missing id:', evt);
+          }
+        } else if (kind === 'leaf.add' || kind === 'leaf_add' || kind === 'spawn_leaf') {
+          const parent = evt.parent_id || evt.parent || 'cap-tools';
+          const label = evt.label || 'leaf';
+          const ttl = Number(evt.ttl_ms) || 6000;
+          console.log('[iris-sim] liveSpawnLeafNear', parent, label, ttl);
+          liveSpawnLeafNear(parent, label, ttl);
+        } else if (kind === 'node.fade' || kind === 'node_fade') {
+          // Python's bus uses node.fade as a generic "smoothly remove
+          // this node" signal. Route project-shaped ids through the
+          // full project-removal path (handles descendants + edges);
+          // best-effort for everything else.
+          const id = evt.id || evt.node_id;
+          if (id) {
+            console.log('[iris-sim] node.fade', id);
+            try { handleProjectRemoved(id); } catch (_) { /* best-effort */ }
+          }
+        } else if (kind === 'node.spawn' || kind === 'node_spawn') {
+          // Phase-0 spawn handling: tier-1 project-category spawns
+          // route through liveAddProject so the user sees the sphere.
+          // Sub-nodes are best-effort no-ops here (the initial scene
+          // payload covers them); this is mainly so brand-new projects
+          // appear when world_state.add_project fires on an open session.
+          const cat = (evt.category || '').toLowerCase();
+          const id = evt.id || evt.node_id;
+          const label = evt.label || id;
+          if (cat === 'project' && id) {
+            console.log('[iris-sim] node.spawn project →', id, label);
+            liveAddProject(id, label);
+          } else {
+            console.debug('[iris-sim] node.spawn (non-project, ignored)', evt);
+          }
+        } else if (kind === 'core.state' || kind === 'state') {
+          // Drive the core's color/intensity from Python state changes
+          // so the user sees: white=idle, blue=listening, orange=
+          // thinking, purple=speaking. Maps the LiveApiState name
+          // (e.g. 'LISTENING') onto the lowercased CORE_STATES key.
+          try {
+            const stateRaw = String(evt.state || evt.name || '').toLowerCase();
+            // Common LiveApiState → CORE_STATES alias mapping
+            const alias = {
+              off:        'idle',
+              ready:      'idle',
+              listening:  'listening',
+              recording:  'listening',
+              thinking:   'thinking',
+              executing:  'thinking',
+              processing: 'thinking',
+              speaking:   'speaking',
+              outputting: 'speaking',
+              responding: 'speaking',
+            };
+            const target = alias[stateRaw] || (CORE_STATES[stateRaw] ? stateRaw : 'idle');
+            setCoreState(target);
+          } catch (_) { /* best-effort */ }
+        } else if (kind === 'status_change' || kind === 'core.audio') {
+          // Reserved — not driving core state from these.
+        } else {
+          console.debug('[iris-sim] unknown cortex.event kind:', kind, evt);
+        }
+      } catch (e) {
+        console.warn('[iris-sim] handleCortexEvent dispatch failed:', e);
+      }
+    }
+
+    // ----- expose handlers globally so Python can call them via
+    // page().runJavaScript() as a fallback when the QWebChannel signal
+    // path is unreliable (cross-process boundary occasionally drops
+    // signals during heavy GPU activity). Best-effort: try blocks let
+    // page boot continue if anything below is undefined this early.
+    try { window.handleProjectRemoved = handleProjectRemoved; } catch (_) {}
+    try { window.handleCortexEvent = handleCortexEvent; } catch (_) {}
+    try { window.liveAddProject = liveAddProject; } catch (_) {}
+    try { window.liveNodeActivity = liveNodeActivity; } catch (_) {}
+    try { window.firePulse = firePulse; } catch (_) {}
+    try { window.liveSpawnLeafNear = liveSpawnLeafNear; } catch (_) {}
+
+    // ----- bridge connect (deferred, defensive) -----
+    function _connectLiveBridge() {
+      if (typeof QWebChannel === 'undefined') {
+        console.info('[iris-sim] QWebChannel unavailable — running standalone (no live updates)');
+        return;
+      }
+      if (typeof qt === 'undefined' || !qt.webChannelTransport) {
+        console.info('[iris-sim] qt.webChannelTransport unavailable — no bridge');
+        return;
+      }
+      try {
+        new QWebChannel(qt.webChannelTransport, (channel) => {
+          const cortex = channel && channel.objects && channel.objects.cortex;
+          if (!cortex) {
+            console.warn('[iris-sim] no "cortex" object on channel');
+            return;
+          }
+          // INSTRUMENTATION: log everything the bridge exposes so we can
+          // confirm each signal/slot is reachable from JS. Helps diagnose
+          // "signal silently dropped" failures by showing whether the
+          // signal name even exists.
+          try {
+            console.log(
+              '[iris-sim] cortex bridge connected, signals:',
+              Object.keys(cortex)
+            );
+          } catch (_) { /* logging is best-effort */ }
+
+          // Per-event-type signals (additive — bridge.event is still the
+          // primary transport for the existing CortexEventBus flow).
+          if (cortex.projectAdded && cortex.projectAdded.connect) {
+            cortex.projectAdded.connect((jsonStr) => {
+              try {
+                const p = JSON.parse(jsonStr || '{}');
+                liveAddProject(p.project_id, p.label || p.project_id);
+                if (typeof setStatus === 'function') {
+                  setStatus(`New project: ${p.label || p.project_id}`, 'firing');
+                }
+              } catch (e) {
+                console.error('[iris-sim] projectAdded parse failed:', e);
+              }
+            });
+          }
+          if (cortex.projectRemoved && cortex.projectRemoved.connect) {
+            cortex.projectRemoved.connect((jsonStr) => {
+              console.log('[iris-sim] projectRemoved signal received:', jsonStr);
+              try {
+                const p = JSON.parse(jsonStr || '{}');
+                handleProjectRemoved(p.project_id);
+                if (typeof setStatus === 'function') {
+                  setStatus(`Removed project: ${p.label || p.project_id}`, 'firing');
+                }
+              } catch (e) {
+                console.error('[iris-sim] projectRemoved parse failed:', e);
+              }
+            });
+            console.log('[iris-sim] projectRemoved listener attached');
+          } else {
+            console.warn('[iris-sim] cortex.projectRemoved missing or unconnectable');
+          }
+          if (cortex.leafAdded && cortex.leafAdded.connect) {
+            cortex.leafAdded.connect((jsonStr) => {
+              try {
+                const p = JSON.parse(jsonStr || '{}');
+                // Anchor leaf to the detected project (proj-<slug>), or
+                // fall back to cap-tools when no project context exists.
+                const slug = (p.project_id || '').toLowerCase().replace(/[^a-z0-9_-]/gi, '-');
+                const projNodeId = slug ? `proj-${slug}` : null;
+                const parentId = (projNodeId && NODES[projNodeId]) ? projNodeId : 'cap-tools';
+                liveSpawnLeafNear(parentId, p.label || 'file', 8000);
+              } catch (e) {
+                console.error('[iris-sim] leafAdded parse failed:', e);
+              }
+            });
+          }
+          if (cortex.toolUsed && cortex.toolUsed.connect) {
+            cortex.toolUsed.connect((jsonStr) => {
+              try {
+                const p = JSON.parse(jsonStr || '{}');
+                liveSpawnLeafNear('cap-tools', p.label || p.tool || 'tool', 5000);
+              } catch (e) {
+                console.error('[iris-sim] toolUsed parse failed:', e);
+              }
+            });
+          }
+          if (cortex.patternAdded && cortex.patternAdded.connect) {
+            cortex.patternAdded.connect((jsonStr) => {
+              try {
+                const p = JSON.parse(jsonStr || '{}');
+                liveSpawnLeafNear('mem-patterns', p.label || 'pattern', 7000);
+              } catch (e) {
+                console.error('[iris-sim] patternAdded parse failed:', e);
+              }
+            });
+          }
+
+          // Generic event channel — bridge.event is the primary
+          // transport for the CortexEventBus flow on the Python side.
+          // The discrete signals above remain wired for back-compat
+          // (and to bypass the JSON.parse on hot paths), but anything
+          // new should arrive here so we don't need to add another
+          // signal-per-event-kind every time the bus grows.
+          if (cortex.event && cortex.event.connect) {
+            cortex.event.connect((jsonStr) => {
+              try {
+                const evt = JSON.parse(jsonStr || '{}');
+                handleCortexEvent(evt);
+              } catch (e) {
+                console.error('[iris-sim] cortex.event parse failed:', e);
+              }
+            });
+            console.log('[iris-sim] cortex.event listener attached');
+          } else {
+            console.warn('[iris-sim] cortex.event missing or unconnectable');
+          }
+
+          // Tell the bridge we're ready (also unsuspends any CortexEventBus
+          // queued on the Python side — harmless if no bus is wired).
+          try { if (cortex.jsReady) cortex.jsReady(); } catch (_) { /* optional */ }
+          console.info('[iris-sim] live cortex bridge connected');
+        });
+      } catch (e) {
+        console.warn('[iris-sim] live bridge setup failed:', e);
+      }
+    }
+    _connectLiveBridge();
+  </script>
+</body>
+</html>

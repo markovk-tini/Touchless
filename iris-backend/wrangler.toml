@@ -1,0 +1,21 @@
+name = "iris-backend"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+
+# Run `wrangler d1 create iris` and paste the returned database_id here.
+[[d1_databases]]
+binding = "DB"
+database_name = "iris"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[vars]
+# Realtime model the broker mints sessions for. Overridable without code.
+REALTIME_MODEL = "gpt-realtime"
+# Where to send users who hit their quota.
+UPGRADE_URL = "https://touchless-control.com/pricing"
+# New-session quota window length in seconds (30 days). Usage resets per window.
+QUOTA_PERIOD_SECONDS = "2592000"
+
+# Secrets (set with `wrangler secret put`, NOT here):
+#   OPENAI_API_KEY      - your real OpenAI key (used only to mint ephemeral tokens)
+#   STRIPE_WEBHOOK_SECRET - for verifying Stripe webhook signatures (later)

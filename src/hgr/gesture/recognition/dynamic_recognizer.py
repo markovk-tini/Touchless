@@ -27,11 +27,16 @@ class DynamicGestureRecognizer:
         self._blocked_horizontal_label: str | None = None
         self._blocked_horizontal_until = 0.0
         self.low_fps_mode = bool(low_fps_mode)
+        # Index-only horizontal swipe for drawing undo/clear. Not
+        # exposed as dynamic_label — builtin swipe_left/right are
+        # open-hand only so they don't collide with custom "1 swipe".
+        self.last_one_pose_horizontal_label: str = "neutral"
 
     def reset(self) -> None:
         self.history.clear()
         self._blocked_horizontal_label = None
         self._blocked_horizontal_until = 0.0
+        self.last_one_pose_horizontal_label = "neutral"
 
     def _effective_low_fps(self) -> bool:
         """True when swipes should use the relaxed (low-fps) gates — either the
@@ -84,10 +89,17 @@ class DynamicGestureRecognizer:
         return clamp01((0.56 * index_gate + 0.44 * folded_avg) * (0.34 + 0.66 * finger_count_gate))
 
     def update(self, hand: HandReading, timestamp: float) -> tuple[str, tuple[GestureCandidate, ...], dict[str, float]]:
-        primary_open = (hand.fingers["index"].openness + hand.fingers["middle"].openness) / 2.0
-        support_open = (hand.fingers["ring"].openness + hand.fingers["pinky"].openness) / 2.0
-        primary_confidence = (hand.fingers["index"].confidence + hand.fingers["middle"].confidence) / 2.0
-        pose_gate = clamp01(0.55 * primary_open + 0.20 * support_open + 0.25 * primary_confidence)
+        # Open-hand swipe: index AND middle must be extended. Averaging
+        # let index-only ("one") score ~0.5 and fire builtin swipe_right,
+        # colliding with custom "1 swipe right". Match the core
+        # classifier: min(index, middle) plus some ring/pinky support.
+        index_open = float(hand.fingers["index"].openness)
+        middle_open = float(hand.fingers["middle"].openness)
+        ring_open = float(hand.fingers["ring"].openness)
+        pinky_open = float(hand.fingers["pinky"].openness)
+        primary_open_gate = clamp01((min(index_open, middle_open) - 0.52) / 0.20)
+        support_open_gate = clamp01((max(ring_open, pinky_open) - 0.34) / 0.28)
+        pose_gate = clamp01(primary_open_gate * (0.55 + 0.45 * support_open_gate))
         one_pose_gate = self._one_pose_gate(hand)
         self.history.append(
             MotionSample(
@@ -102,6 +114,7 @@ class DynamicGestureRecognizer:
         effective_low_fps = self._effective_low_fps()
         min_samples = 3 if effective_low_fps else 4
         if len(self.history) < min_samples:
+            self.last_one_pose_horizontal_label = "neutral"
             return "neutral", tuple(), {}
 
         if timestamp >= self._blocked_horizontal_until:
@@ -138,9 +151,16 @@ class DynamicGestureRecognizer:
             if step[0] < -step_threshold:
                 negative_x_steps += 1
 
-        pose_strength = sum(sample.pose_gate for sample in window) / len(window)
+        # Builtin swipe_left/right: open-hand pose only. Index-only
+        # horizontal motion is scored separately for drawing undo/clear
+        # and is NOT published as dynamic_label.
+        open_pose_strength = sum(sample.pose_gate for sample in window) / len(window)
+        one_pose_strength = sum(sample.one_pose_gate for sample in window) / len(window)
         straightness = clamp01(abs(horizontal) / max(path, 1e-6))
-        horizontal_axis_gate = clamp01(((abs(horizontal) / max(vertical + 0.62 * depth, 1e-6)) - 1.35) / 0.90)
+        # Circles have comparable X and Y travel. Require a clearly
+        # horizontal axis (was 1.35) so an arc of a loop cannot pass
+        # as swipe_left/right.
+        horizontal_axis_gate = clamp01(((abs(horizontal) / max(vertical + 0.62 * depth, 1e-6)) - 1.75) / 0.80)
         if effective_low_fps:
             horizontal_min_duration_gate = clamp01((duration - 0.04) / 0.05)
             horizontal_max_duration_gate = clamp01((1.25 - duration) / 0.50)
@@ -163,44 +183,58 @@ class DynamicGestureRecognizer:
             path_floor_r = 0.34
             path_floor_l = 0.32
         else:
-            right_h_floor = 0.67
-            left_h_floor = 0.61
-            speed_floor_r = 1.35
-            speed_floor_l = 1.22
-            path_floor_r = 0.80
-            path_floor_l = 0.76
-        right_score = clamp01(
-            (
-                0.32 * clamp01((horizontal - right_h_floor) / 0.26)
-                + 0.18 * clamp01((path - path_floor_r) / 0.46)
-                + 0.16 * clamp01((peak_horizontal_speed - speed_floor_r) / 0.95)
-                + 0.14 * clamp01((horizontal - 1.08 * vertical - 0.66 * depth - 0.06) / 0.24)
-                + 0.10 * straightness
-                + 0.10 * clamp01((0.24 - vertical_noise) / 0.18)
+            # r52: loosened Normal-mode swipe geometry and speed
+            # floors so an ordinary committed swipe registers on
+            # the first try. Prior values (0.67/0.61, 1.35/1.22,
+            # 0.80/0.76) required nearly a full-palm sweep at
+            # 1.2+ palm/s — casual users had to over-swipe. New
+            # floors still sit well above Low-FPS's permissive
+            # values (0.28/0.27, 0.44/0.40, 0.34/0.32) so idle
+            # hand drift still fails the horizontal gates.
+            right_h_floor = 0.50
+            left_h_floor = 0.46
+            speed_floor_r = 0.95
+            speed_floor_l = 0.85
+            path_floor_r = 0.60
+            path_floor_l = 0.58
+
+        def _horizontal_scores(pose_strength: float) -> tuple[float, float]:
+            right = clamp01(
+                (
+                    0.32 * clamp01((horizontal - right_h_floor) / 0.26)
+                    + 0.18 * clamp01((path - path_floor_r) / 0.46)
+                    + 0.16 * clamp01((peak_horizontal_speed - speed_floor_r) / 0.95)
+                    + 0.14 * clamp01((horizontal - 1.45 * vertical - 0.66 * depth - 0.06) / 0.24)
+                    + 0.10 * straightness
+                    + 0.10 * clamp01((0.16 - vertical_noise) / 0.14)
+                )
+                * (0.28 + 0.72 * pose_strength)
+                * horizontal_duration_gate
+                * horizontal_commit_gate
+                * positive_x_gate
+                * horizontal_axis_gate
+                * clamp01((0.26 - depth_noise) / 0.20)
             )
-            * (0.28 + 0.72 * pose_strength)
-            * horizontal_duration_gate
-            * horizontal_commit_gate
-            * positive_x_gate
-            * horizontal_axis_gate
-            * clamp01((0.26 - depth_noise) / 0.20)
-        )
-        left_score = clamp01(
-            (
-                0.32 * clamp01(((-horizontal) - left_h_floor) / 0.30)
-                + 0.18 * clamp01((path - path_floor_l) / 0.50)
-                + 0.16 * clamp01((peak_horizontal_speed - speed_floor_l) / 1.00)
-                + 0.14 * clamp01(((-horizontal) - 1.00 * vertical - 0.62 * depth - 0.04) / 0.26)
-                + 0.10 * straightness
-                + 0.10 * clamp01((0.26 - vertical_noise) / 0.20)
+            left = clamp01(
+                (
+                    0.32 * clamp01(((-horizontal) - left_h_floor) / 0.30)
+                    + 0.18 * clamp01((path - path_floor_l) / 0.50)
+                    + 0.16 * clamp01((peak_horizontal_speed - speed_floor_l) / 1.00)
+                    + 0.14 * clamp01(((-horizontal) - 1.40 * vertical - 0.62 * depth - 0.04) / 0.26)
+                    + 0.10 * straightness
+                    + 0.10 * clamp01((0.16 - vertical_noise) / 0.16)
+                )
+                * (0.28 + 0.72 * pose_strength)
+                * horizontal_duration_gate
+                * horizontal_commit_gate
+                * negative_x_gate
+                * horizontal_axis_gate
+                * clamp01((0.28 - depth_noise) / 0.22)
             )
-            * (0.28 + 0.72 * pose_strength)
-            * horizontal_duration_gate
-            * horizontal_commit_gate
-            * negative_x_gate
-            * horizontal_axis_gate
-            * clamp01((0.28 - depth_noise) / 0.22)
-        )
+            return left, right
+
+        left_score, right_score = _horizontal_scores(open_pose_strength)
+        drawing_left, drawing_right = _horizontal_scores(one_pose_strength)
 
         repeat_score = 0.0
         circle_window = list(self.history)[-12:]
@@ -250,6 +284,32 @@ class DynamicGestureRecognizer:
                 * circle_duration_gate
             )
 
+        # A looping path reverses in X and travels in Y. That is a
+        # circle / arc, not a committed swipe — even when one short
+        # window of the loop looks mostly horizontal.
+        plus_x = minus_x = plus_y = minus_y = 0
+        loop_window = list(self.history)[-12:]
+        for prev, current in zip(loop_window, loop_window[1:]):
+            scale = max(current.scale, 1e-6)
+            dx = float(current.center[0] - prev.center[0]) / scale
+            dy = float(current.center[1] - prev.center[1]) / scale
+            tip_dx = float(current.index_tip[0] - prev.index_tip[0]) / scale
+            tip_dy = float(current.index_tip[1] - prev.index_tip[1]) / scale
+            if dx > 0.02 or tip_dx > 0.02:
+                plus_x += 1
+            if dx < -0.02 or tip_dx < -0.02:
+                minus_x += 1
+            if dy > 0.02 or tip_dy > 0.02:
+                plus_y += 1
+            if dy < -0.02 or tip_dy < -0.02:
+                minus_y += 1
+        if min(plus_x, minus_x) >= 2 and min(plus_y, minus_y) >= 1:
+            left_score = 0.0
+            right_score = 0.0
+        elif repeat_score >= 0.40 and repeat_score + 0.02 >= max(left_score, right_score):
+            left_score = 0.0
+            right_score = 0.0
+
         if self._blocked_horizontal_label == "swipe_left" and timestamp < self._blocked_horizontal_until:
             left_score = 0.0
         if self._blocked_horizontal_label == "swipe_right" and timestamp < self._blocked_horizontal_until:
@@ -268,7 +328,18 @@ class DynamicGestureRecognizer:
             )
         )
         best = ranked[0] if ranked else GestureCandidate("neutral", 0.0, "dynamic")
-        score_floor = 0.34 if effective_low_fps else 0.59
+        # r52: Normal score_floor 0.59 → 0.48. Swipes scoring in the
+        # 0.45-0.55 band (moderate committed motion) were silently
+        # dropped to "neutral". 0.48 still sits ~14 pts above the
+        # neutral noise band.
+        score_floor = 0.34 if effective_low_fps else 0.48
+        drawing_best_score = max(drawing_left, drawing_right)
+        if drawing_best_score >= score_floor:
+            self.last_one_pose_horizontal_label = (
+                "swipe_right" if drawing_right >= drawing_left else "swipe_left"
+            )
+        else:
+            self.last_one_pose_horizontal_label = "neutral"
         if best.score < score_floor:
             return "neutral", ranked, scores
 

@@ -81,6 +81,14 @@ hiddenimports += [
     "PySide6.QtWidgets",
     "PySide6.QtMultimedia",
     "PySide6.QtMultimediaWidgets",
+    # Google Picker dialog (app/ui/google_picker_dialog.py) hosts the
+    # Picker widget inside a QWebEngineView and bridges the PICKED
+    # file_id back to Python via QWebChannel. QtWebEngineWidgets is
+    # already collected by the collect_all("PySide6.QtWebEngineWidgets")
+    # block above, but the WebChannel module is separate — listing it
+    # here ensures the frozen bundle can register the pickerBridge
+    # object even if collect_all misses it on a stripped PySide6 build.
+    "PySide6.QtWebChannel",
     # ---- Iris ambient-tools deps (zero-setup for end users) ----------
     # Each is optional at runtime (graceful degrade), but we want them
     # PRESENT in the build so a shipped user gets toast / per-app volume
@@ -243,11 +251,18 @@ def _collect_whisper_runtime(roots):
     # Store-policy compliant, unlike an install-time downloader).
     # Channel is read from TOUCHLESS_BUILD_CHANNEL (set by
     # build_windows.bat: 'store' when STORE=1, else 'website').
+    # v1.1.7.6 (dad rig 2026-08-21): removed medium.en from the website
+    # allowlist. Shipping the 1.5 GB medium.en model in the installer
+    # bloated the payload from ~1.75 GB (1.1.7) to ~3.16 GB (1.1.7.5),
+    # and Windows Defender flagged the unsigned 1.5 GB binary blob during
+    # extraction — dad's install failed 3× with "failed to extract"
+    # errors. Behavior now matches the Store build: ship only small.en
+    # (~490 MB, sufficient for the default dictation flow), and let
+    # users who want higher accuracy pull medium.en at runtime via the
+    # in-app "Voice Recognition Upgrade" download. Same code path the
+    # Store build already used; no functional regression.
     _channel_for_models = os.environ.get("TOUCHLESS_BUILD_CHANNEL", "website").strip().lower()
-    if _channel_for_models == "store":
-        MODEL_ALLOWLIST = {"ggml-small.en.bin"}
-    else:
-        MODEL_ALLOWLIST = {"ggml-small.en.bin", "ggml-medium.en.bin"}
+    MODEL_ALLOWLIST = {"ggml-small.en.bin"}
     collected = []
     seen_models: set[str] = set()
     seen_binaries: set[tuple[str, str]] = set()
@@ -361,6 +376,68 @@ a = Analysis(
     ],
     noarchive=False,
 )
+
+# --- Never ship Windows' own runtime libraries (1.1.9 stop-ship) ------------
+# PyInstaller resolves each binary's DLL imports by searching the build
+# machine's PATH. Whatever it finds gets copied into `_internal/`, which is on
+# the frozen app's DLL search path AHEAD of System32 — so a stray build-machine
+# DLL silently shadows the system one for every user.
+#
+# That is exactly how 1.1.9 shipped broken. PySide6 6.10+ made Qt6Core.dll a
+# hard (non-delay-load) importer of `icuuc.dll`, and the PySide6 wheel ships no
+# ICU at all — upstream expects Windows' own ICU (System32, Windows 10 1703+).
+# The 1.1.9 build ran from a shell where Anaconda's `Library\bin` was reachable,
+# so PyInstaller bundled conda's ICU 73. That build exports version-SUFFIXED
+# symbols (`ucnv_open_73`), while Qt imports the plain names (`ucnv_open`), so
+# every launch died with:
+#     ImportError: DLL load failed while importing QtGui:
+#     The specified procedure could not be found.
+# 1.1.8.1 was built without conda on PATH, bundled no ICU, and worked — the Qt
+# binaries are byte-identical between the two releases, so the ONLY difference
+# was the build environment. Bundling ICU is also wrong even when the symbols
+# match: a newer Windows `icuuc.dll` is a stub that forwards to `icu.dll`, which
+# doesn't exist on older Windows, so copying it breaks those machines too.
+#
+# `ucrtbase.dll` + the `api-ms-win-*.dll` stubs are the same class of bug. They
+# shipped in earlier releases without an obvious failure, but they load a SECOND
+# C runtime alongside System32's (both were confirmed mapped into the running
+# process), giving the process two CRT heaps and two locale states — a known
+# source of `0xc0000409` __fastfail aborts. Windows 10+ always provides these,
+# so drop them and use exactly one system CRT.
+#
+# Filtering here rather than sanitising PATH in build_windows.bat keeps the
+# guarantee attached to the build definition, so a build started from any shell
+# (conda-activated or not) produces the same bundle.
+def _is_system_runtime_dll(dest_path: str) -> bool:
+    name = Path(dest_path).name.lower()
+    if name.startswith("api-ms-win-") and name.endswith(".dll"):
+        return True
+    if name == "ucrtbase.dll":
+        return True
+    # icuuc.dll / icuin.dll / icudt73.dll / icu.dll and their versioned names.
+    if name.endswith(".dll") and name.startswith(("icuuc", "icuin", "icudt", "icu.")):
+        return True
+    return False
+
+
+_stripped_system_dlls = sorted(
+    Path(entry[0]).name for entry in a.binaries if _is_system_runtime_dll(entry[0])
+)
+a.binaries = [entry for entry in a.binaries if not _is_system_runtime_dll(entry[0])]
+print(
+    f"[spec] stripped {len(_stripped_system_dlls)} build-machine system DLL(s) "
+    f"so the app uses Windows' own copies: "
+    + ", ".join(_stripped_system_dlls[:6])
+    + (" ..." if len(_stripped_system_dlls) > 6 else "")
+)
+for _required_system_dll in ("icuuc.dll", "ucrtbase.dll"):
+    if any(
+        Path(entry[0]).name.lower() == _required_system_dll for entry in a.binaries
+    ):
+        raise RuntimeError(
+            f"{_required_system_dll} is still in the bundle — the system-DLL "
+            "filter above did not catch it. Shipping it will break startup."
+        )
 
 pyz = PYZ(a.pure)
 

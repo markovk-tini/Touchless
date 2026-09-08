@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...config.app_config import save_config
-from .window_chrome import apply_touchless_chrome
+from .window_chrome import apply_touchless_chrome, install_indigo_chrome
 
 
 class _PageStack(QStackedWidget):
@@ -203,6 +203,16 @@ class SpotifySetupWizard(QDialog):
         self._text_color = str(getattr(config, "text_color", "") or "#E5F6FF")
         self.setWindowTitle("Set up your own Spotify app")
         self.setModal(True)
+        # v1.1.7.11: allow user resizing. The corner size grip works
+        # even with the frameless indigo chrome (Qt paints the grip on
+        # top of whatever child widgets sit at the corner). Combined
+        # with the setMinimumSize path in _apply_fixed_size_for_page,
+        # this lets users enlarge the dialog past the per-page minimum
+        # if they want more room to read.
+        try:
+            self.setSizeGripEnabled(True)
+        except Exception:
+            pass
         # Explicit per-page dialog sizes. Qt's layout-driven sizing
         # (adjustSize, SetFixedSize) was leaving the dialog far taller
         # than the visible page needed — word-wrap QLabels report a
@@ -211,15 +221,32 @@ class SpotifySetupWizard(QDialog):
         # minimum size, regardless of how the layout signals are
         # configured. Hardcoded setFixedSize() per page sidesteps all
         # of that: the dialog IS this size on each page, end of story.
+        # v1.1.7.11: page 0 always shows the Reconnect frame + copy,
+        # so the base height needs headroom for the frame (title +
+        # body + button + margins ~= 160 px on top of the pre-frame
+        # content). Values are the MINIMUM per page — dialog is now
+        # user-resizable (see _apply_min_size_for_page below) so users
+        # can enlarge if they want more room.
         self._page_sizes = {
-            0: (560, 340),   # intro — trimmed body (4 lines + spacer)
+            0: (560, 520),
             1: (680, 900),   # paste values — Step 1 fallback nav, URI list, Steps 2+3
             2: (560, 400),   # collect Client ID — title + body + input + tip
         }
-        # Touchless-themed title bar (Win11 DWM caption color) + the
-        # surface color from app config so the wizard matches the rest
-        # of the settings UI.
-        apply_touchless_chrome(self)
+        # r51: was apply_touchless_chrome (DWM caption color, Win11
+        # only — dad on Win10 saw white/black chrome). Now uses the
+        # frameless indigo bar so it renders identically on Win10
+        # AND Win11. Content goes on `body` (the QWidget returned by
+        # install_indigo_chrome) instead of `self`.
+        body = install_indigo_chrome(self, "Set up your own Spotify app")
+        # r51 fix: scope background to `body` itself. Naked
+        # `background: X` on a widget's stylesheet cascades as a
+        # universal `* { background: X }` rule onto descendants,
+        # marking child QPushButtons as "user-styled". Qt then drops
+        # the native paint and, because no `color:`/`border:` are set
+        # on the cascade, the wizard's Next/Finish primary buttons
+        # rendered as invisible flat clickable areas.
+        body.setObjectName("wizardBody")
+        body.setStyleSheet(f"QWidget#wizardBody {{ background: {self._surface}; }}")
         self.setStyleSheet(
             f"QDialog {{ background: {self._surface}; }}"
             f"QLabel {{ color: {self._text_color}; font-size: 13px; }}"
@@ -251,7 +278,7 @@ class SpotifySetupWizard(QDialog):
             "QPushButton#wizardSecondary:hover { color: #E5F6FF; }"
         )
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(body)
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(16)
 
@@ -315,12 +342,24 @@ class SpotifySetupWizard(QDialog):
         self._apply_fixed_size_for_page(self._current_page_index)
 
     def _apply_fixed_size_for_page(self, page_index: int) -> None:
-        """Lock the dialog to this page's target size."""
+        """v1.1.7.11: dialog is now user-resizable — apply a MINIMUM
+        size floor per page (so a page with tall content, like page 1,
+        still opens tall enough) but no upper bound, so the user can
+        drag the corners to enlarge. Also call resize() so the initial
+        geometry matches the minimum on first show / page swap.
+        """
         target = self._page_sizes.get(page_index)
         if target is None:
             return
         w, h = target
-        self.setFixedSize(w, h)
+        try:
+            # Clear any prior fixed size latch before switching pages —
+            # if we don't, Qt keeps the previous page's maximum.
+            self.setMaximumSize(16777215, 16777215)
+            self.setMinimumSize(w, h)
+            self.resize(max(self.width(), w), max(self.height(), h))
+        except Exception:
+            pass
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt API name)
         """Re-apply the page's fixed size every time the dialog is
@@ -339,11 +378,9 @@ class SpotifySetupWizard(QDialog):
         belt-and-braces guarantees the indigo title bar."""
         super().showEvent(event)
         QTimer.singleShot(0, lambda: self._apply_fixed_size_for_page(self._current_page_index))
-        # Re-apply title-bar theme now that HWND is definitely valid.
-        try:
-            apply_touchless_chrome(self)
-        except Exception:
-            pass
+        # r51: the frameless indigo bar is painted at construction
+        # time, no HWND-dependent DWM call needed. Left as a no-op
+        # placeholder so any downstream showEvent hooks stay stable.
 
     # ---- page builders ------------------------------------------------
 
@@ -365,17 +402,61 @@ class SpotifySetupWizard(QDialog):
         lay.addWidget(title)
 
         body = _TightWrapLabel(
-            "Three quick steps:<br>"
+            "Three quick steps — click <b>Next</b> below to walk through them:<br>"
             "<b>1.</b> Open the Spotify Developer Dashboard.<br>"
             "<b>2.</b> Paste the values shown on the next page.<br>"
             "<b>3.</b> Paste the resulting Client ID back here.<br><br>"
-            "Your Spotify password never leaves Spotify."
+            "Your Spotify password never leaves Spotify. When the "
+            "wizard finishes it opens the browser sign-in automatically."
         )
         body.setObjectName("wizardBody")
         body.setWordWrap(True)
         body.setTextFormat(Qt.RichText)
         body.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         lay.addWidget(body)
+
+        # v1.1.7.11: Reconnect section — always visible on page 0, sits
+        # just above the Need More Help button. Button is always
+        # enabled: the controller has a client_id either from the
+        # user's own wizard (config.spotify_client_id) OR the embedded
+        # default that ships with Touchless, so PKCE can run in both
+        # cases. If neither exists (extremely rare — implies shipped-
+        # build corruption), authorize_full_scopes surfaces a
+        # NO_CLIENT_ID error via the existing error dialog.
+        reconnect_frame = QFrame()
+        reconnect_frame.setObjectName("wizardReconnectFrame")
+        reconnect_frame.setStyleSheet(
+            "QFrame#wizardReconnectFrame {"
+            f"  background: rgba(29, 233, 182, 0.06);"
+            f"  border: 1px solid rgba(29, 233, 182, 0.35);"
+            "  border-radius: 10px;"
+            "}"
+        )
+        rc_lay = QVBoxLayout(reconnect_frame)
+        rc_lay.setContentsMargins(14, 12, 14, 12)
+        rc_lay.setSpacing(8)
+        rc_title = QLabel("Already set up? Reconnect to Spotify")
+        rc_title.setStyleSheet(
+            f"color: {self._accent}; font-size: 15px; font-weight: 800;"
+        )
+        rc_lay.addWidget(rc_title)
+        rc_body = _TightWrapLabel(
+            "Spotify sometimes expires the sign-in — click below to "
+            "reconnect in about 5 seconds. Only needed if controls "
+            "stopped working."
+        )
+        rc_body.setStyleSheet(
+            f"color: {self._text_color}; font-size: 12px;"
+        )
+        rc_body.setWordWrap(True)
+        rc_body.setTextFormat(Qt.RichText)
+        rc_lay.addWidget(rc_body)
+        reconnect_btn = QPushButton("Reconnect Spotify now")
+        reconnect_btn.setObjectName("wizardPrimary")
+        reconnect_btn.setCursor(Qt.PointingHandCursor)
+        reconnect_btn.clicked.connect(self._trigger_reconnect_from_wizard)
+        rc_lay.addWidget(reconnect_btn, 0, Qt.AlignLeft)
+        lay.addWidget(reconnect_frame)
 
         help_btn = QPushButton("Need more help? Open the setup guide on the Touchless website")
         help_btn.setObjectName("wizardSecondary")
@@ -386,6 +467,23 @@ class SpotifySetupWizard(QDialog):
         # sizeHint to be its actual content height so the dialog hugs
         # the visible page.
         return page
+
+    def _trigger_reconnect_from_wizard(self) -> None:
+        """v1.1.7.11: fire the PKCE reconnect flow on the parent
+        MainWindow (same method the removed 'Connect Spotify' Settings
+        button used) and close the wizard immediately — the browser
+        auth screen takes over from here."""
+        try:
+            parent = self.parent()
+            handler = getattr(parent, "_on_connect_spotify_clicked", None)
+            if callable(handler):
+                handler()
+        except Exception:
+            pass
+        try:
+            self.accept()
+        except Exception:
+            pass
 
     def _build_page_values(self) -> QWidget:
         page = QWidget()

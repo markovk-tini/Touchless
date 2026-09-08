@@ -209,6 +209,9 @@ class GestureClassifier:
         self._sample_to_local_idx = []
         rows: List[List[float]] = []
         for g_idx, g in enumerate(self._gestures):
+            # Static runner only — dynamic / pose_sequence use other runtimes.
+            if str(getattr(g, "kind", "static") or "static") != "static":
+                continue
             for s_idx, sample in enumerate(g.samples):
                 rows.append(sample.features)
                 self._sample_to_gesture_idx.append(g_idx)
@@ -290,6 +293,20 @@ class GestureClassifier:
             runner_up_name=runner_up_name,
             runner_up_score=runner_up_score,
         )
+
+    def raw_score(self, feature_vector: Sequence[float]) -> float:
+        """Best sample score for an already-normalized feature vector,
+        ignoring the match threshold. Pose-sequence uses this to compare
+        adjacent steps (3 vs 2) so a fold can leave step 1."""
+        if self._matrix is None:
+            self.reload()
+        if self._matrix is None or self._matrix.size == 0:
+            return 0.0
+        q = np.array(feature_vector, dtype=np.float32, copy=True)
+        _apply_region_weights(q)
+        diffs = self._matrix - q
+        distances = np.linalg.norm(diffs, axis=1)
+        return _distance_to_score(float(np.min(distances)))
 
     def classify(
         self,

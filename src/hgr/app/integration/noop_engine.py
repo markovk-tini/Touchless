@@ -97,6 +97,28 @@ def _parse_dictation_command(text: str) -> Optional[str]:
         return "paragraph"
     return None
 
+
+# Left-hand "one" (voice listen) is a *held* pose, not a swipe. Net palm
+# travel is measured in palm-scale units from the start of the hold.
+# Landmark jitter is typically ~0.05–0.12; a small drift while holding
+# is fine. A committed swipe is usually >0.6. This cap sits in between
+# so the gate is not "perfectly still".
+_VOICE_ONE_MAX_HOLD_TRAVEL_PALM = 0.40
+
+
+def _palm_net_travel_exceeds(
+    origin_xy: tuple[float, float],
+    current_xy: tuple[float, float],
+    palm_scale: float,
+    *,
+    max_travel: float = _VOICE_ONE_MAX_HOLD_TRAVEL_PALM,
+) -> bool:
+    scale = max(float(palm_scale), 1e-6)
+    dx = (float(current_xy[0]) - float(origin_xy[0])) / scale
+    dy = (float(current_xy[1]) - float(origin_xy[1])) / scale
+    return math.hypot(dx, dy) > max_travel
+
+
 _DICTATION_TRAILING_HALLUCINATIONS = {"the", "you", "and", "a"}
 
 _WHISPER_STOCK_HALLUCINATIONS = (
@@ -433,6 +455,7 @@ class _EngineRunner:
         self._current_engine: GestureRecognitionEngine | None = None
         self._busy = False
         self._result_callback = None
+        self._post_infer = None
 
     @property
     def busy(self) -> bool:
@@ -533,6 +556,16 @@ class _EngineRunner:
                 result = None
             finally:
                 self._busy = False
+            # GPU/Lite custom-gesture MediaPipe must not run on the
+            # GUI thread — it was pulling camera display from ~50 fps
+            # toward ~30. Attach landmarks here so _on_engine_result
+            # only classifies.
+            post = self._post_infer
+            if post is not None and result is not None:
+                try:
+                    post(frame, result)
+                except Exception:
+                    traceback.print_exc()
             inference_seconds = time.perf_counter() - inference_start
             found = bool(getattr(result, "found", False)) if result is not None else False
             log_samples.append((inference_seconds, found))
@@ -560,6 +593,13 @@ class _EngineRunner:
                     cb(frame, result)
                 except Exception:
                     traceback.print_exc()
+
+
+# Fire-once static poses (open Chrome / Spotify / Touchless, mode
+# toggles, voice, clip) must be held this long before the action
+# runs. Continuous poses (volume, wheels, mouse-once-on) keep their
+# own timings.
+_STATIC_GESTURE_HOLD_SECONDS = 1.0
 
 
 class GestureWorker(QObject):
@@ -692,8 +732,26 @@ class GestureWorker(QObject):
     # min_cutoff lowered 1.2 -> 0.6: at rest the cursor was still drifting
     # / shaking (hand tremor leaking through); 0.6 Hz holds it much steadier
     # when the hand is held still. beta keeps fast strokes responsive.
-    _DRAWING_OEF_MIN_CUTOFF = 0.6
-    _DRAWING_OEF_BETA = 0.6
+    # r53 v2: min_cutoff 0.6 -> 0.35. After the beta drop, residual
+    # drift after motion was still visible because at-rest cutoff was
+    # still 0.6 Hz — hand tremor and MediaPipe jitter leaked through
+    # for a beat after the user stopped. 0.35 doubles at-rest
+    # smoothing without pushing lag noticeably higher.
+    _DRAWING_OEF_MIN_CUTOFF = 0.35
+    # r53 v6: beta 0.15 -> 0.35 to unstick the cursor on fast
+    # strokes. 0.15 was too fixed-low-pass — every quick swipe or
+    # letter loop lagged behind the finger by 60-100 ms and the
+    # cursor didn't fully catch up. 0.35 is between yesterday's
+    # 0.6 (jaggy curves) and my r53 0.15 (laggy fast): OneEuro's
+    # cutoff climbs enough with velocity that fast strokes track
+    # in real time, but the base 0.35 Hz cutoff still gives clean
+    # steady-state circles at slow speeds.
+    _DRAWING_OEF_BETA = 0.35
+    # r53 v2: minimum pixel movement before a new stroke sample is
+    # committed. Kills residual drift when the hand is held still —
+    # any point closer than this to the previously committed point
+    # is dropped, so hand tremor at rest doesn't turn into ink.
+    _DRAWING_MIN_MOVE_PX = 3.0
     # Suggestion overlay: triggered when measured FPS stays below 15 for
     # longer than 10 seconds. After the user dismisses (X, left-fist, or
     # auto-dismiss), we wait this many seconds before re-offering.
@@ -836,6 +894,21 @@ class GestureWorker(QObject):
         self._low_fps_above_since: float | None = None
         self._low_fps_auto_engaged = False
         self._low_fps_last_process = 0.0
+        # Track LAST APPLIED mode state separately from config. The UI
+        # updates config.lite_mode (etc.) BEFORE calling set_*_mode on
+        # the worker, so comparing was_enabled = bool(config.lite_mode)
+        # against the new value ALWAYS shows no-op — the no-op gate
+        # silently swallowed every mode toggle. Initialize to None so
+        # the first toggle always applies (even when matching the
+        # persisted config value at startup).
+        self._applied_lite_mode: bool | None = None
+        self._applied_gpu_mode: bool | None = None
+        self._applied_low_fps_mode: bool | None = None
+        # r54 v9: pre-flight short-shutter idempotence latch. Tracks
+        # which device_name the pre-flight fired for so we don't
+        # re-arm on every camera-path re-check. Cleared on ffmpeg
+        # teardown (want_ffmpeg=False branch).
+        self._ffmpeg_preflight_device: str | None = None
         # Suggestion overlay bookkeeping (separate from auto-engage timing).
         self._low_fps_suggest_below_since: float | None = None
         self._low_fps_suggest_cooldown_until = 0.0
@@ -843,6 +916,28 @@ class GestureWorker(QObject):
         self._fullscreen_foreground_active = False
         self._fullscreen_foreground_process = ""
         self._fullscreen_check_last = 0.0
+        # v1.1.7 event-loop optimization (Step 2): when a fullscreen
+        # app (typically a game) has foreground and the user has GPU
+        # inference enabled (config.gpu_mode OR the implicit
+        # prefer_gpu=True baked into Lite Mode), auto-suppress the
+        # GPU path and fall back to CPU MediaPipe for the duration of
+        # the game session. DirectML inference and the game's GPU
+        # work were fighting for the same GPU, dragging both. When
+        # the game closes / minimizes, the transition-detection in
+        # _refresh_fullscreen_foreground clears this flag and swaps
+        # the engine back to the GPU path automatically. Transparent
+        # to the user — no config toggle, no dialog.
+        self._gpu_suppressed_for_fullscreen: bool = False
+        # C17 (v1.1.7): engine cache keyed by config signature. Mode
+        # switches (Lite ↔ GPU, GPU ↔ default, etc.) used to rebuild
+        # the HandDetector every time, which re-loaded the ONNX +
+        # DirectML session and blocked the main thread for ~2 seconds.
+        # On a GPU-capable box that runs both modes on the same ONNX
+        # model, the second build is pure re-init cost. Caching by
+        # signature makes repeat toggles instant (cache HIT) and keeps
+        # first-time builds at their existing cost. Bounded at ~4-6
+        # unique configs in practice; cleared in _shutdown_runtime.
+        self._engine_cache: "dict[tuple, GestureRecognitionEngine] | None" = None
         # Phone-camera-via-QR capture (owned by MainWindow / PhoneCameraServer).
         # None when no phone is connected; set by set_phone_camera_capture().
         self._phone_camera_capture = None
@@ -889,7 +984,7 @@ class GestureWorker(QObject):
         # Hold-and-fire state for the right-hand plain-three / plain-four
         # actions (open_chrome / open_touchless). These bindings have
         # no router consuming them — fired here directly from
-        # _maybe_fire_open_chrome_touchless on a 0.5 s hold.
+        # _maybe_fire_open_chrome_touchless on a 1.0 s hold.
         self._open_action_candidate: Optional[str] = None
         self._open_action_candidate_since: float = 0.0
         self._open_action_cooldown_until: float = 0.0
@@ -971,7 +1066,7 @@ class GestureWorker(QObject):
 
         _pump_events()
         self.chrome_controller = ChromeController()
-        self.chrome_router = ChromeGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.5)
+        self.chrome_router = ChromeGestureRouter(static_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.5)
         self._chrome_mode_enabled = False
         self._chrome_control_text = self.chrome_controller.message
 
@@ -981,7 +1076,7 @@ class GestureWorker(QObject):
         # gesture/voice without having connected the Web API (throttled).
         self._spotify_connect_prompt_cooldown_until = 0.0
         self.spotify_controller.set_opened_listener(self._request_spotify_connect_prompt)
-        self.spotify_router = SpotifyGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.5)
+        self.spotify_router = SpotifyGestureRouter(static_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.5)
         self._spotify_control_text = self.spotify_controller.message
 
         _pump_events()
@@ -991,9 +1086,9 @@ class GestureWorker(QObject):
         # discord_router below for gesture-driven control.
         self.discord_controller = DiscordController()
         self.discord_router = DiscordGestureRouter(
-            static_hold_seconds=0.5,
+            static_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS,
             static_cooldown_seconds=1.5,
-            toggle_hold_seconds=0.7,
+            toggle_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS,
             toggle_cooldown_seconds=1.5,
         )
         self._discord_control_text = self.discord_controller.message
@@ -1002,7 +1097,12 @@ class GestureWorker(QObject):
 
         _pump_events()
         self.youtube_controller = YouTubeController(volume_controller=self.volume_controller)
-        self.youtube_router = YouTubeGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=1.0)
+        self.youtube_router = YouTubeGestureRouter(
+            static_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS,
+            static_cooldown_seconds=1.5,
+            dynamic_cooldown_seconds=1.0,
+            toggle_hold_seconds=_STATIC_GESTURE_HOLD_SECONDS,
+        )
         self._youtube_control_text = "YouTube idle"
         self._youtube_mode_info = "off"
         self._youtube_mode_prev_active = False
@@ -1080,6 +1180,11 @@ class GestureWorker(QObject):
         self._voice_cooldown_until = 0.0
         self._voice_latched_label: str | None = None
         self._voice_one_two_triggered_at: float = 0.0
+        # Palm anchor for the left-hand "one" hold. Used to reject
+        # swipe-scale translation (custom 1-swipe-left must not start
+        # voice) while still allowing jitter / a little drift.
+        self._voice_hold_origin_xy: Optional[tuple[float, float]] = None
+        self._voice_hold_origin_scale: float = 1.0
         # Left-hand thumbs-up CLIP GESTURE state. Hold thumbs-up on
         # the left hand for 0.5 s to trigger a clip with the user's
         # configured default duration (Settings → Clip Presets).
@@ -1264,6 +1369,7 @@ class GestureWorker(QObject):
         # even with the GPU port. With this off-main, the QTimer can
         # fire as fast as the camera feeds frames.
         self._engine_runner = _EngineRunner()
+        self._engine_runner._post_infer = self._attach_custom_hands_on_engine_thread
         self._engine_result_ready.connect(self._on_engine_result)
 
         # Custom-gesture live runner â€” owns its own classifier + hold/
@@ -1279,6 +1385,15 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] runner init failed: {exc}")
             self._custom_gesture_runner = None
+        # Rate-limit the GPU/Lite private MediaPipe pass used when
+        # engine landmarks are not the recorder distribution. Runs on
+        # the engine thread (see _attach_custom_hands_on_engine_thread),
+        # every other inference, so the GUI camera tick stays free.
+        self._custom_runner_slow_path_skip_ratio = 2
+        # Start at 1 so the first GPU/Lite tick samples immediately
+        # ((1+1)%2==0) instead of skipping with an empty cache.
+        self._custom_runner_slow_path_counter = 1
+        self._last_custom_mp_hands: list | None = None
 
         # Dynamic custom-gesture runtime. Parallel to the static
         # runner above — same registry, same `fire_once` cooldown
@@ -1293,6 +1408,19 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] dynamic runtime init failed: {exc}")
             self._dynamic_gesture_runtime = None
+        try:
+            from ...custom_gestures.pose_sequence_runtime import PoseSequenceRuntime
+            self._pose_sequence_runtime = PoseSequenceRuntime()
+            self._pose_sequence_runtime.reload()
+        except Exception as exc:
+            print(f"[custom-gestures] pose sequence runtime init failed: {exc}")
+            self._pose_sequence_runtime = None
+        self._seq_suppress_dynamic_until = 0.0
+        # When a custom horizontal swipe owns the live pose, builtin
+        # swipe_left/right must not also dispatch (sandbox never had
+        # this collision because it has no builtin swipe path).
+        self._suppress_builtin_horizontal_swipe = False
+        self._custom_dyn_builtin_suppress_until = 0.0
 
         # Per-tick timing markers shared between _tick and
         # _on_engine_result â€” needed because the engine call now
@@ -1309,6 +1437,41 @@ class GestureWorker(QObject):
         # skip-frame decision.
         self._async_result_pending: bool = False
 
+        # C14 diagnostic: raw_frame_ready emit rate + tick cadence.
+        # Logged every ~2 s so we can tell "the camera reader is
+        # only delivering 25 fps" apart from "the tick loop is only
+        # running 25 fps despite the reader delivering more." The
+        # per-tick timing block already shows engine=Xms; this fills
+        # in the tick-to-tick cadence view (paint→paint is a widget
+        # metric, this is an engine-side metric).
+        self._raw_emit_count: int = 0
+        self._raw_emit_last_log: float = 0.0
+        self._tick_call_count: int = 0
+
+        # C22 diagnostic: system-level CPU / GPU / RAM every ~5 s so
+        # the user can correlate mode toggles with real resource usage
+        # from the app log alone (instead of having Task Manager open
+        # side by side). NVIDIA GPU stats via nvidia-smi if it's on
+        # PATH; skipped silently on non-NVIDIA or when the CLI is
+        # missing. psutil-based process CPU + RSS is always emitted.
+        # State kept minimal: just the last-log timestamp; everything
+        # else is queried on demand.
+        self._perf_monitor_last_log: float = 0.0
+        try:
+            import psutil as _psutil_mod
+            self._perf_monitor_psutil = _psutil_mod
+            self._perf_monitor_proc = _psutil_mod.Process()
+            # Prime cpu_percent() so the first real call returns a
+            # meaningful delta rather than 0. Same trick psutil docs
+            # recommend for per-process cpu_percent.
+            try:
+                self._perf_monitor_proc.cpu_percent(interval=None)
+            except Exception:
+                pass
+        except Exception:
+            self._perf_monitor_psutil = None
+            self._perf_monitor_proc = None
+
         # Per-frame timing samples used by the Lite Mode diagnostic
         # in _tick. Empty when Lite Mode is off; sampled at every
         # tick when on, summarised to stderr every 2s. Helps tell
@@ -1317,19 +1480,30 @@ class GestureWorker(QObject):
         self._timing_samples: deque[tuple[float, float, float, float, float, float, float, float]] = deque(maxlen=240)
         self._last_timing_log: float = 0.0
 
-        # Skip-frame inference state. When Lite Mode is on AND no
-        # hand was visible in the previous frame, we skip MediaPipe
-        # on every other tick â€” the detector is the single biggest
-        # CPU cost (12-25 ms), and there's nothing it could surface
-        # on an empty frame that the next-tick inference won't catch
-        # one frame (~16 ms) later. As soon as a hand appears we go
-        # back to full-rate inference so dynamic gestures (swipe,
-        # repeat-circle) â€” which depend on frame-by-frame motion â€”
-        # are never sampled at half-rate. `_inference_skipped_last`
-        # guarantees we never skip two ticks in a row, so we always
-        # re-sample to detect a new hand entering the frame.
+        # Skip-frame inference state. Empty frames skip MediaPipe on
+        # a cadence (every other tick, then 2-of-3 after a short idle)
+        # because the detector is the single biggest CPU cost
+        # (12-25 ms) and there's nothing it could surface on an empty
+        # frame that the next inference tick won't catch. As soon as a
+        # hand appears we go back to full-rate inference so dynamic
+        # gestures (swipe, repeat-circle) — which depend on
+        # frame-by-frame motion — are never sampled at half-rate.
         self._last_result_had_hand: bool = False
         self._inference_skipped_last: bool = False
+        self._idle_skip_ticks: int = 0
+        # C13 (v1.1.7): track whether the last engine_landmarks_ready
+        # emit carried a non-empty hands list. When no hand is detected
+        # in the current cycle AND the previous emit also had no hands
+        # AND there's no mouse-mode overlay + no drawing-mode overlay
+        # override, the payload is byte-for-byte identical to the last
+        # one and just re-runs both live-view widgets' slot handlers
+        # for no visible change. Eliding the redundant emit lets the
+        # widgets skip an update_landmarks + paint cycle each. The
+        # hand-present-to-absent transition still fires exactly one
+        # final neutral emit so the widget clears its stashed skeleton
+        # — that's what prevents "hand leaves the frame but the
+        # skeleton stays" ghosting.
+        self._last_emit_had_hands: bool = False
 
         # Wall-clock-rate-limited debug-frame emit. The receivers
         # (mini viewer + live view) each do cv2.cvtColor + QImage +
@@ -1381,6 +1555,18 @@ class GestureWorker(QObject):
             runner.reload()
         except Exception as exc:
             print(f"[custom-gestures] reload failed: {exc}")
+        dyn = getattr(self, "_dynamic_gesture_runtime", None)
+        if dyn is not None:
+            try:
+                dyn.reload()
+            except Exception as exc:
+                print(f"[custom-gestures] dynamic reload failed: {exc}")
+        seq = getattr(self, "_pose_sequence_runtime", None)
+        if seq is not None:
+            try:
+                seq.reload()
+            except Exception as exc:
+                print(f"[custom-gestures] pose sequence reload failed: {exc}")
 
     def _emit_voice_log_step(self, message: str) -> None:
         """Forward a step message from VoiceCommandProcessor to the
@@ -1858,7 +2044,7 @@ class GestureWorker(QObject):
             self._drawing_toggle_candidate_since = now
             self._drawing_control_text = "hold left hand four for drawing mode"
             return True
-        if now - self._drawing_toggle_candidate_since >= 0.6:
+        if now - self._drawing_toggle_candidate_since >= _STATIC_GESTURE_HOLD_SECONDS:
             self._toggle_drawing_mode(now)
             return True
         return True
@@ -3205,8 +3391,18 @@ class GestureWorker(QObject):
                 self._camera_draw_last_point = point
                 self._camera_draw_active_stroke_points = [(float(point[0]), float(point[1]))]
                 return
-            color_bgra = (*brush, 255)
+            # r53 v2: drop samples closer than _DRAWING_MIN_MOVE_PX to
+            # the previous point. Kills the residual drift that showed
+            # up as micro-strokes when the user paused their hand.
             p_prev = self._camera_draw_last_point
+            try:
+                dx = float(point[0] - p_prev[0])
+                dy = float(point[1] - p_prev[1])
+                if (dx * dx + dy * dy) < (self._DRAWING_MIN_MOVE_PX * self._DRAWING_MIN_MOVE_PX):
+                    return
+            except Exception:
+                pass
+            color_bgra = (*brush, 255)
             stroke_points = self._camera_draw_active_stroke_points
             if len(stroke_points) < 2:
                 # Second sample â€” straight line from P_prev to
@@ -3500,13 +3696,13 @@ class GestureWorker(QObject):
     def _derive_display_label(self, prediction, hand_reading) -> tuple[str, bool]:
         # Like _gesture_banner_label but promotes the recognizer's
         # base label to its derived variant (three_together,
-        # four_together, thumb_up, thumb_down) when the finger
-        # pattern matches — so the bbox banner reflects the same
-        # label the action-routing layer uses, instead of stalling
-        # on "three" / "four" / "fist" while the engine is firing
-        # YouTube actions off the derived form. Active flag stays
-        # True for any non-neutral chosen label, which keeps the
-        # bbox green via the existing color branch.
+        # four_together) when the finger pattern matches — so the
+        # bbox banner reflects the same label the action-routing
+        # layer uses, instead of stalling on "three" / "four" while
+        # the engine is firing Chrome / YouTube actions off the
+        # derived form. Active flag stays True for any non-neutral
+        # chosen label, which keeps the bbox green via the existing
+        # color branch.
         if prediction is None:
             return "", False
         if hand_reading is not None:
@@ -3544,11 +3740,28 @@ class GestureWorker(QObject):
             return label, active
         # Suppress labels not bound on this hand. Covers the
         # other-hand-only case (e.g. mute on left hand — only bound
-        # right) and the bound-nowhere case (e.g. thumb_up / thumb_down
-        # on a hand with no binding entry). Without this the banner
-        # showed labels the user couldn't use on the active hand,
-        # which was visually noisy and misleading.
+        # right) and labels with no binding entry at all. Without
+        # this the banner showed names the user couldn't use on the
+        # active hand, which was visually noisy and misleading.
         return "", False
+
+    # Recognizer labels that are not shipped as named preset
+    # gestures. "one" (index finger up) is used internally for
+    # voice-listen / drawing / repeat-circle, but there is no
+    # user-facing gesture called "one". thumb_up / thumb_down were
+    # derived heuristics that collided with snap / fist and are
+    # not product gestures — YouTube like/dislike stay on the wheel.
+    # Showing any of these on the live viewer implies a preset and
+    # collides with custom names.
+    _UNNAMED_RECOGNIZER_LABELS = frozenset({"one", "thumb_up", "thumb_down"})
+
+    @classmethod
+    def _hide_unnamed_recognizer_label(
+        cls, label: str, active: bool,
+    ) -> tuple[str, bool]:
+        if str(label or "") in cls._UNNAMED_RECOGNIZER_LABELS:
+            return "", False
+        return label, active
 
     @staticmethod
     def _build_hand_overlay_info(
@@ -3746,8 +3959,53 @@ class GestureWorker(QObject):
         # promptly. Restored to NORMAL when the game goes away.
         if active and not was_active:
             self._apply_process_priority(above_normal=True)
+            # Adaptive GPU (Step 2): fullscreen app just came up.
+            # If the user has GPU inference on (config.gpu_mode OR
+            # Lite Mode's implicit prefer_gpu=True), swap to CPU
+            # MediaPipe so we stop fighting the game for the GPU.
+            # Skipped if already suppressed (defensive; shouldn't
+            # happen since transitions are gated on was_active).
+            if not self._gpu_suppressed_for_fullscreen and self._running:
+                wants_gpu = (
+                    bool(getattr(self.config, "gpu_mode", False))
+                    or bool(getattr(self.config, "lite_mode", False))
+                )
+                if wants_gpu:
+                    self._gpu_suppressed_for_fullscreen = True
+                    try:
+                        sys.stderr.write(
+                            f"[perf-mode] fullscreen '{process or '?'}' detected — "
+                            "auto-suppressing GPU inference (swapping to CPU "
+                            "MediaPipe) so gesture tracking doesn't fight the "
+                            "foreground app for the GPU. Will restore GPU path "
+                            "when the fullscreen window closes.\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                    try:
+                        self._swap_engine_safely()
+                    except Exception:
+                        pass
         elif was_active and not active:
             self._apply_process_priority(above_normal=False)
+            # Adaptive GPU (Step 2): fullscreen app closed / minimized.
+            # Restore the GPU inference path if we suppressed it.
+            if self._gpu_suppressed_for_fullscreen and self._running:
+                self._gpu_suppressed_for_fullscreen = False
+                try:
+                    sys.stderr.write(
+                        "[perf-mode] fullscreen closed — restoring GPU "
+                        "inference path (was suppressed while a fullscreen "
+                        "foreground app was up).\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    self._swap_engine_safely()
+                except Exception:
+                    pass
 
     @staticmethod
     def _apply_process_priority(*, above_normal: bool) -> None:
@@ -3764,24 +4022,270 @@ class GestureWorker(QObject):
         except Exception:
             pass
 
+    def _build_engine_guarded(self, timeout_seconds: float = 8.0):
+        """Build the engine on a helper thread with a hard wall-clock
+        timeout, so a DirectML EP init hang (D3D12 adapter enumeration
+        blocked by Razer Cortex / Synapse / a laptop's dGPU-iGPU probe)
+        cannot freeze the Qt main thread indefinitely.
+
+        v1.1.7 C20: user reported that when gpu_mode was auto-loaded
+        from config on startup, the app AND the PC briefly froze during
+        engine build. Root cause: HandDetector.__init__ →
+        load_hand_runtime → ort.InferenceSession(providers=[DmlEP,...])
+        runs on the Qt main thread with no timeout. If DirectML EP init
+        blocks (adapter contention), Qt event loop halts.
+
+        Failure recovery: on timeout, force config.gpu_mode=False for
+        THIS session (persisted state is left alone so a future launch
+        may retry once the contention clears), rebuild on CPU, and emit
+        a neutral status message so the user knows GPU didn't engage.
+        """
+        import concurrent.futures as _cf
+        # Log pre-build so a hang shows up as "pre without post" in the
+        # log — this is the decisive line the adversarial verifier
+        # asked for. Includes the requested engine signature so we can
+        # tell whether the hang is in the GPU path specifically.
+        try:
+            sig = self._compute_engine_signature()
+            sys.stderr.write(f"[perf-mode] pre-engine-build sig={sig}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        _t0 = time.perf_counter()
+        # Try the primary build in a background thread with a hard wait.
+        # Pump Qt events during the wait so the UI (splash / status
+        # label / mode toggles that are also on the main thread) stays
+        # responsive. Poll on a short interval so the response feels
+        # snappy on the fast-build success case.
+        try:
+            from PySide6.QtWidgets import QApplication as _QApp
+            _qapp = _QApp.instance()
+        except Exception:
+            _qapp = None
+        exec_ = _cf.ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine-build")
+        try:
+            fut = exec_.submit(self._build_engine_for_fps_mode)
+            engine_new = None
+            timed_out = False
+            deadline = time.monotonic() + max(0.5, float(timeout_seconds))
+            while True:
+                try:
+                    engine_new = fut.result(timeout=0.05)
+                    break
+                except _cf.TimeoutError:
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
+                    if _qapp is not None:
+                        try:
+                            _qapp.processEvents()
+                        except Exception:
+                            pass
+                except Exception:
+                    traceback.print_exc()
+                    engine_new = None
+                    break
+        finally:
+            exec_.shutdown(wait=False)
+        elapsed_ms = (time.perf_counter() - _t0) * 1000.0
+        if timed_out:
+            try:
+                sys.stderr.write(
+                    f"[perf-mode] engine build TIMEOUT after {elapsed_ms:.0f}ms "
+                    f"— disabling gpu_mode for this session and falling back to CPU\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            # In-memory disable only. Do NOT persist to disk — user
+            # may just be in a transient bad state (Razer Cortex
+            # briefly holding the GPU adapter, driver update in
+            # progress, etc.). Next launch retries; if it hangs again
+            # they see the timeout again and can flip gpu_mode off in
+            # Settings.
+            try:
+                self.config.gpu_mode = False
+                self._applied_gpu_mode = False
+            except Exception:
+                pass
+            try:
+                self._emit_status(
+                    "GPU acceleration didn't start — running on CPU. "
+                    "You can retry GPU Mode in Settings."
+                )
+            except Exception:
+                pass
+            # Second build attempt on the main thread — GPU is now
+            # off in config so this takes the CPU path and is safe
+            # to block briefly.
+            try:
+                engine_new = self._build_engine_for_fps_mode()
+            except Exception:
+                traceback.print_exc()
+                engine_new = None
+        try:
+            sys.stderr.write(
+                f"[perf-mode] post-engine-build elapsed={elapsed_ms:.0f}ms "
+                f"timeout={timed_out} ok={engine_new is not None}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return engine_new
+
+    def _compute_engine_signature(self) -> tuple:
+        """Full tuple of every input `_build_engine_for_fps_mode` reads.
+        Two states with the same signature are guaranteed to produce
+        functionally identical engines — so the cache is safe to key on
+        this. Any config field that could change the built HandDetector
+        MUST be included here or a stale cache hit will occur."""
+        low_fps = bool(getattr(self.config, "low_fps_mode", False)) or self._low_fps_auto_engaged
+        lite = bool(getattr(self.config, "lite_mode", False))
+        gpu = bool(getattr(self.config, "gpu_mode", False))
+        fullscreen_suppress = bool(self._gpu_suppressed_for_fullscreen)
+        stable_frames_cfg = int(getattr(self.config, "stable_frames_required", 4))
+        return (low_fps, lite, gpu, fullscreen_suppress, stable_frames_cfg)
+
     def _swap_engine_safely(self) -> None:
+        # C23: reentrancy guard. _build_engine_guarded pumps Qt events
+        # during its future.wait() so the UI stays responsive when
+        # DirectML EP init takes 500-1000 ms. That pump also lets OTHER
+        # queued Qt signals dispatch — including the second half of a
+        # "mode preset" toggle (e.g. clicking a GPU-Mode button
+        # actually fires set_lite_mode(False) THEN set_gpu_mode(True),
+        # and the second one lands DURING the first swap's build wait).
+        # Without this guard, two _swap_engine_safely calls run in
+        # parallel, each spawning its own ThreadPoolExecutor + its own
+        # ort.InferenceSession(DirectML). The two DirectML session
+        # inits contend for the GPU adapter, roughly DOUBLING the total
+        # wall time and stalling the paint loop for ~1.5 s at the mode
+        # switch (which the user perceives as a 1-2 s delay every time
+        # they toggle GPU on). Coalesce: if a swap is already in flight
+        # when a new one is requested, record that a re-run is needed
+        # and return. When the in-flight swap finishes it re-invokes
+        # itself once with the (possibly updated) current config, and
+        # the C17 cache HIT branch collapses that second call to a
+        # constant-time no-op when the signature didn't change.
+        if getattr(self, "_swap_in_progress", False):
+            self._swap_pending_re_run = True
+            try:
+                sys.stderr.write(
+                    "[perf-mode] _swap_engine_safely coalesced (another swap "
+                    "in flight — will re-check config when it finishes)\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        self._swap_in_progress = True
+        try:
+            self._swap_engine_safely_impl()
+        finally:
+            self._swap_in_progress = False
+            if getattr(self, "_swap_pending_re_run", False):
+                self._swap_pending_re_run = False
+                # Recurse once. If config hasn't changed the C17 cache
+                # HIT / "already matches" branch returns immediately
+                # (single dict lookup + one signature compute).
+                self._swap_engine_safely()
+
+    def _swap_engine_safely_impl(self) -> None:
         # Build the new engine first, then hand it to the runner; the
         # runner's set_engine call acquires the engine lock, blocking
         # briefly until any in-flight inference returns. ONLY THEN is
-        # it safe to close() the old engine â€” closing while the runner
-        # thread is mid-call would crash the MediaPipe / ONNX session.
-        # All mid-session engine rebuilds (Lite Mode toggle, GPU Mode
-        # toggle, auto-low-fps engage/disengage, set_low_fps_mode) go
-        # through here for that reason.
-        new_engine = self._build_engine_for_fps_mode()
+        # it safe to close() the old engine.
+        try:
+            lite = bool(getattr(self.config, "lite_mode", False))
+            gpu = bool(getattr(self.config, "gpu_mode", False))
+            lowfps_cfg = bool(getattr(self.config, "low_fps_mode", False))
+            sys.stderr.write(
+                f"[perf-mode] _swap_engine_safely START "
+                f"lite={lite} gpu={gpu} low_fps_cfg={lowfps_cfg} "
+                f"auto_engaged={self._low_fps_auto_engaged} "
+                f"-> low_fps_active will be {lowfps_cfg or self._low_fps_auto_engaged}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        # C17: cache built engines by config signature so repeat mode
+        # toggles (Lite ↔ GPU) skip the ~1-2 s ONNX + DirectML session
+        # re-init that would otherwise freeze the main thread on every
+        # swap. Cache is bounded (~4-6 unique signatures over a session)
+        # and cleared in _shutdown_runtime so state doesn't leak between
+        # engine restarts.
+        swap_start_perf = time.perf_counter()
+        if self._engine_cache is None:
+            self._engine_cache = {}
+        signature = self._compute_engine_signature()
+        cached = self._engine_cache.get(signature)
         old_engine = self.engine
-        self._engine_runner.set_engine(new_engine)
-        self.engine = new_engine
-        if old_engine is not None:
+        cache_hit = False
+        if cached is not None and cached is not old_engine:
+            new_engine = cached
+            cache_hit = True
+            # C17 review fix #10: reset the cached engine's transient
+            # state BEFORE handing it to the runner so a mid-hold pose
+            # or partially-accumulated dynamic gesture from the last
+            # time this engine was active doesn't fire spuriously on
+            # the swap-back frame. detector.reset() clears the
+            # landmark smoother + last_primary_hand; engine.reset()
+            # additionally clears dynamic recognizer history + the
+            # stable-label counter.
             try:
-                old_engine.close()
+                new_engine.reset()
             except Exception:
                 pass
+        elif cached is old_engine and old_engine is not None:
+            # Signature matches the running engine — nothing to do.
+            try:
+                sys.stderr.write(f"[perf-mode] engine already matches sig={signature}, skipping swap\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        else:
+            # C20: guarded build. On DirectML timeout the helper
+            # forces gpu_mode=False and rebuilds on CPU, so
+            # new_engine is a valid CPU engine (not None) in the
+            # timeout path — cache under the CPU signature not the
+            # requested GPU one.
+            new_engine = self._build_engine_guarded()
+            if new_engine is not None:
+                # If the guarded build fell back to CPU, the
+                # signature computed inside the helper's post-log is
+                # the current one (CPU). Recompute after in case
+                # config.gpu_mode was flipped by the fallback.
+                self._engine_cache[self._compute_engine_signature()] = new_engine
+            else:
+                # Build failed with no fallback — keep the current
+                # engine to avoid a null-engine session. Skip the
+                # runner swap below.
+                try:
+                    sys.stderr.write(
+                        "[perf-mode] engine build returned None — keeping current engine\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                return
+        self._engine_runner.set_engine(new_engine)
+        self.engine = new_engine
+        # C17 review add (c): wall-clock timing so we can VERIFY the
+        # cache actually shortcuts the swap. HIT should be a few ms;
+        # MISS is bounded by ONNX + DirectML session build (~1-2 s).
+        try:
+            elapsed_ms = (time.perf_counter() - swap_start_perf) * 1000.0
+            sys.stderr.write(
+                f"[perf-mode] engine cache {'HIT' if cache_hit else 'MISS'} "
+                f"sig={signature} elapsed={elapsed_ms:.1f}ms "
+                f"cache_size={len(self._engine_cache)}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        # DO NOT close old_engine — it stays in the cache for reuse on a
+        # future swap back to its signature. Closed for real in
+        # _shutdown_runtime which drains the cache.
 
     def _engage_auto_low_fps(self) -> None:
         # Log auto-engage so we can see in the debug log when slow
@@ -3820,7 +4324,7 @@ class GestureWorker(QObject):
         if self._cap is not None and not self._low_fps_active:
             self._restore_normal_capture_tuning(self._cap)
         # Restore OpenCV cap unless another perf mode is still active.
-        self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
+        self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
 
     def _maybe_auto_toggle_low_fps(self, now: float) -> None:
         if getattr(self.config, "low_fps_mode", False):
@@ -3950,6 +4454,57 @@ class GestureWorker(QObject):
             except Exception:
                 pass
 
+    @staticmethod
+    def _empty_frame_skip_inference(had_hand: bool, idle_ticks: int) -> tuple[bool, int]:
+        """Decide whether this empty frame can skip MediaPipe.
+
+        Returns (skip, new_idle_ticks). Never skip while a hand is
+        tracked so swipe sampling stays full-rate. Empty frames skip
+        every other tick so idle GPU cost drops without starving
+        reacquisition (bbox / 3→2→1) or collapsing overlay FPS.
+        """
+        if had_hand:
+            return False, 0
+        next_ticks = int(idle_ticks) + 1
+        return (next_ticks % 2) != 0, next_ticks
+
+    def _note_display_fps(self) -> None:
+        """Drive overlay / auto-Low-FPS from camera emit rate.
+
+        Inference-only FPS collapsed to ~6 when empty-frame skip
+        avoided `_on_engine_result`, which then auto-engaged Low FPS
+        and made 3→2→1 look like repeat_circle.
+        """
+        now = time.time()
+        last = float(getattr(self, "_last_time", 0.0) or 0.0)
+        dt = max(now - last, 1e-6) if last > 0.0 else 1e-6
+        self._fps = 0.86 * self._fps + 0.14 * (1.0 / dt) if self._fps else (1.0 / dt)
+        self._last_time = now
+
+    @staticmethod
+    def _builtin_open_hand_swipe_in_flight(prediction) -> bool:
+        """True while builtin swipe_left/right is scoring as in-progress.
+
+        Used to park custom SPRING matching during Spotify skip swipes
+        so DTW does not hitch the live view on the GUI thread.
+        """
+        if prediction is None:
+            return False
+        label = str(getattr(prediction, "dynamic_label", "") or "")
+        if label in {"swipe_left", "swipe_right"}:
+            return True
+        for cand in getattr(prediction, "dynamic_candidates", ()) or ():
+            cand_label = str(getattr(cand, "label", "") or "")
+            if cand_label not in {"swipe_left", "swipe_right"}:
+                continue
+            try:
+                score = float(getattr(cand, "score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            if score >= 0.45:
+                return True
+        return False
+
     def _perf_optimisations_enabled(self) -> bool:
         # Lite Mode, GPU Mode, AND Low FPS Mode (manual or auto-engaged)
         # all imply "the user opted into the performance pipeline" -
@@ -3967,14 +4522,302 @@ class GestureWorker(QObject):
 
     def _any_perf_mode_active(self) -> bool:
         """True if ANY of lite, gpu, low_fps (manual or auto) is on.
-        Used by the camera reopen helper below to decide whether
-        ffmpeg-MJPG should be the active capture path."""
+        Used by skip-inference / debug-frame throttle / other engine-
+        side gates that care about "is any perf mode on."
+
+        NOTE: NO LONGER used to decide the camera-path swap. Use
+        _wants_ffmpeg_cap() for that."""
         return (
             bool(getattr(self.config, "lite_mode", False))
             or bool(getattr(self.config, "gpu_mode", False))
             or bool(getattr(self.config, "low_fps_mode", False))
             or self._low_fps_auto_engaged
         )
+
+    def _wants_ffmpeg_cap(self) -> bool:
+        """v1.1.7 C24: only GPU Mode uses the ffmpeg-MJPG camera path.
+        Lite Mode and Low FPS Mode stay on the default OpenCV cap so
+        toggling them doesn't fire a ~2 s camera-swap dance (release
+        old cap + time.sleep(0.6) DShow-release + ffmpeg subprocess
+        boot + 6-frame warmup discard). Their per-mode benefits — lite
+        MediaPipe / smaller inference frame / reduced overlay work /
+        skip-inference / lite_paint_mode — don't need ffmpeg's higher-
+        fps source to deliver value.
+
+        User's design intent matches: "Lite is a universal CPU boost
+        that works without a strong GPU. GPU is the heaviest boost."
+        Only the heaviest path warrants the camera swap.
+
+        Ffmpeg reopen still fires exactly ONCE per session per
+        Lite/Low-FPS enable/disable cycle — namely when the user
+        toggles GPU. First swap into GPU is the last one that pays
+        the ~2 s cost; every subsequent Default/Lite/Low-FPS toggle
+        is engine-only (~5-10 ms via the C17 cache HIT branch)."""
+        return bool(getattr(self.config, "gpu_mode", False))
+
+    def _preflight_short_shutter_for_ffmpeg(
+        self, index: int, device_name: str
+    ) -> None:
+        """r54 v9: reduce MediaPipe motion blur on GPU-mode ffmpeg cap
+        by pre-flighting a short-shutter EXPOSURE write via cv2/DSHOW
+        BEFORE ffmpeg claims the filter graph. UVC drivers latch
+        exposure at the device level (§4.2.2.1) so the value persists
+        across the pin re-open — ffmpeg then reads frames with a
+        short shutter (~15 ms) instead of the driver's dim-scene
+        long shutter (~40-80 ms), which is what was producing the
+        motion blur → landmark jitter the user reported.
+
+        The r49 short-shutter path in `_apply_default_capture_tuning`
+        already proved CAP_PROP_EXPOSURE=-6.0 is the property this
+        driver class actually latches (2026-07-27 A/B: 12.5 → 32 fps
+        on OpenCV). We reuse the same write against the same device
+        interface before ffmpeg opens.
+
+        Gating rules:
+          - HGR_FFMPEG_SHORT_SHUTTER=0 → off (env opt-out)
+          - HGR_FFMPEG_SHORT_SHUTTER=1 → force on (env opt-in)
+          - unset → auto-arm only when `classify_camera_shutter_hint`
+            says the display_name matches a known generic UVC family
+            (Realtek / USB Camera / Sonix / Chicony). Premium cameras
+            (Kiyo Pro, Brio, C920, etc.) stay untouched — they have
+            their own AE tuning that r50 already respects.
+          - Idempotent: skips if this device was already pre-flighted
+            in this session (`_ffmpeg_preflight_device` tracks it).
+
+        Not applied when platform is non-Windows (DSHOW only exists
+        on Windows). Silent-fails on any exception so a rejecting
+        driver never blocks the ffmpeg open path — worst case, we
+        skip and fall through to whatever the driver's auto-exposure
+        chose (i.e. current behavior).
+        """
+        if not sys.platform.startswith("win"):
+            return
+        try:
+            env = os.environ.get("HGR_FFMPEG_SHORT_SHUTTER")
+        except Exception:
+            env = None
+        if env == "0":
+            return
+        # v1.1.7.2 (dad rig 2026-08-19): mirror the OpenCV-cap
+        # apply_hint decision logic here. Previously this method only
+        # checked the classifier verdict, so a user who had explicitly
+        # unchecked "Boost performance for older cameras" (user_chose=True,
+        # cfg_ss=False) still got the preflight EXPOSURE=-6 written on
+        # ffmpeg-cap open — which then latched at the UVC device level
+        # and darkened the OpenCV fallback cap after ffmpeg failed to
+        # open at 60 fps. Respect the user's explicit off choice here
+        # the same way _apply_default_capture_tuning does.
+        try:
+            _cfg_ss = bool(getattr(self.config, "camera_force_short_shutter", False))
+            _user_chose = bool(getattr(self.config, "camera_force_short_shutter_user_chose", False))
+        except Exception:
+            _cfg_ss = False
+            _user_chose = False
+        if env is None:
+            try:
+                from ..camera.camera_utils import classify_camera_shutter_hint
+                verdict = classify_camera_shutter_hint(device_name)
+            except Exception:
+                verdict = None
+            # Explicit user-off overrides everything except env force.
+            if _user_chose and not _cfg_ss:
+                try:
+                    sys.stderr.write(
+                        f"[preflight-shutter] skip: user explicitly disabled "
+                        f"(user_chose=True, cfg=False) device={device_name!r}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                return
+            # No env override, no explicit config on → only fire when
+            # classifier says generic UVC AND user hasn't opted out.
+            if not _cfg_ss and verdict is not True:
+                return
+            _verdict_label = (
+                "config_user_chose_on" if (_user_chose and _cfg_ss)
+                else "config" if _cfg_ss
+                else "classifier_generic"
+            )
+        else:
+            _verdict_label = "env_force"
+        # Idempotence: skip if we already pre-flighted this device
+        # this session. Reset in the teardown path (_apply_perf_camera_path
+        # want_ffmpeg=False branch, plus _shutdown_runtime).
+        if getattr(self, "_ffmpeg_preflight_device", None) == device_name:
+            return
+        try:
+            pre = cv2.VideoCapture(int(index), cv2.CAP_DSHOW)
+            if not pre.isOpened():
+                try:
+                    sys.stderr.write(
+                        f"[preflight-shutter] skip: cv2 open failed "
+                        f"idx={index} device={device_name!r}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                return
+            # MJPG hint so the pre-flight cap matches ffmpeg's format
+            # request — some drivers only expose the exposure control
+            # in their MJPG pin config.
+            try:
+                pre.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            except Exception:
+                pass
+            # AUTO_EXPOSURE=0.25 = DSHOW manual. Driver may silently
+            # reject this (as r49 documented) but we write it anyway.
+            try:
+                pre.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+            except Exception:
+                pass
+            ok_exp = False
+            readback_exp = None
+            try:
+                ok_exp = bool(pre.set(cv2.CAP_PROP_EXPOSURE, -6.0))
+                readback_exp = pre.get(cv2.CAP_PROP_EXPOSURE)
+            except Exception:
+                pass
+            try:
+                backend = pre.getBackendName()
+            except Exception:
+                backend = None
+            try:
+                pre.release()
+            except Exception:
+                pass
+            # Settle window — let the driver commit the write BEFORE
+            # ffmpeg's Popen tries to re-acquire the filter graph.
+            # Too short → DSHOW handle race (silent-hang retry in
+            # open_ffmpeg_cap_with_fps_fallback covers this at ~4 s
+            # cost but 150 ms should avoid the retry entirely).
+            try:
+                time.sleep(0.15)
+            except Exception:
+                pass
+            self._ffmpeg_preflight_device = device_name
+            # v1.1.7.9 display-invariance: mark the short-shutter path
+            # active so _compensate_short_shutter_for_display lifts the
+            # display frame back to natural brightness. The user sees
+            # the fps benefit of the shutter cut but never sees the
+            # visual dimming caused by 62 ms exposure.
+            self._short_shutter_active_for_display = True
+            try:
+                sys.stderr.write(
+                    f"[preflight-shutter] applied device={device_name!r} "
+                    f"backend={backend} set_ok_exp={ok_exp} "
+                    f"readback_exp={readback_exp} verdict={_verdict_label} "
+                    f"env={env!r}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+        except Exception as exc:
+            try:
+                sys.stderr.write(
+                    f"[preflight-shutter] exception: {type(exc).__name__}: {exc}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+    def _release_ffmpeg_preflight(self, index: int) -> None:
+        """v1.1.7.1 Layer 4: undo a prior preflight EXPOSURE write.
+
+        When `_preflight_short_shutter_for_ffmpeg` fires, it writes
+        `CAP_PROP_EXPOSURE=-6` via a temporary cv2/DSHOW cap. UVC drivers
+        latch that value at the device level, so releasing the cv2 cap
+        does NOT reset the exposure — the next open (ffmpeg or OpenCV)
+        inherits the short-shutter state.
+
+        In the happy path (ffmpeg cap opens with bright frames), that
+        latch is exactly what we wanted. But when ffmpeg fails after
+        preflight — silent hang, luma-net rejection, format error — we
+        need to release the latch before falling back to OpenCV, or
+        the OpenCV cap opens with the same dark exposure and the user
+        sees no improvement over the "just release ffmpeg and open
+        OpenCV" fallback path.
+
+        Idempotent: safe to call even if no preflight was applied
+        (the cv2 write is silent-fail on rejected drivers). Clears the
+        idempotence latch so future ffmpeg opens can re-apply preflight
+        for a fresh session/mode.
+
+        Non-Windows: no-op (DSHOW backend is Windows-only).
+        """
+        if not sys.platform.startswith("win"):
+            return
+        # Nothing to release if we never preflighted this session.
+        if getattr(self, "_ffmpeg_preflight_device", None) is None:
+            return
+        try:
+            pre = cv2.VideoCapture(int(index), cv2.CAP_DSHOW)
+            if not pre.isOpened():
+                try:
+                    pre.release()
+                except Exception:
+                    pass
+                return
+            try:
+                # v1.1.7.2 (dad rig): nudge EXPOSURE to a bright value
+                # FIRST — while the driver is still in manual mode from
+                # the earlier preflight write. Some DSHOW drivers only
+                # respect EXPOSURE writes while AUTO is manual, so this
+                # write goes through cleanly. Then flip AUTO back to
+                # auto so the driver can adapt from there.
+                pre.set(cv2.CAP_PROP_EXPOSURE, -4.0)
+            except Exception:
+                pass
+            try:
+                # DSHOW auto = 0.75. Some drivers also accept 3.0
+                # (MSMF/V4L2 convention) — write both so at least one
+                # takes on any backend that reaches this code path.
+                pre.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+                pre.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3.0)
+            except Exception:
+                pass
+            try:
+                # v1.1.7.2 (dad rig): re-write EXPOSURE=-4 after the
+                # AUTO kick, for drivers that ONLY accept EXPOSURE in
+                # auto mode. Redundant on most drivers but safe on all.
+                pre.set(cv2.CAP_PROP_EXPOSURE, -4.0)
+            except Exception:
+                pass
+            try:
+                pre.release()
+            except Exception:
+                pass
+            # Clear the idempotence latch. If the caller retries GPU
+            # mode later, preflight can re-arm on a fresh classifier
+            # verdict.
+            self._ffmpeg_preflight_device = None
+            # v1.1.7.9 display-invariance: the driver is now nudged back
+            # toward auto-exposure, so the sensor should produce a
+            # naturally-bright frame again. Disable the display-side
+            # gamma lift so the user sees the true auto-exposure output
+            # instead of an over-brightened composite.
+            self._short_shutter_active_for_display = False
+            try:
+                time.sleep(0.15)  # let the driver commit the write
+            except Exception:
+                pass
+            try:
+                sys.stderr.write(
+                    f"[preflight-shutter] released after ffmpeg fallback: "
+                    f"index={index}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+        except Exception as _exc:
+            try:
+                sys.stderr.write(
+                    f"[preflight-shutter] release exception: "
+                    f"{type(_exc).__name__}: {_exc}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
 
     def _apply_perf_camera_path(self, *, want_ffmpeg: bool) -> None:
         """Idempotent: reopen the camera in the requested codec path.
@@ -4026,6 +4869,23 @@ class GestureWorker(QObject):
         except Exception:
             pass
         if want_ffmpeg:
+            # DSHOW handle release is async on Windows. When we call
+            # OpenCV's release() above and immediately launch ffmpeg,
+            # the camera's DirectShow filter graph hasn't finished
+            # tearing down yet, so ffmpeg's `-i video=...` blocks on
+            # the driver and looks like a silent hang (proc_alive=True,
+            # stderr empty, no frames). The hang masks itself as
+            # "60 fps unsupported by camera" and we silently fall back
+            # to 30 fps. A short pause lets the driver actually release
+            # the handle so ffmpeg gets a clean open at the requested
+            # rate. 600 ms is empirically enough for Razer Kiyo Pro,
+            # Logitech BRIO, EOS Webcam Utility; cheaper webcams
+            # release in <200 ms but the extra latency is invisible
+            # next to the camera-open warmup that already happens.
+            try:
+                time.sleep(0.6)
+            except Exception:
+                pass
             from ..camera.ffmpeg_capture import (
                 FfmpegMjpegCapture,  # noqa: F401 - keep import for currently_ffmpeg check
                 resolve_dshow_device_for_index,
@@ -4040,8 +4900,37 @@ class GestureWorker(QObject):
                 if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
                     self._cap = recovered[1]
                 return
+            # C27: open the ffmpeg-MJPG cap at 640x480, not 1280x720.
+            # The higher resolution ~3× the bytes per frame through
+            # every pipeline stage (ffmpeg pipe read, reader thread
+            # decode, QImage.copy in the widget). On the user's Kiyo
+            # Pro, that resolution difference produced a persistent
+            # 1-2 second visual lag in GPU Mode that wasn't present
+            # in Default (which uses 640x480 OpenCV). User said
+            # utilization and fps are fine — priority is latency —
+            # so match Default's resolution. ONNX inference still
+            # runs at max_process_width=960 (from _NORMAL_PROCESS_WIDTH)
+            # which is now a no-op resize on 640×480 input; hand
+            # tracking accuracy is essentially the same on a
+            # face-and-hand-in-frame use case at either resolution.
+            # r54 v9: pre-flight short shutter via cv2/DSHOW so ffmpeg
+            # inherits a fast-shutter driver state → less motion blur
+            # → smoother MediaPipe landmarks. Gated by device
+            # classifier so premium cams stay untouched. See helper
+            # docstring for the full logic + env-var opt-out.
+            self._preflight_short_shutter_for_ffmpeg(int(index), device_name)
+            # v1.1.7.1: luma_min_threshold=50 is the auto-recovery net
+            # for cameras whose driver cuts shutter too aggressively at
+            # the requested fps and produces a frame MediaPipe can't
+            # detect hands in. See open_ffmpeg_cap_with_fps_fallback's
+            # docstring for the full failure mode + rationale. Kicks
+            # in for HP HD Camera / cheap laptop webcams that can't
+            # sustain 60 fps in indoor lighting; Kiyo Pro / Brio /
+            # C920 and healthy driver states pass the threshold on
+            # first try and pay only the ~0.4 s sample-window cost.
             ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                device_name, width=1280, height=720
+                device_name, width=640, height=480,
+                luma_min_threshold=50.0,
             )
             if ffmpeg_cap is not None and ffmpeg_cap.isOpened():
                 self._cap = ffmpeg_cap
@@ -4053,14 +4942,56 @@ class GestureWorker(QObject):
                 except Exception:
                     pass
             _log(f"ffmpeg cap failed for device={device_name!r}, falling back to OpenCV")
+            # v1.1.7.1 Layer 4: if we pre-flighted the shutter and the
+            # ffmpeg cap ended up unusable (silent hang, luma-net
+            # exhaustion, format rejection), the EXPOSURE=-6 write is
+            # still latched at the UVC device level. The OpenCV cap
+            # we're about to open would inherit that dark state and
+            # look identical to the ffmpeg cap we just released.
+            # Release the preflight by writing DSHOW-auto back — worst
+            # case (driver rejects) it's a harmless no-op; best case
+            # the OpenCV cap opens with the natural auto-exposure.
+            try:
+                self._release_ffmpeg_preflight(int(index))
+            except Exception:
+                pass
             recovered = open_camera_by_index(int(index), max_index=self.config.camera_scan_limit)
             if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
                 self._cap = recovered[1]
+                # v1.1.7.2 (dad rig): the OpenCV fallback cap needs
+                # `_apply_default_capture_tuning` to run so the standard
+                # decision logic (should_kick, luma verify, auto-rollback)
+                # gets a chance to correct any lingering manual state
+                # the preflight release couldn't undo. Without this the
+                # OpenCV cap inherits whatever state the driver latched
+                # during the failed ffmpeg attempt.
+                try:
+                    self._apply_default_capture_tuning(recovered)
+                except Exception:
+                    pass
         else:
+            # r54 v9: leaving ffmpeg mode → clear the pre-flight
+            # idempotence latch so the next re-entry to ffmpeg mode
+            # (or a fresh device) re-arms the short-shutter write.
+            self._ffmpeg_preflight_device = None
+            # v1.1.7.2 (dad rig): also release any latched preflight
+            # EXPOSURE state on the driver before we open OpenCV.
+            # Without this, dropping from GPU/Lite/LowFps → Default
+            # (any transition that pushed us into ffmpeg mode earlier)
+            # leaves the driver in short-shutter mode and the fresh
+            # OpenCV cap opens dark.
+            try:
+                self._release_ffmpeg_preflight(int(index))
+            except Exception:
+                pass
             recovered = open_camera_by_index(int(index), max_index=self.config.camera_scan_limit)
             if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
                 self._cap = recovered[1]
                 _log("restored OpenCV cap")
+                try:
+                    self._apply_default_capture_tuning(recovered)
+                except Exception:
+                    pass
 
     def _build_engine_for_fps_mode(self) -> GestureRecognitionEngine:
         self._low_fps_active = bool(getattr(self.config, "low_fps_mode", False)) or self._low_fps_auto_engaged
@@ -4071,6 +5002,13 @@ class GestureWorker(QObject):
         # it on can never break gesture recognition â€” it just won't
         # speed anything up if the GPU path can't engage.
         prefer_gpu = bool(getattr(self.config, "gpu_mode", False))
+        # v1.1.7 Step 2 (adaptive GPU): if a fullscreen foreground app
+        # (game) is up and we auto-suppressed the GPU path, force
+        # prefer_gpu=False for this rebuild. When the game closes the
+        # transition-detector flips the flag back and swaps the engine
+        # again — no config change, fully automatic.
+        if self._gpu_suppressed_for_fullscreen:
+            prefer_gpu = False
         if self._low_fps_active:
             # Low-FPS already implies lite landmark model â€” keep its
             # tuned thresholds; lite_mode would be redundant here.
@@ -4086,20 +5024,67 @@ class GestureWorker(QObject):
             )
             stable_frames = 1
         elif lite_active:
-            # Lite Mode: lite landmark model (~2.5x faster on CPU)
-            # + smaller inference frame, but keep Normal-mode
-            # confidence thresholds + full stable-frame requirement
-            # so gesture decisions still feel as solid as before.
+            # Lite Mode (v1.1.7 C23): CPU-only. The previous version
+            # silently set prefer_gpu=True so Lite would use ONNX +
+            # DirectML on GPU-capable hardware — but that made two
+            # things worse:
+            #   1. Lite and GPU Mode became functionally identical on
+            #      the common case (both landed on DirectML with only
+            #      the inference-input width differing), so users saw
+            #      no meaningful difference when toggling between them.
+            #   2. Every switch INTO Lite paid the 500-1000 ms
+            #      ort.InferenceSession(DirectML) init on the Qt main
+            #      thread. The user perceived that as a 1-2 second
+            #      lag every time they toggled Lite. Confirmed via the
+            #      [perf-mode] engine-build elapsed=795ms log line.
+            # Now Lite = lite landmark model + narrower inference frame
+            # + CPU MediaPipe. Engine build is ~5 ms (MediaPipe init is
+            # cheap). Users who want the GPU acceleration should use
+            # GPU Mode explicitly. Matches user's stated intent for the
+            # mode topology: "Lite is a universal CPU-cost boost that
+            # works without a strong GPU."
             detector = HandDetector(
                 model_complexity=0,
                 max_process_width=self._LITE_MODE_PROCESS_WIDTH,
-                prefer_gpu=prefer_gpu,
+                prefer_gpu=False,
             )
-            stable_frames = max(2, self.config.stable_frames_required // 2)
+            # C26: user reported that Lite Mode felt identical to
+            # Default on their strong hardware (camera Synapse-capped
+            # at 35 fps, so no fps or CPU delta was perceivable). The
+            # workflow diagnosed that Lite's real per-frame benefits
+            # are below sample noise when the camera is the bottleneck.
+            # Give Lite ONE lever the user WILL feel on every camera:
+            # gesture-snap. stable_frames=1 fires a static gesture on
+            # the first consistent frame instead of waiting for the
+            # default half-of-stable_frames_required (typically 2-3
+            # frames = ~60-90 ms). Matches the Low FPS branch's
+            # precedent above.
+            #
+            # Tradeoff: rapid pose transitions (e.g. moving fist →
+            # open_palm passes through four/three) can now fire a
+            # phantom intermediate gesture. The user opted into Lite
+            # explicitly, so this is acceptable — and the whole
+            # point of the mode is to be a "snappier response"
+            # tradeoff. If false-positives become a support issue,
+            # gate this behind a per-user config knob.
+            stable_frames = 1
         else:
+            # r54 v8: C31 baseline + tighter landmark smoother. User
+            # felt residual skeleton jitter on a still hand after the
+            # C31 revert and explicitly opted into deviating from the
+            # baseline for reduced landmark noise. Smoother params
+            # tightened from C31 defaults (0.58 / 0.18 / 0.76) to
+            # (0.50 / 0.15 / 0.62): ~20 % less per-frame jitter, ~15 ms
+            # extra lag on fast motion. Baseline memory updated.
             detector = HandDetector(
                 max_process_width=self._NORMAL_PROCESS_WIDTH,
                 prefer_gpu=prefer_gpu,
+                smoother=AdaptiveLandmarkSmoother(
+                    alpha=0.50, min_alpha=0.15, max_alpha=0.62,
+                ),
+                secondary_smoother=AdaptiveLandmarkSmoother(
+                    alpha=0.50, min_alpha=0.15, max_alpha=0.62,
+                ),
             )
             stable_frames = max(2, self.config.stable_frames_required // 2)
         return GestureRecognitionEngine(
@@ -4111,11 +5096,23 @@ class GestureWorker(QObject):
     def set_low_fps_mode(self, enabled: bool) -> None:
         enabled = bool(enabled)
         self.config.low_fps_mode = enabled
+        prev_applied = self._applied_low_fps_mode
+        try:
+            sys.stderr.write(
+                f"[perf-mode] set_low_fps_mode({enabled}) running={self._running} "
+                f"applied_was={prev_applied} -> applying={prev_applied != enabled}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         if not enabled:
             self._low_fps_auto_engaged = False
             self._low_fps_below_since = None
             self._low_fps_above_since = None
         self._low_fps_last_process = 0.0
+        if prev_applied == enabled:
+            return
+        self._applied_low_fps_mode = enabled
         if self._running:
             self._swap_engine_safely()
             self._fps = 0.0
@@ -4129,40 +5126,229 @@ class GestureWorker(QObject):
             # the existing OpenCV cap, which means a user enabling
             # Low FPS Mode on slow hardware stayed on the YUY2 8-10
             # fps ceiling and the mode produced no noticeable effect.
-            self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
+            self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
+            # C25: also refresh the OpenCV cap fps request so a Low
+            # FPS → Lite transition picks up Lite's 60 fps target
+            # (the _restore_normal_capture_tuning above uses 30 fps).
+            try:
+                self._apply_default_capture_tuning((None, self._cap))
+            except Exception:
+                pass
 
     def set_lite_mode(self, enabled: bool) -> None:
-        # Lite-model toggle. Rebuilds engine with lite landmark model +
-        # downsampled inference and, if no faster perf mode wins, swaps
-        # the camera capture to ffmpeg-MJPG via _apply_perf_camera_path.
-        self.config.lite_mode = bool(enabled)
+        # Lite-model toggle. Compares against LAST APPLIED state, not
+        # config — the UI updates config.lite_mode before calling this,
+        # so config-based comparison always shows no-op. See the
+        # _applied_*_mode docstring in __init__.
+        enabled = bool(enabled)
+        self.config.lite_mode = enabled
+        prev_applied = self._applied_lite_mode
+        try:
+            sys.stderr.write(
+                f"[perf-mode] set_lite_mode({enabled}) running={self._running} "
+                f"applied_was={prev_applied} -> applying={prev_applied != enabled}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         if not self._running:
             return
+        if prev_applied == enabled:
+            return
+        self._applied_lite_mode = enabled
         self._swap_engine_safely()
         self._fps = 0.0
-        # Reopen camera in fast path if ANY perf mode is active (lite,
-        # gpu, low_fps manual, or low_fps auto-engaged). Previously this
-        # function would early-return when _low_fps_active was already
-        # True, leaving dad's-PC-class hardware stuck on the OpenCV YUY2
-        # ceiling even after the toggle "succeeded."
-        self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
+        self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
+        # C25: re-apply OpenCV capture tuning when a mode toggle
+        # changes the target fps request. Noop when the current cap
+        # is our FfmpegMjpegCapture wrapper. Handles the case where
+        # user toggles Lite ON while the camera path is a noop
+        # (Default ↔ Lite share the OpenCV cap under C24), so
+        # without this the driver stays on the pre-toggle fps
+        # request and Lite doesn't get its 60-fps bump.
+        try:
+            self._apply_default_capture_tuning((None, self._cap))
+        except Exception:
+            pass
 
     def set_gpu_mode(self, enabled: bool) -> None:
-        # GPU-acceleration toggle. Threads prefer_gpu through to the
-        # detector + reopens camera in fast path via
-        # _apply_perf_camera_path so the inference speedup actually
-        # translates to higher live FPS instead of being masked by
-        # the OpenCV YUY2 ceiling.
-        self.config.gpu_mode = bool(enabled)
+        # GPU-acceleration toggle. See set_lite_mode for the
+        # config-vs-applied rationale.
+        enabled = bool(enabled)
+        self.config.gpu_mode = enabled
+        prev_applied = self._applied_gpu_mode
+        try:
+            sys.stderr.write(
+                f"[perf-mode] set_gpu_mode({enabled}) running={self._running} "
+                f"applied_was={prev_applied} -> applying={prev_applied != enabled}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         if not self._running:
             return
+        if prev_applied == enabled:
+            return
+        self._applied_gpu_mode = enabled
         self._swap_engine_safely()
         self._fps = 0.0
-        self._apply_perf_camera_path(want_ffmpeg=self._any_perf_mode_active())
+        self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
+        # C25: re-apply OpenCV capture tuning when a mode toggle
+        # changes the target fps request. Noop when the current cap
+        # is our FfmpegMjpegCapture wrapper. Handles the case where
+        # user toggles Lite ON while the camera path is a noop
+        # (Default ↔ Lite share the OpenCV cap under C24), so
+        # without this the driver stays on the pre-toggle fps
+        # request and Lite doesn't get its 60-fps bump.
+        try:
+            self._apply_default_capture_tuning((None, self._cap))
+        except Exception:
+            pass
 
     def set_force_ten_fps_test_mode(self, enabled: bool) -> None:
         self.config.force_ten_fps_test_mode = bool(enabled)
         self._low_fps_last_process = 0.0
+
+    def _maybe_log_perf_monitor(self) -> None:
+        """C22: log a system-resource snapshot every 5 s so the user
+        can see CPU / GPU / RAM change as they toggle modes from the
+        log alone. Non-blocking: nvidia-smi is queried on a background
+        thread and the result cached across ticks, so a slow query
+        never blocks the main-thread tick loop.
+
+        Emits ONE stderr line every ~5 s in the shape:
+
+            [perf-monitor] proc: cpu=X.X% rss=NNMB | sys: cpu=X.X% |
+                gpu: NN% mem=NN%/NNNMB (RTX 4070) | tick_fps=NN
+                emit_fps=NN
+
+        Any component that can't be measured is elided from the line
+        (e.g. non-NVIDIA systems drop the gpu block entirely).
+        """
+        try:
+            _now = time.monotonic()
+            if self._perf_monitor_last_log <= 0.0:
+                self._perf_monitor_last_log = _now
+                # Kick off the first background GPU query so the log
+                # has data by the time we hit the 5-second window.
+                self._perf_monitor_kickoff_gpu_query()
+                return
+            if (_now - self._perf_monitor_last_log) < 5.0:
+                return
+            self._perf_monitor_last_log = _now
+            parts: list[str] = []
+            # ---- Process CPU + RAM via psutil ----
+            if self._perf_monitor_proc is not None:
+                try:
+                    p_cpu = self._perf_monitor_proc.cpu_percent(interval=None)
+                    p_rss_mb = self._perf_monitor_proc.memory_info().rss / (1024 * 1024)
+                    parts.append(f"proc: cpu={p_cpu:.1f}% rss={p_rss_mb:.0f}MB")
+                except Exception:
+                    pass
+            # ---- System-wide CPU ----
+            if self._perf_monitor_psutil is not None:
+                try:
+                    sys_cpu = self._perf_monitor_psutil.cpu_percent(interval=None)
+                    parts.append(f"sys: cpu={sys_cpu:.1f}%")
+                except Exception:
+                    pass
+            # ---- GPU: consume the background-thread result if ready,
+            # then kick off the next query. This keeps the main tick
+            # off nvidia-smi's ~50-100 ms subprocess spawn.
+            gpu_row = self._perf_monitor_consume_gpu_result()
+            if gpu_row is not None:
+                util_pct, mem_used_mb, mem_total_mb, gpu_name = gpu_row
+                mem_pct = (100.0 * mem_used_mb / mem_total_mb) if mem_total_mb > 0 else 0.0
+                parts.append(
+                    f"gpu: {util_pct:.0f}% mem={mem_pct:.0f}%/{mem_used_mb:.0f}MB "
+                    f"({gpu_name})"
+                )
+            self._perf_monitor_kickoff_gpu_query()
+            # ---- fps context ----
+            try:
+                parts.append(f"self._fps={self._fps:.1f}")
+            except Exception:
+                pass
+            try:
+                sys.stderr.write("[perf-monitor] " + " | ".join(parts) + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            # r50: one-shot post-hint fps breadcrumb. Fires once, on the
+            # first perf-monitor tick that lands >=3 s after the r49
+            # hint was armed, so support readers can correlate the
+            # hint's outcome against delivered fps without a bespoke
+            # timer. Skipped when the wall-clock anchor is absent
+            # (hint never applied) or already reported.
+            try:
+                _armed_ts = getattr(self, "_r49_hint_applied_wallclock", None)
+                _reported = getattr(self, "_r50_post_hint_fps_reported", False)
+                if _armed_ts is not None and not _reported:
+                    import time as _t
+                    elapsed = _t.time() - float(_armed_ts)
+                    if elapsed >= 3.0:
+                        _reason = getattr(self, "_r50_last_decision_reason", "unknown")
+                        _display = getattr(self, "_r50_last_display_name", "")
+                        sys.stderr.write(
+                            f"[r49-short-shutter] post_hint_fps={self._fps:.1f} "
+                            f"elapsed={elapsed:.1f}s reason={_reason} "
+                            f"display_name={_display!r}\n"
+                        )
+                        sys.stderr.flush()
+                        self._r50_post_hint_fps_reported = True
+            except Exception:
+                pass
+        except Exception:
+            # Never let the diagnostic take down the tick loop.
+            pass
+
+    def _perf_monitor_kickoff_gpu_query(self) -> None:
+        """Spawn nvidia-smi in a helper thread. Result is stashed on
+        `_perf_monitor_gpu_result` for the next tick that reaches the
+        5-second window. If nvidia-smi is missing or the machine has no
+        NVIDIA GPU, the result stays None forever (silent no-op)."""
+        if getattr(self, "_perf_monitor_gpu_query_in_flight", False):
+            return
+        self._perf_monitor_gpu_query_in_flight = True
+        def _worker() -> None:
+            try:
+                import subprocess as _sp
+                out = _sp.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used,memory.total,name",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    stderr=_sp.DEVNULL,
+                    timeout=1.5,
+                    creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+                )
+                text = out.decode("utf-8", errors="replace").strip().splitlines()
+                if not text:
+                    return
+                first_row = text[0]
+                fields = [f.strip() for f in first_row.split(",")]
+                if len(fields) < 4:
+                    return
+                util_pct = float(fields[0])
+                mem_used_mb = float(fields[1])
+                mem_total_mb = float(fields[2])
+                gpu_name = fields[3]
+                self._perf_monitor_gpu_result = (util_pct, mem_used_mb, mem_total_mb, gpu_name)
+            except Exception:
+                # nvidia-smi missing, timeout, non-NVIDIA GPU, etc.
+                pass
+            finally:
+                self._perf_monitor_gpu_query_in_flight = False
+        try:
+            threading.Thread(target=_worker, name="perf-monitor-gpu", daemon=True).start()
+        except Exception:
+            self._perf_monitor_gpu_query_in_flight = False
+
+    def _perf_monitor_consume_gpu_result(self):
+        """Return the most-recent nvidia-smi row (util, used, total,
+        name) or None if we haven't gotten one yet."""
+        return getattr(self, "_perf_monitor_gpu_result", None)
 
     def _should_skip_forced_fps_tick(self, now: float) -> bool:
         if not bool(getattr(self.config, "force_ten_fps_test_mode", False)):
@@ -4182,7 +5368,18 @@ class GestureWorker(QObject):
         if self._running:
             return
         self._shutdown_runtime(emit_signal=False)
-        self.engine = self._build_engine_for_fps_mode()
+        # C20: guard the initial build with a wall-clock timeout so a
+        # persisted-from-config gpu_mode=True that hangs on DirectML
+        # init cannot freeze the Qt main thread at startup. Falls back
+        # to CPU on timeout with a neutral status message.
+        self.engine = self._build_engine_guarded()
+        # C17: seed the engine cache with the startup engine so a later
+        # toggle back to this signature hits the cache instead of paying
+        # another ONNX + DirectML session build.
+        if self._engine_cache is None:
+            self._engine_cache = {}
+        if self.engine is not None:
+            self._engine_cache[self._compute_engine_signature()] = self.engine
         # Spin up the background-thread engine runner. The lambda
         # bridge translates the runner-thread callback into a
         # cross-thread Qt signal emit, which auto-queues the result
@@ -4252,8 +5449,33 @@ class GestureWorker(QObject):
 
         camera_info, cap = self._open_camera()
         if cap is None or camera_info is None:
+            # v1.1.7 UX rewrite: never blame specific apps in the
+            # user-visible error. The camera-lock detector still
+            # runs — but only to stderr for our diagnostics. A user
+            # who just installed Razer Synapse (per our own Kiyo Pro
+            # fps guidance) shouldn't be told to close it. The status
+            # and error emit stay neutral so the Stop/Start retry
+            # entrypoint is the only action they need.
+            try:
+                from ..camera.camera_lock_detector import (
+                    detect_camera_holding_processes,
+                    summarize_processes_for_user,
+                )
+                detected_holders = detect_camera_holding_processes()
+                if detected_holders:
+                    holder_summary = summarize_processes_for_user(detected_holders)
+                    sys.stderr.write(
+                        f"[camera-diag] engine open failed; camera-sharing apps "
+                        f"currently running: {holder_summary}. Not surfacing to user.\n"
+                    )
+                    sys.stderr.flush()
+            except Exception:
+                pass
             self._emit_status("no camera found")
-            self.error_occurred.emit("No available camera was found.")
+            self.error_occurred.emit(
+                "Touchless couldn't reach a camera. Make sure your webcam is "
+                "plugged in, then press Start again."
+            )
             self.running_state_changed.emit(False)
             return
 
@@ -4357,8 +5579,28 @@ class GestureWorker(QObject):
             if self._cap is not self._phone_camera_capture:
                 self._cap.release()
             self._cap = None
+        # C17: drain the engine cache before nulling self.engine — some
+        # of the entries may be the currently active engine, others are
+        # inactive cached siblings. Closing all of them here matches the
+        # pre-cache behavior where every mode swap closed its old engine
+        # immediately. Never leak an engine across engine-restarts.
+        if self._engine_cache is not None:
+            for cached_engine in self._engine_cache.values():
+                try:
+                    cached_engine.close()
+                except Exception:
+                    pass
+            self._engine_cache = None
         if self.engine is not None:
-            self.engine.close()
+            try:
+                # If self.engine was already closed via the cache drain
+                # above, close() is idempotent — the underlying MediaPipe
+                # / ONNX close() call short-circuits on already-closed
+                # state. Kept for the (rare) case where the engine was
+                # never added to the cache.
+                self.engine.close()
+            except Exception:
+                pass
             self.engine = None
         self._camera_info = None
         self._running = False
@@ -4464,6 +5706,10 @@ class GestureWorker(QObject):
         else:
             result = open_preferred_or_first_available(self.config.preferred_camera_index, max_index=self.config.camera_scan_limit)
         self._apply_low_fps_capture_tuning(result)
+        # C20: default-mode tuning — nudge the OpenCV cap to 30 fps +
+        # MJPG. No-op for Low FPS (already tuned above) and for Lite /
+        # GPU (they upgrade to ffmpeg-MJPG right after this).
+        self._apply_default_capture_tuning(result)
         result = self._upgrade_to_ffmpeg_capture_if_lite(result)
         return result
 
@@ -4485,6 +5731,33 @@ class GestureWorker(QObject):
         if now - self._camera_recovery_last_at < self._camera_recovery_cooldown_s:
             return
         self._camera_recovery_last_at = now
+        # Detect known camera-holding apps every recovery attempt so
+        # the user's status pill shows the specific culprit ("Razer
+        # Synapse 3 is holding your camera") instead of a generic
+        # "no camera" message. When the user closes that app, the
+        # next recovery cycle succeeds automatically — zero clicks
+        # inside Touchless. Detection is cheap (~150 ms one-shot to
+        # tasklist) and only runs when recovery is actually needed,
+        # so no impact on the happy path.
+        # v1.1.7 UX rewrite: run the detector for stderr diagnostics
+        # but keep user-facing text neutral. Never blame a specific
+        # app in the recovery status.
+        detected_holders: list = []
+        try:
+            from ..camera.camera_lock_detector import (
+                detect_camera_holding_processes,
+                summarize_processes_for_user,
+            )
+            detected_holders = detect_camera_holding_processes()
+            if detected_holders:
+                holder_summary = summarize_processes_for_user(detected_holders)
+                sys.stderr.write(
+                    f"[camera-diag] recovery in progress; camera-sharing apps "
+                    f"currently running: {holder_summary}. Not surfacing to user.\n"
+                )
+                sys.stderr.flush()
+        except Exception:
+            detected_holders = []
         if self._camera_recovery_attempts >= self._camera_recovery_max_attempts:
             # Give up — clean shutdown rather than spinning forever.
             if self._camera_recovery_attempts == self._camera_recovery_max_attempts:
@@ -4493,9 +5766,7 @@ class GestureWorker(QObject):
                 try:
                     self._emit_status("camera disconnected")
                     self.error_occurred.emit(
-                        "Camera connection lost and could not be restored. "
-                        "Check the USB cable / make sure no other app is using the camera, "
-                        "then press Stop and Start to retry."
+                        "Camera connection lost. Press Stop and Start to try again."
                     )
                 except Exception:
                     pass
@@ -4625,8 +5896,19 @@ class GestureWorker(QObject):
             cap.release()
         except Exception:
             pass
+        # C27: match _apply_perf_camera_path — 640x480 not 1280x720.
+        # Same rationale: kill the persistent 1-2 s visual lag the
+        # user reports on GPU Mode by keeping frame size at parity
+        # with Default's OpenCV cap.
+        # r54 v9: pre-flight short shutter (see helper docstring).
+        # v1.1.7.1: luma_min_threshold=50 downshifts 60→30 fps when
+        # the driver produces a too-dark frame at the higher rate
+        # (Subodh Tope's HP HD Camera 2026-08-16 report). Safety net
+        # only — bright frames pass first try, dim ones fall back.
+        self._preflight_short_shutter_for_ffmpeg(index_int, device_name)
         ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-            device_name, width=1280, height=720
+            device_name, width=640, height=480,
+            luma_min_threshold=50.0,
         )
         if ffmpeg_cap is not None and ffmpeg_cap.isOpened():
             _log("ffmpeg cap engaged")
@@ -4637,6 +5919,16 @@ class GestureWorker(QObject):
                 ffmpeg_cap.release()
             except Exception:
                 pass
+        # v1.1.7.2 (dad rig): release the preflight EXPOSURE latch
+        # before opening the OpenCV fallback cap. If we don't, the
+        # driver keeps EXPOSURE=-6 across the cap re-open and the
+        # OpenCV cap opens dark, exactly like dad's 2026-08-19 log
+        # showed. The release helper writes EXP=-4 then AUTO=auto
+        # so the driver leaves manual mode with a bright exposure.
+        try:
+            self._release_ffmpeg_preflight(index_int)
+        except Exception:
+            pass
         # DirectShow-release race guard: the OpenCV cap was released
         # just moments ago (line above the ffmpeg attempt) so the
         # Windows DSHOW filter may still be tearing down. Reopening
@@ -4661,6 +5953,13 @@ class GestureWorker(QObject):
             ):
                 if retry_idx > 0:
                     _log(f"OpenCV reopen succeeded on retry {retry_idx}")
+                # v1.1.7.2 (dad rig): re-run the standard tuning on
+                # the fresh OpenCV cap so should_kick / luma verify
+                # get a chance to correct any lingering manual state.
+                try:
+                    self._apply_default_capture_tuning(recovered)
+                except Exception:
+                    pass
                 return recovered
             time.sleep(0.25)
         # Last-ditch: open with Media Foundation so we have *some*
@@ -4746,6 +6045,829 @@ class GestureWorker(QObject):
         except Exception:
             pass
 
+    def _apply_default_capture_tuning(self, open_result) -> None:
+        """Push a 30 fps + MJPG FOURCC hint into the OpenCV cap on
+        initial open when we're in default mode (no perf toggle).
+
+        Motivation (v1.1.7 C20): the user reports steady 20 fps in
+        default mode on a Kiyo Pro that the DShow probe confirms can
+        do 60 fps at every 640×480 / 720p / 1080p mode. cv2.VideoCapture
+        never sends the DShow driver an explicit framerate request on
+        open — it takes whatever the driver defaults to. The default
+        for many UVC drivers under YUY2 is 15-20 fps because that's
+        the exposure-time-safe rate under Windows auto-exposure. An
+        explicit CAP_PROP_FPS=30 request lifts that cap on drivers
+        that honour it (including the Kiyo Pro's).
+
+        MJPG FOURCC hint is best-effort: OpenCV's Windows path often
+        silently ignores it, but when it works the driver switches
+        to MJPG which lifts the YUY2 bandwidth cap. Zero cost when
+        ignored.
+
+        v1.1.7 C25: also applies to Lite Mode (which now shares the
+        default OpenCV cap since C24) with an fps request bumped to
+        60 fps instead of 30. On drivers that honour it (Kiyo Pro
+        does), Lite delivers noticeably higher fps than Default at
+        the cost of higher camera-decode CPU per second — matches
+        the user's "Lite is a universal CPU-cost fps boost" intent.
+        On drivers that ignore CAP_PROP_FPS (Lite is no worse than
+        Default in that case), it's a silent no-op.
+
+        Skipped when GPU Mode is on (ffmpeg-MJPG handles fps itself)
+        or Low FPS is active (its own tuning path targets 30 fps to
+        keep CPU low on weak hardware).
+        """
+        if self._wants_ffmpeg_cap() or self._low_fps_active:
+            # r49 diag: log why the tuning was skipped so a support
+            # reader can tell 'toggle was dead' from 'toggle never
+            # fired'. Without this line, GPU-Mode / Low-FPS sessions
+            # produce ZERO r49 breadcrumbs and look identical to a
+            # session where the code path never executed.
+            try:
+                _reason = "wants_ffmpeg" if self._wants_ffmpeg_cap() else "low_fps_active"
+                sys.stderr.write(
+                    f"[r49-short-shutter] skip: reason={_reason} "
+                    f"(exposure hint is dead in this mode)\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        cap = None
+        if isinstance(open_result, tuple) and len(open_result) >= 2:
+            cap = open_result[1]
+        elif open_result is not None and hasattr(open_result, "set"):
+            cap = open_result
+        if cap is None:
+            return
+        # Skip if the cap is our ffmpeg wrapper (already 60 fps MJPG).
+        try:
+            if "FfmpegMjpegCapture" in type(cap).__name__:
+                try:
+                    sys.stderr.write(
+                        "[r49-short-shutter] skip: reason=ffmpeg_cap "
+                        "(exposure hint is dead on ffmpeg cap)\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        # MJPG FOURCC hint. Best-effort — many Windows OpenCV builds
+        # silently keep YUY2. When it lands, the driver can hit higher
+        # fps at the same resolution than YUY2 bandwidth would allow.
+        try:
+            if hasattr(cv2, "CAP_PROP_FOURCC"):
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        except Exception:
+            pass
+        # Explicit fps request. UVC drivers honour this when the
+        # requested rate is within their advertised range for the
+        # current (fmt, resolution) combo. C25: Lite gets 60 fps
+        # request (matches the mode's "fps boost" intent); Default
+        # keeps 30 fps.
+        try:
+            if hasattr(cv2, "CAP_PROP_FPS"):
+                lite_active = bool(getattr(self.config, "lite_mode", False))
+                fps_target = 60.0 if lite_active else 30.0
+                cap.set(cv2.CAP_PROP_FPS, fps_target)
+        except Exception:
+            pass
+        # Small buffer size so a brief stall doesn't accumulate
+        # latency in the driver's queue.
+        try:
+            if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        # r49: opt-in short-shutter hint (was C31 unconditional,
+        # r47 reverted to no-op). We now gate it on the config flag
+        # camera_force_short_shutter (default False) so premium
+        # cameras like the Razer Kiyo Pro do NOT trip the 60->25 fps
+        # HDR/auto-exposure throttle by default, while dad's cheap
+        # Realtek UVC can flip it ON in Settings -> General to stop
+        # its driver from holding the shutter open for 40-80 ms per
+        # frame in indoor light. Env HGR_FORCE_SHORT_SHUTTER=0/1
+        # overrides the config for A/B without touching settings.
+        #
+        # Value semantics WARNING (documented for the log reader):
+        # OpenCV's DSHOW backend historically uses 0.25=manual /
+        # 0.75=auto for CAP_PROP_AUTO_EXPOSURE. MSMF and V4L2 use
+        # 1/3. We write 1.0 here; on DSHOW the driver may clamp to
+        # 0.75 (which is AUTO -- opposite of intent). The post-hint
+        # readback below logs cap.getBackendName() so a support
+        # reader can interpret the readback correctly and know
+        # whether to A/B with HGR_FORCE_SHORT_SHUTTER=0 vs =1.
+        # r50: pull display_name for the classifier. At the initial
+        # cap-open call site self._camera_info is still None (assigned
+        # AFTER _open_camera returns). Prefer the fresh info from the
+        # open_result tuple, fall back to the live self._camera_info
+        # for the three mid-session re-tune callers, guard with getattr
+        # so no path can AttributeError.
+        _display_name = ""
+        try:
+            fresh_info = None
+            if isinstance(open_result, tuple) and len(open_result) >= 1:
+                fresh_info = open_result[0]
+            _display_name = getattr(fresh_info, "display_name", None) or getattr(
+                self._camera_info, "display_name", None
+            ) or ""
+        except Exception:
+            _display_name = ""
+        # r50: classifier verdict. None = unknown, True = generic UVC
+        # (auto-apply hint), False = premium (skip hint).
+        _classifier_verdict = None
+        try:
+            from ..camera.camera_utils import classify_camera_shutter_hint as _clf
+            _classifier_verdict = _clf(_display_name)
+        except Exception:
+            _classifier_verdict = None
+        # v1.1.7.1 Layer 3 sticky rollback: if we already auto-applied
+        # the hint on this camera THIS SESSION and rolled it back on
+        # darkness verification, suppress the classifier verdict so we
+        # don't re-apply and re-darken on every settings toggle / mode
+        # re-tune. User can still force it via the explicit config
+        # checkbox — this suppression only demotes the classifier's
+        # auto-verdict, not the user's explicit choice.
+        try:
+            _rb_set = getattr(self, "_r49_auto_rollback_cameras", None)
+            if _rb_set:
+                _display_key_gate = str(_display_name or "").lower().strip()
+                if _display_key_gate and _display_key_gate in _rb_set:
+                    if _classifier_verdict is True:
+                        _classifier_verdict = None
+                    try:
+                        sys.stderr.write(
+                            f"[r49-short-shutter] classifier verdict SUPPRESSED "
+                            f"(prior auto-rollback this session) "
+                            f"camera={_display_key_gate!r}\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        env_override = None
+        _decision_reason = "default_off"
+        try:
+            import os as _os
+            env_override = _os.environ.get("HGR_FORCE_SHORT_SHUTTER")
+            _user_chose = bool(
+                getattr(self.config, "camera_force_short_shutter_user_chose", False)
+            )
+            _cfg_ss = bool(getattr(self.config, "camera_force_short_shutter", False))
+            if env_override is not None:
+                apply_hint = env_override.strip() not in ("", "0", "false", "False")
+                _decision_reason = "env"
+            elif _user_chose:
+                # r53: user has explicitly toggled the checkbox — respect
+                # whatever they set, don't let the classifier override.
+                apply_hint = _cfg_ss
+                _decision_reason = "config_user_chose" if _cfg_ss else "config_user_chose_off"
+            elif _cfg_ss:
+                apply_hint = True
+                _decision_reason = "config"
+            elif _classifier_verdict is True:
+                apply_hint = True
+                _decision_reason = "classifier_generic"
+            elif _classifier_verdict is False:
+                apply_hint = False
+                _decision_reason = "classifier_premium"
+            else:
+                apply_hint = False
+                _decision_reason = "default_off"
+        except Exception:
+            apply_hint = False
+            _decision_reason = "default_off"
+        # Stash for the r50 post_hint_fps breadcrumb + first-fire pill.
+        self._r50_last_display_name = _display_name
+        self._r50_last_decision_reason = _decision_reason
+        self._r50_last_classifier_verdict = _classifier_verdict
+        # r49 diag Q1 (extended in r50): gate evaluation -- always
+        # emitted so the log answers 'did the gate open?' independent
+        # of what happens after. Extended in r50 with display_name +
+        # classifier verdict + decision reason so Kiyo Pro's
+        # 'deliberately did nothing' is captured in the log as
+        # non-regression proof.
+        try:
+            _cfg_ss = bool(getattr(self.config, "camera_force_short_shutter", False))
+            sys.stderr.write(
+                f"[r49-short-shutter] evaluate: env={env_override!r} "
+                f"config.camera_force_short_shutter={_cfg_ss} "
+                f"display_name={_display_name!r} "
+                f"classifier={_classifier_verdict} "
+                f"reason={_decision_reason} "
+                f"-> apply_hint={apply_hint}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        if apply_hint:
+            # r49 diag Q2: pre/post driver readback + backend name.
+            # cap.set() returns True on many UVC drivers even when
+            # the value is silently rejected; only cap.get() after
+            # tells the truth. Backend name disambiguates DSHOW's
+            # 0.25/0.75 magic values from MSMF/V4L2's 1/3.
+            _backend_name = None
+            try:
+                _backend_name = cap.getBackendName()
+            except Exception:
+                pass
+            # r51: capture the pre-hint driver state so we can RESTORE
+            # it on the OFF transition. Without this, ON->OFF was a
+            # no-op write and left the camera dark until app restart
+            # (dad + user reported). Guard with `if not _armed:` so
+            # only the very first ON captures the true baseline; a
+            # mid-armed re-open (recovery reopen, hot-swap) uses the
+            # cap-identity guard below to invalidate the stash.
+            try:
+                pre_auto = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE") else None
+                pre_exp = cap.get(cv2.CAP_PROP_EXPOSURE) if hasattr(cv2, "CAP_PROP_EXPOSURE") else None
+                pre_fps = cap.get(cv2.CAP_PROP_FPS) if hasattr(cv2, "CAP_PROP_FPS") else None
+                pre_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC)) if hasattr(cv2, "CAP_PROP_FOURCC") else None
+                sys.stderr.write(
+                    f"[r49-short-shutter] pre-hint driver state: "
+                    f"backend={_backend_name!r} "
+                    f"auto_exp={pre_auto} exp={pre_exp} "
+                    f"driver_fps={pre_fps} fourcc={pre_fourcc}\n"
+                )
+                sys.stderr.flush()
+            except Exception as _e:
+                pre_auto = None
+                pre_exp = None
+                try:
+                    sys.stderr.write(
+                        f"[r49-short-shutter] pre-hint readback exception: "
+                        f"{type(_e).__name__}: {_e}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            # r51: stash the true baseline. Only stash on the first
+            # ON transition (guarded by _armed=False) AND only when
+            # the cap identity matches or is a fresh cap. Cap identity
+            # invalidation happens in the OFF/restore block below on
+            # recovery reopen. Sentinels: -0.99 for AUTO (typical
+            # "unset/unknown" is -1.0 on Realtek + Kiyo), -19.99 for
+            # EXP (real IR/low-light UVCs advertise log2 down to -15).
+            try:
+                _armed = bool(getattr(self, "_r51_shutter_armed", False))
+                _cap_id_stash = getattr(self, "_r51_shutter_cap_id", None)
+                _cur_cap_id = id(cap)
+                if _armed and _cap_id_stash != _cur_cap_id:
+                    # Different cap object -> stash from a prior cap
+                    # is meaningless. Reset armed state and let the
+                    # `if not _armed` branch below re-stash.
+                    self._r51_shutter_armed = False
+                    _armed = False
+                if not _armed:
+                    # v1.1.7.1 (dad rig 2026-08-19): reject values that
+                    # look like MANUAL mode. UVC drivers latch EXPOSURE
+                    # at the device level, so a fresh session start can
+                    # read back a MANUAL state that a prior session left
+                    # behind (either our own r49 hint from a previous run
+                    # of Touchless, or user's other camera software).
+                    # If we stash that manual state as "baseline" and
+                    # later "restore" it on FSS-off, we just re-apply
+                    # the short-shutter darkness we were trying to escape.
+                    # DSHOW manual AUTO = 0.25, auto = 0.75.
+                    # MSMF/V4L2 manual AUTO = 1.0, auto = 3.0.
+                    # Short-shutter EXP is in the -3 or more-negative
+                    # range (log2 seconds); real auto-exposure values
+                    # in indoor lighting are typically -2 to 0.
+                    _auto_looks_manual = pre_auto is not None and (
+                        abs(float(pre_auto) - 0.25) < 0.05
+                        or abs(float(pre_auto) - 1.0) < 0.05
+                    )
+                    _exp_looks_short_shutter = (
+                        pre_exp is not None
+                        and float(pre_exp) < -2.5
+                    )
+                    _valid_auto = (
+                        pre_auto is not None
+                        and pre_auto > -0.99
+                        and not _auto_looks_manual
+                    )
+                    _valid_exp = (
+                        pre_exp is not None
+                        and pre_exp > -19.99
+                        and not _exp_looks_short_shutter
+                    )
+                    self._r51_shutter_stashed_auto = pre_auto if _valid_auto else None
+                    self._r51_shutter_stashed_exp = pre_exp if _valid_exp else None
+                    self._r51_shutter_cap_id = _cur_cap_id
+                    self._r51_shutter_armed = True
+                    try:
+                        sys.stderr.write(
+                            f"[r51-shutter-stash] pre_auto={pre_auto} "
+                            f"pre_exp={pre_exp} "
+                            f"auto_looks_manual={_auto_looks_manual} "
+                            f"exp_looks_short_shutter={_exp_looks_short_shutter} "
+                            f"-> stashed_auto={self._r51_shutter_stashed_auto} "
+                            f"stashed_exp={self._r51_shutter_stashed_exp}\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            ok_auto = None
+            ok_exp = None
+            # r51: two independent try blocks so an AUTO failure
+            # never suppresses the load-bearing EXPOSURE write. Per
+            # our field-log analysis, EXPOSURE is what actually
+            # changes fps on Realtek + Kiyo Pro; AUTO is a no-op on
+            # both (driver rejects). Losing EXPOSURE because AUTO
+            # threw on an unknown MSMF driver would defeat the whole
+            # feature.
+            try:
+                if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                    ok_auto = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
+            except Exception as _e:
+                try:
+                    sys.stderr.write(
+                        f"[r49-short-shutter] AUTO write exception: "
+                        f"{type(_e).__name__}: {_e}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            try:
+                if hasattr(cv2, "CAP_PROP_EXPOSURE"):
+                    ok_exp = cap.set(cv2.CAP_PROP_EXPOSURE, -6.0)
+            except Exception as _e:
+                try:
+                    sys.stderr.write(
+                        f"[r49-short-shutter] EXP write exception: "
+                        f"{type(_e).__name__}: {_e}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            # v1.1.7.9 display-invariance: flag the display path to lift
+            # the dark short-shutter frame back to natural brightness.
+            self._short_shutter_active_for_display = True
+            try:
+                post_auto = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE") else None
+                post_exp = cap.get(cv2.CAP_PROP_EXPOSURE) if hasattr(cv2, "CAP_PROP_EXPOSURE") else None
+                post_fps = cap.get(cv2.CAP_PROP_FPS) if hasattr(cv2, "CAP_PROP_FPS") else None
+                post_fourcc = int(cap.get(cv2.CAP_PROP_FOURCC)) if hasattr(cv2, "CAP_PROP_FOURCC") else None
+                sys.stderr.write(
+                    f"[r49-short-shutter] post-hint driver readback: "
+                    f"backend={_backend_name!r} "
+                    f"auto_exp_set_return={ok_auto} exp_set_return={ok_exp} "
+                    f"auto_exp={post_auto} exp={post_exp} "
+                    f"driver_fps={post_fps} fourcc={post_fourcc}\n"
+                )
+                sys.stderr.flush()
+            except Exception as _e:
+                try:
+                    sys.stderr.write(
+                        f"[r49-short-shutter] post-hint readback exception: "
+                        f"{type(_e).__name__}: {_e}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            # r49 diag Q3 anchor: arm a bounded delivered-frame-dt
+            # sample window so the next perf-monitor cycles can be
+            # correlated to the hint. The tick loop already tracks
+            # per-tick timing for self._fps; this flag just tells
+            # a future dt-histogram consumer 'measurement starts
+            # here'. Even without a histogram consumer, this line
+            # gives the log a wall-time anchor to bisect against.
+            try:
+                import time as _t
+                self._r49_hint_applied_wallclock = _t.time()
+                # r50: reset the one-shot post_hint_fps guard so a
+                # mid-session mode swap that re-fires this block
+                # (Lite Mode toggle, Low FPS toggle) re-samples fps.
+                self._r50_post_hint_fps_reported = False
+                sys.stderr.write(
+                    f"[r49-short-shutter] armed: hint_applied_ts={self._r49_hint_applied_wallclock:.3f} "
+                    f"(watch next 6 perf-monitor lines for fps delta)\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            # r50: first-fire acknowledgement pill. Fires only when the
+            # classifier auto-applied the hint (reason='classifier_generic')
+            # AND this camera name has not yet had the pill shown. The
+            # pill signal rides the existing engine_log Signal(str) — main
+            # window intercepts the '[r50-classifier-pill]' prefix and
+            # renders a 4s ProcessingOverlay toast + persists the camera
+            # name into config.short_shutter_pill_shown_for_cameras.
+            # Explicit user-config or env-override paths deliberately
+            # skip the pill: those users made the choice themselves and
+            # already know what's happening.
+            try:
+                _reason = getattr(self, "_r50_last_decision_reason", None)
+                if _reason == "classifier_generic":
+                    _display = getattr(self, "_r50_last_display_name", "") or ""
+                    _display_key = _display.lower().strip()
+                    shown = list(
+                        getattr(
+                            self.config,
+                            "short_shutter_pill_shown_for_cameras",
+                            [],
+                        )
+                    )
+                    already_shown = _display_key in {str(x).lower().strip() for x in shown}
+                    if _display_key and not already_shown:
+                        engine_log = getattr(self, "engine_log", None)
+                        if engine_log is not None:
+                            try:
+                                engine_log.emit(
+                                    "[r50-classifier-pill] "
+                                    "Your camera is set up for smooth tracking. "
+                                    "You can change this in Settings > Camera anytime. "
+                                    f"camera={_display}"
+                                )
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            # v1.1.7.1 Layer 3: auto-rollback if the hint made the
+            # frame too dark. Applies ONLY when the classifier auto-
+            # applied the hint on this camera (reason=classifier_generic).
+            # User-explicit config (user_chose=True with cfg=True) and
+            # env override are respected as-is — those users made an
+            # informed choice and know the trade-off. For the auto-
+            # applied case, we sample luma over ~300 ms after the driver
+            # settles; if median falls below threshold, MediaPipe can't
+            # detect hands regardless of how smooth the pipeline is, so
+            # we restore the pre-hint state and mark the camera as
+            # "auto-hint tried, rolled back" for the remainder of the
+            # session.
+            _auto_applied = _decision_reason == "classifier_generic"
+            if _auto_applied and cap is not None:
+                try:
+                    # Settle time: the driver needs a beat to commit the
+                    # new exposure before its readback matches what we
+                    # just wrote. Sampling too early = we read the pre-
+                    # write bright frames and mis-conclude "not dark."
+                    time.sleep(0.15)
+                    _luma_samples: list[float] = []
+                    _luma_deadline = time.monotonic() + 0.35
+                    while len(_luma_samples) < 10 and time.monotonic() < _luma_deadline:
+                        try:
+                            _ok, _frame = cap.read()
+                        except Exception:
+                            _ok, _frame = False, None
+                        if not _ok or _frame is None:
+                            try:
+                                time.sleep(0.005)
+                            except Exception:
+                                pass
+                            continue
+                        try:
+                            _small = _frame[::4, ::4]
+                            if _small.ndim < 3 or _small.size == 0:
+                                continue
+                            _b = _small[:, :, 0].astype(np.float32)
+                            _g = _small[:, :, 1].astype(np.float32)
+                            _r = _small[:, :, 2].astype(np.float32)
+                            _y = 0.0722 * _b + 0.7152 * _g + 0.2126 * _r
+                            _luma_samples.append(float(np.median(_y)))
+                        except Exception:
+                            continue
+                    if len(_luma_samples) >= 4:
+                        _median_luma = float(np.median(_luma_samples))
+                    else:
+                        _median_luma = None
+                    # Threshold 45 — slightly more permissive than the
+                    # ffmpeg safety net's 50 because r49 short-shutter
+                    # legitimately produces a slightly darker frame on
+                    # cameras where it's supposed to work (r49 field-log
+                    # confirmed on Realtek). Only very dark = rollback.
+                    _too_dark = (
+                        _median_luma is not None
+                        and _median_luma < 45.0
+                    )
+                    try:
+                        sys.stderr.write(
+                            f"[r49-short-shutter] auto-hint luma verify: "
+                            f"samples={len(_luma_samples)} median={_median_luma} "
+                            f"too_dark={_too_dark}\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                    if _too_dark:
+                        # v1.1.7.1 rollback path — always kick to AUTO,
+                        # NEVER trust stashed values here. The stash may
+                        # have captured a manual state from a prior
+                        # session (UVC latching), and writing it back
+                        # would just re-apply the darkness. Kicking to
+                        # auto is what actually gets us out of manual
+                        # mode. The driver's own auto-exposure logic
+                        # then picks a sensible exposure — that's
+                        # exactly what we want when the hint's own
+                        # short shutter proved too aggressive.
+                        try:
+                            _rb_wrote_something = False
+                            if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                                try:
+                                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)  # DSHOW auto
+                                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3.0)   # MSMF/V4L2 auto
+                                    _rb_wrote_something = True
+                                except Exception:
+                                    pass
+                            # v1.1.7.1 (dad rig): nudge EXPOSURE back
+                            # to a medium value. Just kicking AUTO to
+                            # auto isn't enough on drivers that keep
+                            # the manually-set EXPOSURE value even in
+                            # auto mode — the shutter stays short and
+                            # the preview stays dark. -4 in log2s ≈
+                            # 62 ms which is a reasonable brightness
+                            # for indoor lighting; if the driver re-
+                            # enters true auto it will readjust from
+                            # there. We prefer a stashed EXPOSURE if
+                            # it looks safe (>-2.5), otherwise we
+                            # nudge to -4 as a safe default.
+                            _rb_exp_stash = getattr(self, "_r51_shutter_stashed_exp", None)
+                            _rb_exp_target = None
+                            if (
+                                _rb_exp_stash is not None
+                                and _rb_exp_stash > -2.5
+                                and _rb_exp_stash > -19.99
+                            ):
+                                _rb_exp_target = float(_rb_exp_stash)
+                            else:
+                                _rb_exp_target = -4.0
+                            if hasattr(cv2, "CAP_PROP_EXPOSURE") and _rb_exp_target is not None:
+                                try:
+                                    cap.set(cv2.CAP_PROP_EXPOSURE, _rb_exp_target)
+                                    _rb_wrote_something = True
+                                except Exception:
+                                    pass
+                            # Suppress future auto-apply on this camera
+                            # this session so the darkness doesn't come
+                            # back on the next Lite Mode toggle etc.
+                            _display_key_rb = (
+                                str(getattr(self, "_r50_last_display_name", "") or "")
+                                .lower().strip()
+                            )
+                            _rolled_back_set = getattr(
+                                self, "_r49_auto_rollback_cameras", None
+                            )
+                            if _rolled_back_set is None:
+                                _rolled_back_set = set()
+                                self._r49_auto_rollback_cameras = _rolled_back_set
+                            if _display_key_rb:
+                                _rolled_back_set.add(_display_key_rb)
+                            # Clear armed state — we just restored, no
+                            # need for the OFF branch to try to
+                            # restore again on the next toggle.
+                            self._r51_shutter_armed = False
+                            self._r51_shutter_stashed_auto = None
+                            self._r51_shutter_stashed_exp = None
+                            self._r51_shutter_cap_id = None
+                            try:
+                                sys.stderr.write(
+                                    f"[r49-short-shutter] AUTO-ROLLBACK: "
+                                    f"wrote_something={_rb_wrote_something} "
+                                    f"rb_auto={_rb_auto} rb_exp={_rb_exp} "
+                                    f"camera={_display_key_rb!r}. Auto-classifier "
+                                    f"suppressed for this camera this session.\n"
+                                )
+                                sys.stderr.flush()
+                            except Exception:
+                                pass
+                        except Exception as _e:
+                            try:
+                                sys.stderr.write(
+                                    f"[r49-short-shutter] rollback exception: "
+                                    f"{type(_e).__name__}: {_e}\n"
+                                )
+                                sys.stderr.flush()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        else:
+            # r51: OFF branch. If we previously armed the hint on
+            # this cap, restore the stashed pre-hint AUTO_EXPOSURE +
+            # EXPOSURE. Without this, ON->OFF was a no-op and the
+            # camera stayed dark until app restart. Only clears the
+            # armed flag on VERIFIED restore (post-readback matches
+            # target within 0.5) so a silently-rejecting driver
+            # doesn't lock the user into permanent darkness — the
+            # next OFF click retries the same restore.
+            #
+            # r53 v7: also unconditionally kick the driver back into
+            # AUTO_EXPOSURE mode even when not armed. This handles
+            # the case where the camera FIRST opened with FSS=True
+            # (persisted config), so the stash captured the manual
+            # values as "baseline" and restoring them keeps the
+            # camera dark. DSHOW auto=0.75, MSMF/V4L2 auto=3.0 —
+            # write both since neither backend errors on an out-of-
+            # range value, and one of them will be honoured.
+            try:
+                _armed = bool(getattr(self, "_r51_shutter_armed", False))
+                _cap_id_stash = getattr(self, "_r51_shutter_cap_id", None)
+                _cur_cap_id = id(cap)
+                if _armed and _cap_id_stash != _cur_cap_id:
+                    # Cap was reopened (recovery, hot-swap). The
+                    # stashed values are stale. Drop armed state so
+                    # a fresh ON re-captures a valid baseline.
+                    self._r51_shutter_armed = False
+                    self._r51_shutter_stashed_auto = None
+                    self._r51_shutter_stashed_exp = None
+                    self._r51_shutter_cap_id = None
+                    _armed = False
+            except Exception:
+                _armed = False
+            # v1.1.7.1: gate the auto-mode kick. r53 v7 wrote AUTO=0.75
+            # then AUTO=3.0 on EVERY engine start — the intent was to
+            # rescue cameras stuck in manual mode from a prior session.
+            # In practice it also fired on cameras we had never touched
+            # (HP HD Camera + other built-in laptop webcams whose names
+            # don't match any classifier keyword), and on some of them
+            # the double-write left the driver in a half-manual state
+            # that produced a dark preview the moment the engine started
+            # (Subodh Tope 2026-08-18 report: engine OFF = bright,
+            # engine ON = dark). Only kick when there's evidence we
+            # should be managing this camera's exposure:
+            #   * _armed: we stashed pre-hint state in this session and
+            #     may need to restore from auto (kick runs BEFORE the
+            #     restore block below).
+            #   * user_chose: user has explicitly toggled the checkbox,
+            #     so we own this camera's exposure state either way.
+            #   * classifier_verdict is True: this is a generic UVC we
+            #     WOULD have applied the hint to; kick handles the case
+            #     where a prior session persisted a manual state at the
+            #     UVC device level and needs release.
+            # For cameras where none of these apply (Kiyo Pro fresh
+            # install, HP HD Camera fresh install, any built-in laptop
+            # webcam that no user has ever configured), we leave the
+            # driver's auto-exposure state exactly as it was.
+            _user_chose_kick = bool(getattr(self.config, "camera_force_short_shutter_user_chose", False))
+            # v1.1.7.1 (dad rig 2026-08-19): also kick when the driver's
+            # CURRENT state looks like manual mode. This catches cameras
+            # where a prior session (or unrelated software) left a manual
+            # exposure state latched at the UVC device level and the
+            # user hasn't explicitly asked for anything. Auto mode is
+            # what 99% of users want on engine start — if we detect
+            # the driver isn't in auto right now, kick it.
+            # Only reads that clearly look manual trigger this — unknown
+            # (-1) or ambiguous readings don't. Avoids kicking cameras
+            # whose driver reports state opaquely.
+            _pre_kick_auto = None
+            try:
+                if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                    _pre_kick_auto = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+            except Exception:
+                _pre_kick_auto = None
+            _current_looks_manual = _pre_kick_auto is not None and (
+                abs(float(_pre_kick_auto) - 0.25) < 0.05  # DSHOW manual
+                or abs(float(_pre_kick_auto) - 1.0) < 0.05  # MSMF/V4L2 manual
+            )
+            # v1.1.7.3 (dad rig 2026-08-19): drivers that don't report
+            # AUTO state truthfully (return -1.0 "unknown") were slipping
+            # past _current_looks_manual and staying dark. Also look at
+            # the read-back EXPOSURE: if it's in the short-shutter range
+            # (< -2.5 log2s), the driver IS in a manual-short-shutter
+            # state regardless of what AUTO reports. This is dad's rig
+            # exactly: pre_kick_auto=-1.0, post_exp=-6.0, camera dark.
+            _pre_kick_exp_readback = None
+            try:
+                if hasattr(cv2, "CAP_PROP_EXPOSURE"):
+                    _pre_kick_exp_readback = cap.get(cv2.CAP_PROP_EXPOSURE)
+            except Exception:
+                _pre_kick_exp_readback = None
+            _current_exp_looks_short = (
+                _pre_kick_exp_readback is not None
+                and _pre_kick_exp_readback > -19.99
+                and _pre_kick_exp_readback < -2.5
+            )
+            _should_kick = (
+                _armed
+                or _user_chose_kick
+                or _classifier_verdict is True
+                or _current_looks_manual
+                or _current_exp_looks_short
+            )
+            if _should_kick:
+                try:
+                    if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+                        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3.0)
+                except Exception:
+                    pass
+                # v1.1.7.1 (dad rig): if EXPOSURE looks like a leftover
+                # short-shutter latch, also nudge it back toward the
+                # driver's default. Many DSHOW drivers keep the manual
+                # EXPOSURE value even after AUTO_EXPOSURE=auto, so the
+                # camera stays dark even in "auto" mode. Writing EXP=-4
+                # (~62 ms shutter) gives the driver a bright starting
+                # point; if it re-enters true auto, it will readjust
+                # from there. Only fires when the read-back EXP is in
+                # the short-shutter range (< -2.5 log2s = <180 ms).
+                try:
+                    _pre_kick_exp = cap.get(cv2.CAP_PROP_EXPOSURE) if hasattr(cv2, "CAP_PROP_EXPOSURE") else None
+                except Exception:
+                    _pre_kick_exp = None
+                if (
+                    _pre_kick_exp is not None
+                    and _pre_kick_exp > -19.99
+                    and _pre_kick_exp < -2.5
+                ):
+                    try:
+                        cap.set(cv2.CAP_PROP_EXPOSURE, -4.0)
+                    except Exception:
+                        pass
+                    # v1.1.7.9 display-invariance: -4 (62 ms shutter) is
+                    # still shorter than the driver's typical auto pick
+                    # (-2 / 250 ms). Enable display gamma-lift so the
+                    # user's preview stays natural-looking even when the
+                    # driver leaves EXP latched. If auto really does
+                    # kick in and the sensor brightens, the compensation
+                    # function's median-check returns a no-op anyway.
+                    self._short_shutter_active_for_display = True
+            # Post-kick readback for diagnosis.
+            try:
+                _kick_auto = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE) if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE") else None
+                _kick_exp = cap.get(cv2.CAP_PROP_EXPOSURE) if hasattr(cv2, "CAP_PROP_EXPOSURE") else None
+                sys.stderr.write(
+                    f"[r53-shutter-off-kick] armed={_armed} "
+                    f"should_kick={_should_kick} "
+                    f"user_chose={_user_chose_kick} "
+                    f"verdict={_classifier_verdict} "
+                    f"current_looks_manual={_current_looks_manual} "
+                    f"pre_kick_auto={_pre_kick_auto} "
+                    f"post_auto={_kick_auto} post_exp={_kick_exp}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            if _armed:
+                _target_auto = getattr(self, "_r51_shutter_stashed_auto", None)
+                _target_exp = getattr(self, "_r51_shutter_stashed_exp", None)
+                _restore_ok_auto = None
+                _restore_ok_exp = None
+                # Two independent try blocks — AUTO failure must not
+                # suppress the load-bearing EXPOSURE restore.
+                try:
+                    if _target_auto is not None and hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                        _restore_ok_auto = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, float(_target_auto))
+                except Exception:
+                    pass
+                try:
+                    if _target_exp is not None and hasattr(cv2, "CAP_PROP_EXPOSURE"):
+                        _restore_ok_exp = cap.set(cv2.CAP_PROP_EXPOSURE, float(_target_exp))
+                except Exception:
+                    pass
+                # Post-restore readback + verification.
+                _post_auto = None
+                _post_exp = None
+                try:
+                    if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                        _post_auto = cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
+                    if hasattr(cv2, "CAP_PROP_EXPOSURE"):
+                        _post_exp = cap.get(cv2.CAP_PROP_EXPOSURE)
+                except Exception:
+                    pass
+                _exp_ok = (
+                    _target_exp is None
+                    or (
+                        _post_exp is not None
+                        and abs(float(_post_exp) - float(_target_exp)) < 0.5
+                    )
+                )
+                try:
+                    sys.stderr.write(
+                        f"[r51-short-shutter] restore: "
+                        f"target_auto={_target_auto} target_exp={_target_exp} "
+                        f"set_return_auto={_restore_ok_auto} set_return_exp={_restore_ok_exp} "
+                        f"post_auto={_post_auto} post_exp={_post_exp} "
+                        f"verified={_exp_ok}\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                if _exp_ok:
+                    # Verified restore -> clear the armed state so
+                    # the next ON captures a fresh baseline.
+                    self._r51_shutter_armed = False
+                    self._r51_shutter_stashed_auto = None
+                    self._r51_shutter_stashed_exp = None
+                    self._r51_shutter_cap_id = None
+                else:
+                    # Driver silently rejected the restore. Keep
+                    # armed=True + stash intact so the next OFF click
+                    # retries against the same baseline. Never lock
+                    # the user into permanent darkness.
+                    try:
+                        sys.stderr.write(
+                            "[r51-short-shutter] restore rejected; "
+                            "a camera reopen may be needed\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+
     def _restore_normal_capture_tuning(self, open_result) -> None:
         cap = None
         if isinstance(open_result, tuple) and len(open_result) >= 2:
@@ -4777,9 +6899,199 @@ class GestureWorker(QObject):
         except Exception:
             return frame
 
+    def _apply_brightness_boost_if_needed(self, frame):
+        """v1.1.7.8: CLAHE-based low-light enhancement.
+
+        Uses Contrast Limited Adaptive Histogram Equalization (CLAHE)
+        on the Y channel of YCrCb color space. This is the exact
+        technique Zoom, Google Meet, and Microsoft Teams use for their
+        "adjust for low light" mode:
+
+          * Luminance-only enhancement — the Y channel gets equalized
+            while Cr and Cb (color difference) channels are untouched.
+            Result: hue is preserved perfectly, ZERO yellow cast
+            (fixed the 1.1.7.4-6 complaint that linear multiply
+            amplified the camera's warm tint).
+          * Adaptive per 8×8 tile — dark corners get more brightening
+            than already-bright zones. Prevents blown-out highlights
+            and preserves the overall look of the scene.
+          * Hysteresis (enable at Y<70, disable at Y>100) — prevents
+            the "adjusting" flicker the user reported on 1.1.7.4 when
+            a linear boost turned on/off at a single threshold.
+          * clipLimit=2.5 default — Zoom/Meet use similar values.
+            Higher values (up to 5.0 via config) give more aggressive
+            enhancement for genuinely dim scenes.
+
+        Config knobs:
+          - camera_brightness_boost_enabled (bool, default True) —
+            master switch for the display path. False = raw pixels
+            always. Detection path is unaffected (MediaPipe always
+            benefits from the enhancement when dark).
+          - camera_brightness_boost (int, default 0):
+              0 = auto (fires when Y median < 70, off when > 100)
+              1–100 = forced clipLimit scale (2.0 → 5.0)
+
+        Cost: ~1.5 ms per 640×480 frame when enhancement fires;
+        zero cost when disabled (early return). Luma sample runs
+        every 15 ticks on a 4×-downsampled slice.
+        """
+        if frame is None:
+            return frame
+        try:
+            cfg_boost = int(getattr(self.config, "camera_brightness_boost", 0) or 0)
+        except Exception:
+            cfg_boost = 0
+        cfg_boost = max(0, min(100, cfg_boost))
+
+        # Sample luma periodically. Every 15 ticks (~500 ms at 30 fps)
+        # keeps the cost trivial while still reacting to lighting
+        # changes fast enough that a user turning on a light doesn't
+        # sit in over-boosted mode for long.
+        _cnt = int(getattr(self, "_bboost_tick_counter", 0)) + 1
+        self._bboost_tick_counter = _cnt
+        _should_sample = (_cnt % 15) == 0 or not hasattr(self, "_bboost_last_luma")
+        if _should_sample:
+            try:
+                small = frame[::4, ::4]
+                if small.ndim >= 3 and small.size > 0:
+                    b = small[:, :, 0].astype(np.float32)
+                    g = small[:, :, 1].astype(np.float32)
+                    r = small[:, :, 2].astype(np.float32)
+                    y = 0.0722 * b + 0.7152 * g + 0.2126 * r
+                    luma = float(np.median(y))
+                    self._bboost_last_luma = luma
+                    # Hysteresis: enable at Y<70, disable at Y>100.
+                    # The 30-unit dead zone means a scene hovering
+                    # around Y=80 doesn't toggle the state on every
+                    # sample — the flicker complaint from 1.1.7.4
+                    # was caused by a single-threshold trigger that
+                    # kept flipping.
+                    was_active = getattr(self, "_bboost_active", False)
+                    if was_active:
+                        self._bboost_active = luma < 100.0
+                    else:
+                        self._bboost_active = luma < 70.0
+            except Exception:
+                pass
+
+        # Decide whether to apply enhancement.
+        auto_active = getattr(self, "_bboost_active", False)
+        if cfg_boost > 0:
+            # Manual force: user picked a strength.
+            clip_limit = 2.0 + (cfg_boost / 100.0) * 3.0  # 2.0 → 5.0
+        elif auto_active:
+            # Auto-mode: gentle default.
+            clip_limit = 2.5
+        else:
+            return frame  # Nothing to do; frame is bright enough.
+
+        # Apply CLAHE on Y channel — the whole point of this pipeline.
+        # tileGridSize=8x8 gives good local adaptation on 640×480 without
+        # visible tile boundaries. Larger tiles look global; smaller
+        # tiles start showing tile-edge artifacts on flat regions.
+        try:
+            ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+            y_ch, cr, cb = cv2.split(ycrcb)
+            clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+            y_boosted = clahe.apply(y_ch)
+            ycrcb_boosted = cv2.merge([y_boosted, cr, cb])
+            return cv2.cvtColor(ycrcb_boosted, cv2.COLOR_YCrCb2BGR)
+        except Exception:
+            return frame
+
+    def _compensate_short_shutter_for_display(self, frame):
+        """v1.1.7.9: display-side invariance for Boost Performance mode.
+
+        The pipeline contract the user asked for: when Boost mode forces
+        the camera to a short shutter (higher fps but darker sensor
+        output), the DISPLAY should look the same as it would at the
+        camera's natural exposure — the user sees the fps benefit
+        without any visible dimming. When Boost is off, this function
+        is a no-op (raw pass-through) so the user still sees the
+        sensor's natural output.
+
+        Method: adaptive gamma correction on the Y channel of YCrCb,
+        targeting median luma ~= 100 (comfortable mid-range that reads
+        as "normal room lighting, not dim"). Chosen over linear gain
+        because gamma lifts midtones without clipping highlights (linear
+        multiply on a dim frame produces the yellow cast we saw in
+        1.1.7.4). Chosen over CLAHE because the target here is GLOBAL
+        brightness restoration, not local contrast enhancement — CLAHE
+        would over-enhance already-lit regions.
+
+        Only fires when `self._short_shutter_active_for_display` is
+        True, which the camera-open path sets whenever it actually
+        writes EXPOSURE=-6 (or a similar short-shutter override) to the
+        driver. If the driver silently rejects the write (r49 field
+        note documents this on some UVCs), the sensor output is bright
+        anyway and the median-check inside will short-circuit the
+        compensation.
+
+        Cost: cv2.LUT is O(N) over pixels, ~0.5 ms per 640x480 frame;
+        one cvtColor round-trip is ~0.5 ms. Total ~1.2 ms per frame
+        while Boost is active. Zero cost when Boost is off (early
+        return before any cv2 call). Median sampled every 15 frames
+        on a 4x-downsampled slice; LUT rebuilt only when the gamma
+        target moves by >0.02 so lighting changes cost ~0 in steady
+        state.
+        """
+        if frame is None:
+            return frame
+        if not getattr(self, "_short_shutter_active_for_display", False):
+            return frame
+        _cnt = int(getattr(self, "_ss_disp_tick", 0)) + 1
+        self._ss_disp_tick = _cnt
+        _sample_ok = _cnt % 15 == 0 or not hasattr(self, "_ss_disp_target_gamma")
+        if _sample_ok:
+            try:
+                small = frame[::4, ::4]
+                if small.ndim >= 3 and small.size > 0:
+                    b = small[:, :, 0].astype(np.float32)
+                    g = small[:, :, 1].astype(np.float32)
+                    r = small[:, :, 2].astype(np.float32)
+                    y = 0.0722 * b + 0.7152 * g + 0.2126 * r
+                    _median = float(np.median(y))
+                else:
+                    _median = 128.0
+            except Exception:
+                _median = 128.0
+            _TARGET = 100.0
+            if _median >= _TARGET or _median < 2.0:
+                self._ss_disp_target_gamma = None
+            else:
+                try:
+                    gamma = float(
+                        np.log(_TARGET / 255.0) / np.log(_median / 255.0)
+                    )
+                except Exception:
+                    gamma = 1.0
+                self._ss_disp_target_gamma = float(np.clip(gamma, 0.35, 1.0))
+        _gamma = getattr(self, "_ss_disp_target_gamma", None)
+        if _gamma is None:
+            return frame
+        _cached = getattr(self, "_ss_disp_lut_gamma", None)
+        if _cached is None or abs(_cached - _gamma) > 0.02:
+            try:
+                idx = np.arange(256, dtype=np.float32) / 255.0
+                self._ss_disp_lut = np.clip(
+                    np.power(idx, _gamma) * 255.0, 0, 255
+                ).astype(np.uint8)
+                self._ss_disp_lut_gamma = _gamma
+            except Exception:
+                return frame
+        try:
+            ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+            y_ch, cr, cb = cv2.split(ycrcb)
+            y_lifted = cv2.LUT(y_ch, self._ss_disp_lut)
+            ycrcb_lifted = cv2.merge([y_lifted, cr, cb])
+            return cv2.cvtColor(ycrcb_lifted, cv2.COLOR_YCrCb2BGR)
+        except Exception:
+            return frame
+
     def _tick(self) -> None:
         if not self._running or self._cap is None or self.engine is None:
             return
+        self._tick_call_count += 1
         # Dead-cap auto-recovery. The threaded reader marks the
         # capture dead (isOpened() → False) when it hits the
         # consecutive-failure ceiling — typically a USB hiccup or
@@ -4881,6 +7193,18 @@ class GestureWorker(QObject):
         if not bool(getattr(self.config, "camera_source_is_mirrored", False)):
             frame = cv2.flip(frame, 1)
         frame = self._prepare_runtime_frame(frame)
+        # Split display from detection — the pipeline contract.
+        # Detection: CLAHE-preprocessed for MediaPipe accuracy in dim
+        # scenes; MediaPipe never sees the raw dim frame.
+        # Display: pristine sensor output BY DEFAULT (boost mode off).
+        # When boost mode has forced a short shutter for fps, the
+        # sensor output is darker than natural auto-exposure would be —
+        # `_compensate_short_shutter_for_display` lifts it back with an
+        # adaptive gamma curve on the Y channel so the user's preview
+        # looks approximately the same whether boost is on or off.
+        # This is the invariance contract: boost mode's ONLY visible
+        # effect is higher fps; nothing else changes.
+        detection_frame = self._apply_brightness_boost_if_needed(frame)
         t_prep = time.perf_counter() if debug_timing else 0.0
         # Camera-target drawing composite. The drawing canvas
         # accumulates strokes in _update_camera_drawing_canvas
@@ -4899,6 +7223,11 @@ class GestureWorker(QObject):
             self._blend_camera_drawing_overlay(frame)
         except Exception:
             pass
+        # v1.1.7.9 display-invariance: apply the boost-mode gamma lift
+        # only when the camera-open path flagged short-shutter as
+        # active. When boost is off, this is a no-op fast path and the
+        # emitted buffer is the raw frame.
+        display_frame = self._compensate_short_shutter_for_display(frame)
         # Decoupled display path. CRUCIAL ordering: emit the raw
         # frame BEFORE the back-pressure check below. This is what
         # makes the live view update at camera fps even when GPU
@@ -4912,18 +7241,71 @@ class GestureWorker(QObject):
             capture_ts = float(getattr(self._cap, "_last_consumed_ts", 0.0) or 0.0)
             if capture_ts <= 0.0:
                 capture_ts = time.monotonic()
-            self.raw_frame_ready.emit(frame, capture_ts)
+            # r54 v3 REVERTED: display WB "fix" made colors worse in
+            # practice — gray-world assumption failed on a scene with
+            # non-neutral objects, and my correction was pushing an
+            # already-broken frame further off. Root cause of the
+            # green/purple cast is being properly diagnosed via
+            # workflow. Emitting the raw frame like before.
+            self.raw_frame_ready.emit(display_frame, capture_ts)
+            self._raw_emit_count += 1
+            self._note_display_fps()
         except Exception:
             pass
+        # C14 diagnostic: raw emit rate + tick fire rate. Camera
+        # reader delivers frames independently of engine work, so
+        # the emit rate tells us whether QTimer is firing at its
+        # 15 ms cadence (≈66 fps ceiling) or whether main-thread
+        # work is pushing tick fires apart.
+        if self._perf_optimisations_enabled():
+            _now_perf = time.monotonic()
+            if self._raw_emit_last_log <= 0.0:
+                self._raw_emit_last_log = _now_perf
+            elif (_now_perf - self._raw_emit_last_log) >= 2.0:
+                _elapsed = _now_perf - self._raw_emit_last_log
+                _emit_fps = self._raw_emit_count / _elapsed if _elapsed > 0 else 0.0
+                _tick_fps = self._tick_call_count / _elapsed if _elapsed > 0 else 0.0
+                try:
+                    sys.stderr.write(
+                        f"[raw_frame] emit rate: {_emit_fps:.1f} fps "
+                        f"(tick fires: {_tick_fps:.1f} fps, {self._tick_call_count} "
+                        f"calls / {_elapsed:.2f} s)\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                self._raw_emit_count = 0
+                self._tick_call_count = 0
+                self._raw_emit_last_log = _now_perf
+        # C22 diagnostic: system resource snapshot every ~5 s. Runs
+        # regardless of perf-mode so the user can watch CPU / GPU
+        # move as they toggle modes without needing Task Manager open
+        # side-by-side. Cheap: psutil calls are microseconds; the
+        # nvidia-smi shell out is bounded at 500 ms per query and
+        # cached to a background thread so the main tick doesn't
+        # jitter when the subprocess is slow.
+        self._maybe_log_perf_monitor()
         # Back-pressure: if the engine runner is still chewing on the
-        # previous frame, OR a runner result is queued waiting for the
-        # main thread to handle it, drop the rest of this tick (no
-        # inference, no debug payload). Display already went out
-        # above so the live view stays smooth. The next tick will
-        # pick up a fresh camera frame for inference once the runner
-        # is free. Skipping here keeps the request queue at depth=1
-        # so we never build an inference backlog.
-        if self._engine_runner.busy or self._async_result_pending:
+        # previous frame, drop the rest of this tick (no inference,
+        # no debug payload). Display already went out above so the
+        # live view stays smooth. The next tick will pick up a fresh
+        # camera frame for inference once the runner is free.
+        # Runner.submit() also self-checks _busy, so the request queue
+        # stays at depth=1 either way.
+        #
+        # Note: we deliberately no longer gate on
+        # _async_result_pending here. The runner clears its _busy
+        # flag the instant inference finishes (before it emits the
+        # queued result signal), so gating on _busy alone lets the
+        # next tick submit a fresh frame the moment the runner is
+        # idle, without waiting the extra ~5-15 ms it takes for Qt's
+        # queued-signal delivery to land _on_engine_result on the
+        # main thread. That single change lifts the tick cadence
+        # from ~25 fps to camera-limited (see release notes for
+        # measurements). _last_result_had_hand may be one cycle stale
+        # for the skip-inference optimization; that only affects when
+        # we can shortcut the neutral-frame case, never correctness.
+        if self._engine_runner.busy:
             return
         tick_now = time.time()
         if self._should_skip_forced_fps_tick(tick_now):
@@ -4938,22 +7320,16 @@ class GestureWorker(QObject):
         # without the worker firing the matching binding.
         if self._frozen:
             return
-        # Smart skip-frame inference: when Lite Mode is on AND we
-        # know the previous frame was empty (no hand), skip MediaPipe
-        # this tick and synthesise a "no hand" result. Never skip two
-        # ticks in a row â€” that guarantees we'll always detect a new
-        # hand within one camera frame (~16 ms). When a hand was
-        # visible last tick we always run inference, so dynamic
-        # gestures (swipes, repeat-circle) â€” which feed every frame's
-        # landmark velocity to the dynamic recognizer â€” never lose
-        # any frames during a gesture. Net: ~50% of MediaPipe's cost
-        # disappears during empty-frame periods (idle / between
-        # gestures), no impact during active gesturing.
-        skip_inference = (
-            self._perf_optimisations_enabled()
-            and not self._low_fps_active
-            and not self._last_result_had_hand
-            and not self._inference_skipped_last
+        # Smart skip-frame inference: when the previous frame was
+        # empty (no hand), skip MediaPipe this tick without running
+        # the result pipeline. Always on — not just Lite/GPU — because
+        # empty-frame MediaPipe was the random live-view hitch with
+        # nobody in frame. Full-rate inference resumes the instant a
+        # hand is tracked, so swipes / repeat-circle keep every
+        # landmark sample. Empty frames skip every other tick so idle
+        # GPU cost drops without starving hand reacquisition.
+        skip_inference, self._idle_skip_ticks = self._empty_frame_skip_inference(
+            self._last_result_had_hand, self._idle_skip_ticks
         )
         # Stash timing context so _on_engine_result can finish the
         # debug breakdown using the same per-tick start markers, even
@@ -4961,12 +7337,13 @@ class GestureWorker(QObject):
         # thread.
         self._tick_timing_state = (debug_timing, t0, t_read, t_prep)
         if skip_inference:
-            # neutral_result_for_frame is a cheap helper (no detector
-            # call) â€” keep it inline so we don't pay a thread hop for
-            # what would otherwise be a sub-millisecond operation.
-            result = self.engine.neutral_result_for_frame(frame)
+            # Empty-frame skip used to synthesise a no-hand result and
+            # still run the full _on_engine_result pipeline (YouTube
+            # ticks, custom hand_lost, overlay, FPS). That GUI-thread
+            # work was the remaining idle hitch in GPU mode. Display
+            # already went out via raw_frame_ready above; the last
+            # real empty inference already cleared the skeleton.
             self._inference_skipped_last = True
-            self._on_engine_result(frame, result)
             return
         self._inference_skipped_last = False
         # Push left-handed mode to the engine each tick (cheap bool set
@@ -4974,39 +7351,36 @@ class GestureWorker(QObject):
         # from config so the Settings toggle takes effect next frame.
         if self.engine is not None:
             self.engine.swap_handedness = bool(getattr(self.config, "left_handed_mode", False))
-        # Async engine path: dispatch to runner thread and return
-        # immediately. The runner runs engine.process_frame on its
-        # own thread; the result fires _on_engine_result via a
-        # queued Qt signal back to the main thread. With decoupled
-        # display (raw_frame_ready emitted ABOVE before this
-        # dispatch), the user-visible video updates at camera fps
-        # regardless of engine completion time. Async here frees
-        # the main thread for ~7-17 ms per cycle (the engine wall
-        # time), which lifts the GpuVideoWidget's paint rate from
-        # the ~25 fps cap (engine-blocked) toward the camera's
-        # 30 fps.
+        # v1.1.7.5: submit the DETECTION frame (may be brightness-boosted)
+        # to MediaPipe. The display already got the pristine frame via
+        # raw_frame_ready above. This is the split-frame architecture:
+        # detection runs on whatever gets MediaPipe the best signal,
+        # while the user sees an unmodified camera picture.
         if self._engine_runner.is_running:
             self._async_result_pending = True
-            if self._engine_runner.submit(frame):
+            if self._engine_runner.submit(detection_frame):
                 return
             self._async_result_pending = False
         try:
-            result = self.engine.process_frame(frame)
+            result = self.engine.process_frame(detection_frame)
         except Exception:
             traceback.print_exc()
             return
-        self._on_engine_result(frame, result)
+        try:
+            self._attach_custom_hands_on_engine_thread(detection_frame, result)
+        except Exception:
+            pass
+        self._on_engine_result(detection_frame, result)
 
     def _on_engine_result(self, frame, result) -> None:
-        # Runs on the GUI (main) thread. Reached via three paths:
-        #   1. Direct call from _tick for the skip-inference fast path
-        #      (synthetic neutral result, no thread hop needed).
-        #   2. Direct call from _tick when the runner couldn't accept
+        # Runs on the GUI (main) thread. Reached via two paths:
+        #   1. Direct call from _tick when the runner couldn't accept
         #      a submission and we fell back to inline inference.
-        #   3. Queued signal from the _EngineRunner thread when async
+        #   2. Queued signal from the _EngineRunner thread when async
         #      inference completes â€” Qt's auto-connection routes the
         #      cross-thread emit through the GUI thread's event loop,
         #      so widget mutations below are safe.
+        # Empty-frame skip returns from _tick without coming here.
         # Clear the async-pending guard up front so the next _tick is
         # free to dispatch even if the bail-outs below trigger. The
         # skip-inference / inline-fallback paths set this flag to
@@ -5039,9 +7413,6 @@ class GestureWorker(QObject):
         t_engine = time.perf_counter() if debug_timing else 0.0
         self._drawing_secondary_hand_reading = getattr(result, "secondary_hand_reading", None)
         now = time.time()
-        dt = max(now - self._last_time, 1e-6)
-        self._fps = 0.86 * self._fps + 0.14 * (1.0 / dt) if self._fps else (1.0 / dt)
-        self._last_time = now
         self._refresh_fullscreen_foreground(now)
         self._maybe_auto_toggle_low_fps(now)
         self._maybe_offer_low_fps_suggestion(now)
@@ -5091,6 +7462,13 @@ class GestureWorker(QObject):
                         custom_match = dyn.current_match(time.monotonic())
                     except Exception:
                         custom_match = None
+            if custom_match is None:
+                seq = getattr(self, "_pose_sequence_runtime", None)
+                if seq is not None:
+                    try:
+                        custom_match = seq.current_banner()
+                    except Exception:
+                        custom_match = None
 
             def _apply_custom_label(default_label: str, default_active: bool, hand_handedness: Optional[str]):
                 """Override the banner with the custom gesture's name
@@ -5114,12 +7492,13 @@ class GestureWorker(QObject):
                 label, active = self._filter_banner_label_by_handedness(
                     label, active, primary_handedness
                 )
+                label, active = self._hide_unnamed_recognizer_label(label, active)
                 label, active = _apply_custom_label(label, active, primary_handedness)
                 # Display: underscore -> space so derived labels read
-                # naturally ('three together', 'four together',
-                # 'thumb up', 'thumb down') instead of with underscores.
-                # Done after the filter pipeline so any binding lookup
-                # that needs the underscore form still sees it.
+                # naturally ('three together', 'four together')
+                # instead of with underscores. Done after the filter
+                # pipeline so any binding lookup that needs the
+                # underscore form still sees it.
                 display_label = label.replace("_", " ") if label else label
                 hands_info.append(
                     self._build_hand_overlay_info(
@@ -5138,6 +7517,7 @@ class GestureWorker(QObject):
                 label, active = self._filter_banner_label_by_handedness(
                     label, active, sec_handedness
                 )
+                label, active = self._hide_unnamed_recognizer_label(label, active)
                 label, active = _apply_custom_label(label, active, sec_handedness)
                 display_label = label.replace("_", " ") if label else label
                 hands_info.append(
@@ -5212,101 +7592,123 @@ class GestureWorker(QObject):
             hide_hand_overlay = bool(
                 self._drawing_mode_enabled and self._drawing_render_target == "camera"
             )
-            if mouse_overlay is not None or hide_hand_overlay:
-                payload = {
-                    "hands": hands_info,
-                    "mouse_overlay": mouse_overlay,
-                    "hide_hand_overlay": hide_hand_overlay,
-                }
-            else:
-                payload = hands_info
-            self.engine_landmarks_ready.emit(payload)
+            # C13: elide the emit when the payload would be a
+            # steady-state repeat (no hands, no mouse overlay, no
+            # drawing-mode override). The hand-present-to-absent
+            # transition still fires because _last_emit_had_hands is
+            # True on that specific cycle, forcing should_emit to True
+            # and letting the widget clear its stashed skeleton.
+            has_hands = bool(hands_info)
+            should_emit = True
+            if (
+                not has_hands
+                and mouse_overlay is None
+                and not hide_hand_overlay
+                and not self._last_emit_had_hands
+            ):
+                should_emit = False
+            if should_emit:
+                if mouse_overlay is not None or hide_hand_overlay:
+                    payload = {
+                        "hands": hands_info,
+                        "mouse_overlay": mouse_overlay,
+                        "hide_hand_overlay": hide_hand_overlay,
+                    }
+                else:
+                    payload = hands_info
+                self.engine_landmarks_ready.emit(payload)
+                self._last_emit_had_hands = has_hands
         except Exception:
             pass
 
-        # Custom-gesture live processing. Runs on the tracked hand's
-        # landmarks after the built-in pipeline has had its turn this
-        # frame. The runner manages its own hold/cooldown state and
-        # calls fire_once() on activation. Falls through silently if
-        # the user has no custom gestures registered.
+        # Custom-gesture live processing (static, dynamic, pose
+        # sequence). Recorders use MediaPipe Hands at complexity=1;
+        # GPU/Lite engine landmarks are a different distribution, so
+        # one shared hand list per tick is either engine output (CPU
+        # MediaPipe complexity 1) or a private MediaPipe pass.
+        fired_dyn = None
+        custom_hands: list = []
+        custom_hands_sampled = False
+        runner_now = time.monotonic()
+        dynamic_runtime = getattr(self, "_dynamic_gesture_runtime", None)
+        seq_runtime = getattr(self, "_pose_sequence_runtime", None)
+        try:
+            if self._custom_gesture_runner is not None:
+                self._custom_gesture_runner.maybe_reload_if_changed(runner_now)
+            if dynamic_runtime is not None:
+                dynamic_runtime.maybe_reload_if_changed(runner_now)
+            if seq_runtime is not None:
+                seq_runtime.maybe_reload_if_changed(runner_now)
+        except Exception:
+            pass
+
+        need_custom = False
+        try:
+            if self._custom_gesture_runner is not None and self._custom_gesture_runner.has_gestures:
+                need_custom = True
+            if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
+                need_custom = True
+            if seq_runtime is not None and seq_runtime.has_sequences():
+                need_custom = True
+        except Exception:
+            need_custom = bool(self._custom_gesture_runner is not None)
+
+        if need_custom:
+            try:
+                custom_hands, custom_hands_sampled = self._custom_hands_this_frame(
+                    result, frame
+                )
+            except Exception as exc:
+                print(f"[custom-gestures] landmark extract error: {exc}")
+                custom_hands, custom_hands_sampled = [], True
+
         if self._custom_gesture_runner is not None:
             try:
-                # Auto-reload from the registry file if it changed on
-                # disk since our last check (recorder / sandbox /
-                # wizard saved a new gesture). Throttled internally to
-                # one stat() per ~3 s, so the per-frame cost is
-                # negligible.
-                runner_now = time.monotonic()
-                self._custom_gesture_runner.maybe_reload_if_changed(runner_now)
-
-                # Fast path: when the engine's hand-tracking runtime is
-                # MediaPipe-compatible AND configured the same way the
-                # recorder uses (model_complexity=1), reuse the engine's
-                # already-extracted landmarks. Skips a redundant private
-                # MediaPipe pass and saves ~5â€“10 ms/frame.
-                #
-                # Slow path: when the runtime differs from the recorder
-                # (ONNX/DirectML GPU, or lite mode with model_complexity=0),
-                # fall back to the runner's private MediaPipe pass so the
-                # landmark distribution matches what the user trained
-                # against. Without this, classifier scores drop ~0.10â€“0.15
-                # below the trained baseline and gestures get missed.
-                use_engine_landmarks = self._custom_runner_can_use_engine_landmarks()
                 fired = None
-                if use_engine_landmarks:
-                    hands_for_runner = self._build_engine_hands_for_runner(result)
-                    if hands_for_runner:
-                        fired = self._custom_gesture_runner.process_engine_hands(
-                            hands_for_runner, runner_now
-                        )
-                    else:
-                        self._custom_gesture_runner.hand_lost(runner_now)
-                else:
-                    frame_for_mp = getattr(result, "annotated_frame", None)
-                    if frame_for_mp is not None:
-                        fired = self._custom_gesture_runner.process_frame(
-                            frame_for_mp, runner_now
-                        )
-                    else:
-                        self._custom_gesture_runner.hand_lost(runner_now)
+                if custom_hands:
+                    fired = self._custom_gesture_runner.process_engine_hands(
+                        custom_hands, runner_now
+                    )
+                elif custom_hands_sampled and need_custom:
+                    self._custom_gesture_runner.hand_lost(runner_now)
                 if fired:
                     try:
                         self.command_detected.emit(f"custom: {fired}")
                     except Exception:
                         pass
-                    # Log custom-gesture fires to recent-actions so
-                    # users can see ALL gesture activity in one place,
-                    # not just the built-in media/volume routes.
                     self._record_action(
                         f"custom:{fired}",
                         f"custom gesture: {fired}",
                     )
             except Exception as exc:
-                # A bad sample / classifier hiccup must not break the
-                # main pipeline â€” log once and continue.
                 print(f"[custom-gestures] process error: {exc}")
 
-        # Dynamic custom-gesture runtime — parallel to the static
-        # runner. Uses the same registry + same fire_once cooldown
-        # but matches motion (DTW) instead of pose. Falls through
-        # silently when no dynamic gestures are registered.
-        dynamic_runtime = getattr(self, "_dynamic_gesture_runtime", None)
         if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
             try:
-                runner_now = time.monotonic()
-                dynamic_runtime.maybe_reload_if_changed(runner_now)
-                hand_lost = not (
-                    result.found
-                    and result.tracked_hand is not None
-                    and result.hand_reading is not None
+                swipe_in_flight = self._builtin_open_hand_swipe_in_flight(
+                    getattr(result, "prediction", None)
                 )
-                if hand_lost:
+                pred = getattr(result, "prediction", None)
+                counting = str(getattr(pred, "stable_label", "") or "") in {"two", "three"}
+                loop_custom = False
+                try:
+                    loop_custom = bool(dynamic_runtime.has_loop_or_complex_templates())
+                except Exception:
+                    loop_custom = False
+                lm, live_hand = self._pick_custom_hand(custom_hands)
+                if (
+                    (not custom_hands and custom_hands_sampled)
+                    or (swipe_in_flight and not loop_custom)
+                    or counting
+                    or self._pose_sequence_owns_motion(runner_now)
+                ):
                     dynamic_runtime.hand_lost()
-                else:
+                elif lm is not None:
+                    from ...custom_gestures.dynamic_recording import palm_scale_from_landmarks
                     fired_dyn = dynamic_runtime.process_frame(
-                        result.hand_reading.landmarks,
-                        palm_scale=float(result.hand_reading.palm.scale),
-                        handedness=str(result.tracked_hand.handedness or ""),
+                        lm,
+                        palm_scale=palm_scale_from_landmarks(lm),
+                        handedness=str(live_hand or ""),
                         timestamp=runner_now,
                     )
                     if fired_dyn:
@@ -5320,6 +7722,72 @@ class GestureWorker(QObject):
                         )
             except Exception as exc:
                 print(f"[custom-gestures] dynamic runtime error: {exc}")
+
+        if seq_runtime is not None and seq_runtime.has_sequences():
+            try:
+                lm, live_hand = self._pick_custom_hand(custom_hands)
+                if not custom_hands and custom_hands_sampled:
+                    seq_runtime.hand_lost(runner_now)
+                elif lm is not None:
+                    fired_seq = seq_runtime.process_landmarks(
+                        lm,
+                        handedness=str(live_hand or ""),
+                        timestamp=runner_now,
+                        # Lone-hand GPU labels often say Left for a
+                        # right hand. Never drop a recorded sequence
+                        # on that flicker.
+                        strict_hand=False,
+                        hint_label=str(
+                            getattr(getattr(result, "prediction", None), "stable_label", "")
+                            or ""
+                        ),
+                    )
+                    if fired_seq:
+                        self._seq_suppress_dynamic_until = runner_now + 1.2
+                        try:
+                            self.command_detected.emit(f"custom: {fired_seq}")
+                        except Exception:
+                            pass
+                        self._record_action(
+                            f"custom_sequence:{fired_seq}",
+                            f"custom pose sequence: {fired_seq}",
+                        )
+            except Exception as exc:
+                print(f"[custom-gestures] pose sequence runtime error: {exc}")
+
+        # Builtin swipe_left/right fire on the same index-only
+        # horizontal motion as a custom "1 swipe right". Preempt
+        # the builtin path when a horizontal custom template claims
+        # this pose, or for 1.2s after a custom dynamic fire.
+        self._suppress_builtin_horizontal_swipe = False
+        try:
+            if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
+                now_m = time.monotonic()
+                if fired_dyn:
+                    self._custom_dyn_builtin_suppress_until = now_m + 1.2
+                lm = None
+                scale = 1.0
+                pick_lm, _pick_hand = self._pick_custom_hand(custom_hands)
+                if pick_lm is not None:
+                    from ...custom_gestures.dynamic_recording import palm_scale_from_landmarks
+                    lm = pick_lm
+                    scale = float(palm_scale_from_landmarks(pick_lm))
+                elif (
+                    result.found
+                    and result.hand_reading is not None
+                    and getattr(result.hand_reading, "landmarks", None) is not None
+                ):
+                    lm = result.hand_reading.landmarks
+                    scale = float(result.hand_reading.palm.scale)
+                if (
+                    now_m < float(getattr(self, "_custom_dyn_builtin_suppress_until", 0.0) or 0.0)
+                    or dynamic_runtime.should_preempt_builtin_horizontal_swipe(
+                        lm, palm_scale=scale, now=now_m,
+                    )
+                ):
+                    self._suppress_builtin_horizontal_swipe = True
+        except Exception:
+            self._suppress_builtin_horizontal_swipe = False
 
         hand_handedness = result.tracked_hand.handedness if result.found and result.tracked_hand is not None else None
         # MediaPipe occasionally labels a single visible right hand
@@ -5421,17 +7889,29 @@ class GestureWorker(QObject):
         # see massive perceived display lag (the 2-second-delayed
         # camera feeling). Always emit on hand appear/disappear or
         # action-fire so toasts and overlays stay punctual.
-        should_emit = True
-        if self._perf_optimisations_enabled() and not self._low_fps_active:
-            since_last = monotonic_now - self._last_emit_monotonic
-            significant = self._is_significant_state_change(result)
-            should_emit = significant or since_last >= self._emit_min_interval_seconds
-        if should_emit:
-            self._last_emit_monotonic = monotonic_now
-            try:
-                self.debug_frame_ready.emit(display_frame, payload)
-            except Exception:
-                pass
+        # REMOVED the 30 fps emit throttle that ran in perf modes. It
+        # was actively erasing the speedup that Lite/GPU Mode delivers:
+        # engine drops from 27ms (normal) to 3-7ms (Lite/GPU), but the
+        # emit-side throttle clamped visible fps at 30 either way, so
+        # the modes "did nothing" from the user's perspective. The
+        # throttle existed to avoid hammering the camera widget at
+        # >30 fps but modern displays handle 60-120+ fps fine, and the
+        # whole point of perf modes is to give the user MORE fps not
+        # less. Now every engine tick emits its display frame. The
+        # actual fps cap becomes whichever of:
+        #   - engine work time (Lite: ~7ms ceiling 140 fps; GPU: ~6ms
+        #     ceiling 160 fps; Normal: ~27ms ceiling 37 fps),
+        #   - camera capture rate (YUY2 ~30 fps; ffmpeg-MJPG ~60 fps),
+        #   - display refresh / Qt paint coalescing (usually 60 Hz).
+        # On a strong PC with Lite or GPU mode + ffmpeg-MJPG camera,
+        # actual fps should now reach 50-60. On dad's-PC-class hardware
+        # the engine work itself remains the cap; the throttle wasn't
+        # helping there either.
+        self._last_emit_monotonic = monotonic_now
+        try:
+            self.debug_frame_ready.emit(display_frame, payload)
+        except Exception:
+            pass
         if debug_timing:
             t_end = time.perf_counter()
             self._timing_samples.append(
@@ -5465,8 +7945,22 @@ class GestureWorker(QObject):
                 )
                 inferred_fps = 1000.0 / avg_total if avg_total > 0 else 0.0
                 try:
+                    # Surface mode state in every timing log so you can
+                    # see which mode is actually engaged when fps doesn't
+                    # match expectations. Useful for the "I toggled Lite
+                    # Mode but engine is still 27ms" diagnostic.
+                    _mode_lite = bool(getattr(self.config, "lite_mode", False))
+                    _mode_gpu = bool(getattr(self.config, "gpu_mode", False))
+                    _mode_lowfps = self._low_fps_active
+                    _mode_tag = (
+                        "LOW_FPS" if _mode_lowfps
+                        else ("LITE" if _mode_lite
+                              else ("GPU" if _mode_gpu else "NORMAL"))
+                    )
                     sys.stderr.write(
-                        f"[lite_mode/timing] read={avg_read:.1f} "
+                        f"[lite_mode/timing] mode={_mode_tag} "
+                        f"(lite={_mode_lite},gpu={_mode_gpu},lowfps={_mode_lowfps}) "
+                        f"read={avg_read:.1f} "
                         f"prep={avg_prep:.1f} engine={avg_engine:.1f} "
                         f"vol={avg_vol:.1f} app={avg_app:.1f} "
                         f"wheel={avg_wheel:.1f} overlay={avg_overlay:.1f} "
@@ -5529,8 +8023,41 @@ class GestureWorker(QObject):
             self._update_volume_overlay()
             return
 
-        current_level = self.volume_controller.get_level()
-        current_muted = self._read_system_mute()
+        # v1.1.7 event-loop optimization (Step 1): only pay the
+        # Windows COM cost of reading system volume + mute when there's
+        # an actual chance we'll act on it this tick. Fresh state
+        # matters when:
+        #   - Volume overlay is already visible (user is controlling)
+        #   - Volume mode was already active last tick (in-progress)
+        #   - The trigger pose is being shown right now (about to enter)
+        # Otherwise, use the cached values from the engine's own
+        # bookkeeping (_volume_level / _volume_muted) — the volume
+        # tracker's update() will no-op with stale values because it's
+        # gated on the same pose the fresh-state check is gated on.
+        # When the tracker DOES activate on a subsequent tick, the
+        # entering_overlay branch below fires refresh_cache() which
+        # reads a fresh COM value before the first level adjustment.
+        # Savings: ~2-3 ms of main-thread work per idle tick × 25
+        # ticks/sec = 50-75 ms/sec of Qt event-loop budget freed up
+        # (the 25→35+ fps tick rate improvement the diagnostic release
+        # identified as the largest deferred win).
+        is_volume_pose_this_tick = (
+            hand_handedness == "Right"
+            and result.found
+            and result.prediction is not None
+            and getattr(result.prediction, "stable_label", "") == "volume_pose"
+        )
+        need_fresh_volume_state = (
+            self._volume_overlay_visible
+            or self._volume_mode_active
+            or is_volume_pose_this_tick
+        )
+        if need_fresh_volume_state:
+            current_level = self.volume_controller.get_level()
+            current_muted = self._read_system_mute()
+        else:
+            current_level = self._volume_level
+            current_muted = self._volume_muted
         if self.mouse_tracker.mode_enabled:
             self._volume_level = current_level
             self._volume_muted = current_muted
@@ -5553,7 +8080,7 @@ class GestureWorker(QObject):
             self._volume_init_palm_x = None
             self._update_volume_overlay()
             return
-        if hand_handedness == "Right" and result.prediction.dynamic_label in {"swipe_left", "swipe_right"}:
+        if hand_handedness == "Right" and self._effective_dynamic_label(result.prediction) in {"swipe_left", "swipe_right"}:
             self._mute_block_until = max(self._mute_block_until, now + 0.5)
 
         features = None
@@ -5856,12 +8383,9 @@ class GestureWorker(QObject):
                 if not (self._voice_listening or self._dictation_active):
                     self._start_voice_command()
                     fired = True
-            elif action_id == "dictation_toggle":
-                if self._dictation_active:
-                    self._stop_dictation_capture()
-                else:
-                    self._start_dictation_capture()
-                fired = True
+            # r53: dictation_toggle dispatch removed (dictation temporarily
+            # retired). Keeping the dictation code paths alive but unbound
+            # from any gesture so voice command / manual triggers still work.
             elif action_id == "mouse_mode_toggle":
                 self._mouse_mode_enabled = not self._mouse_mode_enabled
                 try:
@@ -5909,8 +8433,15 @@ class GestureWorker(QObject):
                             ).start()
                         fired = True
                     else:
-                        if not self.spotify_controller.is_window_active():
-                            self.spotify_controller.focus_or_open_window()
+                        # EnumWindows + process walk + possible launch
+                        # used to run on the gesture/UI thread and hitch
+                        # the live view for a split second. Same work,
+                        # background thread.
+                        threading.Thread(
+                            target=self.spotify_controller.focus_or_open_window,
+                            name="spotify-focus",
+                            daemon=True,
+                        ).start()
                         fired = True
                 except Exception:
                     fired = False
@@ -5934,7 +8465,11 @@ class GestureWorker(QObject):
                     fired = False
             elif action_id == "open_chrome":
                 try:
-                    self.chrome_controller.focus_or_open_window()
+                    threading.Thread(
+                        target=self.chrome_controller.focus_or_open_window,
+                        name="chrome-focus",
+                        daemon=True,
+                    ).start()
                     fired = True
                 except Exception:
                     fired = False
@@ -6042,7 +8577,7 @@ class GestureWorker(QObject):
         now: float,
     ) -> None:
         """Right-hand plain-three -> open_chrome,
-        right-hand plain-four -> open_touchless. Fire after a 0.4 s
+        right-hand plain-four -> open_touchless. Fire after a 1.0 s
         hold with a 2.0 s cooldown so a quick gesture doesn't double-
         fire when the user is in transit between poses.
 
@@ -6057,6 +8592,11 @@ class GestureWorker(QObject):
         binding remap step above this call already rewrote the
         stable_label, so the labels here will be different and this
         method early-exits. No competing path."""
+        seq = getattr(self, "_pose_sequence_runtime", None)
+        if seq is not None and seq.has_sequences() and seq.is_in_progress():
+            # Mid-count 3→2→1 owns the right-hand "three"; do not
+            # also arm open-Chrome on that hold.
+            return
         # Resolve which prediction is from the RIGHT hand. _handle_app_controls
         # is called with the primary prediction + its handedness. If the
         # primary is the right hand, use it. Otherwise, walk the engine's
@@ -6107,7 +8647,7 @@ class GestureWorker(QObject):
         if now < self._open_action_cooldown_until:
             return
         held = now - self._open_action_candidate_since
-        if held < 0.4:
+        if held < _STATIC_GESTURE_HOLD_SECONDS:
             return
         self._open_action_cooldown_until = now + 2.0
         action_id = "open_chrome" if stable_label == "three" else "open_touchless"
@@ -6171,6 +8711,40 @@ class GestureWorker(QObject):
             # Cross-handedness â€” skip remap (see docstring).
             return prediction
         return self._rewrite_prediction_labels(prediction, target_raw_label)
+
+    def _effective_dynamic_label(self, prediction) -> str:
+        """Builtin swipe_left/right, with custom-horizontal preemption.
+
+        When a custom index-only swipe-right owns the pose, the live
+        app must not also dispatch the builtin swipe. Returns
+        "neutral" in that case; otherwise the prediction's label.
+        """
+        label = str(getattr(prediction, "dynamic_label", "neutral") or "neutral")
+        if (
+            getattr(self, "_suppress_builtin_horizontal_swipe", False)
+            and label in {"swipe_left", "swipe_right"}
+        ):
+            return "neutral"
+        if label == "repeat_circle":
+            stable = str(getattr(prediction, "stable_label", "") or "")
+            if stable in {"two", "three", "four"}:
+                return "neutral"
+            if self._pose_sequence_owns_motion():
+                return "neutral"
+        return label
+
+    def _pose_sequence_owns_motion(self, now: float | None = None) -> bool:
+        """True while a 3→2→1 (or similar) sequence is mid-count, or
+        briefly after it fires, so repeat_circle / custom circle cannot
+        steal the last 'one' pose."""
+        seq = getattr(self, "_pose_sequence_runtime", None)
+        if seq is not None and seq.has_sequences() and seq.is_in_progress():
+            return True
+        until = float(getattr(self, "_seq_suppress_dynamic_until", 0.0) or 0.0)
+        if until <= 0.0:
+            return False
+        now_m = float(now if now is not None else time.monotonic())
+        return now_m < until
 
     @staticmethod
     def _neutralize_prediction(prediction):
@@ -6251,11 +8825,106 @@ class GestureWorker(QObject):
             model_complexity = int(getattr(detector, "model_complexity", 1)) if detector is not None else 1
         except Exception:
             return False
-        if backend not in ("mediapipe-cpu", "mediapipe-tasks-gpu", "onnx-directml"):
+        if backend not in ("mediapipe-cpu", "mediapipe-tasks-gpu"):
             return False
         if model_complexity != 1:
             return False
         return True
+
+    def _custom_hands_this_frame(self, result, frame) -> tuple[list, bool]:
+        """Landmarks for custom static / dynamic / pose-sequence.
+
+        Returns (hands, sampled). `sampled` is True on a fresh engine
+        or MediaPipe observation. False means the MediaPipe path was
+        rate-limited and `hands` is the previous sample — callers must
+        not treat an empty list as hand_lost in that case.
+
+        Recorders always use MediaPipe Hands at complexity=1. GPU
+        (ONNX) and Lite landmarks are a different distribution, so
+        those modes run a private MediaPipe pass on the detection
+        frame (already selfie-mirrored) rather than engine output.
+        When the engine runner attached a payload on its thread,
+        reuse that so this method stays cheap on the GUI thread.
+        """
+        attached = getattr(result, "custom_hands_payload", None)
+        if attached is not None:
+            hands, sampled = attached
+            return (list(hands) if hands else []), bool(sampled)
+        return GestureWorker._compute_custom_hands(self, result, frame)
+
+    def _attach_custom_hands_on_engine_thread(self, frame, result) -> None:
+        """Run GPU/Lite custom MediaPipe on the engine thread.
+
+        Called after process_frame, before the queued GUI delivery.
+        Stashes (hands, sampled) on the result so the GUI path does
+        not pay 5–10 ms of MediaPipe on the camera tick.
+        """
+        if result is None:
+            return
+        need_custom = False
+        try:
+            if self._custom_gesture_runner is not None and self._custom_gesture_runner.has_gestures:
+                need_custom = True
+            dynamic_runtime = getattr(self, "_dynamic_gesture_runtime", None)
+            if dynamic_runtime is not None and dynamic_runtime.has_dynamic_gestures():
+                need_custom = True
+            seq_runtime = getattr(self, "_pose_sequence_runtime", None)
+            if seq_runtime is not None and seq_runtime.has_sequences():
+                need_custom = True
+        except Exception:
+            need_custom = bool(self._custom_gesture_runner is not None)
+        if not need_custom:
+            result.custom_hands_payload = ([], True)
+            return
+        try:
+            result.custom_hands_payload = GestureWorker._compute_custom_hands(
+                self, result, frame
+            )
+        except Exception:
+            result.custom_hands_payload = ([], True)
+
+    def _compute_custom_hands(self, result, frame) -> tuple[list, bool]:
+        """Landmarks for custom static / dynamic / pose-sequence.
+
+        Returns (hands, sampled). `sampled` is True on a fresh engine
+        or MediaPipe observation. False means the MediaPipe path was
+        rate-limited and `hands` is the previous sample — callers must
+        not treat an empty list as hand_lost in that case.
+
+        Recorders always use MediaPipe Hands at complexity=1. GPU
+        (ONNX) and Lite landmarks are a different distribution, so
+        those modes run a private MediaPipe pass on the detection
+        frame (already selfie-mirrored) rather than engine output.
+        """
+        if self._custom_runner_can_use_engine_landmarks():
+            return self._build_engine_hands_for_runner(result), True
+        self._custom_runner_slow_path_counter = (
+            (self._custom_runner_slow_path_counter + 1)
+            % max(1, self._custom_runner_slow_path_skip_ratio)
+        )
+        should_run = self._custom_runner_slow_path_counter == 0
+        if not should_run:
+            cached = getattr(self, "_last_custom_mp_hands", None)
+            return (list(cached) if cached else []), False
+        frame_for_mp = frame if frame is not None else getattr(result, "annotated_frame", None)
+        runner = getattr(self, "_custom_gesture_runner", None)
+        if runner is None or frame_for_mp is None:
+            self._last_custom_mp_hands = []
+            return [], True
+        try:
+            hands = runner.extract_hands(frame_for_mp)
+        except Exception:
+            hands = []
+        self._last_custom_mp_hands = list(hands) if hands else []
+        return self._last_custom_mp_hands, True
+
+    @staticmethod
+    def _pick_custom_hand(hands: list):
+        """First (landmarks, handedness) pair, or (None, None)."""
+        if not hands:
+            return None, None
+        lm, label = hands[0]
+        return lm, label
 
     @staticmethod
     def _build_engine_hands_for_runner(result) -> list:
@@ -6676,11 +9345,20 @@ class GestureWorker(QObject):
         # also fires it via _dispatch_action. See the helper docstring.
         prediction = self._apply_gesture_binding_remap(prediction, hand_handedness, now)
 
+        # Mid-count 3→2→1 owns one/two/three. Do not arm Chrome,
+        # Spotify, or YouTube holds from the builtin label — the
+        # banner is not a fire, but those routers start timers as
+        # soon as they see the name.
+        if self._pose_sequence_owns_motion():
+            sl = str(getattr(prediction, "stable_label", "") or "")
+            if sl in {"one", "two", "three", "four"}:
+                prediction = self._neutralize_prediction(prediction)
+
         # Default-bound open_chrome (right_three) / open_touchless
         # (right_four) actions have no router. Fire them here on a
-        # short hold. Runs BEFORE the rest of the handler so a brief
-        # three / four reliably opens its target before any other
-        # router (spotify, chrome) gets a turn.
+        # 1.0 s hold. Runs BEFORE the rest of the handler so a
+        # three / four opens its target before any other router
+        # (spotify, chrome) gets a turn.
         self._maybe_fire_open_chrome_touchless(prediction, hand_handedness, now)
 
         # When a save-location prompt is awaiting input, give the left-hand voice handler
@@ -6805,9 +9483,22 @@ class GestureWorker(QObject):
                 hand_handedness == "Right"
                 and hand_reading is not None
                 and now >= self._drawing_swipe_cooldown_until
+                # r53 v2: drawing undo/clear stays index-only ("one").
+                # Builtin swipe_left/right (Spotify skip, HUD, etc.)
+                # are open-hand only, so they no longer share this
+                # label. Read the one-pose swipe from the recognizer.
+                and self._drawing_draw_pose_active(prediction, hand_reading)
             ):
-                dynamic_label = str(getattr(prediction, "dynamic_label", "neutral") or "neutral")
-                if dynamic_label in {"swipe_left", "swipe_right"}:
+                one_pose_swipe = "neutral"
+                try:
+                    recog = getattr(self.engine, "dynamic_recognizer", None)
+                    one_pose_swipe = str(
+                        getattr(recog, "last_one_pose_horizontal_label", "neutral")
+                        or "neutral"
+                    )
+                except Exception:
+                    one_pose_swipe = "neutral"
+                if one_pose_swipe in {"swipe_left", "swipe_right"}:
                     if (
                         self._drawing_render_target == "camera"
                         and self._camera_draw_active_stroke_points
@@ -6817,7 +9508,7 @@ class GestureWorker(QObject):
                     self._drawing_draw_grace_until = 0.0
                     self._drawing_erase_grace_until = 0.0
                     self._drawing_draw_active_streak = 0
-                    if self._perform_drawing_swipe_action(dynamic_label):
+                    if self._perform_drawing_swipe_action(one_pose_swipe):
                         self._drawing_swipe_cooldown_until = now + 1.2
                     self._chrome_control_text = self._drawing_control_text
                     self._spotify_control_text = self._drawing_control_text
@@ -6944,10 +9635,8 @@ class GestureWorker(QObject):
         if self._left_hand_prediction is not None:
             self._handle_left_hand_voice(self._left_hand_prediction, now)
             # CLIP GESTURE — runs alongside voice handler. Voice
-            # handler returns early on fist/one/two; clip gesture
-            # only fires on routed_label="thumb_up" so the two
-            # never collide. Order doesn't matter (no shared state
-            # mutation between them).
+            # handler returns early on fist/one/two; clip fires on
+            # left-hand TWO so the two never collide.
             self._handle_left_hand_clip_gesture(
                 self._left_hand_prediction,
                 self._left_hand_reading,
@@ -6992,7 +9681,7 @@ class GestureWorker(QObject):
 
         youtube_snapshot = self.youtube_router.update(
             stable_label=app_static_label,
-            dynamic_label=prediction.dynamic_label,
+            dynamic_label=self._effective_dynamic_label(prediction),
             controller=self.youtube_controller,
             now=now,
         )
@@ -7028,7 +9717,7 @@ class GestureWorker(QObject):
 
         chrome_snapshot = self.chrome_router.update(
             stable_label=app_static_label,
-            dynamic_label=prediction.dynamic_label,
+            dynamic_label=self._effective_dynamic_label(prediction),
             controller=self.chrome_controller,
             now=now,
         )
@@ -7058,7 +9747,7 @@ class GestureWorker(QObject):
 
         snapshot = self.spotify_router.update(
             stable_label=prediction.stable_label,
-            dynamic_label=prediction.dynamic_label,
+            dynamic_label=self._effective_dynamic_label(prediction),
             controller=self.spotify_controller,
             now=now,
         )
@@ -7544,7 +10233,7 @@ class GestureWorker(QObject):
         # surfacing in the debug display and on _dynamic_hold_label,
         # which the user found distracting. Swipes are kept because
         # drawing mode actively uses left/right swipes for nav.
-        incoming_dynamic = prediction.dynamic_label
+        incoming_dynamic = self._effective_dynamic_label(prediction)
         if self._drawing_mode_enabled and incoming_dynamic == "repeat_circle":
             incoming_dynamic = "neutral"
         dynamic_display = incoming_dynamic
@@ -7561,6 +10250,15 @@ class GestureWorker(QObject):
         payload_stable_label = prediction.stable_label
         payload_dynamic_label = dynamic_display
         banner_text = prediction.stable_label if prediction.stable_label != "neutral" else prediction.raw_label
+        if banner_text in self._UNNAMED_RECOGNIZER_LABELS:
+            banner_text = "neutral"
+        seq_banner = None
+        try:
+            seq = getattr(self, "_pose_sequence_runtime", None)
+            if seq is not None:
+                seq_banner = seq.current_banner()
+        except Exception:
+            seq_banner = None
         if self._drawing_mode_enabled:
             payload_raw_label = "neutral"
             payload_stable_label = "neutral"
@@ -7583,6 +10281,8 @@ class GestureWorker(QObject):
             # chip used to flip on/off once a second instead of
             # showing the user that volume control is engaged.
             gesture_chip = "Volume"
+        elif seq_banner:
+            gesture_chip = f"Gesture: {seq_banner[0]}"
         elif dynamic_display != "neutral":
             gesture_chip = f"Dynamic: {dynamic_display.replace('_', ' ')}"
         else:
@@ -7843,18 +10543,6 @@ class GestureWorker(QObject):
                 return "three"
         if stable_label in {"four", "neutral"} and self._is_four_together(hand_reading):
             return "four_together"
-        # Thumb-up / thumb-down: only thumb extended, four others
-        # folded. Direction picked from thumb-tip vs wrist in image
-        # y-coordinates (y grows downward). Tested against fist /
-        # neutral base labels because a thumb-only-extended hand
-        # typically gets classified as fist by the static recognizer
-        # (the thumb is short relative to palm scale and the
-        # finger-count heuristic rounds toward fist).
-        if stable_label in {"fist", "neutral"}:
-            if self._is_thumb_up(hand_reading):
-                return "thumb_up"
-            if self._is_thumb_down(hand_reading):
-                return "thumb_down"
         return stable_label
 
     def _is_three_together(self, hand_reading) -> bool:
@@ -8597,26 +11285,18 @@ class GestureWorker(QObject):
 
     def _handle_left_hand_voice(self, prediction, now: float) -> None:
         # Apply Gesture Binds remap for the left hand. Same semantics
-        # as the right-hand call site in _handle_app_controls â€” see the
+        # as the right-hand call site in _handle_app_controls — see the
         # helper docstring for why this is the chokepoint.
         prediction = self._apply_gesture_binding_remap(prediction, "Left", now)
         stable_label = prediction.stable_label
-        trigger_labels = {"one", "two"}
+        # r53 v7: dictation temporarily retired. "two" is no longer a
+        # voice trigger — it now belongs to the instant-clip handler
+        # (see _handle_left_hand_clip_gesture below). "fist" no longer
+        # cancels voice / dismisses low-fps toast either, per user
+        # request that left-fist do nothing at all. Only "one" remains
+        # as a left-hand voice trigger.
+        trigger_labels = {"one"}
 
-        if stable_label == "fist":
-            # Left-fist also dismisses the low-FPS suggestion toast when it's up.
-            # Cheap no-op when the overlay is already hidden, so this is safe
-            # to call ahead of the existing voice-cancel logic.
-            self._dismiss_low_fps_suggestion_via_gesture()
-            if self._voice_latched_label == "fist":
-                return
-            if now - float(getattr(self, "_voice_one_two_triggered_at", 0.0) or 0.0) < 1.0:
-                return
-            if self._voice_listening or self._dictation_active or self._save_prompt_active or self._selection_prompt_active:
-                self._cancel_all_voice_stages()
-                self._voice_latched_label = "fist"
-                self._voice_cooldown_until = now + 0.8
-            return
         if self._voice_latched_label == "fist":
             self._voice_latched_label = None
 
@@ -8626,68 +11306,44 @@ class GestureWorker(QObject):
             return
 
         if stable_label not in trigger_labels:
-            if self._dictation_active and self._dictation_toggle_release_required:
-                if self._dictation_release_candidate_since <= 0.0:
-                    self._dictation_release_candidate_since = now
-                elif now - self._dictation_release_candidate_since >= 0.35:
-                    self._dictation_toggle_release_required = False
-            else:
-                self._dictation_release_candidate_since = 0.0
             self._reset_voice_candidate(now)
             return
-
-        self._dictation_release_candidate_since = 0.0
 
         if stable_label != self._voice_candidate:
             self._voice_candidate = stable_label
             self._voice_candidate_since = now
+            self._begin_voice_hold_anchor()
+            return
+
+        if self._voice_one_hold_is_translating():
+            # Hand is doing a swipe (or other committed move), not a
+            # stationary listen pose. Restart the hold from here so a
+            # later still "one" can still arm voice.
+            self._reset_voice_candidate(now)
             return
 
         if stable_label == "one" and (self._voice_listening or self._dictation_active):
             return
-        if stable_label == "two" and self._dictation_active and self._dictation_toggle_release_required:
-            return
-        if stable_label == "two" and self._dictation_active and now < self._dictation_stop_rearm_at:
-            return
         if now < self._voice_cooldown_until:
             return
-        if now - self._voice_candidate_since < 0.5:
+        if now - self._voice_candidate_since < _STATIC_GESTURE_HOLD_SECONDS:
             return
 
         self._voice_latched_label = stable_label
         self._voice_cooldown_until = now + 1.25
         self._voice_one_two_triggered_at = now
-        if stable_label == "two":
-            if self._dictation_active:
-                self._stop_dictation_capture()
-            else:
-                self._start_dictation_capture()
-            return
         if self._selection_prompt_active:
             self._start_voice_capture(mode="selection", preferred_app=None)
             return
         self._start_voice_command()
 
     def _handle_left_hand_clip_gesture(self, prediction, hand_reading, now: float) -> None:
-        """LEFT-hand FIST with dual semantics:
+        """LEFT-hand TWO (V-shape) held for 1.0 s → instant clip.
 
-          PRIMARY (preserves original behavior):
-            If any voice / dictation / save-prompt / selection-prompt
-            is active, fist CANCELS it. _handle_left_hand_voice runs
-            FIRST in the dispatcher and does the cancel (setting
-            _voice_latched_label = "fist"). This handler then sees
-            the latch and skips — no clip triggered.
-
-          SECONDARY (new):
-            If NOTHING is cancellable when fist appears, holding the
-            fist for 0.5 s triggers a clip with the user's default
-            duration from Settings → Clip Presets → Duration.
-
-        The two semantics never collide because the voice handler
-        runs first and latches `_voice_latched_label = "fist"` ONLY
-        when it actually cancels something. A bare fist with no
-        cancellable state leaves the latch unset, freeing this
-        handler to run.
+        r53 v7: gesture swapped from left-fist to left-two. Dictation
+        used to live on left-two but was retired; the fist-based clip
+        also went away (fist now does nothing at all). Left-two hold
+        is the single canonical gesture for the buffered clip trigger.
 
         After a clip triggers, a 3-s cooldown prevents the held
         pose from re-triggering.
@@ -8697,32 +11353,19 @@ class GestureWorker(QObject):
             return
         if now < self._clip_gesture_cooldown_until:
             return
-        # PRIORITY GUARD #1: voice handler just cancelled something
-        # via this fist. The latch stays set until the user releases
-        # the pose (cleared at _handle_left_hand_voice line ~8431).
-        # Don't double-fire as a clip.
-        if self._voice_latched_label == "fist":
-            self._clip_gesture_candidate_since = 0.0
-            return
-        # PRIORITY GUARD #2: cancellable state is currently active.
-        # Voice handler should have set latch above; this is belt-
-        # and-braces for the racy case where the cancellable state
-        # appeared between the voice handler's check and this one.
+        # Don't trigger while a voice command / save prompt / selection
+        # prompt is up — clip would interrupt user's in-progress voice
+        # interaction.
         if (self._voice_listening or self._dictation_active
                 or self._save_prompt_active or self._selection_prompt_active):
             self._clip_gesture_candidate_since = 0.0
             return
-        # Check the LEFT-hand stable label directly. `fist` is the
-        # static recognizer's base label for a closed hand. We do
-        # NOT call _derive_app_static_label here because that would
-        # promote thumb_up (which we don't want to bind) and the
-        # raw stable_label is sufficient for the fist check.
         try:
             stable_label = str(getattr(prediction, "stable_label", "neutral") or "neutral")
         except Exception:
             self._clip_gesture_candidate_since = 0.0
             return
-        if stable_label != "fist":
+        if stable_label != "two":
             self._clip_gesture_candidate_since = 0.0
             return
         # First detection — start the hold timer.
@@ -8730,8 +11373,8 @@ class GestureWorker(QObject):
             self._clip_gesture_candidate_since = now
             return
         # Hold satisfied? Threshold matches voice trigger hold
-        # (0.5 s) for muscle-memory parity.
-        if now - self._clip_gesture_candidate_since < 0.5:
+        # (1.0 s) for muscle-memory parity.
+        if now - self._clip_gesture_candidate_since < _STATIC_GESTURE_HOLD_SECONDS:
             return
         # Trigger. Reset candidate and arm cooldown so the same
         # held pose doesn't fire again.
@@ -8761,6 +11404,12 @@ class GestureWorker(QObject):
             self._pending_clip_voice_end_ts = None
         # Toast + diag log so the user knows the gesture registered
         # before the export wall-time (~10-30 s for HQ encode).
+        # r53: gated on Settings > General > Overlay > Text pop-ups.
+        # Was bypassing the flag before, so users who turned pop-ups
+        # off still saw the "Clipping last N seconds" pill on trigger.
+        # label_text is also emitted via command_detected below, which
+        # a dev log consumer might still want, so we build it either
+        # way and only skip the visible overlay.
         try:
             mins = duration_s // 60
             if mins >= 2:
@@ -8769,7 +11418,14 @@ class GestureWorker(QObject):
                 label_text = "Clipping last 1 minute"
             else:
                 label_text = f"Clipping last {duration_s} seconds"
-            self.voice_status_overlay.show_info_hint(label_text, duration=2.5)
+            try:
+                _popups_on = bool(
+                    getattr(self.config, "overlay_text_popups_enabled", True)
+                )
+            except Exception:
+                _popups_on = True
+            if _popups_on:
+                self.voice_status_overlay.show_info_hint(label_text, duration=2.5)
         except Exception:
             pass
         try:
@@ -8779,9 +11435,8 @@ class GestureWorker(QObject):
         try:
             import sys as _cg_sys, time as _cg_time
             _cg_sys.stderr.write(
-                f"[clip-gesture] left-fist hold triggered at {now:.3f} "
-                f"duration={duration_s}s -> queueing clip_gesture "
-                f"(nothing was cancellable, fist re-purposed for clip)\n"
+                f"[clip-gesture] left-two hold triggered at {now:.3f} "
+                f"duration={duration_s}s -> queueing clip_gesture\n"
             )
             _cg_sys.stderr.flush()
         except Exception:
@@ -8795,9 +11450,45 @@ class GestureWorker(QObject):
         except Exception:
             pass
 
+    def _begin_voice_hold_anchor(self) -> None:
+        self._voice_hold_origin_xy = None
+        self._voice_hold_origin_scale = 1.0
+        xy = self._palm_xy(getattr(self, "_left_hand_reading", None))
+        if xy is None:
+            return
+        try:
+            scale = float(self._left_hand_reading.palm.scale)
+        except Exception:
+            scale = 1.0
+        self._voice_hold_origin_xy = xy
+        self._voice_hold_origin_scale = max(scale, 1e-6)
+
+    def _voice_one_hold_is_translating(self) -> bool:
+        """True when left-hand palm has moved swipe-scale since hold start.
+
+        Small jitter and a little drift stay under the cap so a held
+        "one" still starts voice. Missing landmarks fail open (no
+        reading → not treated as moving).
+        """
+        reading = getattr(self, "_left_hand_reading", None)
+        xy = self._palm_xy(reading)
+        if xy is None:
+            return False
+        if self._voice_hold_origin_xy is None:
+            self._begin_voice_hold_anchor()
+            return False
+        try:
+            scale = float(reading.palm.scale)
+        except Exception:
+            scale = self._voice_hold_origin_scale
+        scale = max(float(scale), float(self._voice_hold_origin_scale), 1e-6)
+        return _palm_net_travel_exceeds(self._voice_hold_origin_xy, xy, scale)
+
     def _reset_voice_candidate(self, now: float) -> None:
         self._voice_candidate = "neutral"
         self._voice_candidate_since = now
+        self._voice_hold_origin_xy = None
+        self._voice_hold_origin_scale = 1.0
         if self._voice_latched_label is not None:
             self._voice_latched_label = None
 

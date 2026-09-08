@@ -25,6 +25,7 @@ import numpy as np
 
 from .action import fire_once
 from .dynamic_classifier import (
+    _DEFAULT_MATCH_THRESHOLD,
     DynamicGestureClassifier,
     DynamicGestureTemplate,
 )
@@ -214,6 +215,55 @@ class DynamicGestureRuntime:
     def has_dynamic_gestures(self) -> bool:
         return self._classifier is not None and bool(self._gestures_by_name)
 
+    def has_loop_or_complex_templates(self) -> bool:
+        if self._classifier is None:
+            return False
+        try:
+            return bool(self._classifier.has_loop_or_complex_templates())
+        except Exception:
+            return False
+
+    def spring_debug_rows(self):
+        """Sandbox diagnostic: latest SPRING cost vs threshold per gesture."""
+        if self._classifier is None:
+            return []
+        try:
+            return self._classifier.spring_debug_rows()
+        except Exception:
+            return []
+
+    def should_preempt_builtin_horizontal_swipe(
+        self,
+        landmarks_21x3: Optional[np.ndarray],
+        *,
+        palm_scale: float,
+        now: float,
+    ) -> bool:
+        """See DynamicGestureClassifier.preempts_builtin_horizontal_swipe.
+
+        Also true during the post-fire banner window so a builtin
+        swipe that latches a frame later than the custom fire is
+        still swallowed.
+        """
+        if self.has_loop_or_complex_templates():
+            return True
+        if self.current_match(now) is not None:
+            return True
+        try:
+            if self._classifier is not None and self._classifier.live_path_looks_like_loop():
+                return True
+        except Exception:
+            pass
+        if self._classifier is None or landmarks_21x3 is None:
+            return False
+        try:
+            raw = landmarks_21x3.astype(np.float32)
+            scale = max(float(palm_scale), 1e-6)
+            normalized = normalize_frame(raw, scale)
+            return bool(self._classifier.preempts_builtin_horizontal_swipe(normalized))
+        except Exception:
+            return False
+
     # ---- internal ----
 
     def _read_registry_mtime(self) -> float:
@@ -225,12 +275,16 @@ class DynamicGestureRuntime:
     @staticmethod
     def _live_match_threshold() -> float:
         """Allow override via env var, same pattern as the static
-        runner uses for HGR_CUSTOM_GESTURES_LIVE_THRESHOLD."""
+        runner uses for HGR_CUSTOM_GESTURES_LIVE_THRESHOLD. Default
+        matches the classifier's tuned _DEFAULT_MATCH_THRESHOLD (0.18)
+        — the previous 0.30 default left the live engine ~67% LOOSER
+        than the classifier was tuned for, which is why every
+        moderate hand motion fired a match."""
         raw = os.environ.get("HGR_DYNAMIC_GESTURES_THRESHOLD", "").strip()
         try:
-            return float(raw) if raw else 0.30
+            return float(raw) if raw else float(_DEFAULT_MATCH_THRESHOLD)
         except (TypeError, ValueError):
-            return 0.30
+            return float(_DEFAULT_MATCH_THRESHOLD)
 
     @staticmethod
     def _template_from_registry_entry(gesture) -> Optional[DynamicGestureTemplate]:
@@ -252,10 +306,80 @@ class DynamicGestureRuntime:
             ]
             if not valid:
                 return None
+            # Wrist channel — rehydrate only when the registry stored
+            # a 1-to-1 parallel set of well-shaped (T, 3) wrist
+            # trajectories. Legacy records (pre-wrist-channel) have an
+            # empty list here; we silently fall back to finger-only
+            # matching by passing an empty wrist list and strength 0.
+            raw_wrist = getattr(gesture, "wrist_trajectories", None) or []
+            wrist: List[np.ndarray] = []
+            if len(raw_wrist) == len(valid):
+                for w in raw_wrist:
+                    try:
+                        arr = np.asarray(w, dtype=np.float32)
+                    except Exception:
+                        wrist = []
+                        break
+                    if arr.ndim != 2 or arr.shape[1] != 3:
+                        wrist = []
+                        break
+                    wrist.append(arr)
+            try:
+                strength = float(getattr(gesture, "wrist_motion_strength", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                strength = 0.0
+            if not wrist:
+                strength = 0.0
+            # v1.1.8.1: prefer the per-template match_threshold saved
+            # in the registry. Legacy records (no field) get an on-the-
+            # fly auto-threshold from pairwise DTW between takes, then
+            # cached on the DynamicGestureTemplate for this session.
+            # v1.1.8.2: the on-the-fly DTW pairwise threshold was
+            # removed. Templates now persist match_threshold at build
+            # time (SPRING-native pairwise self-scoring). Legacy
+            # templates without a saved threshold fall through with
+            # `None`, which lets the classifier apply its own default
+            # (they still won't fire because they also lack
+            # sample_features — see the WARN log in __init__).
+            saved_threshold = getattr(gesture, "match_threshold", None)
+            template_threshold: Optional[float] = (
+                float(saved_threshold) if saved_threshold is not None else None
+            )
+            # v1.1.8.2 SPRING features. Legacy templates (schema < 3)
+            # have empty sample_features and fall back to segment-DTW.
+            raw_features = getattr(gesture, "sample_features", None) or []
+            sample_features_list: List[np.ndarray] = []
+            for feat in raw_features:
+                try:
+                    arr = np.asarray(feat, dtype=np.float32)
+                    if arr.ndim == 2 and arr.shape[0] > 0:
+                        sample_features_list.append(arr)
+                except Exception:
+                    continue
+            # v1.1.8.2 (post-audit r2) intent-signature fields.
+            intent_direction = getattr(gesture, "intent_direction", None)
+            intent_magnitude = float(getattr(gesture, "intent_magnitude", 0.0) or 0.0)
+            intent_window_seconds = float(
+                getattr(gesture, "intent_window_seconds", 0.0) or 0.0
+            )
+            raw_tip_ext = getattr(gesture, "intent_fingertip_extension", None)
+            intent_fingertip_extension = (
+                list(raw_tip_ext) if raw_tip_ext and len(raw_tip_ext) == 5 else None
+            )
             return DynamicGestureTemplate(
                 name=str(gesture.name),
                 key_point_indices=indices,
                 sample_trajectories=valid,
+                wrist_trajectories=wrist,
+                wrist_motion_strength=strength,
+                match_threshold=template_threshold,
+                sample_features=sample_features_list,
+                intent_direction=(
+                    list(intent_direction) if intent_direction else None
+                ),
+                intent_magnitude=intent_magnitude,
+                intent_window_seconds=intent_window_seconds,
+                intent_fingertip_extension=intent_fingertip_extension,
             )
         except Exception:
             return None

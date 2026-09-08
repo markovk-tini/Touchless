@@ -148,12 +148,79 @@ def resolve_dshow_device_for_index(index: int, qt_name_hint: str = "") -> str | 
     return None
 
 
+def _median_luma_from_bgr(frame: np.ndarray) -> float:
+    """Estimate the median luminance of a BGR frame in [0, 255].
+
+    Uses BT.709 coefficients (Y' = 0.0722*B + 0.7152*G + 0.2126*R) and
+    downsamples 4× on each axis to keep the compute cost negligible
+    (~15k pixels on a 640×480 frame). Median (not mean) so a bright
+    window in one corner doesn't mask a dark scene, and a single dark
+    letterbox doesn't drag the value below threshold either.
+    """
+    if frame is None or frame.size == 0 or frame.ndim < 3:
+        return 0.0
+    small = frame[::4, ::4]
+    b = small[:, :, 0].astype(np.float32)
+    g = small[:, :, 1].astype(np.float32)
+    r = small[:, :, 2].astype(np.float32)
+    y = 0.0722 * b + 0.7152 * g + 0.2126 * r
+    try:
+        return float(np.median(y))
+    except Exception:
+        return 0.0
+
+
+def _measure_cap_luma(
+    cap: "FfmpegMjpegCapture",
+    *,
+    n_frames: int = 18,
+    timeout_s: float = 1.5,
+    warmup_frames: int = 6,
+) -> Optional[float]:
+    """Sample frames off a live ffmpeg cap and return the median of their
+    per-frame median luma. Returns None if we couldn't gather enough
+    samples inside the timeout window — caller should treat that as
+    "no signal" and NOT downshift on that alone (the cap might just be
+    slow to warm up on a particular driver; we don't want a slow warmup
+    to be misread as darkness and cost the user their higher fps).
+
+    Reads the first `warmup_frames` off the cap and discards them so a
+    camera's auto-exposure has a chance to settle before we sample.
+    Consumers don't see these frames because the wrapper is called
+    from the open path, before the cap is returned to the caller."""
+    if cap is None or not cap.isOpened():
+        return None
+    deadline = time.monotonic() + max(0.5, timeout_s)
+    consumed = 0
+    samples: list[float] = []
+    while (consumed < warmup_frames + n_frames) and time.monotonic() < deadline:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            time.sleep(0.005)
+            continue
+        consumed += 1
+        if consumed <= warmup_frames:
+            continue
+        try:
+            samples.append(_median_luma_from_bgr(frame))
+        except Exception:
+            continue
+    # Need at least a quarter of the requested samples to make a call.
+    if len(samples) < max(4, n_frames // 4):
+        return None
+    try:
+        return float(np.median(samples))
+    except Exception:
+        return None
+
+
 def open_ffmpeg_cap_with_fps_fallback(
     device_name: str,
     *,
     width: int = 1280,
     height: int = 720,
     fps_candidates: tuple[int, ...] = (60, 30),
+    luma_min_threshold: float | None = None,
 ) -> "FfmpegMjpegCapture | None":
     """Try opening the ffmpeg MJPG cap at decreasing frame rates.
 
@@ -166,9 +233,68 @@ def open_ffmpeg_cap_with_fps_fallback(
     decompressed BGR frames without the per-frame uncompress cost
     YUY2 carries.
 
+    v1.1.7.1 luma safety net (`luma_min_threshold`): after a successful
+    open, sample the first ~18 post-warmup frames and compute their
+    median luma. If it's below the threshold (typical: 50/255) we
+    treat that as "camera driver cut shutter to keep up with fps",
+    close the cap, and continue to the next (lower) fps candidate.
+    A brighter frame is worth more to hand tracking than the extra
+    fps: MediaPipe simply cannot find hands in a dark image.
+
+    The safety net is scoped tightly:
+      * Only downshift — never brighten past the driver's natural
+        exposure. If the room is genuinely dark, downshifting doesn't
+        help but also doesn't hurt (lower fps just gives the driver a
+        larger shutter budget it may or may not use).
+      * Only fires on the primary open path. Cameras that are fine at
+        60 fps (Kiyo Pro, Brio, C920, most modern sensors in adequate
+        lighting) pass the threshold on the first attempt and never
+        pay a wall-clock cost beyond the ~0.4 s luma sample window.
+      * Env-var opt-out: `HGR_FFMPEG_LUMA_CHECK=0` disables it entirely
+        for users who want to force the highest fps regardless of
+        brightness.
+      * A None reading (couldn't read enough frames within timeout) is
+        NOT treated as "too dark" — we return the cap anyway. A slow-
+        warmup cap should not be misread as darkness and demoted.
+
+    Single-retry budget for silent hangs:
+      * Real failure (fatal stderr pattern OR non-None returncode) →
+        next fps candidate immediately. Fast path.
+      * Silent hang (subprocess alive, no stderr, no first frame) →
+        retry the SAME fps once with extra warmup. Probably DSHOW
+        handle race from a prior cap teardown.
+      * The retry budget is SHARED across all fps candidates: only
+        one retry per call total. If the first silent-hang retry
+        also fails, something is genuinely holding the camera
+        (Razer Synapse, Windows Camera, a zombie ffmpeg from a
+        crashed test session, etc.) and retrying 30 fps with the
+        same warmup will also fail. Bail to OpenCV fallback right
+        away so the user isn't staring at a frozen splash for 15+
+        seconds while we cycle through doomed attempts.
+
+    Worst-case wall clock with default 2.5 s timeout:
+      * Silent hang once → retry succeeds: ~4 s. 60 fps engaged.
+      * Silent hang on first attempt, retry also hangs: ~6 s. Bail.
+      * Real format-rejection at 60, success at 30: ~3 s. 30 fps.
+      * Real failure on both: ~5 s. Caller falls to OpenCV.
+      * Luma downshift at 60, success at 30: ~4 s. 30 fps, brighter.
+
     Returns the opened capture, or None if every candidate failed.
     The caller should fall through to the OpenCV path on None.
     """
+    # Env-var opt-out for the luma safety net. Set HGR_FFMPEG_LUMA_CHECK=0
+    # to force the highest fps regardless of resulting brightness. Also
+    # respected when luma_min_threshold is None (default) — the env var
+    # only matters when the caller actually asked for the safety net.
+    luma_check_disabled = False
+    try:
+        _env_luma = os.environ.get("HGR_FFMPEG_LUMA_CHECK")
+        if _env_luma is not None and str(_env_luma).strip() == "0":
+            luma_check_disabled = True
+    except Exception:
+        pass
+
+    retry_used = False
     for fps in fps_candidates:
         cap = FfmpegMjpegCapture(
             device_name,
@@ -177,6 +303,45 @@ def open_ffmpeg_cap_with_fps_fallback(
             fps=fps,
         )
         if cap.isOpened():
+            # Luma safety net — only fires when caller asked for it and
+            # env-var didn't opt out. If the reading is below threshold,
+            # release the cap and continue to the next fps candidate.
+            # A None reading means "couldn't sample confidently" and is
+            # NOT treated as darkness — we return the cap anyway.
+            if luma_min_threshold is not None and not luma_check_disabled:
+                try:
+                    median_luma = _measure_cap_luma(cap)
+                except Exception:
+                    median_luma = None
+                if median_luma is not None and median_luma < float(luma_min_threshold):
+                    try:
+                        print(
+                            f"[ffmpeg_capture] {fps} fps opened but median luma "
+                            f"{median_luma:.1f} < threshold {float(luma_min_threshold):.1f} — "
+                            f"driver likely cut shutter to keep up with fps. "
+                            f"Releasing and downshifting to next candidate.",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        cap.release()
+                    except Exception:
+                        pass
+                    # Deliberate release — do NOT trigger the silent-hang
+                    # retry path (that's for genuine open failures).
+                    continue
+                if median_luma is not None:
+                    try:
+                        print(
+                            f"[ffmpeg_capture] {fps} fps luma check passed: "
+                            f"median={median_luma:.1f} (threshold={float(luma_min_threshold):.1f})",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
             try:
                 print(
                     f"[ffmpeg_capture] engaged at {width}x{height} @ {fps} fps MJPG",
@@ -186,10 +351,75 @@ def open_ffmpeg_cap_with_fps_fallback(
             except Exception:
                 pass
             return cap
+        silent_hang = cap._last_failure_was_silent_hang()
         try:
             cap.release()
         except Exception:
             pass
+        if silent_hang and not retry_used:
+            retry_used = True
+            try:
+                print(
+                    f"[ffmpeg_capture] {fps} fps open hung silently (likely DSHOW "
+                    f"handle race — one-shot retry with extra warmup)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
+            try:
+                time.sleep(1.0)
+            except Exception:
+                pass
+            cap = FfmpegMjpegCapture(
+                device_name,
+                width=width,
+                height=height,
+                fps=fps,
+            )
+            if cap.isOpened():
+                try:
+                    print(
+                        f"[ffmpeg_capture] engaged at {width}x{height} @ {fps} fps MJPG "
+                        f"(after silent-hang retry)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+                return cap
+            try:
+                cap.release()
+            except Exception:
+                pass
+            # Retry also silent-hung — something is genuinely holding
+            # the camera. Bail to OpenCV fallback rather than burning
+            # another 5–8 s on the next fps candidate that will
+            # almost certainly fail the same way.
+            try:
+                print(
+                    f"[ffmpeg_capture] {fps} fps retry also silent-hung — "
+                    f"camera is being held by another process. Bailing to "
+                    f"OpenCV fallback instead of cycling more ffmpeg attempts. "
+                    f"Check Task Manager for zombie ffmpeg.exe, close Razer "
+                    f"Synapse / Windows Camera app, or unplug-replug the webcam.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return None
+        if silent_hang and retry_used:
+            try:
+                print(
+                    f"[ffmpeg_capture] {fps} fps silent-hung; retry budget "
+                    f"already spent — bailing to OpenCV fallback",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return None
         try:
             print(
                 f"[ffmpeg_capture] {fps} fps unsupported by camera — trying next candidate",
@@ -234,19 +464,15 @@ class FfmpegMjpegCapture:
         self._height = int(height)
         self._fps = int(fps)
         self._ffmpeg_path = ffmpeg_path or locate_ffmpeg()
-        # Lowered startup_timeout from 8s to 2.5s. The 8s value was
-        # there to forgive a DSHOW driver that hadn't yet released
-        # the device after an in-app camera-restart — but on the
-        # cold-start path (e.g. tutorial launched from Settings while
-        # the main app is closed) there's no lingering driver lock,
-        # so 8s just means an extra 16 s of dead time when ffmpeg
-        # genuinely can't open the device (failure × two fps
-        # candidates). 2.5 s is plenty for the legitimate cold-open
-        # case (typical first-frame latency is <500 ms when ffmpeg
-        # works at all). The rare DSHOW-still-busy-after-restart
-        # case now falls through to OpenCV faster — the user
-        # perceives "camera came up" instead of "camera frozen for
-        # 16 s then came up".
+        # Startup timeout: 2.5 s. Real failures (Could-not-set-video-
+        # options, Error-opening-input) still bail in <500 ms because
+        # _stderr_loop matches fatal patterns. The DSHOW-handle-race
+        # case (silent hang) is handled by a one-shot retry in
+        # open_ffmpeg_cap_with_fps_fallback — extending the timeout
+        # here did NOT help, because a hung DSHOW open stays hung
+        # until the other process releases the handle, however long
+        # we wait. Better to time out faster and lean on the retry's
+        # extra warmup window.
         self._startup_timeout = float(startup_timeout_seconds)
         # Known-fatal stderr substrings that mean ffmpeg has decided
         # it can't open this device: when any of these appear in the
@@ -293,6 +519,13 @@ class FfmpegMjpegCapture:
         self._fresh_frame_event = threading.Event()
         self._opened = False
         self._read_error = False
+        # Populated by _start() if startup fails so
+        # _last_failure_was_silent_hang() can classify the failure
+        # (DSHOW handle race vs genuine "this fps not supported")
+        # without re-inspecting the already-killed subprocess.
+        self._last_failure_proc_alive: bool | None = None
+        self._last_failure_returncode: int | None = None
+        self._last_failure_stderr_tail: str = ""
         # Fixed-prefix warmup discard. EOS Webcam Utility and some
         # other DSHOW filters emit a few placeholder frames immediately
         # after open (cached single-color frame, or auto-exposure
@@ -482,6 +715,13 @@ class FfmpegMjpegCapture:
             tail_pre = "".join(self._stderr_log[-12:]).strip()
         except Exception:
             tail_pre = ""
+        # Record the failure signature so
+        # _last_failure_was_silent_hang() can classify it for the
+        # fallback wrapper. Read these BEFORE _teardown_proc clears
+        # _proc and stderr below.
+        self._last_failure_proc_alive = proc_alive
+        self._last_failure_returncode = proc_returncode
+        self._last_failure_stderr_tail = tail_pre
         try:
             print(
                 f"[ffmpeg_capture] startup failed after {self._startup_timeout:.1f}s: "
@@ -563,9 +803,23 @@ class FfmpegMjpegCapture:
         # too fast (shouldn't happen but defensive).
         drain_limit_per_iter = 16
         last_read_done = 0.0
+        # C15 diagnostic: reader-side frame rate + per-frame breakdown.
+        # Logs the actual rate at which ffmpeg is delivering frames
+        # into the pipe (independent of what our main-thread consumer
+        # does). If _tick shows emit rate 25 fps but this shows the
+        # reader producing at 60 fps, then the consumer clear-on-read
+        # semantics are dropping frames; if the reader is also at
+        # 25 fps, the bottleneck is upstream (camera driver, USB
+        # bandwidth, auto-exposure framerate throttling).
+        stats_last_log = time.monotonic()
+        stats_frames = 0
+        stats_drained = 0
+        stats_read_wall_us: list[int] = []
+        stats_decode_wall_us: list[int] = []
         while not self._stop_event.is_set():
             drained = 0
             chunk: bytes | None = None
+            _read_start = time.monotonic()
             while True:
                 try:
                     raw = self._read_exact(self._proc.stdout, frame_bytes)
@@ -585,10 +839,12 @@ class FfmpegMjpegCapture:
                     # this frame and grab the next one.
                     last_read_done = now
                     drained += 1
+                    stats_drained += 1
                     continue
                 last_read_done = now
                 chunk = raw
                 break
+            _read_end = time.monotonic()
             try:
                 frame = np.frombuffer(chunk, dtype=np.uint8).reshape(
                     (self._height, self._width, 3)
@@ -610,6 +866,32 @@ class FfmpegMjpegCapture:
                 self._latest_frame_ts = decoded_at
             self._first_frame_event.set()
             self._fresh_frame_event.set()
+            # C15: reader-side rate + timing breakdown, logged every 2 s.
+            stats_frames += 1
+            stats_read_wall_us.append(int((_read_end - _read_start) * 1_000_000))
+            stats_decode_wall_us.append(int((decoded_at - _read_end) * 1_000_000))
+            if (decoded_at - stats_last_log) >= 2.0 and stats_frames >= 4:
+                elapsed = decoded_at - stats_last_log
+                fps = stats_frames / elapsed if elapsed > 0 else 0.0
+                read_avg_us = sum(stats_read_wall_us) // max(1, len(stats_read_wall_us))
+                read_max_us = max(stats_read_wall_us)
+                decode_avg_us = sum(stats_decode_wall_us) // max(1, len(stats_decode_wall_us))
+                try:
+                    sys.stderr.write(
+                        f"[ffmpeg_reader] delivered: {fps:.1f} fps "
+                        f"({stats_frames} frames / {elapsed:.2f} s, drained {stats_drained}) | "
+                        f"pipe read wall avg={read_avg_us/1000.0:.1f}ms max={read_max_us/1000.0:.1f}ms | "
+                        f"decode+copy avg={decode_avg_us/1000.0:.2f}ms | "
+                        f"target={self._fps}fps interval={camera_interval_s*1000.0:.1f}ms\n"
+                    )
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                stats_last_log = decoded_at
+                stats_frames = 0
+                stats_drained = 0
+                stats_read_wall_us.clear()
+                stats_decode_wall_us.clear()
 
     @staticmethod
     def _read_exact(stream, size: int) -> bytes | None:
@@ -623,6 +905,34 @@ class FfmpegMjpegCapture:
                 return None
             buf.extend(chunk)
         return bytes(buf)
+
+    def _last_failure_was_silent_hang(self) -> bool:
+        """Classify the most recent startup failure for the fallback
+        wrapper.
+
+        Returns True only when the signature matches "DSHOW handle
+        race" — meaning the ffmpeg subprocess was still alive when
+        the startup timeout fired, never produced a frame, and never
+        emitted a fatal error in stderr. That's the case where a
+        same-fps retry (after a longer warmup) usually succeeds,
+        because the driver finishes releasing the prior handle in
+        the meantime.
+
+        Returns False when ffmpeg either exited with a returncode
+        (real format-rejection failure) or printed a fatal pattern
+        like "Could not set video options" — those are genuine "this
+        fps isn't supported" cases where retrying just wastes time.
+        Caller should move to the next fps candidate immediately.
+        """
+        if self._last_failure_proc_alive is False:
+            return False
+        if self._last_failure_returncode is not None:
+            return False
+        tail_lower = (self._last_failure_stderr_tail or "").lower()
+        for pattern in self._fatal_stderr_patterns:
+            if pattern in tail_lower:
+                return False
+        return True
 
     def isOpened(self) -> bool:  # cv2.VideoCapture API parity
         if not self._opened:

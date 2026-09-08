@@ -33,6 +33,7 @@ Why parse + execute manually rather than just calling execute():
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -207,9 +208,39 @@ _EMAIL_COMPOSE_WORDS = (
     "email", "e-mail", "compose", "draft an email", "send an email", "mail to",
 )
 _EMAIL_COMPOSE_CUES = (
-    "@", " saying ", " about ", " that says ", " telling ", " tell ",
+    "@", " saying ", " about ", " that ", " that says ", " telling ", " tell ",
     " subject ", " body ", " message ", " re ",
 )
+# Spreadsheet/doc context words + A1 cell tokens (e.g. C1, B12, AA3). When
+# ANY of these appear the utterance targets a sheet/doc edit, so the word
+# 'email' is CONTENT — not a compose intent. In that case do NOT hand off
+# to the LLM email-compose path (which would leak outlook_compose on the
+# Realtime tool surface).
+_SHEET_DOC_CONTEXT_MARKERS = (
+    "sheet", "spreadsheet", "google doc", "document",
+    "slide", " cell ", " range ", " row ", " column ",
+)
+_A1_CELL_RE = re.compile(r"\b[A-Z]{1,3}[0-9]{1,4}\b")
+
+# Verbless "email <recipient> <body>" — recipient is one token (@ address or a
+# name with letters/apostrophes/hyphens), body is >=2 more chars after it.
+# Matched at the START so an embedded "...email..." doesn't false-trigger.
+# Single-token "email later" and pronoun recipients ("email me ...", "email
+# everyone ...") do NOT match — they fall through to the existing parser
+# (blank composer behavior preserved).
+_EMAIL_VERBLESS_COMPOSE_RE = re.compile(
+    r"^(?:please\s+|hey\s+)?"
+    r"(?:send\s+(?:me\s+|an?\s+)?)?"
+    r"(?:e[-\s]?mail|mail)\s+(?:to\s+)?"
+    r"(?P<to>\S+@\S+\.\S+|[A-Za-z][A-Za-z'\-]+)"
+    r"\s+(?P<body>\S(?:.*\S)?)\s*$",
+    re.IGNORECASE,
+)
+_EMAIL_VERBLESS_REJECT_RECIPIENTS = frozenset({
+    "me", "myself", "him", "her", "them", "us",
+    "everyone", "everybody", "anyone", "anybody", "someone", "somebody",
+    "the", "a", "an", "my", "your", "our", "their", "all",
+})
 
 # READING/summarizing mail goes to the LLM (iris opens Outlook + read_screen) —
 # the deterministic voice parser greedily turns any "...email..." into a blank
@@ -230,6 +261,12 @@ _EMAIL_LOOKUP_MARKERS = (
 )
 _EMAIL_LOOKUP_OBJECT = ("email address", "email for", "'s email", "s email")
 
+# Contacts lookups ("find Dani in my contacts", "search my address book for
+# Sam") must fall through Layer 0 — the deterministic processor doesn't know
+# contacts and 'find' in CHROME_SEARCH_PHRASES would otherwise mis-route them
+# to a Chrome search. Classifier's contacts_search pattern handles these.
+_CONTACT_LOOKUP_MARKERS = (" contacts", " contact", " address book")
+
 # Phrases that ask Iris to REPORT CONTENT back (read a page, summarize, list
 # results). The deterministic router can only open/search — it can't read a
 # page and tell you what's on it. Anything asking for a spoken/written answer
@@ -242,6 +279,41 @@ _REPORT_BACK_MARKERS = (
     " top three", " top 3", " top five", " top 5", " top ten", " top 10",
     " headlines", " give me the", " list the", " show me the",
     " how many", " find out", " look up", " search for and",
+)
+
+# Explicit Tier-1 local-model routing — 'use ollama', 'use the local model
+# to ...', 'X via ollama', 'with the local llm, ...'. These are deliberate
+# overrides asking for the cheap path (planner/classifier.py pattern 0).
+# Without this skip, 'use' from APP_LAUNCH_PHRASES in command_processor
+# greedy-matches an app catalog entry ('use the local model to explain
+# monads' opened OneNote because 'note' fuzzy-matched 'local model').
+_LOCAL_MODEL_MARKERS = (
+    "use ollama", "use the ollama",
+    "use the local model", "use local model",
+    "use the local llm", "use local llm",
+    "use the local ai", "use local ai",
+    "using ollama", "using the local",
+    "via ollama", "with ollama",
+    "via the local model", "with the local model",
+    "via the local llm", "with the local llm",
+    "via the local ai", "with the local ai",
+)
+
+# Pronoun-only open ('open it', 'show that', 'open the doc you just made')
+# refers to the last artifact the planner created — Tier 1's iris_open_last
+# pseudo-tool. Without this skip the catalog fuzzy matcher mis-grabs short
+# pronouns ('open it' opened 'It Takes Two' from Steam). Mirrors the
+# classifier iris_open_last regex so any phrase that pattern catches gets
+# deferred here too.
+_PRONOUN_OPEN_RE = re.compile(
+    r"^(?:can\s+you\s+|could\s+you\s+|please\s+)*"
+    r"(?:open|show(?:\s+me)?|pull\s+up|bring\s+up|view)\s+"
+    r"(?:it|that|this|the\s+(?:doc(?:ument)?|sheet|spreadsheet|"
+    r"slide(?:show|s)?|presentation|deck|onenote|page|note|file|"
+    r"link|thing)(?:\s+(?:you|i|we)\s+(?:just\s+)?"
+    r"(?:made|created|opened))?)"
+    r"(?:\s+please)?\??\s*$",
+    re.IGNORECASE,
 )
 
 # Punctuation / patterns that suggest natural language (questions,
@@ -331,8 +403,32 @@ class CommandRouter:
         if any(marker in lower for marker in _MULTI_STEP_MARKERS):
             self._logger.event("router_skip_multi_step", text_len=len(text))
             return RouterResult(matched=False)
+        # Broader multi-action check: catches 'add task X, set volume Y, and
+        # tell me Z' and 'write a haiku and add a task' — patterns where the
+        # narrower _MULTI_STEP_MARKERS list (which lacks plain ' and ' /
+        # ', and ') misses, letting the catalog parser greedy-match ONE
+        # embedded sub-action ('set volume to 30') and execute it standalone.
+        try:
+            from .planner.triggers import looks_multi_action
+            if looks_multi_action(text):
+                self._logger.event("router_skip_multi_action", text_len=len(text))
+                return RouterResult(matched=False)
+        except Exception:
+            # Import or pattern failure must never block the router; fall
+            # through to the narrower checks below.
+            pass
         if any(word in lower for word in _BUILD_WORDS):
             self._logger.event("router_skip_build_word", text_len=len(text))
+            return RouterResult(matched=False)
+        # Explicit local-model route — must skip BEFORE the catalog opener
+        # (which greedy-matches 'use' as an app launch phrase).
+        if any(m in lower for m in _LOCAL_MODEL_MARKERS):
+            self._logger.event("router_skip_local_model", text_len=len(text))
+            return RouterResult(matched=False)
+        # Pronoun-only 'open it/that/this' belongs to iris_open_last, not
+        # the catalog fuzzy matcher.
+        if _PRONOUN_OPEN_RE.match(text):
+            self._logger.event("router_skip_pronoun_open", text_len=len(text))
             return RouterResult(matched=False)
         # Coding-agent commands always go to the LLM.
         if any(m in lower for m in _CODING_AGENT_MARKERS):
@@ -360,7 +456,15 @@ class CommandRouter:
             self._logger.event("router_skip_window_mgmt", text_len=len(text))
             return RouterResult(matched=False)
         # Email-with-content → LLM + email connector (fills recipient/body).
-        if any(w in lower for w in _EMAIL_COMPOSE_WORDS) and any(c in lower for c in _EMAIL_COMPOSE_CUES):
+        # Exception: when the utterance carries spreadsheet/doc context (an
+        # A1 cell token or a sheet/doc/slide word) the word 'email' is
+        # CONTENT (e.g. "change C1 to say Email"), not a compose intent —
+        # don't skip to the LLM email path here; let the deeper matchers
+        # (classifier's sheets_update_range / gdocs_*) win instead.
+        if (any(w in lower for w in _EMAIL_COMPOSE_WORDS)
+                and any(c in lower for c in _EMAIL_COMPOSE_CUES)
+                and not (any(m in lower for m in _SHEET_DOC_CONTEXT_MARKERS)
+                         or _A1_CELL_RE.search(text) is not None)):
             self._logger.event("router_skip_email_compose", text_len=len(text))
             return RouterResult(matched=False)
         # Read/summarize mail → LLM (iris opens Outlook + read_screen). Without
@@ -375,6 +479,23 @@ class CommandRouter:
         if (any(m in lower for m in _EMAIL_LOOKUP_MARKERS)
                 and any(o in lower for o in _EMAIL_LOOKUP_OBJECT)):
             self._logger.event("router_skip_email_lookup", text_len=len(text))
+            return RouterResult(matched=False)
+        # Verbless "email <name> <body>" — no connective but a real recipient
+        # token + body. Skip so the classifier can build the outlook_compose
+        # step. Ambiguous-recipient forms ("email me ...", "email everyone
+        # ...") and recipient-only forms ("email vesko", "email later") fall
+        # through unchanged → blank composer (preserves current behavior).
+        vm = _EMAIL_VERBLESS_COMPOSE_RE.match(text)
+        if vm:
+            to_tok = vm.group("to").lower().strip(",.;:!?")
+            if "@" in to_tok or to_tok not in _EMAIL_VERBLESS_REJECT_RECIPIENTS:
+                self._logger.event("router_skip_email_verbless_compose", text_len=len(text))
+                return RouterResult(matched=False)
+        # Contacts lookup → classifier's contacts_search. Without this skip,
+        # "find Dani in my contacts" parses as a Chrome search ('find' is in
+        # CHROME_SEARCH_PHRASES) and never reaches the orchestrator.
+        if any(m in lower for m in _CONTACT_LOOKUP_MARKERS):
+            self._logger.event("router_skip_contact_lookup", text_len=len(text))
             return RouterResult(matched=False)
 
         processor = self._ensure_processor()
@@ -482,20 +603,44 @@ def _humanize_result_message(intent, result, success: bool) -> str:
             q = f" for {query}" if query else ""
             return f"Searched in {app.title()}{q}"
         if action == "play":
-            # Spotify play returns a useful "Song: ... | Artist: ..." string.
-            if raw_useful and "|" in info:
-                # Keep but trim to the first two segments for readability.
-                parts = [p.strip() for p in info.split("|")[:2]]
-                return " | ".join(parts)
-            return f"Started playback{f' ({query})' if query else ''}"
+            # Spotify play returns a "Song: X | Artist: Y | Album: …"
+            # string. Parse it into a "X by Y" subject then run through
+            # the persona-tinted reply layer so the chat panel speaks
+            # in the active voice instead of the raw structured form.
+            subject = ""
+            if raw_useful and "Song:" in info:
+                # info shape: "Song: X | Artist: Y | Album: Z | …"
+                parts = {}
+                for seg in info.split("|"):
+                    if ":" in seg:
+                        k, v = seg.split(":", 1)
+                        parts[k.strip().lower()] = v.strip()
+                song = parts.get("song", "")
+                artist = parts.get("artist", "")
+                if song and artist:
+                    subject = f"{song} by {artist}"
+                elif song:
+                    subject = song
+            if not subject and query:
+                subject = query
+            try:
+                from .planner.orchestrator import IrisPlanner
+                return IrisPlanner._persona_play_reply(subject)
+            except Exception:
+                return (f"Playing {subject}." if subject
+                        else "Playing.")
         if action == "next":
-            return "Skipped to next track"
+            return "Skipping."
         if action == "previous":
-            return "Skipped to previous track"
+            return "Going back."
         if action == "pause":
-            return "Paused"
+            return "Paused."
         if action == "resume":
-            return "Resumed"
+            try:
+                from .planner.orchestrator import IrisPlanner
+                return IrisPlanner._persona_play_reply("")
+            except Exception:
+                return "Resumed."
         if action == "shuffle":
             return "Toggled shuffle"
         if action == "repeat":

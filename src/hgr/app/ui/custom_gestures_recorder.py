@@ -65,7 +65,27 @@ from hgr.custom_gestures.registry import (
 )
 
 from .custom_gestures_chrome import apply_touchless_titlebar
+from .custom_gestures_recording_help import (
+    ExpandableHelpPanel,
+    RecordingConsistencyTip,
+)
 
+
+_STATIC_SUMMARY = (
+    "Use <b>Static</b> for a single held hand shape (thumbs-up, OK, open palm, "
+    "etc.). Hold the pose while Touchless samples many frames, then save."
+)
+_STATIC_DETAILS = (
+    "<p style='margin:0 0 6px 0;'><b>Good for:</b> one pose that triggers an "
+    "action after a short hold.</p>"
+    "<p style='margin:0 0 6px 0;'><b>Don’t use for:</b> motion paths (use "
+    "<b>Dynamic</b>) or several poses in order (use <b>Sequence</b>).</p>"
+    "<p style='margin:0 0 6px 0;'><b>How to record:</b> hold the pose, press "
+    "Begin / Space, keep fingertips visible, and let the hand drift slightly "
+    "so the classifier learns your real range.</p>"
+    "<p style='margin:0;'><b>Limits:</b> one hand; avoid heavy finger "
+    "occlusion; hold-to-activate / cooldown are set in the wizard.</p>"
+)
 
 _TARGET_SAMPLES = 100
 _CAPTURE_INTERVAL_FRAMES = 3
@@ -92,11 +112,12 @@ class RecordingWindow(QDialog):
         config=None,
     ) -> None:
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
         self.setWindowTitle(f"Recording: {name}")
         self.setModal(True)
         self.setMinimumSize(820, 560)
+        self._body = install_indigo_chrome(self, f"Recording: {name}")
         self._worker = worker
         self._accent_color = accent_color
         self._name = name
@@ -165,6 +186,12 @@ class RecordingWindow(QDialog):
         if not self._camera_connect_attempted:
             self._camera_connect_attempted = True
             QTimer.singleShot(0, self._deferred_connect)
+        # Tip overlay on the live view — once per open.
+        if not getattr(self, "_consistency_tip_shown", False):
+            self._consistency_tip_shown = True
+            tip = getattr(self, "_consistency_tip", None)
+            if tip is not None:
+                QTimer.singleShot(0, lambda: tip.attach(self._video_label))
 
     def _deferred_connect(self) -> None:
         self._video_label.setText("Connecting to camera...")
@@ -208,17 +235,21 @@ class RecordingWindow(QDialog):
             """
         )
 
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
 
-        self._instructions = QLabel(
-            "Hold your gesture in front of the camera, then click "
-            "<b>Begin Recording</b> or press <b>Spacebar</b>. Let your "
-            "hand drift naturally during the ~10-second capture so the "
-            "classifier learns your real range."
+        self._help = ExpandableHelpPanel(
+            summary_html=(
+                f"{_STATIC_SUMMARY} Click <b>Begin Recording</b> or press "
+                f"<b>Spacebar</b>."
+            ),
+            details_html=_STATIC_DETAILS,
         )
-        self._instructions.setWordWrap(True)
+        root.addWidget(self._help)
+
+        self._instructions = QLabel("")
+        self._instructions.hide()
         root.addWidget(self._instructions)
 
         self._video_label = QLabel("Waiting for camera frames...")
@@ -251,6 +282,9 @@ class RecordingWindow(QDialog):
             "}"
         )
         self._complete_overlay.hide()
+
+        self._consistency_tip = RecordingConsistencyTip(self._video_label)
+        # Shown once the dialog is on screen (showEvent) so geometry is known.
 
         self._progress_label = QLabel(
             f"Samples captured: 0 / {_TARGET_SAMPLES}"
@@ -986,24 +1020,22 @@ class RecordingWindow(QDialog):
                 # Custom gestures CAN be overridden — offer that as the
                 # only positive choice. Override deletes the existing
                 # gesture so live use only fires the new one.
+                # r51: use touchless_message_box (frameless indigo) so
+                # the popup renders identically on Win10 and Win11.
                 from PySide6.QtWidgets import QMessageBox as _QMB
-                from .window_chrome import apply_touchless_chrome
-                box = _QMB(self)
-                box.setIcon(_QMB.Warning)
-                box.setWindowTitle("Pose already in use")
-                box.setText(
+                from .window_chrome import touchless_message_box
+                result = touchless_message_box(
+                    self,
+                    "Pose already in use",
                     f"This gesture pose already exists as <b>{top_name}</b>.<br><br>"
-                    f"Override it (the existing <b>{top_name}</b> will be "
-                    f"deleted), or cancel and use a different pose?"
+                    f"Override it? The existing <b>{top_name}</b> will be "
+                    f"deleted so this new gesture becomes the sole owner "
+                    f"of this pose.",
+                    icon=_QMB.Warning,
+                    buttons=_QMB.Yes | _QMB.Cancel,
+                    default_button=_QMB.Cancel,
                 )
-                override_btn = box.addButton(
-                    f"Override {top_name}", _QMB.AcceptRole
-                )
-                cancel_btn = box.addButton(_QMB.Cancel)
-                box.setDefaultButton(cancel_btn)
-                apply_touchless_chrome(box)
-                box.exec()
-                if box.clickedButton() is not override_btn:
+                if result != _QMB.Yes:
                     return
                 # User chose Override — drop the old gesture so the
                 # new one is the sole owner of this pose.
@@ -1230,8 +1262,8 @@ class GesturePosePickerDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
         self._thumbnails = list(thumbnails)
         self._selected_index: Optional[int] = None
         self._accent = accent_color or "#1DE9B6"
@@ -1241,6 +1273,7 @@ class GesturePosePickerDialog(QDialog):
         self.setObjectName("gesturePosePicker")
         self.setModal(True)
         self.setMinimumWidth(720)
+        self._body = install_indigo_chrome(self, "Pick a gesture image")
         self._build(gesture_name, description)
         self._apply_theme()
 
@@ -1254,7 +1287,7 @@ class GesturePosePickerDialog(QDialog):
             return None
 
     def _build(self, gesture_name: str, description: str) -> None:
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(20, 18, 20, 16)
         root.setSpacing(12)
 

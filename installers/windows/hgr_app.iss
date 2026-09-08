@@ -21,7 +21,7 @@
 ;   /DMONOLITHIC=1                     (optional — switches to embedded zip)
 
 #define MyAppName "Touchless"
-#define MyAppVersion "1.1.6"
+#define MyAppVersion "1.1.9.1"
 #define MyAppPublisher "Konstantin Markov"
 #define MyAppExeName "Touchless.exe"
 #define DistDir "..\..\dist\Touchless"
@@ -61,8 +61,17 @@ AppPublisher={#MyAppPublisher}
 ; admin approval. Same approach Discord/Slack/VS Code (User Installer)
 ; use. Trade-off: each Windows user installs separately, which is
 ; fine for the friends-and-family scale we ship at.
+;
+; v1.1.7 fix: PrivilegesRequiredOverridesAllowed=dialog was REMOVED.
+; It popped a "just for me / all users" choice dialog on startup;
+; users clicking "all users" (whether by accident, or because it looked
+; like the safer default) then hit Inno's SetupErrorRoleMustBeAdmin
+; error — "You must be logged in as an administrator when installing
+; this program" — and the install died. Standard-user accounts with
+; no admin creds available anywhere on the box were completely locked
+; out of a working installer. With the override removed, there's no
+; dialog and no choice — Inno silently installs to %LOCALAPPDATA%.
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
 DefaultDirName={localappdata}\Programs\{#MyAppName}
 ; FSL-1.1-Apache-2.0 license shown on the License Agreement page so
 ; users see the terms before installing. Path is relative to the
@@ -113,6 +122,32 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 ; UAC-free. Users whose GPU mode falls back to CPU because Defender
 ; quarantined DirectML.dll can add the exclusion manually via
 ; Windows Security -> Virus & threat protection -> Exclusions.
+
+[InstallDelete]
+; v1.1.9 rebuild — remove Windows system DLLs that older builds wrongly
+; shipped inside the bundle. 1.1.9 shipped Anaconda's ICU 73 in
+; `_internal\` (PyInstaller resolves DLL imports off the build machine's
+; PATH), and `_internal\` precedes System32 on the frozen app's DLL search
+; path, so that copy shadowed Windows' own ICU. Its symbols are
+; version-suffixed (`ucnv_open_73`) while PySide6 6.10+ Qt6Core imports the
+; plain names, so the app could not start at all:
+;   ImportError: DLL load failed while importing QtGui:
+;   The specified procedure could not be found
+; Inno does NOT delete orphaned files on an in-place upgrade, and neither
+; does the app-zip updater (it only carries Touchless.exe + assets). Without
+; this section, "updating" a broken 1.1.9 — including the Microsoft Store's
+; own Update button, which runs this installer over the existing folder —
+; would leave the shadowing DLL behind and the app would keep crashing.
+; `builder\windows\hgr_app.spec` now strips these at build time; this
+; section heals machines that already have them.
+; NOTE: only `_internal\*.dll` at the top level is matched. QtWebEngine's
+; `PySide6\resources\icudtl.dat` is a required data file and is NOT touched.
+Type: files; Name: "{app}\_internal\icuuc.dll"
+Type: files; Name: "{app}\_internal\icuin.dll"
+Type: files; Name: "{app}\_internal\icu.dll"
+Type: files; Name: "{app}\_internal\icudt*.dll"
+Type: files; Name: "{app}\_internal\ucrtbase.dll"
+Type: files; Name: "{app}\_internal\api-ms-win-*.dll"
 
 [Files]
 #ifdef MONOLITHIC
@@ -188,30 +223,73 @@ begin
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Attempt: Integer;
+  MaxAttempts: Integer;
+  LastError: String;
+  Succeeded: Boolean;
 begin
   if CurPageID = wpReady then begin
-    DownloadPage.Clear;
-    DownloadPage.Add('{#PAYLOAD_URL}', '{#PAYLOAD_FILE}', '{#PAYLOAD_SHA256}');
-    DownloadPage.Show;
-    try
-      try
-        DownloadPage.Download;
-        Result := True;
-      except
-        if DownloadPage.AbortedByUser then begin
-          Log('Aborted by user.');
-          Result := False;
-        end else begin
-          SuppressibleMsgBox(
-            'Download failed: ' + GetExceptionMessage,
-            mbCriticalError,
-            MB_OK,
-            IDOK);
-          Result := False;
-        end;
+    // r45: retry the 3-GB payload download up to 4 times before
+    // surfacing a hard failure. Inno's DownloadPage.Download uses
+    // WinInet's single-shot GET with no resume support, so any
+    // transient connection drop mid-transfer (Cloudflare 5xx, ISP
+    // hiccup, laptop wake-from-sleep) throws and the user has to
+    // restart. Real-world reports: ~30-40% of first-attempt installs
+    // over slow/flaky connections were failing. Retrying WITH the
+    // Show/Hide cycle keeps the UX identical to a fresh attempt.
+    MaxAttempts := 4;
+    Succeeded := False;
+    LastError := '';
+    for Attempt := 1 to MaxAttempts do begin
+      DownloadPage.Clear;
+      DownloadPage.Add('{#PAYLOAD_URL}', '{#PAYLOAD_FILE}', '{#PAYLOAD_SHA256}');
+      if Attempt > 1 then begin
+        DownloadPage.SetText(
+          'Downloading Touchless (attempt ' + IntToStr(Attempt) +
+          ' of ' + IntToStr(MaxAttempts) + ')',
+          'The previous attempt was interrupted. Retrying...');
       end;
-    finally
-      DownloadPage.Hide;
+      DownloadPage.Show;
+      try
+        try
+          DownloadPage.Download;
+          Succeeded := True;
+        except
+          if DownloadPage.AbortedByUser then begin
+            Log('Aborted by user.');
+            DownloadPage.Hide;
+            Result := False;
+            Exit;
+          end else begin
+            LastError := GetExceptionMessage;
+            Log('Download attempt ' + IntToStr(Attempt) +
+                ' failed: ' + LastError);
+          end;
+        end;
+      finally
+        DownloadPage.Hide;
+      end;
+      if Succeeded then break;
+      // Brief backoff before retrying so the network stack gets a
+      // moment to settle if the previous failure was transient.
+      // 1500 ms is short enough not to feel like a wait, long enough
+      // for a Cloudflare edge to reset any half-closed sockets.
+      if Attempt < MaxAttempts then
+        Sleep(1500);
+    end;
+    if Succeeded then
+      Result := True
+    else begin
+      SuppressibleMsgBox(
+        'Download failed after ' + IntToStr(MaxAttempts) +
+        ' attempts. Last error: ' + LastError + #13#10#13#10 +
+        'Please check your internet connection and re-run the ' +
+        'installer.',
+        mbCriticalError,
+        MB_OK,
+        IDOK);
+      Result := False;
     end;
   end else
     Result := True;
@@ -358,6 +436,19 @@ begin
         Sleep(500);
       end;
       WizardForm.ProgressGauge.Position := TotalFiles;
+      // v1.1.7.10: replace the frozen "6047 / 6047 files, attempt 1..."
+      // label with an honest "still working" message. The rest of the
+      // ssInstall step (verification + rename probe + Inno's own [Icons]
+      // / [Registry] stages) can take 2-3 minutes on slower computers,
+      // mostly because Windows Defender / Norton is scanning each of the
+      // just-extracted files before letting us open them for the probe.
+      // Users seeing 6047/6047 with no motion have historically thought
+      // the installer hung — this message tells them what's actually
+      // happening. Bar stays at 100% because progress is meaningful up
+      // to this point; the sub-messages below update as we advance.
+      WizardForm.StatusLabel.Caption :=
+        'Finalizing installation — this can take 1-3 minutes while ' +
+        'antivirus scans the new files. The installer is not stuck.';
       WizardForm.Update;
 
       LoadStringFromFile(DoneFlag, ResultStr);
@@ -395,6 +486,8 @@ begin
     //      back. If AV / another process is holding the handle, the
     //      rename fails — catches the "fresh file but still locked"
     //      race that would block the user's first launch.
+    WizardForm.StatusLabel.Caption := 'Verifying installation files...';
+    WizardForm.Update;
     if not FileExists(TouchlessExePath) then
       RaiseException(ExpandConstant('{#MyAppExeName}')
                      + ' was not extracted to ' + ExtractDir + '.'
@@ -416,6 +509,9 @@ begin
 
     // Writability probe: rename Touchless.exe to a temp name and back.
     // If anyone is holding the file open, RenameFile fails.
+    WizardForm.StatusLabel.Caption :=
+      'Waiting for antivirus to finish scanning Touchless.exe...';
+    WizardForm.Update;
     RenameTestPath := TouchlessExePath + '.locktest';
     if FileExists(RenameTestPath) then DeleteFile(RenameTestPath);
     if RenameFile(TouchlessExePath, RenameTestPath) then
@@ -427,6 +523,12 @@ begin
                      + 'Wait a moment for any antivirus scan to finish, then '
                      + 'try launching Touchless. If the app fails to start, '
                      + 'reboot and launch again.');
+    // v1.1.7.10: final message before returning to Inno's own [Icons]
+    // / [Registry] / [Run] stages, which are usually near-instant but
+    // benefit from an honest "almost done" label instead of leaving
+    // the previous "waiting for antivirus" text hanging.
+    WizardForm.StatusLabel.Caption := 'Almost done, setting up shortcuts...';
+    WizardForm.Update;
   end;
 end;
 #endif

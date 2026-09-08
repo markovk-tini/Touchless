@@ -3799,7 +3799,34 @@ class VoiceCommandProcessor:
                 matched_alias=matched_alias,
             )
 
-        if self._contains_any(text, ("compose", "draft", "write", "send email", "email")):
+        # Guard: refuse to fire compose when "email" is CONTENT rather than
+        # ACTION — e.g. "change C1 to say Email" (setting a cell value to
+        # the string "Email"), "add a task called email dani about Q3"
+        # (the word appearing in a task title), etc. Signals that this
+        # is NOT a compose intent:
+        #   (a) utterance contains an A1-style cell reference (C1, B12)
+        #   (b) utterance names a spreadsheet / doc / slide context
+        #   (c) "email" appears only as an object/noun after a set/edit
+        #       verb ("to say", "to write", "put ... in", etc.)
+        # In any of those cases we fall through — the classifier /
+        # intent extractor / realtime LLM will pick the real intent.
+        _NON_COMPOSE_CONTEXT = (
+            "sheet", "spreadsheet", "google sheet", "google doc",
+            "document", "slide", "cell ", " cell", "range ",
+            "row ", "column ", " column",
+            "to say ", "to write ", "to read ", "to equal ",
+            "to contain ", " in c", " in b", " in a", " in d",
+        )
+        _has_a1_ref = bool(re.search(r"\b[A-Z]{1,3}[0-9]{1,4}\b", text))
+        _has_sheet_ctx = any(t in text.lower() for t in _NON_COMPOSE_CONTEXT)
+        _has_actual_compose_verb = self._contains_any(
+            text, ("compose", "draft", "write email", "send email",
+                   "shoot", "fire off", "mail to", "email to"))
+        _bare_email_word = "email" in text.lower() and not _has_actual_compose_verb
+        if (_has_a1_ref or _has_sheet_ctx) and _bare_email_word:
+            # Word "email" is content, not action. Skip the compose branch.
+            pass
+        elif self._contains_any(text, ("compose", "draft", "write", "send email", "email")):
             action = "compose"
             recipient = self._strip_outlook_tail(self._extract_slot(text, start_phrase="to ", stop_phrases=(" subject ", " body ", " message ")))
             subject = self._strip_outlook_tail(self._extract_slot(text, start_phrase="subject ", stop_phrases=(" body ", " message ")))

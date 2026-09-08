@@ -16,6 +16,11 @@ class _FakeChromeController:
         self.new_incognito_calls = 0
         self._window_open = True
 
+    def dispatch_async(self, callable_obj, *args, on_complete=None, **kwargs) -> None:
+        result = callable_obj(*args, **kwargs)
+        if on_complete is not None:
+            on_complete(bool(result), str(self.message or ""))
+
     def focus_or_open_window(self) -> bool:
         self.focus_calls += 1
         self.message = "chrome focused"

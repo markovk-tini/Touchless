@@ -160,13 +160,69 @@ def _resolve_llama_server_executable() -> Optional[Tuple[str, Path]]:
     return None
 
 
-def _resolve_model_file(filename: str) -> Optional[Path]:
-    """Return the absolute path of `filename` if it exists in any candidate root."""
+# Ordered preference of GGUF model filenames. Mirrors the dictation
+# grammar corrector (src/hgr/voice/llama_server.py) so Iris reuses whatever
+# the user already has downloaded — one model file, two consumers, no
+# wasted disk. Order = preferred-first; smaller models top of list because
+# the time-to-first-token / RAM cost is the dominant UX axis on a free
+# user's machine.
+PREFERRED_MODEL_FILES: Tuple[str, ...] = (
+    "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+    "qwen2.5-3b-instruct-q4_k_m.gguf",
+    "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+    "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+)
+
+# HuggingFace download URLs for the same files (one-shot fetch on first
+# Iris launch when local is the auto-selected backend and the user has
+# no GGUF yet). Keyed by filename. Repositories are official Qwen + Meta
+# repackages; size is shown so the download UI can warn the user.
+MODEL_DOWNLOAD_INFO: Dict[str, Dict[str, Any]] = {
+    "Qwen2.5-3B-Instruct-Q4_K_M.gguf": {
+        "url": ("https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/"
+                "resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf"),
+        "size_bytes": 2_000_000_000,  # ~2.0 GB
+        "label": "Qwen 2.5 3B Instruct (Q4_K_M, ~2 GB)",
+    },
+    "Qwen2.5-7B-Instruct-Q4_K_M.gguf": {
+        "url": ("https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/"
+                "resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf"),
+        "size_bytes": 4_700_000_000,  # ~4.7 GB
+        "label": "Qwen 2.5 7B Instruct (Q4_K_M, ~4.7 GB)",
+    },
+}
+
+
+def _resolve_model_file(
+    filename: str,
+    candidates: Optional[Tuple[str, ...]] = None,
+) -> Optional[Path]:
+    """Return the absolute path of a GGUF model that exists in any
+    candidate root.
+
+    Priority: (1) try the explicitly-named `filename` first, (2) then walk
+    `candidates` (or `PREFERRED_MODEL_FILES` when None) so a user who
+    already downloaded a model for the dictation grammar corrector has
+    Iris pick it up without a second download."""
+    names = [filename] if filename else []
+    if not candidates:
+        candidates = PREFERRED_MODEL_FILES
+    for c in candidates:
+        if c not in names:
+            names.append(c)
     for root in _candidate_model_roots():
-        candidate = root / filename
-        if candidate.exists():
-            return candidate
+        for name in names:
+            candidate = root / name
+            if candidate.exists():
+                return candidate
     return None
+
+
+def preferred_model_download_dir() -> Path:
+    """Where Iris should drop a downloaded GGUF model. Matches the
+    dictation corrector's primary search dir so one download serves both
+    features."""
+    return Path.home() / "Documents" / "TouchlessVoiceModels"
 
 
 def _resolve_whisper_command() -> Optional[Tuple[str, ...]]:
@@ -251,6 +307,158 @@ def _find_free_port(preferred: int = 8758) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
+
+
+def probe_local_backend(
+    *, model_filename: str = "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+    require_audio: bool = False,
+) -> Dict[str, Any]:
+    """Cheap readiness check — does NOT spawn the server. Used by
+    config.py + the chat UI to decide whether 'local' is a viable
+    backend before falling back to it.
+
+    Result shape:
+        {
+          ready:              bool,
+          reason:             short human-readable status,
+          has_binary:         bool — llama-server.exe present,
+          has_model:          bool — any preferred GGUF resolved,
+          llama_server:       absolute path or None,
+          model_path:         absolute path or None,
+          gpu_backend:        "cuda"|"vulkan"|"cpu"|None,
+          model_download:     {url, size_bytes, label} | None
+                              — surfaced when has_binary but not has_model,
+                              so the UI can offer a one-click download,
+          whisper_command:    list[str] | None,
+          whisper_model:      absolute path or None,
+        }
+
+    `has_binary=False` is a SHIP-side failure (the user's installer
+    didn't include the runtime). `has_binary=True && has_model=False`
+    is a USER-side recoverable state — they just need to download or
+    place a GGUF in `~/Documents/TouchlessVoiceModels/`."""
+    info: Dict[str, Any] = {
+        "ready": False, "reason": "",
+        "has_binary": False, "has_model": False,
+        "llama_server": None, "model_path": None,
+        "whisper_command": None, "whisper_model": None,
+        "gpu_backend": None,
+        "model_download": None,
+    }
+    llama = _resolve_llama_server_executable()
+    if llama is None:
+        info["reason"] = ("llama-server.exe not found — local LLM "
+                          "binary missing from this build")
+        return info
+    backend_label, llama_path = llama
+    info["has_binary"] = True
+    info["llama_server"] = str(llama_path)
+    info["gpu_backend"] = backend_label
+    model = _resolve_model_file(model_filename)
+    if model is None:
+        # Recoverable: surface what to download.
+        dl = MODEL_DOWNLOAD_INFO.get(model_filename) or next(
+            (MODEL_DOWNLOAD_INFO[k] for k in PREFERRED_MODEL_FILES
+             if k in MODEL_DOWNLOAD_INFO), None)
+        info["model_download"] = dl
+        info["reason"] = (
+            f"local model not found in {preferred_model_download_dir()}. "
+            "Place any of: "
+            + ", ".join(PREFERRED_MODEL_FILES[:2])
+            + " there, or trigger the one-click download from Iris.")
+        return info
+    info["has_model"] = True
+    info["model_path"] = str(model)
+    if require_audio:
+        wcmd = _resolve_whisper_command()
+        wmodel = _resolve_whisper_model()
+        if wcmd is None:
+            info["reason"] = "whisper-cli.exe not found"
+            return info
+        if wmodel is None:
+            info["reason"] = "whisper model file not found"
+            return info
+        info["whisper_command"] = list(wcmd)
+        info["whisper_model"] = str(wmodel)
+    info["ready"] = True
+    info["reason"] = "ok"
+    return info
+
+
+def download_llm_model(
+    *,
+    filename: str = "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+    progress: Optional[Any] = None,
+    cancelled: Optional[Any] = None,
+) -> Tuple[bool, str, Optional[Path]]:
+    """One-shot GGUF download to the preferred dir. Streams to disk so a
+    2GB file doesn't sit in RAM. Returns (ok, message, dest_path).
+
+    `progress`  — callable(downloaded_bytes:int, total_bytes:int|None);
+                  invoked every ~256 KiB. Lets the UI render a bar.
+    `cancelled` — callable() -> bool; checked between chunks so a user
+                  Cancel button stops mid-download cleanly.
+
+    Writes to `preferred_model_download_dir() / filename` atomically
+    (downloads to `.partial`, renames on success). If the file already
+    exists at full size, returns (True, 'already present', path)
+    without re-downloading."""
+    info = MODEL_DOWNLOAD_INFO.get(filename)
+    if info is None:
+        return False, f"no download URL registered for {filename!r}", None
+    url = info["url"]
+    expected_size = int(info.get("size_bytes") or 0)
+    dest_dir = preferred_model_download_dir()
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        return False, f"can't create model dir: {exc}", None
+    dest = dest_dir / filename
+    if dest.exists() and (expected_size == 0
+                          or dest.stat().st_size >= expected_size * 0.95):
+        return True, "already present", dest
+    partial = dest.with_suffix(dest.suffix + ".partial")
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "Touchless-Iris/1.0"})
+        with urllib.request.urlopen(req, timeout=30.0) as resp:
+            total = int(resp.headers.get("Content-Length") or expected_size or 0)
+            downloaded = 0
+            with open(partial, "wb") as f:
+                while True:
+                    if cancelled is not None:
+                        try:
+                            if cancelled():
+                                try:
+                                    partial.unlink()
+                                except Exception:
+                                    pass
+                                return False, "cancelled by user", None
+                        except Exception:
+                            pass
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress is not None:
+                        try:
+                            progress(downloaded, total or None)
+                        except Exception:
+                            pass
+    except Exception as exc:
+        try:
+            if partial.exists():
+                partial.unlink()
+        except Exception:
+            pass
+        return False, f"download failed: {type(exc).__name__}: {exc}", None
+    try:
+        partial.replace(dest)
+    except Exception as exc:
+        return False, f"finalize failed: {exc}", None
+    return True, "downloaded", dest
 
 
 # ---------- backend itself ----------

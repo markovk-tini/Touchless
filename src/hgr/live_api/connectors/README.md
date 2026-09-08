@@ -78,12 +78,25 @@ Setup split:
 Mechanics: `google_client.status()` drives the button
 (`needs_libs`/`needs_client`/`ready_to_connect`/`connected`); `connect()`
 runs `InstalledAppFlow.run_local_server()` on a worker thread and saves the
-token; it refreshes silently after. Scopes: gmail.send, gmail.readonly,
-calendar, documents, drive.file — **all "sensitive" (free verification, no
-paid CASA assessment)**. `gmail.readonly` is intentionally excluded (it's
+token; it refreshes silently after. Scopes: gmail.send, calendar,
+drive.file — **all "sensitive" (free verification, no paid CASA
+assessment)**. `gmail.readonly` is intentionally excluded (it's
 "restricted" and would require the paid assessment for public release), so
 Gmail is **send-only**. Sending (`gmail_send`) is **confirmed** in the UI
 before it fires.
+
+**Docs / Sheets / Slides — drive.file migration (2026-07-29).** The
+broad `documents` / `spreadsheets` / `presentations` scopes were removed
+after Google's OAuth verification review rejected them (restricted-tier).
+Docs v1, Sheets v4, and Slides v1 all accept `drive.file`-issued tokens
+as long as the API caller has a `file_id` for a file that was either
+CREATED by this app (all `*_connector.create` paths satisfy this
+automatically — the freshly-minted file is warm-cached under its title
+for immediate append-by-name follow-ups) or explicitly opened by the
+user via the Google Picker widget (`app/ui/google_picker_dialog.py`).
+Picked ids are remembered in `google_picker_cache.PickerCache` keyed
+by slug so each file only needs to be picked once. See
+`google_picker_cache.py` for the SQLite schema and slugify rules.
 
 ## Capability-search router (how tools stay lean)
 

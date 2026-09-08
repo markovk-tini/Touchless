@@ -1475,15 +1475,47 @@ class ToolExecutor:
                 path=str(target),
                 next_action="ask_user_then_retry_with_confirmed_true",
             )
+        # Phase-1 trust substrate: route through Recycle Bin instead
+        # of permanent unlink. The user's confirmation above already
+        # said "yes" to deletion; this ensures the action is RECOVERABLE
+        # for the next ~30 days (default Recycle Bin retention).
+        # Files only — for directories we still use rmtree because
+        # send2trash on big trees is slow and the directory case is
+        # comparatively rare for Iris-driven deletes. The destructiveness
+        # metadata for delete_file is IRREVERSIBLE; this routing makes
+        # the FILE case effectively REVERSIBLE while honoring the
+        # original tool contract.
         try:
             if target.is_dir():
                 shutil.rmtree(target)
+                self._logger.event("tool_delete_file_dir_ok",
+                                   path=str(target))
+                return _result(status="ok",
+                               message=f"deleted directory {target}",
+                               path=str(target), via="rmtree")
             else:
-                target.unlink()
+                from .safety_gate import safe_file_delete
+                ok, msg = safe_file_delete(target)
+                if ok:
+                    self._logger.event("tool_delete_file_recycled",
+                                       path=str(target))
+                    return _result(status="ok",
+                                   message=msg,
+                                   path=str(target),
+                                   via="recycle_bin",
+                                   recoverable=True)
+                # Recycle-bin send failed (no send2trash, no SHFileOperation).
+                # safe_file_delete deliberately refuses rather than
+                # hard-unlinking. Surface a clear error so the user
+                # can either install send2trash OR explicitly use a
+                # platform tool — never silently hard-delete.
+                return _result(status="error",
+                               error=msg,
+                               code="recycle_bin_unavailable",
+                               path=str(target))
         except Exception as exc:
-            return _result(status="error", error=str(exc), code="delete_failed", path=str(target))
-        self._logger.event("tool_delete_file_ok", path=str(target))
-        return _result(status="ok", message=f"deleted {target}", path=str(target))
+            return _result(status="error", error=str(exc),
+                           code="delete_failed", path=str(target))
 
     def _t_list_recent_paths(self, args: Dict[str, Any]) -> Dict[str, Any]:
         return _result(
@@ -2058,86 +2090,21 @@ class ToolExecutor:
                 ms_state = "unavailable_no_mailbox"
                 ms_res = None
 
-        # THIRD STAGE: browser-automation fallback. If every API-backed
-        # connector struck out (not connected / no scope / 0 unread /
-        # not supported), try driving the user's existing Chrome session
-        # at mail.google.com or outlook.live.com. This rescues users
-        # who are logged into webmail but haven't connected any OAuth
-        # account in Touchless — the most common "but I DO have email"
-        # complaint. Browser scrape is 3-5s cold so emit a diagnostic
-        # the user can see in stderr while it works. Skipped silently
-        # if any earlier connector already returned >0 (handled by the
-        # early returns above).
+        # THIRD STAGE (removed): browser-automation is NO LONGER a
+        # silent fallback. It used to drive Chrome to mail.google.com
+        # and then outlook.live.com whenever the API connectors struck
+        # out, which — combined with outlook_com's own auto-launch on
+        # COM dispatch — meant a single "check my email" utterance
+        # could open Outlook desktop AND a Chrome tab on Gmail AND a
+        # second Chrome tab on outlook.live.com. That's three app
+        # launches for a read-only question. Users hated it.
         #
-        # `browser_state` aggregates Gmail+Outlook attempts so the
-        # trailing fallback messaging can tell the user exactly why
-        # browser-auto didn't help ("you weren't signed in" vs "Chrome
-        # isn't installed" vs "tried and got nothing"). States:
-        #   missing      -> Chrome/CDP isn't available (no point trying)
-        #   not_connected -> page loaded but user wasn't signed in
-        #   err          -> page loaded but parse/navigation failed
-        #   ok           -> at least one provider returned (count may be 0)
-        browser_state = "missing"
-        browser_res: Optional[Dict[str, Any]] = None
-        browser_res2: Optional[Dict[str, Any]] = None
-
-        def _classify_browser(res: Optional[Dict[str, Any]]) -> str:
-            if not isinstance(res, dict):
-                return "missing"
-            if res.get("status") == "ok":
-                return "ok"
-            code = str(res.get("code") or "")
-            if code in ("cdp_unavailable", "no_web"):
-                return "missing"
-            if code == "auth_required":
-                return "not_connected"
-            return "err"
-
-        def _bump_browser_state(prev: str, new: str) -> str:
-            # Prefer the most informative state — `ok` > `not_connected`
-            # > `err` > `missing` — so an Outlook-not-signed-in followed
-            # by Gmail-Chrome-missing still surfaces "you weren't signed
-            # in" as the actionable hint.
-            rank = {"missing": 0, "err": 1, "not_connected": 2, "ok": 3}
-            return new if rank.get(new, 0) > rank.get(prev, 0) else prev
-
-        _diag("trying browser-auto Gmail read...")
-        try:
-            browser_res = self._t_email_read_browser({
-                "provider": "gmail",
-                "unread_only": unread_only,
-                "max": min(max_n, 25),
-                "include_body": False,
-            })
-        except Exception as exc:
-            _diag(f"browser gmail: raised {type(exc).__name__}: {exc}")
-            browser_res = None
-        browser_state = _bump_browser_state(browser_state,
-                                            _classify_browser(browser_res))
-        if (isinstance(browser_res, dict)
-                and browser_res.get("status") == "ok"
-                and int(browser_res.get("count") or 0) > 0):
-            browser_res["source"] = "browser_gmail"
-            return browser_res
-
-        _diag("trying browser-auto Outlook web read...")
-        try:
-            browser_res2 = self._t_email_read_browser({
-                "provider": "outlook_web",
-                "unread_only": unread_only,
-                "max": min(max_n, 25),
-                "include_body": False,
-            })
-        except Exception as exc:
-            _diag(f"browser outlook_web: raised {type(exc).__name__}: {exc}")
-            browser_res2 = None
-        browser_state = _bump_browser_state(browser_state,
-                                            _classify_browser(browser_res2))
-        if (isinstance(browser_res2, dict)
-                and browser_res2.get("status") == "ok"
-                and int(browser_res2.get("count") or 0) > 0):
-            browser_res2["source"] = "browser_outlook"
-            return browser_res2
+        # The browser scrape still exists as _t_email_read_browser and
+        # is directly callable via `email_read_browser` when the user
+        # explicitly asks ("open Gmail in my browser", "read my Gmail
+        # in browser") — we just don't fire it silently. The trailing
+        # suggested_actions carry that path forward as a chip so the
+        # user opts in.
 
         # Surface connector-level hard errors verbatim so the user sees
         # the REAL failure instead of "no email accounts connected" when
@@ -2212,8 +2179,64 @@ class ToolExecutor:
 
         # Strongest case: Outlook desktop returned 0 unread. That IS
         # the user's actual inbox in nearly every case (whichever
-        # provider, Outlook is what they see). Trust it.
+        # provider, Outlook is what they see). Trust it — but ONLY
+        # after acknowledging any other source we couldn't
+        # successfully check. Saying "all caught up" when Gmail read
+        # is disabled (not_supported / scope missing / connector
+        # unavailable) would be a lie: the user could have unread
+        # Gmail we simply didn't look at.
+        #
+        # `err` states already returned above via `any_errored`; the
+        # remaining non-`ok` states we still need to caveat are
+        # `not_supported` (Gmail read needs paid CASA in public
+        # builds), `unavailable`, `not_connected`, `missing`, and
+        # `unavailable_no_mailbox` (personal MSA with no Outlook
+        # mailbox provisioned).
         if outlook_ok_empty:
+            gmail_ok = (gmail_state == "ok" and gmail_res is not None
+                        and gmail_res.get("status") == "ok")
+            ms_ok = (ms_state == "ok" and ms_res is not None
+                     and ms_res.get("status") == "ok")
+            caveats: List[str] = []
+            if not gmail_ok:
+                if gmail_state == "not_supported":
+                    caveats.append(
+                        "I could not check Gmail (Gmail read "
+                        "permission is not enabled). Set "
+                        "TOUCHLESS_GMAIL_READONLY=1 and restart if "
+                        "you want me to include it.")
+                elif gmail_state in ("unavailable", "not_connected",
+                                     "missing"):
+                    caveats.append(
+                        "I did not check Gmail (Gmail is not "
+                        "connected).")
+            if not ms_ok:
+                if ms_state == "not_supported":
+                    caveats.append(
+                        "I could not check your Microsoft mailbox "
+                        "(Microsoft Graph read is not enabled in "
+                        "this build).")
+                elif ms_state in ("unavailable",
+                                  "unavailable_no_mailbox",
+                                  "not_connected", "missing"):
+                    # Skip nagging when neither Gmail nor MS is
+                    # connected AND Outlook desktop already covered
+                    # the answer — the user clearly uses Outlook
+                    # desktop as their primary mail client. Only
+                    # mention MS if Gmail was actually connected
+                    # (so the two-source expectation is real).
+                    if gmail_ok:
+                        caveats.append(
+                            "I did not check a Microsoft mailbox "
+                            "(none is connected).")
+            if caveats:
+                return _result(
+                    status="ok", count=0, messages=[],
+                    source="outlook_desktop",
+                    summary=("Your Outlook inbox is clear. Heads "
+                             "up — " + " ".join(caveats)),
+                    suggested_actions=["read_gmail_in_browser",
+                                       "read_outlook_screen"])
             return _result(
                 status="ok", count=0, messages=[],
                 source="outlook_desktop",
@@ -2228,19 +2251,11 @@ class ToolExecutor:
 
         # Both connectors checked, both empty — the user's main complaint
         # is that we said "no unread in Gmail" without mentioning Outlook
-        # at all, so this branch explicitly names both. Also mention the
-        # browser-auto path was tried so the user knows we checked
-        # Gmail / Outlook web too (and that webmail is logged in but
-        # empty, vs. logged out).
+        # at all, so this branch explicitly names both. Browser scrape
+        # is no longer a silent fallback (it opened Chrome behind the
+        # user's back) so there's nothing extra to report — the
+        # suggested_actions chips carry the browser path as an opt-in.
         browser_hint = ""
-        if browser_state == "not_connected":
-            browser_hint = (" I also tried reading Gmail/Outlook in your "
-                            "browser but you weren't signed in — open "
-                            "Gmail or Outlook in your browser and stay "
-                            "logged in, then ask me again.")
-        elif browser_state == "ok":
-            browser_hint = (" I also checked Gmail/Outlook in your "
-                            "browser and they're empty too.")
         if gmail_ok_empty and ms_ok_empty:
             return _result(
                 status="ok", count=0, messages=[], source="both",
@@ -2279,42 +2294,23 @@ class ToolExecutor:
                 suggested_actions=["read_gmail_in_browser",
                                    "read_outlook_screen"])
 
-        # Nothing reachable. List the actually-shippable free paths in
-        # order of likely-to-work — Outlook desktop comes first because
-        # it covers ANY account Outlook syncs (including Gmail-via-IMAP).
-        # Gmail API reads aren't in the list because they require
-        # Google's paid CASA verification and aren't shipped in public
-        # builds. The browser-auto path has already been tried at this
-        # point, so we tell the user explicitly what happened with it
-        # rather than offering it as an option that "might work" — if
-        # they weren't signed in, the next step is to sign in.
-        browser_final = ""
-        if browser_state == "not_connected":
-            browser_final = (
-                " I also tried opening Gmail / Outlook in your browser, "
-                "but you weren't signed in there either. (3) Sign into "
-                "Gmail or Outlook in your browser and ask me again — "
-                "I'll read whatever inbox is open.")
-        elif browser_state == "missing":
-            browser_final = (
-                " (3) The browser-auto path needs Chrome — install it "
-                "and I'll be able to read Gmail / Outlook web for free "
-                "without you connecting anything in Touchless.")
-        else:
-            browser_final = (
-                " I also tried reading Gmail / Outlook in your browser "
-                "and it didn't return anything readable.")
+        # Nothing reachable. Explicit, actionable spoken hint that
+        # doesn't launch anything behind the user's back. The user
+        # opts into the browser scrape via one of the suggested_actions
+        # chips ('open Gmail in my browser') if they want it — we no
+        # longer fire it silently, because combined with outlook_com's
+        # historical auto-launch that meant a single "check my email"
+        # utterance opened Outlook desktop AND two Chrome tabs.
         return _result(
             status="ok", count=0, messages=[], source="none",
-            summary=("I can't read your email yet. Free options that "
-                     "don't need any sign-in dance: (1) launch Outlook "
-                     "desktop — once it's open I'll read whatever "
-                     "inbox(es) you have synced there (Gmail via IMAP, "
-                     "Exchange, Outlook.com, all of them); (2) sign "
-                     "into Gmail or Outlook web in your browser and "
-                     "I'll scrape it for you." + browser_final +
-                     " If none of those work, say 'read my Outlook "
-                     "screen' and I'll OCR whatever window you have open."),
+            summary=("I can send Gmail but I don't have permission to "
+                     "read it, and no Microsoft mailbox is connected. "
+                     "Free options: (1) launch Outlook desktop with "
+                     "your accounts synced and ask me again — I'll "
+                     "read them there; (2) say 'open Gmail in my "
+                     "browser' and I'll drive Chrome to it; (3) set "
+                     "TOUCHLESS_GMAIL_READONLY=1 and reconnect Google "
+                     "in Settings to grant read scope."),
             suggested_actions=["read_gmail_in_browser",
                                "read_outlook_in_browser",
                                "read_outlook_screen"])
@@ -2443,36 +2439,39 @@ class ToolExecutor:
             pass
         _time.sleep(0.8)
 
-        # Sign-in detection. If the page redirected to a sign-in screen
-        # or shows a chooser, return a structured auth_required error
-        # so the cascade can mention "open Gmail/Outlook and stay signed
-        # in" in the final fallback message.
+        # Authenticated-inbox gate (runs BEFORE any DOM extraction).
+        # An unauthenticated redirect lands on a marketing / sign-in
+        # page whose URL is NOT the real inbox; the over-broad DOM
+        # selectors below would otherwise happily scrape marketing
+        # tiles as "emails". Refuse to scrape unless the post-redirect
+        # URL is the actual logged-in inbox.
+        current_url = ""
         try:
-            text_probe = web.get_text(max_chars=1500)
-            probe_text = str((text_probe or {}).get("text") or "")
+            ev_url = web.evaluate("location.href")
+            current_url = str((ev_url or {}).get("result") or "")
         except Exception:
-            probe_text = ""
-        if probe_text:
-            lowered = probe_text.lower()
-            for marker in sign_in_markers:
-                if marker.lower() in lowered:
-                    # Heuristic — Gmail's normal inbox also contains
-                    # "Sign in" inside account chooser links. Require
-                    # that the URL is on the sign-in host OR the
-                    # marker is prominent.
-                    cur_url = str(nav.get("url") or "")
-                    if ("signin" in cur_url.lower()
-                            or "login" in cur_url.lower()
-                            or "accounts.google.com" in cur_url.lower()
-                            or marker == "Choose an account"):
-                        _diag(f"sign-in marker {marker!r} at {cur_url!r}")
-                        return _result(
-                            status="error",
-                            error=(f"You're not signed into {display} in "
-                                   "your browser. Open it, sign in, then "
-                                   "ask me again."),
-                            code="auth_required")
-                    break
+            current_url = ""
+        if not current_url:
+            current_url = str(nav.get("url") or "")
+        url_low = current_url.lower()
+        if provider == "gmail":
+            real_inbox = ("mail.google.com" in url_low
+                          and "inbox" in url_low)
+            sign_in_host = "mail.google.com"
+        else:
+            real_inbox = (("outlook.live.com" in url_low
+                           or "outlook.office.com" in url_low)
+                          and "inbox" in url_low)
+            sign_in_host = "outlook.live.com"
+        if not real_inbox:
+            _diag(f"not on authenticated inbox post-redirect "
+                  f"(url={current_url!r}) — refusing to scrape")
+            return _result(
+                status="error",
+                error=(f"I can't read your {display} email — your "
+                       "account isn't signed in to the browser. Sign "
+                       f"in at {sign_in_host} and try again."),
+                code="auth_required")
 
         # DOM extraction. Try structured selectors first; fall back to
         # text-parse on the visible inbox text if selectors break (Gmail
@@ -2541,7 +2540,8 @@ class ToolExecutor:
             js = (
                 "(function(){"
                 "var rows=Array.from(document.querySelectorAll("
-                "  \"[role='option'][aria-label],div[role='listitem']\"));"
+                "  \"div[role='list'][aria-label*='message' i] [role='option'][aria-label],\""
+                "  +\"div[aria-label*='Message list' i] [role='option'][aria-label]\"));"
                 "var unreadOnly=" + ("true" if unread_only else "false") + ";"
                 "if(unreadOnly){"
                 "  rows=rows.filter(function(r){"
@@ -2586,7 +2586,9 @@ class ToolExecutor:
 
         # Selector fallback: if structured extraction returned nothing,
         # fall back to a text-parse on get_text(). This is brittle but
-        # survives UI iterations that break the selectors above.
+        # survives UI iterations that break the selectors above. The
+        # authenticated-inbox URL gate above already guarantees we're
+        # on the real logged-in inbox at this point.
         if not msgs:
             try:
                 txt_res = web.get_text(max_chars=8000)
@@ -2628,6 +2630,31 @@ class ToolExecutor:
                         "preview": snippet[:200],
                     })
                     i += 3
+
+        # Marketing-page sanity check. Even with the URL gate above,
+        # SPAs may rewrite history before they render real content;
+        # if every row's sender/subject reads like marketing chrome,
+        # treat as auth_required rather than returning ad copy as mail.
+        if msgs:
+            _marketing_terms = (
+                "get the app", "sign up", "sign in", "microsoft 365",
+                "new: gmail", "download outlook", "try outlook",
+                "create account", "create one!", "privacy", "terms",
+            )
+            def _looks_marketing(m: Dict[str, Any]) -> bool:
+                blob = (str(m.get("subject") or "") + " "
+                        + str(m.get("from") or "") + " "
+                        + str(m.get("preview") or "")).lower()
+                return any(t in blob for t in _marketing_terms)
+            if all(_looks_marketing(m) for m in msgs):
+                _diag("all rows look like marketing chrome — "
+                      "treating as auth_required")
+                return _result(
+                    status="error",
+                    error=(f"I can't read your {display} email — your "
+                           "account isn't signed in to the browser. "
+                           f"Sign in at {sign_in_host} and try again."),
+                    code="auth_required")
 
         # Deterministic faithful summary built from the real DOM read,
         # mirroring gmail_list / ms_mail_list. The LLM has fabricated

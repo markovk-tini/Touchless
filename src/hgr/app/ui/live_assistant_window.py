@@ -159,6 +159,63 @@ def _load_voice_enabled(*, default: bool = True) -> bool:
     return default
 
 
+def _parse_when(text: str):
+    """Parse a casual time phrase ('in 30 min', '3pm',
+    'tomorrow 9am') into an epoch seconds value. Returns None on
+    failure so the caller can prompt for retry."""
+    if not text:
+        return None
+    import re as _re
+    import time as _time
+    from datetime import datetime as _dt, timedelta as _td
+    t = text.strip().lower()
+    now = _dt.now()
+    # 'in N (min|minute|m | hour|h | sec|s)'
+    m = _re.match(
+        r"in\s+(\d+)\s*(s|sec|second|seconds|m|min|minute|minutes|"
+        r"h|hr|hour|hours)\b", t)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit.startswith("s"):
+            return _time.time() + n
+        if unit.startswith("h"):
+            return _time.time() + n * 3600
+        return _time.time() + n * 60   # default minutes
+    # 'tomorrow [time]'
+    tomorrow = "tomorrow" in t
+    base = now + _td(days=1) if tomorrow else now
+    if tomorrow:
+        t = t.replace("tomorrow", "").strip()
+    # 'Ham|Hpm' / 'H:MMam|pm'
+    m = _re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", t)
+    if m:
+        h = int(m.group(1))
+        mm = int(m.group(2) or 0)
+        ampm = m.group(3)
+        if ampm == "pm" and h < 12:
+            h += 12
+        if ampm == "am" and h == 12:
+            h = 0
+        target = base.replace(hour=h, minute=mm, second=0,
+                              microsecond=0)
+        # If the target already passed today and no 'tomorrow'
+        # was given, push it to tomorrow.
+        if not tomorrow and target <= now:
+            target += _td(days=1)
+        return target.timestamp()
+    # 24-hour 'HH:MM'
+    m = _re.match(r"(\d{1,2}):(\d{2})\b", t)
+    if m:
+        h, mm = int(m.group(1)), int(m.group(2))
+        target = base.replace(hour=h, minute=mm, second=0,
+                              microsecond=0)
+        if not tomorrow and target <= now:
+            target += _td(days=1)
+        return target.timestamp()
+    return None
+
+
 def _save_voice_enabled(enabled: bool) -> None:
     try:
         from PySide6.QtCore import QSettings
@@ -397,10 +454,7 @@ class LiveAssistantWindow(QWidget):
         # Header: clickable "Iris" title (opens Cortex viz) + state pill.
         header = QHBoxLayout()
         title = _ClickableLabel("Iris  🧠")
-        title.setToolTip(
-            "Click: toggle the embedded Iris Cortex side panel\n"
-            "Right-click: open the full-size Cortex pop-out window"
-        )
+        title.setToolTip("Click: toggle panel · Right-click: pop out.")
         title.setStyleSheet(
             f"QLabel {{ font-size: 18px; font-weight: 800; color: {pal['text']}; }}"
             f"QLabel:hover {{ color: {pal['accent']}; }}"
@@ -543,6 +597,29 @@ class LiveAssistantWindow(QWidget):
         self._voice_btn.setStyleSheet(self._button_style(subtle=True))
         controls.addWidget(self._voice_btn)
 
+        # Phase-1/3: incognito toggle. When ON, every Iris substrate
+        # that persists user data (cot_layer, audit_log, memory,
+        # utterance_cache, dictation_bridge, shadow_mode, stuck-
+        # pattern, earcons) checks `is_incognito()` and silently
+        # skips writes / emissions. Visible state via button label.
+        try:
+            from ...live_api.incognito import (
+                is_incognito as _is_incognito,
+                subscribe as _subscribe_incognito,
+            )
+            self._incognito_btn = QPushButton(
+                self._incognito_btn_label(_is_incognito()))
+            self._incognito_btn.setToolTip("Private mode — nothing this session persists.")
+            self._incognito_btn.clicked.connect(self._on_toggle_incognito)
+            self._incognito_btn.setStyleSheet(
+                self._button_style(subtle=True))
+            controls.addWidget(self._incognito_btn)
+            self._incognito_unsub = _subscribe_incognito(
+                self._on_incognito_changed)
+        except Exception:
+            self._incognito_btn = None
+            self._incognito_unsub = None
+
         # One-click Gmail connect (only shown when the Google libs are present
         # and not yet connected). Runs the OAuth consent flow in the browser.
         self._gmail_btn = QPushButton("Connect Gmail")
@@ -578,9 +655,7 @@ class LiveAssistantWindow(QWidget):
         # Notion, Linear, filesystem, etc.). Changes apply on next Start.
         self._mcp_btn = QPushButton("🔌 MCP")
         self._mcp_btn.setStyleSheet(self._button_style(subtle=True))
-        self._mcp_btn.setToolTip(
-            "Enable / configure Model Context Protocol servers — "
-            "GitHub, Slack, Notion, Linear, Filesystem, and more.")
+        self._mcp_btn.setToolTip("Configure MCP servers (GitHub, Slack, Notion…).")
         self._mcp_btn.clicked.connect(self._open_mcp_picker)
         controls.addWidget(self._mcp_btn)
 
@@ -1945,6 +2020,17 @@ class LiveAssistantWindow(QWidget):
     def _wire_manager(self) -> None:
         self._manager.set_confirm_callback(self._confirm_tool)
         self._confirm_request.connect(self._on_confirm_request)
+        # Phase-1 trust substrate: install the same Qt-message-box
+        # callback as the safety_gate (irreversible speed bump) so
+        # DESTRUCTIVE / IRREVERSIBLE tool calls go through the user
+        # before invoking. The gate is failure-OPEN when no callback
+        # is installed, so installing it here is what actually turns
+        # the substrate into a blocking gate for the chat UI.
+        try:
+            from ...live_api.safety_gate import install_confirm_callback
+            install_confirm_callback(self._confirm_tool)
+        except Exception:
+            pass
         self._manager.state_changed.connect(self._on_state_changed)
         self._manager.transcript_received.connect(self._on_transcript)
         self._manager.assistant_text.connect(self._on_assistant_delta)
@@ -1958,12 +2044,384 @@ class LiveAssistantWindow(QWidget):
         except Exception:
             # Older managers without the signal — harmless.
             pass
+        # Phase-3 wiring: subscribe to the StuckPatternDetector so
+        # repeated failures / circular dialogues surface a helper
+        # chip in chat instead of firing into the void.
+        try:
+            from ...live_api.stuck_pattern_detector import (
+                global_stuck_detector)
+            self._stuck_unsub = global_stuck_detector().subscribe(
+                self._on_stuck_signal)
+        except Exception:
+            self._stuck_unsub = None
+        # Phase-3 wiring: refresh the cost pill on a timer so the
+        # green/yellow/orange/red status reflects today's spend.
+        try:
+            self._install_cost_pill()
+        except Exception:
+            pass
 
     # ---- session control ----
 
     @staticmethod
     def _voice_btn_label(enabled: bool) -> str:
         return "🔊 Voice on" if enabled else "🔇 Voice off"
+
+    # ---- slash commands -----------------------------------------------
+    def _handle_slash_command(self, text: str) -> bool:
+        """Lightweight slash-command interceptor. Returns True when
+        the input WAS handled here (caller should NOT send to the
+        planner). Currently handles:
+
+          /persona [text...]   — set / show / clear the Iris persona
+                                  ("/persona clear" reverts to default)
+          /incognito           — toggle private mode
+          /status              — show daemon + cost summary
+        """
+        if not text.startswith("/"):
+            return False
+        parts = text[1:].strip().split(maxsplit=1)
+        if not parts:
+            return False
+        cmd = parts[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        try:
+            if cmd == "persona":
+                return self._slash_persona(rest)
+            if cmd == "incognito":
+                self._on_toggle_incognito()
+                self._add_system_bubble("Incognito mode toggled.")
+                return True
+            if cmd == "status":
+                self._slash_status()
+                return True
+            if cmd in ("help", "?"):
+                self._slash_help()
+                return True
+            if cmd == "explain":
+                self._slash_explain()
+                return True
+            if cmd == "forget":
+                # Future: per-fact forgetting via the memory pseudo-tool.
+                # For now, hint the path.
+                self._add_system_bubble(
+                    "Say 'forget Dani' (or any contact name) "
+                    "and Iris will drop it from memory.")
+                return True
+            if cmd in ("watch", "remind"):
+                return self._slash_watch(rest, kind=cmd)
+            if cmd == "orders":
+                self._slash_orders()
+                return True
+            if cmd == "unwatch":
+                return self._slash_unwatch(rest)
+            if cmd == "audio":
+                return self._slash_audio(rest)
+        except Exception:
+            pass
+        return False  # unknown / errored — fall through to planner
+
+    def _slash_audio(self, rest: str) -> bool:
+        """Refresh the audio output so it picks up the current
+        Windows default device. Use this after switching speakers ↔
+        headset mid-session."""
+        sub = (rest or "").strip().lower()
+        if sub in ("", "refresh", "reload"):
+            try:
+                ap = getattr(self._manager, "_audio_player", None)
+                if ap is None:
+                    self._add_system_bubble(
+                        "No audio player initialized yet — "
+                        "start a session first.")
+                    return True
+                ok = ap.restart_stream()
+                if ok:
+                    self._add_system_bubble(
+                        "🔊 Audio refreshed — now using your "
+                        "current Windows default output device.")
+                else:
+                    err = ap.init_error() or "unknown"
+                    self._add_system_bubble(
+                        f"⚠️ Audio restart failed: {err}")
+            except Exception as exc:
+                self._add_system_bubble(
+                    f"⚠️ Couldn't restart audio: {exc}")
+            return True
+        self._add_system_bubble(
+            "Usage: `/audio` or `/audio refresh` — re-opens the "
+            "TTS output stream against your current Windows "
+            "default device.")
+        return True
+
+    def _slash_help(self) -> None:
+        self._add_system_bubble(
+            "Quick reference:\n"
+            "  /persona            Show active voice preset\n"
+            "  /persona list       List available voices\n"
+            "  /persona <name>     Switch voice "
+            "(default/jarvis/concise/warm/playful/tutor)\n"
+            "  /persona <text>     Custom free-form override\n"
+            "  /persona clear      Revert to default\n"
+            "  /incognito         Toggle private mode\n"
+            "  /status            Daemon + cost summary\n"
+            "  /explain           Walk through your last "
+            "Iris reasoning trail\n"
+            "  /forget            How to drop a contact\n"
+            "  /watch <query>     Watch your inbox for matches\n"
+            "  /remind <when>     Remind me (e.g. 'in 30 min', '3pm')\n"
+            "  /orders            List active standing orders\n"
+            "  /unwatch <id>      Cancel a standing order\n"
+            "  /audio             Refresh TTS output (after device swap)\n"
+            "  /help              This list\n\n"
+            "Memory: just talk. 'I live in Berlin' / 'always send via "
+            "gmail' / 'remember Dani's email is dani@x' all stick. "
+            "Ask anything later — Iris pulls it back automatically.")
+
+    # ---- standing orders ----------------------------------------------
+    def _slash_watch(self, rest: str, *, kind: str) -> bool:
+        rest = (rest or "").strip()
+        if not rest:
+            self._add_system_bubble(
+                f"Usage: /{kind} <text>. "
+                "Examples: '/watch Q3 contract from Dani' "
+                "(inbox), '/remind in 30 min'")
+            return True
+        try:
+            from ...live_api.standing_orders import (
+                global_store, make_inbox_watch_order,
+                make_time_at_order)
+        except Exception:
+            return False
+        if kind == "watch":
+            order = make_inbox_watch_order(
+                user_text=f"watch inbox: {rest}",
+                query=rest, tool="gmail_list",
+                label=f"inbox: {rest[:60]}")
+            global_store().add(order)
+            self._add_system_bubble(
+                f"📌 Watching your inbox for \"{rest}\". "
+                f"I'll ping you when something matches. "
+                f"(id: {order.id})")
+            return True
+        if kind == "remind":
+            target_ts = _parse_when(rest)
+            if target_ts is None:
+                self._add_system_bubble(
+                    "Couldn't parse the time. Try '/remind in 30 min' "
+                    "or '/remind 3:30pm' or '/remind tomorrow 9am'.")
+                return True
+            order = make_time_at_order(
+                user_text=f"reminder: {rest}",
+                at_ts=target_ts,
+                label=f"remind: {rest[:60]}")
+            global_store().add(order)
+            from datetime import datetime as _dt
+            self._add_system_bubble(
+                f"📌 I'll remind you about \"{rest}\" at "
+                f"{_dt.fromtimestamp(target_ts).strftime('%a %I:%M %p')}. "
+                f"(id: {order.id})")
+            return True
+        return False
+
+    def _slash_orders(self) -> None:
+        try:
+            from ...live_api.standing_orders import global_store
+            orders = global_store().all()
+        except Exception:
+            self._add_system_bubble(
+                "Standing orders unavailable.")
+            return
+        if not orders:
+            self._add_system_bubble(
+                "No active standing orders. Try /watch or /remind.")
+            return
+        lines = ["📌 Active standing orders:"]
+        for o in orders[:15]:
+            lines.append(f"  {o.id}  — {o.short_label()}  "
+                         f"({o.state})")
+        if len(orders) > 15:
+            lines.append(f"  …and {len(orders) - 15} more.")
+        self._add_system_bubble("\n".join(lines))
+
+    def _slash_unwatch(self, rest: str) -> bool:
+        rest = (rest or "").strip()
+        if not rest:
+            self._add_system_bubble(
+                "Usage: /unwatch <id>. Use /orders to see ids.")
+            return True
+        try:
+            from ...live_api.standing_orders import global_store
+            ok = global_store().delete(rest)
+        except Exception:
+            ok = False
+        if ok:
+            self._add_system_bubble(f"Cancelled order {rest}.")
+        else:
+            self._add_system_bubble(
+                f"No order with id {rest}. Try /orders.")
+        return True
+
+    def _slash_explain(self) -> None:
+        try:
+            from ...live_api.cot_explainer import explain_last_turn
+            out = explain_last_turn()
+        except Exception:
+            out = ""
+        if not out:
+            self._add_system_bubble(
+                "No recent reasoning trail to walk through.")
+            return
+        self._add_system_bubble(out)
+
+    def _slash_persona(self, rest: str) -> bool:
+        from ...live_api.persona import (get_persona_block,
+                                          set_persona_block)
+        try:
+            from ...live_api import persona_voice
+        except Exception:
+            persona_voice = None
+        if not rest:
+            # No args → show the active preset + a hint.
+            if persona_voice is not None:
+                p = persona_voice.active_preset()
+                self._add_system_bubble(
+                    f"Active voice: **{p.display_name}** — "
+                    f"{p.description}\n\n"
+                    "Try `/persona list` to see all voices, "
+                    "`/persona <name>` to switch "
+                    "(default, jarvis, concise, warm, playful, "
+                    "tutor), or `/persona <free text>` to "
+                    "write your own.")
+            else:
+                current = get_persona_block()
+                self._add_system_bubble(
+                    f"Current Iris persona:\n\n{current[:600]}")
+            return True
+        low = rest.lower().strip()
+        if low in ("clear", "reset", "default"):
+            set_persona_block(None)
+            if persona_voice is not None:
+                persona_voice.set_active(None)
+            self._add_system_bubble(
+                "Voice cleared — reverted to default.")
+            return True
+        if low == "list" and persona_voice is not None:
+            lines = []
+            for p in persona_voice.all_presets():
+                mark = ("●"
+                        if p.name == persona_voice.active_preset().name
+                        else "○")
+                lines.append(
+                    f"{mark} **{p.display_name}** "
+                    f"(`{p.name}`) — {p.description}")
+            self._add_system_bubble(
+                "Available voices:\n\n" + "\n".join(lines))
+            return True
+        # Preset name?
+        if persona_voice is not None:
+            preset = persona_voice.get_preset(low)
+            if preset is not None:
+                persona_voice.set_active(preset.name)
+                # Also clear any free-form override so the preset
+                # actually wins.
+                set_persona_block(None)
+                # Persist across restarts when memory is available.
+                try:
+                    mem = getattr(self._manager, "_memory_manager",
+                                  None)
+                    if mem is not None:
+                        persona_voice.persist_choice_to_memory(
+                            mem, preset.name)
+                except Exception:
+                    pass
+                # Push fresh system prompt to the live realtime
+                # client so the swap takes effect on the very next
+                # reply (without this the user has to restart the
+                # session for persona changes to land).
+                self._push_persona_to_realtime()
+                self._add_system_bubble(
+                    f"Voice set to **{preset.display_name}** — "
+                    f"{preset.description}")
+                return True
+        # Anything else → free-form override.
+        set_persona_block(rest)
+        self._push_persona_to_realtime()
+        self._add_system_bubble(
+            f"Voice set to custom override:\n\n{rest[:300]}")
+        return True
+
+    def _push_persona_to_realtime(self) -> None:
+        """Re-issue session.update with refreshed instructions so a
+        persona swap takes effect on the live session, not just the
+        next one. Best-effort; failures are silent."""
+        try:
+            from ...live_api.live_api_manager import (
+                build_system_instructions)
+            new_text = build_system_instructions()
+            client = getattr(self._manager, "_client", None)
+            if client is None:
+                return
+            updater = getattr(client, "update_instructions", None)
+            if updater is None:
+                return
+            updater(new_text)
+        except Exception:
+            pass
+
+    def _slash_status(self) -> None:
+        from ...live_api.sentinel_status import current_status
+        from ...live_api.cost_meter import global_meter
+        from ...live_api.cost_surfaces import format_today_summary
+        try:
+            view = current_status()
+            cost = format_today_summary(global_meter())
+        except Exception:
+            self._add_system_bubble("Status unavailable.")
+            return
+        self._add_system_bubble(
+            f"{view.one_line}\n{cost}")
+
+    # ---- incognito toggle ---------------------------------------------
+    @staticmethod
+    def _incognito_btn_label(on: bool) -> str:
+        return "🕶 Private" if on else "👁 Normal"
+
+    def _on_toggle_incognito(self) -> None:
+        try:
+            from ...live_api.incognito import toggle_incognito
+            now_on = toggle_incognito()
+        except Exception:
+            return
+        # The subscribe() callback will refresh the button text + style,
+        # so we don't need to do it inline. But if the user spammed the
+        # button between subscriber callbacks, refresh defensively.
+        try:
+            self._on_incognito_changed(now_on)
+        except Exception:
+            pass
+
+    def _on_incognito_changed(self, on: bool) -> None:
+        """Subscriber for incognito state changes. Runs from any thread
+        depending on who toggled — hop to the UI thread for widget edits."""
+        try:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(
+                0, lambda v=on: self._render_incognito_state(v))
+        except Exception:
+            pass
+
+    def _render_incognito_state(self, on: bool) -> None:
+        if not getattr(self, "_incognito_btn", None):
+            return
+        try:
+            self._incognito_btn.setText(self._incognito_btn_label(on))
+            # Distinct color when private mode is on so it's obvious.
+            self._incognito_btn.setStyleSheet(
+                "background: #533; color: #fff; padding: 4px 10px;"
+                "border-radius: 4px; font-weight: 600;" if on
+                else self._button_style(subtle=True))
+        except Exception:
+            pass
 
     def _on_toggle_voice(self) -> None:
         """Flip the spoken-reply toggle. Persists immediately; the change
@@ -2063,15 +2521,18 @@ class LiveAssistantWindow(QWidget):
             "the dictation grammar corrector. Cancel to use a different "
             "backend instead (set OPENAI_API_KEY).")
         try:
+            # r51: touchless_message_box (frameless indigo) for Win10+11 parity.
             from PySide6.QtWidgets import QMessageBox
-            mbox = QMessageBox(self)
-            mbox.setIcon(QMessageBox.Question)
-            mbox.setWindowTitle(title)
-            mbox.setText(detail)
-            mbox.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            mbox.setDefaultButton(QMessageBox.Yes)
-            QTimer.singleShot(0, lambda: self._tint_titlebar(mbox))
-            if mbox.exec() != QMessageBox.Yes:
+            from ..ui.window_chrome import touchless_message_box
+            result = touchless_message_box(
+                self,
+                title,
+                detail,
+                icon=QMessageBox.Question,
+                buttons=QMessageBox.Yes | QMessageBox.No,
+                default_button=QMessageBox.Yes,
+            )
+            if result != QMessageBox.Yes:
                 self._add_system_bubble(
                     "Download skipped. Set OPENAI_API_KEY to use the "
                     "cloud backend, or click Start again to retry.")
@@ -2133,6 +2594,13 @@ class LiveAssistantWindow(QWidget):
         if not text:
             return
         self._input.clear()
+        # Phase-3 polish: tiny slash-command surface for tuning
+        # Iris from chat without a settings page. Only intercepts
+        # commands that don't make sense to dispatch as planner
+        # input. Anything not recognized falls through to normal
+        # send.
+        if self._handle_slash_command(text):
+            return
         # Fire cortex pulses IMMEDIATELY on Send (before send_user_text)
         # so the neuron view animates the instant the user clicks. The
         # realtime_client only emits voice-mic → core for audio
@@ -2361,8 +2829,17 @@ class LiveAssistantWindow(QWidget):
             status = str(info.get("status", "") or "")
             ok = status == "ok"
             mark = "✓" if ok else "✕"
+            err = str(info.get("error", "") or "").strip()
             if source == "touchless" and ok:
                 text = f"{icon} {badge} · {display_name} — handled locally · 0 tokens {mark}"
+            elif (not ok) and err:
+                # Surface the connector's error message on the pill —
+                # the bubble may be scrolled past / clipped, and 'error'
+                # alone reads as 'iris is broken'. 80-char clamp keeps
+                # the pill width sane.
+                snippet = err if len(err) <= 80 else err[:77] + "..."
+                text = (f"{icon} {badge} · {display_name} — "
+                        f"{status or 'error'}: {snippet} {mark}")
             else:
                 text = f"{icon} {badge} · {display_name} — {status or 'done'} {mark}"
             fill = color if ok else "#EF4444"
@@ -2388,23 +2865,42 @@ class LiveAssistantWindow(QWidget):
 
     def _refresh_gmail_button(self) -> None:
         """Show/label the button per current state. Hidden when the Google
-        libs aren't installed (nothing to connect) or no client is embedded."""
+        libs aren't installed (nothing to connect) or no client is embedded.
+        Stays ENABLED when connected so the user can force re-OAuth after
+        new scopes are added to the consent screen or new Google APIs are
+        enabled in Cloud Console — clicking again runs the consent flow
+        with prompt='consent' and overwrites token.json with a fresh grant."""
         st = self._gmail_status()
         if st in ("needs_libs", "needs_client"):
             self._gmail_btn.setVisible(False)
             return
         self._gmail_btn.setVisible(True)
+        self._gmail_btn.setEnabled(True)
         if st == "connected":
-            self._gmail_btn.setText("Gmail ✓")
-            self._gmail_btn.setEnabled(False)
+            self._gmail_btn.setText("Google ✓ (reconnect)")
+            self._gmail_btn.setToolTip(
+                "Re-authorize Google — check ALL consent boxes.")
         else:  # ready_to_connect
             self._gmail_btn.setText("Connect Gmail")
-            self._gmail_btn.setEnabled(True)
+            self._gmail_btn.setToolTip(
+                "Sign in — check ALL Google consent boxes.")
 
     def _on_connect_gmail(self) -> None:
+        is_reconnect = (self._gmail_status() == "connected")
         self._gmail_btn.setEnabled(False)
-        self._gmail_btn.setText("Connecting…")
-        self._add_system_bubble("Opening your browser to connect Gmail — approve the consent screen.")
+        self._gmail_btn.setText("Reconnecting…" if is_reconnect else "Connecting…")
+        if is_reconnect:
+            self._add_system_bubble(
+                "Opening your browser to re-authorize Google — on the "
+                "consent screen, CHECK ALL CHECKBOXES (especially Tasks, "
+                "Docs, Sheets, Slides, Photos) before clicking Continue. "
+                "Google leaves new sensitive scopes UNCHECKED by default.")
+        else:
+            self._add_system_bubble(
+                "Opening your browser to connect Gmail — on the consent "
+                "screen, CHECK ALL CHECKBOXES (especially Tasks, Docs, "
+                "Sheets, Slides, Photos) before clicking Continue. Google "
+                "leaves new sensitive scopes UNCHECKED by default.")
 
         def _worker() -> None:
             try:
@@ -2417,8 +2913,25 @@ class LiveAssistantWindow(QWidget):
         threading.Thread(target=_worker, name="GmailConnect", daemon=True).start()
 
     def _on_gmail_result(self, ok: bool, message: str) -> None:
-        self._add_system_bubble(("✓ " if ok else "⚠ ") + message)
+        # connect() now embeds a "you declined N scope(s)" warning in the
+        # success message when the user un-checked boxes on the consent
+        # screen. Detect that and route the bubble through the warning
+        # glyph + render a reconnect chip so a partial grant is visible
+        # and recoverable in one click (instead of staying silent until
+        # some future tool call 403s).
+        is_partial = bool(ok and "declined" in (message or "").lower())
+        if not ok or is_partial:
+            self._add_system_bubble("⚠ " + message)
+        else:
+            self._add_system_bubble("✓ " + message)
         self._refresh_gmail_button()
+        if is_partial:
+            # Reuse the existing inline-chip pathway (same chip
+            # reauth_nudge fires for tasks_* scope_missing failures).
+            try:
+                self._on_suggested_actions(["connect_gmail"])
+            except Exception:
+                pass
 
     # ---- Microsoft 365 connect (one-click OAuth, mirrors Gmail) ----
 
@@ -2471,27 +2984,40 @@ class LiveAssistantWindow(QWidget):
 
     def _on_confirm_request(self, title: str, detail: str, holder: dict) -> None:
         try:
-            # Instantiate manually (not QMessageBox.question) so we can
-            # paint the OS titlebar Touchless deep-indigo to match every
-            # other Touchless window — the static .question() call doesn't
-            # expose the box before it goes modal.
-            mbox = QMessageBox(self)
-            mbox.setIcon(QMessageBox.Question)
-            mbox.setWindowTitle("Confirm action")
-            mbox.setText(f"{title}\n\n{detail}")
-            mbox.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-            mbox.setDefaultButton(QMessageBox.No)
-            # Apply the titlebar tint after the HWND exists. Qt creates it
-            # lazily during show(), so this singleShot fires after the
-            # event loop processes show — DwmSetWindowAttribute then has
-            # a real window handle to colour.
-            def _tint():
+            # r51: use touchless_message_box (frameless indigo QDialog) so
+            # the popup renders identically on Win10 + Win11 — the old
+            # QMessageBox + titlebar-tint path only recoloured on Win11.
+            from ..ui.window_chrome import touchless_message_box
+            try:
+                result = touchless_message_box(
+                    self,
+                    "Confirm action",
+                    f"{title}\n\n{detail}",
+                    icon=QMessageBox.Question,
+                    buttons=QMessageBox.Yes | QMessageBox.No,
+                    default_button=QMessageBox.No,
+                )
+                holder["result"] = result == QMessageBox.Yes
+            except Exception as exc:
+                # Modal construction / exec crashed. Fail CLOSED so a
+                # destructive tool never runs just because the popup
+                # never showed. Historical regression: a PySide6
+                # QDialogButtonBox TypeError here was letting the
+                # safety-gate treat an unanswered prompt as declined
+                # but only after a noisy uncaught exception on the UI
+                # thread. Explicit False + log keeps the bias correct
+                # and makes future breakage visible.
+                holder["result"] = False
                 try:
-                    apply_touchless_titlebar(mbox)
+                    import sys as _sys
+                    import traceback as _tb
+                    _sys.stderr.write(
+                        f"[confirm-modal] failed, declining tool: {exc!r}\n"
+                    )
+                    _tb.print_exc(file=_sys.stderr)
+                    _sys.stderr.flush()
                 except Exception:
                     pass
-            QTimer.singleShot(0, _tint)
-            holder["result"] = mbox.exec() == QMessageBox.Yes
         finally:
             holder["event"].set()
 
@@ -2534,6 +3060,154 @@ class LiveAssistantWindow(QWidget):
         "connect_ms": "Connect Outlook",
         "read_outlook_screen": "Read Outlook screen",
     }
+
+    # ---- Phase-3 wiring: stuck-pattern + cost surfaces -----------------
+    def _on_stuck_signal(self, signal) -> None:
+        """Called from the StuckPatternDetector when 3+ same-error /
+        5+ same-action / 3+ same-utterance fires. Surfaces an inline
+        helper chip with the suggested action so the user sees the
+        nudge instead of it firing into the void.
+
+        Runs on a non-Qt thread (the detector's bus subscription
+        callback). Hop back to the UI thread via a single-shot
+        timer so widget creation is safe."""
+        try:
+            suggestion = getattr(signal, "suggested_action", "") or ""
+            kind = getattr(signal, "kind", None)
+            kind_str = (kind.value if hasattr(kind, "value")
+                        else str(kind))
+            if not suggestion:
+                return
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(
+                0,
+                lambda s=suggestion, k=kind_str:
+                    self._render_stuck_chip(k, s))
+        except Exception:
+            pass
+
+    def _render_stuck_chip(self, kind: str, suggestion: str) -> None:
+        """UI thread: build the helper chip and insert it as an
+        inline row. Respects the InterruptionGate so we don't pop
+        a chip mid-call / mid-screen-share.
+
+        For REPEATED_ERROR signals, includes a "Why?" button that
+        surfaces the CoT trail of the most recent failed turn so
+        the user can see exactly which steps failed and why."""
+        try:
+            from ...live_api.interruption_gate import (
+                global_gate, InterruptSeverity)
+            decision = global_gate().can_interrupt(InterruptSeverity.LOW)
+            if not decision.allow:
+                return  # not a good moment — silently drop
+        except Exception:
+            pass
+        try:
+            row_widget = QWidget()
+            rh = QHBoxLayout(row_widget)
+            rh.setContentsMargins(8, 4, 8, 4)
+            rh.setSpacing(6)
+            label = QLabel(f"💡 Looks like you're stuck — {suggestion}")
+            label.setWordWrap(True)
+            label.setStyleSheet(
+                "color: #ccc; font-style: italic; padding: 4px 8px;")
+            rh.addWidget(label, stretch=1)
+            # Add a "Why?" button for REPEATED_ERROR — clicking it
+            # surfaces the explainer for the most recent failed turn.
+            if "repeated_error" in (kind or "").lower():
+                why_btn = QPushButton("Why?")
+                why_btn.setCursor(Qt.PointingHandCursor)
+                why_btn.setStyleSheet(self._button_style(subtle=True))
+                why_btn.clicked.connect(self._slash_explain)
+                rh.addWidget(why_btn)
+            self._insert_row(row_widget, align=Qt.AlignLeft)
+        except Exception:
+            pass
+
+    def _install_cost_pill(self) -> None:
+        """Mount a small green/yellow/orange/red cost pill in the
+        chat header that polls the global CostMeter every ~10s.
+        Also mounts the Sentinel-daemon status pill next to it.
+        Best-effort: when there's no header to attach to (older
+        layout), silently skip."""
+        header = getattr(self, "_title_bar", None) \
+            or getattr(self, "_header_widget", None)
+        if header is None:
+            return
+        try:
+            from PySide6.QtCore import QTimer
+            self._cost_pill = QLabel("·")
+            self._cost_pill.setToolTip("Daily LLM spend")
+            self._cost_pill.setStyleSheet(
+                "padding: 1px 8px; border-radius: 8px;"
+                "background: #2a2a2a; color: #999;"
+                "font-size: 11px; margin-right: 6px;")
+            self._sentinel_pill = QLabel("·")
+            self._sentinel_pill.setToolTip(
+                "Background watcher status")
+            self._sentinel_pill.setStyleSheet(
+                "padding: 1px 8px; border-radius: 8px;"
+                "background: #2a2a2a; color: #999;"
+                "font-size: 11px; margin-right: 6px;")
+            # Best-effort attach: most title bars have a layout that
+            # accepts an extra widget at the end. Falls through
+            # silently if not.
+            try:
+                header.layout().addWidget(self._cost_pill)
+                header.layout().addWidget(self._sentinel_pill)
+            except Exception:
+                self._cost_pill = None
+                self._sentinel_pill = None
+                return
+            self._cost_pill_timer = QTimer(self)
+            self._cost_pill_timer.setInterval(10_000)  # 10 sec
+            self._cost_pill_timer.timeout.connect(self._refresh_cost_pill)
+            self._cost_pill_timer.timeout.connect(
+                self._refresh_sentinel_pill)
+            self._cost_pill_timer.start()
+            self._refresh_cost_pill()
+            self._refresh_sentinel_pill()
+        except Exception:
+            pass
+
+    def _refresh_sentinel_pill(self) -> None:
+        if not getattr(self, "_sentinel_pill", None):
+            return
+        try:
+            from ...live_api.sentinel_status import format_status_pill
+            pill = format_status_pill()
+            self._sentinel_pill.setText(pill["text"])
+            self._sentinel_pill.setToolTip(pill["tooltip"])
+            self._sentinel_pill.setStyleSheet(
+                f"padding: 1px 8px; border-radius: 8px;"
+                f"background: {pill['color']}; color: #fff;"
+                f"font-size: 11px; margin-right: 6px;")
+        except Exception:
+            pass
+
+    def _refresh_cost_pill(self) -> None:
+        try:
+            from ...live_api.cost_meter import global_meter
+            from ...live_api.cost_surfaces import (
+                cost_badge_state, format_today_summary, CostBadge)
+            meter = global_meter()
+            state = cost_badge_state(meter)
+            color = {
+                CostBadge.GREEN:  "#3a7d3a",
+                CostBadge.YELLOW: "#9c8a3a",
+                CostBadge.ORANGE: "#c97a32",
+                CostBadge.RED:    "#b04040",
+            }.get(state.badge, "#666")
+            self._cost_pill.setText(
+                f"${state.spent_usd:.2f}" if state.cap_usd > 0
+                else f"${state.spent_usd:.2f}·")
+            self._cost_pill.setStyleSheet(
+                f"padding: 1px 8px; border-radius: 8px;"
+                f"background: {color}; color: #fff;"
+                f"font-size: 11px; margin-right: 6px;")
+            self._cost_pill.setToolTip(format_today_summary(meter))
+        except Exception:
+            pass
 
     def _on_suggested_actions(self, actions: List[str]) -> None:
         """Slot for LiveApiManager.suggested_actions. Builds an inline
@@ -2974,6 +3648,40 @@ class LiveAssistantWindow(QWidget):
             pass
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        # Stop the cost/sentinel pill QTimer so it can't fire after the
+        # window's event dispatcher is gone (refresh slots touch Qt
+        # objects on the GUI thread; a late timeout would race the
+        # widget teardown).
+        try:
+            _pill_timer = getattr(self, "_cost_pill_timer", None)
+            if _pill_timer is not None:
+                _pill_timer.stop()
+        except Exception:
+            pass
+        # Disconnect from manager signals BEFORE stop() so any in-flight
+        # queued events from background watcher threads don't get delivered
+        # to widgets we're about to delete (use-after-free in Qt6Core).
+        # IMPORTANT: disconnect per-(signal, slot) — calling sig.disconnect()
+        # with no arg nukes EVERY connection on that signal, including any
+        # other parts of the app (cortex view, suggested-actions chips,
+        # stuck-pattern detector, etc.) that wired themselves up. Only
+        # tear down the slots THIS window connected.
+        for sig, slot in (
+            (self._manager.state_changed, self._on_state_changed),
+            (self._manager.assistant_text, self._on_assistant_delta),
+            (self._manager.assistant_message_break, self._on_assistant_break),
+            (self._manager.tool_event, self._on_tool_event),
+            (self._manager.suggested_actions, self._on_suggested_actions),
+            (self._manager.error_occurred, self._on_error),
+            (self._manager.transcript_received, self._on_transcript),
+        ):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                # Not connected, or signal/slot already torn down.
+                pass
+            except Exception:
+                pass
         try:
             self._manager.stop()
         except Exception:

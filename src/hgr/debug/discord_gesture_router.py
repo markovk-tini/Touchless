@@ -82,9 +82,9 @@ class DiscordGestureRouter:
     def __init__(
         self,
         *,
-        static_hold_seconds: float = 0.5,
+        static_hold_seconds: float = 1.0,
         static_cooldown_seconds: float = 1.5,
-        toggle_hold_seconds: float = 0.7,
+        toggle_hold_seconds: float = 1.0,
         toggle_cooldown_seconds: float = 1.5,
     ) -> None:
         self.static_hold_seconds = float(static_hold_seconds)

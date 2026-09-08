@@ -158,12 +158,45 @@ def format_gesture_summary(gesture: CustomGesture) -> str:
     """Multi-line human-readable summary of a saved gesture, including the
     pose recipe derived from the categorical features. Ranges are shown
     when natural recording variation produced them."""
+    kind = str(getattr(gesture, "kind", "static") or "static")
+    if kind == "pose_sequence":
+        lines: List[str] = []
+        title = f"How to do '{gesture.name}'"
+        banner = "=" * min(len(title) + 2, 48)
+        lines.append(banner)
+        lines.append(f" {title}")
+        lines.append(banner)
+        if gesture.description:
+            lines.append(f"Description: {gesture.description}")
+        lines.append(f"Action:      {describe_action(gesture.action)}")
+        if gesture.handedness in ("Left", "Right"):
+            lines.append(f"Hand:        {gesture.handedness} (only fires on this hand)")
+        else:
+            lines.append("Hand:        either (fires on left or right)")
+        lines.append(
+            f"Sequence:    {len(gesture.pose_sequence_steps)} poses · "
+            f"learned hold {gesture.pose_sequence_dwell_ms}–"
+            f"{gesture.pose_sequence_max_hold_ms} ms · "
+            f"gap ≤ {gesture.pose_sequence_max_gap_ms} ms"
+        )
+        lines.append("")
+        lines.append("Perform poses in this order (timing from your demo):")
+        for i, step in enumerate(gesture.pose_sequence_steps):
+            lines.append(
+                f"  {i + 1}. {step.name or f'step {i + 1}'} "
+                f"({len(step.samples)} samples)"
+            )
+        return "\n".join(lines)
+
     sig = pose_signature(gesture)
-    lines: List[str] = []
+    lines = []
     title = f"How to do '{gesture.name}'"
-    lines.append("=" * (len(title) + 2))
+    # Cap banner width so a long gesture name can't force the
+    # settings card wider than the scroll viewport.
+    banner = "=" * min(len(title) + 2, 48)
+    lines.append(banner)
     lines.append(f" {title}")
-    lines.append("=" * (len(title) + 2))
+    lines.append(banner)
 
     if gesture.description:
         lines.append(f"Description: {gesture.description}")

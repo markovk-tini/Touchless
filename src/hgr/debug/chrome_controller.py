@@ -4,6 +4,7 @@ import ctypes
 import platform
 import re
 import subprocess
+import threading
 import time
 from ctypes import wintypes
 from difflib import SequenceMatcher
@@ -146,6 +147,24 @@ class ChromeController:
             return True
         self._message = "chrome focus failed"
         return False
+
+    def dispatch_async(self, callable_obj, *args, on_complete=None, **kwargs) -> None:
+        # Window enum / launch used to run on the gesture thread and
+        # hitch the live view for a split second on "open chrome".
+        def _runner():
+            result = None
+            try:
+                result = callable_obj(*args, **kwargs)
+            except Exception:
+                pass
+            if on_complete is not None:
+                try:
+                    on_complete(bool(result), str(self._message or ""))
+                except Exception:
+                    pass
+
+        worker = threading.Thread(target=_runner, name="chrome-action", daemon=True)
+        worker.start()
 
     def launch_chrome(self) -> bool:
         if self._launch_target():
@@ -477,7 +496,7 @@ class ChromeController:
             chrome_pids = set()
         if not chrome_pids:
             self._handles_cache = []
-            self._handles_cache_until = now + 1.0
+            self._handles_cache_until = now + 5.0
             return []
 
         user32 = ctypes.windll.user32
@@ -502,7 +521,10 @@ class ChromeController:
         except Exception:
             handles = []
         self._handles_cache = list(handles)
-        self._handles_cache_until = now + 1.0
+        # r42: raised TTL 1.0s -> 5.0s so opening a new app (Spotify
+        # etc.) that adds ~10-20 processes doesn't force a hot-path
+        # frame to run psutil.process_iter + EnumWindows every second.
+        self._handles_cache_until = now + 5.0
         return handles
 
     def _invalidate_handles_cache(self) -> None:

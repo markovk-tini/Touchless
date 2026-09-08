@@ -27,6 +27,15 @@ class VolumeGestureTracker:
         release_frames: int = 5,
         hold_seconds: float = 1.5,
         mute_cooldown_seconds: float = 1.0,
+        # v1.1.7 tester feedback: mute was firing instantly on the
+        # first stable frame (~100 ms), which combined with the mute
+        # pose's overlap with a swipe-recovery hand shape produced
+        # frequent false positives. Requiring the mute pose to hold
+        # for 1.0 s before firing eliminates transient false
+        # positives (a hand naturally passing through a shaka-shape
+        # can't hold it that long) while remaining fast enough that
+        # a deliberate mute still feels responsive.
+        mute_hold_seconds: float = 1.0,
         deadzone_fraction: float = 0.20,
         smoothing: float = 0.14,
         # Was 0.40 — bumped to 0.60 so a brief pose-invalid window
@@ -41,6 +50,7 @@ class VolumeGestureTracker:
         self.release_frames = int(release_frames)
         self.hold_seconds = float(hold_seconds)
         self.mute_cooldown_seconds = float(mute_cooldown_seconds)
+        self.mute_hold_seconds = float(mute_hold_seconds)
         self.deadzone_fraction = float(deadzone_fraction)
         self.smoothing = float(smoothing)
         self.pose_grace_seconds = float(pose_grace_seconds)
@@ -67,6 +77,11 @@ class VolumeGestureTracker:
         self._status = 'idle'
         self._last_mute_toggle_time = 0.0
         self._mute_gesture_latched = False
+        # Timestamp when the current continuous run of stable_gesture
+        # == "mute" started, or None if the gesture is not currently
+        # held. Fires the actual mute toggle only after this run has
+        # persisted for `mute_hold_seconds` (default 1.0 s).
+        self._mute_candidate_since: float | None = None
         self._lock_until = 0.0
         self._pinky_hold_latched = False
         self._activation_ready_frames = 0
@@ -93,9 +108,16 @@ class VolumeGestureTracker:
 
         trigger_mute = False
         if stable_gesture == 'mute':
+            # Start (or continue) the candidate-hold timer. If the
+            # gesture was just released and reappears, we restart
+            # the timer — a fresh 1.0 s hold is required each time.
+            if self._mute_candidate_since is None:
+                self._mute_candidate_since = now
+            candidate_held_for = now - self._mute_candidate_since
             if (
                 allow_mute_toggle
                 and not self._mute_gesture_latched
+                and candidate_held_for >= self.mute_hold_seconds
                 and now - self._last_mute_toggle_time >= self.mute_cooldown_seconds
             ):
                 self._last_mute_toggle_time = now
@@ -104,7 +126,12 @@ class VolumeGestureTracker:
                 self._message = 'mute toggle'
                 self._status = 'muted' if not current_muted else 'unmuted'
         else:
+            # Gesture broken — clear the latch AND the candidate
+            # timer so the next mute pose must hold a full 1.0 s
+            # from a fresh start, not from wherever the previous
+            # incomplete hold left off.
             self._mute_gesture_latched = False
+            self._mute_candidate_since = None
 
         upright_ok = True
         if palm_roll_deg is not None:

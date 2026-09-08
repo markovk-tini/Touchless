@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import platform
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -39,6 +40,73 @@ def _macos_camera_auth_status() -> str:
         return f"AVFoundation auth={s} ({names.get(s, '?')})"
     except Exception as exc:  # noqa: BLE001
         return f"AVFoundation auth unavailable ({type(exc).__name__})"
+
+
+def _cv2_open_with_timeout(
+    index: int,
+    backend: int,
+    timeout_seconds: float = 6.0,
+) -> Optional[cv2.VideoCapture]:
+    """Construct a `cv2.VideoCapture(index, backend)` in a background
+    daemon thread, abandoning the thread (NOT killing it — Python has
+    no portable way to interrupt a native call) if construction blocks
+    beyond `timeout_seconds`.
+
+    Why this exists:
+    On Windows, `cv2.VideoCapture(idx, CAP_DSHOW)` builds a full
+    DirectShow filter graph during construction. When another process
+    (Razer Synapse, Windows Camera app, a crashed Touchless test
+    session that didn't clean up, etc.) is holding the camera handle,
+    Windows' DSHOW infrastructure can block this constructor for
+    60-120 seconds before timing out. Without a wrapper, Touchless's
+    cold-start camera scan would freeze the splash for several
+    minutes — the user perceives this as "the app hung", quits with
+    Ctrl+C, and tries again, often making the device-state worse.
+
+    With this wrapper:
+      * Healthy cameras open in <1 s — well under the timeout.
+      * Locked cameras let the calling thread give up after 6 s and
+        try the next backend / fall through to the OpenCV-fallback
+        path or, eventually, "no camera" UI. The leaked background
+        thread is a daemon, so it dies when Python exits; while
+        Python is still alive it stays blocked on the OS call until
+        Windows times out internally and the thread cleanly returns.
+
+    Returns the cv2.VideoCapture on success, or None on timeout /
+    construction exception. Caller is responsible for the rest of
+    the open dance (cap.isOpened(), the read_attempts warmup loop).
+    """
+    result: list[Optional[cv2.VideoCapture]] = [None]
+
+    def _worker() -> None:
+        try:
+            result[0] = cv2.VideoCapture(index, backend)
+        except Exception:
+            result[0] = None
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"cv2-open-idx{index}-bk{backend}",
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=float(timeout_seconds))
+    if thread.is_alive():
+        try:
+            sys.stderr.write(
+                f"[camera_utils] cv2.VideoCapture(index={index}, backend={backend}) "
+                f"blocked beyond {timeout_seconds:.1f}s timeout — likely the camera "
+                f"is held by another process (Razer Synapse, Windows Camera, OBS, "
+                f"a crashed Touchless test session, etc.). Skipping this backend; "
+                f"the leaked background thread will resolve when Windows DSHOW "
+                f"times out internally (no user impact, daemon thread dies with "
+                f"the process).\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return None
+    return result[0]
 
 
 @dataclass(frozen=True)
@@ -154,9 +222,22 @@ def try_open_camera(
     read_interval: float = 0.03,
 ) -> Optional[cv2.VideoCapture]:
     with _quiet_opencv_probe():
-        cap = cv2.VideoCapture(index, backend)
+        # Construct via timeout-wrapped helper. Healthy cameras open
+        # in <1 s; a locked DSHOW device would otherwise block this
+        # constructor for 60-120 s while Windows times out the
+        # contended handle, freezing the whole Touchless splash.
+        # 6 s is plenty for cold-start virtual cameras (EOS Webcam
+        # Utility, OBS Virtual Camera) — those deliver their first
+        # frame slowly inside the read_attempts loop below, not
+        # during the VideoCapture() constructor itself.
+        cap = _cv2_open_with_timeout(index, backend, timeout_seconds=6.0)
+        if cap is None:
+            return None
         if not cap.isOpened():
-            cap.release()
+            try:
+                cap.release()
+            except Exception:
+                pass
             if platform.system() == "Darwin":
                 _cam_log(f"open idx={index} backend={backend_name(backend)} -> NOT opened")
             return None
@@ -185,7 +266,10 @@ def try_open_camera(
                 return cap
             time.sleep(read_interval)
 
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
         if platform.system() == "Darwin":
             _cam_log(f"open idx={index} backend={backend_name(backend)} -> opened but NO frame in {read_attempts} reads")
         return None
@@ -213,6 +297,65 @@ def request_camera_access_main_thread(max_index: int = 4) -> tuple[bool, str]:
         "macOS camera access was not granted yet. Approve camera access when prompted, "
         "or enable it in System Settings > Privacy & Security > Camera for Terminal or your packaged app, then try again."
     )
+
+
+# r50: auto-detect classifier for the r49 short-shutter camera hint.
+#
+# Allowlist is checked BEFORE the denylist so a Kiyo Pro (which contains
+# 'kiyo') can never be resolved to 'generic' even if a partial substring
+# also matched a denylist term. Both lists are conservative — the
+# denylist is trimmed to high-confidence keyword substrings ('realtek',
+# 'sonix', 'chicony', literal generic UVC names). Broad terms like
+# 'integrated camera' and 'hd webcam' were intentionally excluded to
+# avoid false-positives on premium built-in laptop cameras.
+_R50_PREMIUM_CAMERA_KEYWORDS = (
+    "kiyo",
+    "brio",
+    "c920",
+    "c922",
+    "c930",
+    "streamcam",
+    "elgato facecam",
+    "insta360 link",
+    "opal",
+    "poly studio",
+    "logitech mx brio",
+    "sony imx",
+)
+_R50_GENERIC_UVC_KEYWORDS = (
+    "full hd 1080p webcam",
+    "usb2.0 camera",
+    "usb camera",
+    "uvc camera",
+    "general webcam",
+    "realtek",
+    "sonix",
+    "chicony",
+)
+
+
+def classify_camera_shutter_hint(display_name: str) -> Optional[bool]:
+    """Return True if the camera's display name matches a known generic
+    UVC driver family that benefits from the short-shutter hint;
+    False if it matches a known premium camera family that must NOT
+    receive the hint; None if the name is unknown (caller should
+    fall through to the user's explicit config value).
+
+    Runtime-only classifier — the caller does NOT persist the result
+    to config. Every camera-open re-evaluates from the current
+    display_name, which stays deterministic across restarts and can
+    never diverge from a user's explicit Settings choice.
+    """
+    name = str(display_name or "").lower().strip()
+    if not name:
+        return None
+    for premium in _R50_PREMIUM_CAMERA_KEYWORDS:
+        if premium in name:
+            return False
+    for generic in _R50_GENERIC_UVC_KEYWORDS:
+        if generic in name:
+            return True
+    return None
 
 
 def is_eos_or_canon_name(display_name: str) -> bool:
@@ -347,6 +490,58 @@ def list_available_cameras(max_index: int = 8) -> List[CameraInfo]:
 
     if platform.system() == "Darwin":
         _cam_log(f"list_available_cameras -> {len(discovered)} found ({[c.display_name for c in discovered]})")
+
+    # v1.1.7 Windows ffmpeg-DShow enumeration fallback. On some
+    # driver/OS combos (post Razer Synapse install, WMF-hidden UVC
+    # devices, or a camera briefly held by a background app while
+    # we probed), QMediaDevices returns empty AND every OpenCV
+    # backend fails to open — so the user sees "no camera" even
+    # though ffmpeg's DShow enumeration can see the device fine.
+    # If ffmpeg's list is non-empty when our probe found nothing,
+    # synthesize CameraInfo entries so the app can still open via
+    # the ffmpeg-subprocess path (open_camera_by_index has the
+    # matching fallback). Zero cost when the OpenCV probe already
+    # found the camera — this branch only runs when discovered is
+    # empty AND we're on Windows.
+    if not discovered and platform.system() == "Windows":
+        import sys as _sys
+        try:
+            _sys.stderr.write(
+                "[camera-enum] OpenCV probe returned 0 cameras; trying ffmpeg-DShow fallback\n"
+            )
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        dshow_devices: list[str] = []
+        try:
+            from .ffmpeg_capture import list_dshow_video_devices
+            dshow_devices = list_dshow_video_devices()
+        except Exception as _exc:
+            try:
+                _sys.stderr.write(
+                    f"[camera-enum] list_dshow_video_devices raised: {_exc!r}\n"
+                )
+                _sys.stderr.flush()
+            except Exception:
+                pass
+            dshow_devices = []
+        try:
+            _sys.stderr.write(
+                f"[camera-enum] ffmpeg-DShow fallback returned {len(dshow_devices)} device(s): {dshow_devices!r}\n"
+            )
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        for idx, name in enumerate(dshow_devices):
+            discovered.append(
+                CameraInfo(
+                    index=idx,
+                    backend=-1,
+                    backend_name="ffmpeg-dshow",
+                    display_name=f"{name} (Camera {idx})",
+                )
+            )
+
     return discovered
 
 
@@ -458,8 +653,17 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
             if device_name:
                 try:
                     from .ffmpeg_capture import open_ffmpeg_cap_with_fps_fallback
+                    # C27: 640x480 to match Default's OpenCV cap res.
+                    # Higher res introduced a persistent 1-2 s live-
+                    # viewer lag through the frame-copy pipeline.
+                    # v1.1.7.1: luma_min_threshold=50 auto-downshifts
+                    # 60→30 fps when the driver responds to the higher
+                    # rate by cutting shutter below usable brightness
+                    # (HP HD Camera and similar built-in webcams that
+                    # can't sustain 60 fps in indoor lighting).
                     ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                        device_name, width=1280, height=720
+                        device_name, width=640, height=480,
+                        luma_min_threshold=50.0,
                     )
                 except Exception:
                     ffmpeg_cap = None
@@ -473,6 +677,47 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
                     # ffmpeg_cap is already async-buffered internally
                     # (ffmpeg pipes raw BGR24 into our reader thread),
                     # so no ThreadedCvCapture wrapper needed here.
+                    return info, ffmpeg_cap
+    # v1.1.7 general Windows ffmpeg-DShow open fallback. Every
+    # cv2.VideoCapture backend failed above — usually because Qt/
+    # OpenCV rely on Windows Media Foundation which sometimes
+    # doesn't see UVC devices that DirectShow does (post Synapse
+    # install for Kiyo Pro, some Razer/Discord/Teams driver states
+    # that briefly park the camera). ffmpeg's DShow enumeration
+    # runs in a child process and typically succeeds where the
+    # in-process cv2.VideoCapture doesn't. Same shape ffmpeg cap
+    # the perf-mode path already uses, so downstream code is
+    # transparent to which path we came from.
+    if platform.system() == "Windows":
+        try:
+            from .ffmpeg_capture import list_dshow_video_devices, open_ffmpeg_cap_with_fps_fallback
+            dshow_devices = list_dshow_video_devices()
+        except Exception:
+            dshow_devices = []
+        if 0 <= index < len(dshow_devices):
+            device_name = str(dshow_devices[index] or "").strip()
+            if device_name:
+                try:
+                    # C27: 640x480 to match Default's OpenCV cap res.
+                    # Higher res introduced a persistent 1-2 s live-
+                    # viewer lag through the frame-copy pipeline.
+                    # v1.1.7.1: luma_min_threshold=50 auto-downshifts
+                    # 60→30 fps if the driver responds by cutting
+                    # shutter too aggressively (see camera_utils.py
+                    # EOS path for the full rationale).
+                    ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
+                        device_name, width=640, height=480,
+                        luma_min_threshold=50.0,
+                    )
+                except Exception:
+                    ffmpeg_cap = None
+                if ffmpeg_cap is not None and ffmpeg_cap.isOpened():
+                    info = CameraInfo(
+                        index=index,
+                        backend=-1,
+                        backend_name="ffmpeg-dshow",
+                        display_name=f"{device_name} (Camera {index}, ffmpeg)",
+                    )
                     return info, ffmpeg_cap
     return None, None
 

@@ -67,8 +67,9 @@ class SandboxWindow(QDialog):
         config=None,
     ) -> None:
         super().__init__(parent)
-        from .window_chrome import apply_touchless_chrome
-        apply_touchless_chrome(self)
+        # r51: install_indigo_chrome for Win10 + Win11 parity.
+        from .window_chrome import install_indigo_chrome
+        self._body = install_indigo_chrome(self, "Custom gesture sandbox")
         self.setWindowTitle("Custom Gestures Sandbox")
         self.setModal(False)
         self.setMinimumSize(820, 560)
@@ -103,6 +104,9 @@ class SandboxWindow(QDialog):
         # up even in read-only mode.
         self._dynamic_runtime = DynamicGestureRuntime()
         self._dynamic_runtime.reload()
+        from hgr.custom_gestures.pose_sequence_runtime import PoseSequenceRuntime
+        self._sequence_runtime = PoseSequenceRuntime()
+        self._sequence_runtime.reload()
 
         # Hold-to-activate state.
         self._hold_name: Optional[str] = None
@@ -200,7 +204,7 @@ class SandboxWindow(QDialog):
             }}
             """
         )
-        root = QVBoxLayout(self)
+        root = QVBoxLayout(self._body)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
 
@@ -258,12 +262,16 @@ class SandboxWindow(QDialog):
 
         cap = self._open_configured_camera()
         if cap is None:
-            QMessageBox.critical(
+            # r51: touchless_message_box (indigo chrome, Win10+Win11 parity).
+            from .window_chrome import touchless_message_box
+            touchless_message_box(
                 self,
                 "Camera unavailable",
                 "Could not open the camera. If you're using a phone "
                 "camera, make sure your phone is on the same Wi-Fi "
                 "network and the QR pairing is still active.",
+                icon=QMessageBox.Critical,
+                buttons=QMessageBox.Ok,
             )
             return
         self._cap = cap
@@ -415,15 +423,23 @@ class SandboxWindow(QDialog):
                     return
             if np_frame.ndim != 3 or np_frame.shape[2] not in (3, 4):
                 return
+            # Always copy. Worker frames are a reused capture buffer;
+            # drawing landmarks / putText on that array leaves ghosts
+            # (duplicate skeletons, stacked "hand present" text) on
+            # the next emit of the same memory.
+            if np_frame.shape[2] == 4:
+                np_frame = np_frame[:, :, :3]
+            work = np.ascontiguousarray(np_frame).copy()
             # Mirror to selfie view when we own the camera; skip when
             # borrowing the worker's frames (already mirrored upstream).
             should_flip = self._owns_camera and not bool(
                 getattr(self._config, "camera_source_is_mirrored", False)
             )
-            mirrored = cv2.flip(np_frame, 1) if should_flip else np_frame
-            rgb = cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB) if mirrored.shape[2] == 3 else mirrored[:, :, :3]
+            display_bgr = cv2.flip(work, 1) if should_flip else work
+            rgb = cv2.cvtColor(display_bgr, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
             result = self._mp_hands.process(rgb)
-            display_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            rgb.flags.writeable = True
 
             now = time.monotonic()
             match = None
@@ -554,6 +570,25 @@ class SandboxWindow(QDialog):
                     self._last_fire_at = now
                     if fire_now:
                         self._cooldown_until = now + _DEFAULT_COOLDOWN
+                try:
+                    fired_seq = self._sequence_runtime.process_landmarks(
+                        lm,
+                        handedness=live_hand or "",
+                        timestamp=now,
+                        dispatch=fire_now,
+                    )
+                except Exception as exc:
+                    fired_seq = None
+                    print(f"[sandbox] pose sequence error: {exc}")
+                if fired_seq:
+                    self._last_match_label = (
+                        f"sequence: {fired_seq}"
+                        + ("  fired" if fire_now else "  (detected, fire-off)")
+                    )
+                    self._last_fire_name = fired_seq
+                    self._last_fire_at = now
+                    if fire_now:
+                        self._cooldown_until = now + _DEFAULT_COOLDOWN
             else:
                 self._latest_sig = {}
                 self._latest_feats = None
@@ -566,6 +601,10 @@ class SandboxWindow(QDialog):
                     self._fired_for_hold = False
                 try:
                     self._dynamic_runtime.hand_lost()
+                except Exception:
+                    pass
+                try:
+                    self._sequence_runtime.hand_lost()
                 except Exception:
                     pass
 
@@ -619,6 +658,50 @@ class SandboxWindow(QDialog):
                 frame, f"FIRED: {self._last_fire_name}", (12, 80),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA,
             )
+
+        # Dynamic SPRING scoreboard — shows why a circle / wave is or
+        # isn't firing (cost vs threshold). Green when cost is under
+        # threshold; grey otherwise. Also show live wrist path so a
+        # near-threshold circle that hasn't traveled enough is obvious.
+        try:
+            rows = self._dynamic_runtime.spring_debug_rows()
+        except Exception:
+            rows = []
+        y = 110
+        live_path = None
+        try:
+            clf = getattr(self._dynamic_runtime, "_classifier", None)
+            if clf is not None:
+                live_path = float(clf._live_wrist_path_length(2.5))
+        except Exception:
+            live_path = None
+        if live_path is not None:
+            cv2.putText(
+                frame,
+                f"wrist_path={live_path:.2f}",
+                (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (180, 180, 180),
+                1,
+                cv2.LINE_AA,
+            )
+            y += 20
+        for name, cost, thr, rising in rows[:6]:
+            under = cost < thr
+            color = (40, 220, 40) if under else (170, 170, 170)
+            mark = "*" if rising else " "
+            cv2.putText(
+                frame,
+                f"{mark}{name}: {cost:.2f}/{thr:.2f}",
+                (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+            y += 20
 
     def _draw_progress_bar(
         self,

@@ -16,12 +16,11 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
-from .base import Connector, connector_result
-from ...utils.subprocess_utils import hidden_subprocess_kwargs, launch_external
+from .base import Connector, connector_result, friendly_api_error
+from ...utils.subprocess_utils import launch_external
 
 
 # Phone Link's AppX package name. Microsoft renamed it twice; we check
@@ -184,7 +183,7 @@ class PhoneLinkConnector(Connector):
 
         except Exception as exc:
             return connector_result(
-                "error", error=f"{type(exc).__name__}: {exc}")
+                "error", error=friendly_api_error(exc, api_label="Phone Link"))
         return connector_result(
             "error", error=f"unknown phone_link tool: {name}",
             code="no_handler")
@@ -326,37 +325,74 @@ class PhoneLinkConnector(Connector):
 # ---- module-level helpers (no UIA needed) ---------------------------------
 def _find_phone_link_appx() -> Optional[str]:
     """Returns the AppX package name if Phone Link is installed, else None.
-    Uses PowerShell which is universally available on Win10+.
-    hidden_subprocess_kwargs suppresses the PowerShell console-window
-    flash in PyInstaller --windowed builds."""
+
+    v1.1.7: was `powershell -Command Get-AppxPackage -Name ...`. That exact
+    byte pattern (hidden powershell.exe launch enumerating installed AppX
+    packages) is one of the Defender ASR fingerprints that started
+    quarantining the app. We enumerate shell:AppsFolder via Shell.Application
+    COM instead and look for the AppUserModelID prefix — same detection,
+    no subprocess, no fingerprint.
+    """
     try:
-        for candidate in _APPX_NAMES:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 f"(Get-AppxPackage -Name {candidate} | Select-Object -First 1).Name"],
-                capture_output=True, text=True, timeout=8,
-                **hidden_subprocess_kwargs(),
-            )
-            out = (r.stdout or "").strip()
-            if out and out.lower() == candidate.lower():
-                return candidate
+        from comtypes import CoInitialize, CoUninitialize
+        import comtypes.client
     except Exception:
-        pass
-    return None
+        return None
+    CoInitialize()
+    try:
+        try:
+            shell = comtypes.client.CreateObject("Shell.Application", dynamic=True)
+            apps_folder = shell.NameSpace("shell:AppsFolder")
+        except Exception:
+            return None
+        if apps_folder is None:
+            return None
+        try:
+            items = apps_folder.Items()
+            count = int(items.Count)
+        except Exception:
+            return None
+        lowered_targets = [name.lower() for name in _APPX_NAMES]
+        for index in range(count):
+            try:
+                item = items.Item(index)
+                app_id = str(item.Path or "").lower()
+            except Exception:
+                continue
+            if not app_id:
+                continue
+            for target_name, lowered in zip(_APPX_NAMES, lowered_targets):
+                if app_id.startswith(lowered + "_"):
+                    return target_name
+        return None
+    finally:
+        try:
+            CoUninitialize()
+        except Exception:
+            pass
 
 
 def _appx_version(appx_name: str) -> str:
-    """Best-effort PowerShell probe for Version. '' on failure."""
+    """Best-effort version probe. Returns "" on failure or when winsdk
+    isn't available in this build. Non-critical — used only for a debug
+    hint in setup_self output. Was a PowerShell Get-AppxPackage call;
+    now uses winsdk (WinRT PackageManager) so no subprocess is spawned.
+    """
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             f"(Get-AppxPackage -Name {appx_name}).Version"],
-            capture_output=True, text=True, timeout=6,
-            **hidden_subprocess_kwargs(),
-        )
-        return (r.stdout or "").strip()
+        from winsdk.windows.management.deployment import PackageManager  # type: ignore
     except Exception:
         return ""
+    try:
+        manager = PackageManager()
+        for package in manager.find_packages_by_name(appx_name):
+            try:
+                version = package.id.version
+                return f"{version.major}.{version.minor}.{version.build}.{version.revision}"
+            except Exception:
+                continue
+    except Exception:
+        return ""
+    return ""
 
 
 def _launch_phone_link() -> bool:

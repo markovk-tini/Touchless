@@ -1302,124 +1302,17 @@ class DesktopController:
         if cached is not None and now - cached[0] <= 20.0:
             return list(cached[1])
 
-        payload = {
-            "token_sets": [list(tokens) for tokens in token_sets],
-            "scopes": list(scope_values),
-            "extension": desired_extension or "",
-            "item_kind": item_kind,
-            "limit": int(max(8, min(120, limit))),
-        }
-        script = r"""
-$ErrorActionPreference = 'Stop'
-$payload = $args[0] | ConvertFrom-Json
-function SqlLiteral([string]$value) {
-    if ($null -eq $value) {
-        return ''
-    }
-    return ([string]$value).Replace("'", "''")
-}
-function LikeLiteral([string]$value) {
-    $escaped = SqlLiteral($value)
-    $escaped = $escaped.Replace('[', '[[]').Replace('%', '[%]').Replace('_', '[_]')
-    return $escaped
-}
-$rows = New-Object System.Collections.ArrayList
-$connection = $null
-try {
-    $connection = New-Object -ComObject ADODB.Connection
-    $connection.Open("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';")
-    foreach ($tokenSet in @($payload.token_sets)) {
-        if ($null -eq $tokenSet -or @($tokenSet).Count -eq 0) {
-            continue
-        }
-        $conditions = New-Object System.Collections.Generic.List[string]
-        $scopeConditions = New-Object System.Collections.Generic.List[string]
-        foreach ($scope in @($payload.scopes)) {
-            if ([string]::IsNullOrWhiteSpace($scope)) {
-                continue
-            }
-            $normalizedScope = (SqlLiteral([string]$scope)).Replace('\', '/')
-            $scopeConditions.Add("(SCOPE='file:$normalizedScope')")
-        }
-        if ($scopeConditions.Count -gt 0) {
-            $conditions.Add("(" + ($scopeConditions -join " OR ") + ")")
-        }
-        foreach ($token in @($tokenSet)) {
-            if ([string]::IsNullOrWhiteSpace($token)) {
-                continue
-            }
-            $conditions.Add("System.FileName LIKE '%" + (LikeLiteral([string]$token)) + "%'")
-        }
-        if (-not [string]::IsNullOrWhiteSpace([string]$payload.extension)) {
-            $conditions.Add("System.FileExtension = '" + (SqlLiteral([string]$payload.extension)) + "'")
-        }
-        $sql = "SELECT TOP " + [int]$payload.limit + " System.ItemPathDisplay, System.DateModified FROM SYSTEMINDEX"
-        if ($conditions.Count -gt 0) {
-            $sql += " WHERE " + ($conditions -join " AND ")
-        }
-        $sql += " ORDER BY System.DateModified DESC"
-        $recordset = $connection.Execute($sql)
-        try {
-            while (-not $recordset.EOF) {
-                $pathValue = [string]$recordset.Fields.Item('System.ItemPathDisplay').Value
-                $modifiedValue = [string]$recordset.Fields.Item('System.DateModified').Value
-                [void]$rows.Add([PSCustomObject]@{
-                    path = $pathValue
-                    modified = $modifiedValue
-                })
-                $recordset.MoveNext()
-            }
-        } finally {
-            if ($null -ne $recordset) {
-                $recordset.Close()
-            }
-        }
-    }
-    $rows | ConvertTo-Json -Compress
-} finally {
-    if ($null -ne $connection) {
-        $connection.Close()
-    }
-}
-"""
-        try:
-            completed = subprocess.run(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    script,
-                    json.dumps(payload),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=8.0,
-                check=False,
-                **self._subprocess_hidden_kwargs(),
-            )
-        except Exception:
+        query_limit = int(max(8, min(120, limit)))
+        parsed_rows = self._run_indexed_search(
+            token_sets=[list(tokens) for tokens in token_sets],
+            scopes=list(scope_values),
+            extension=desired_extension or "",
+            top_n=query_limit,
+        )
+        if parsed_rows is None:
             self._indexed_search_supported = False
             return []
-        stdout_text = completed.stdout.strip()
-        if completed.returncode != 0 or not stdout_text:
-            self._indexed_search_supported = False
-            return []
-        try:
-            parsed = json.loads(stdout_text)
-        except json.JSONDecodeError:
-            self._indexed_search_supported = False
-            return []
-
         self._indexed_search_supported = True
-        if isinstance(parsed, dict):
-            parsed_rows = [parsed]
-        elif isinstance(parsed, list):
-            parsed_rows = [item for item in parsed if isinstance(item, dict)]
-        else:
-            parsed_rows = []
 
         seen_paths: set[str] = set()
         candidates: list[Path] = []
@@ -1445,6 +1338,113 @@ try {
 
         self._indexed_search_cache[cache_key] = (now, list(candidates))
         return candidates
+
+    def _run_indexed_search(
+        self,
+        *,
+        token_sets: list[list[str]],
+        scopes: list[str],
+        extension: str,
+        top_n: int,
+    ) -> list[dict] | None:
+        """Query the Windows Search index via ADODB.Connection COM.
+
+        v1.1.7: was a `powershell.exe -Command` script. That byte pattern
+        was one of the ASR fingerprints Windows Defender / SmartScreen
+        started auto-quarantining, so we call the same COM objects
+        directly from Python via comtypes. Returns None on total failure
+        (unsupported / COM unreachable), or a list of {path, modified}
+        dicts (possibly empty) when the query ran.
+        """
+        try:
+            from comtypes import CoInitialize, CoUninitialize
+            import comtypes.client
+        except Exception:
+            return None
+
+        def _sql_literal(value: str) -> str:
+            return value.replace("'", "''")
+
+        def _like_literal(value: str) -> str:
+            escaped = _sql_literal(value)
+            return escaped.replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
+
+        rows: list[dict] = []
+        CoInitialize()
+        try:
+            try:
+                connection = comtypes.client.CreateObject("ADODB.Connection", dynamic=True)
+            except Exception:
+                return None
+            try:
+                connection.Open("Provider=Search.CollatorDSO;Extended Properties='Application=Windows';")
+            except Exception:
+                return None
+            try:
+                for token_set in token_sets:
+                    if not token_set:
+                        continue
+                    conditions: list[str] = []
+                    scope_conditions: list[str] = []
+                    for scope in scopes:
+                        if not scope or not str(scope).strip():
+                            continue
+                        normalized_scope = _sql_literal(str(scope)).replace("\\", "/")
+                        scope_conditions.append(f"(SCOPE='file:{normalized_scope}')")
+                    if scope_conditions:
+                        conditions.append("(" + " OR ".join(scope_conditions) + ")")
+                    for token in token_set:
+                        if not token or not str(token).strip():
+                            continue
+                        conditions.append(
+                            "System.FileName LIKE '%" + _like_literal(str(token)) + "%'"
+                        )
+                    if extension and str(extension).strip():
+                        conditions.append(
+                            "System.FileExtension = '" + _sql_literal(str(extension)) + "'"
+                        )
+                    sql = (
+                        f"SELECT TOP {int(top_n)} System.ItemPathDisplay, "
+                        "System.DateModified FROM SYSTEMINDEX"
+                    )
+                    if conditions:
+                        sql += " WHERE " + " AND ".join(conditions)
+                    sql += " ORDER BY System.DateModified DESC"
+                    try:
+                        recordset = connection.Execute(sql)
+                    except Exception:
+                        continue
+                    try:
+                        while not recordset.EOF:
+                            try:
+                                path_value = str(
+                                    recordset.Fields.Item("System.ItemPathDisplay").Value or ""
+                                )
+                                modified_value = str(
+                                    recordset.Fields.Item("System.DateModified").Value or ""
+                                )
+                            except Exception:
+                                path_value = ""
+                                modified_value = ""
+                            if path_value:
+                                rows.append({"path": path_value, "modified": modified_value})
+                            recordset.MoveNext()
+                    finally:
+                        try:
+                            recordset.Close()
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    connection.Close()
+                except Exception:
+                    pass
+        finally:
+            try:
+                CoUninitialize()
+            except Exception:
+                pass
+        return rows
 
     def _scan_file_candidates(
         self,
@@ -2119,51 +2119,64 @@ try {
     def _iter_start_apps_entries(self) -> list[DesktopAppEntry]:
         if not self._available:
             return []
-        command = [
-            "powershell",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress",
-        ]
+        # v1.1.7: was `powershell -Command Get-StartApps | ConvertTo-Json`.
+        # Windows Defender's ASR rules flag that exact base64-encoded
+        # powershell.exe launch pattern as a dropper fingerprint, so we
+        # enumerate shell:AppsFolder directly via Shell.Application COM.
+        # Same data source Get-StartApps ultimately reads.
         try:
-            raw = subprocess.check_output(
-                command,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=10,
-                **self._subprocess_hidden_kwargs(),
-            )
+            from comtypes import CoInitialize, CoUninitialize
+            import comtypes.client
         except Exception:
             return []
-        raw = raw.strip()
-        if not raw:
-            return []
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            return []
-        items = payload if isinstance(payload, list) else [payload]
         entries: list[DesktopAppEntry] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("Name") or "").strip()
-            app_id = str(item.get("AppID") or "").strip()
-            if not name or not app_id:
-                continue
-            target = f"shell:AppsFolder\\{app_id}"
-            entries.append(
-                DesktopAppEntry(
-                    display_name=name,
-                    normalized_name=self._normalize_application_name(name),
-                    target=target,
-                    source="start_apps",
-                    aliases=self._build_entry_aliases(name),
-                    category=self._infer_category(name),
+        CoInitialize()
+        try:
+            try:
+                shell = comtypes.client.CreateObject("Shell.Application", dynamic=True)
+                apps_folder = shell.NameSpace("shell:AppsFolder")
+            except Exception:
+                return []
+            if apps_folder is None:
+                return []
+            try:
+                items = apps_folder.Items()
+            except Exception:
+                return []
+            try:
+                count = int(items.Count)
+            except Exception:
+                count = 0
+            for index in range(count):
+                try:
+                    item = items.Item(index)
+                except Exception:
+                    continue
+                if item is None:
+                    continue
+                try:
+                    name = str(item.Name or "").strip()
+                    app_id = str(item.Path or "").strip()
+                except Exception:
+                    continue
+                if not name or not app_id:
+                    continue
+                target = f"shell:AppsFolder\\{app_id}"
+                entries.append(
+                    DesktopAppEntry(
+                        display_name=name,
+                        normalized_name=self._normalize_application_name(name),
+                        target=target,
+                        source="start_apps",
+                        aliases=self._build_entry_aliases(name),
+                        category=self._infer_category(name),
+                    )
                 )
-            )
+        finally:
+            try:
+                CoUninitialize()
+            except Exception:
+                pass
         return entries
 
     def _iter_start_menu_entries(self) -> list[DesktopAppEntry]:
@@ -2635,26 +2648,33 @@ try {
     def _resolve_windows_shortcut(self, path: Path) -> tuple[str | None, str]:
         if not self._available or path.suffix.lower() != ".lnk":
             return None, ""
-        script = (
-            "$WshShell = New-Object -ComObject WScript.Shell; "
-            f"$Shortcut = $WshShell.CreateShortcut('{str(path).replace("'", "''")}'); "
-            "[Console]::WriteLine($Shortcut.TargetPath); "
-            "[Console]::WriteLine($Shortcut.Arguments)"
-        )
+        # v1.1.7: was `powershell.exe -Command ... WScript.Shell.CreateShortcut(...)`.
+        # Windows Defender's ASR rules quarantine that exact byte pattern.
+        # Drive WScript.Shell directly via comtypes instead — same result,
+        # no subprocess, no fingerprint.
         try:
-            output = subprocess.check_output(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=8,
-                **self._subprocess_hidden_kwargs(),
-            )
+            from comtypes import CoInitialize, CoUninitialize
+            import comtypes.client
         except Exception:
             return None, ""
-        lines = output.splitlines()
-        target_path = lines[0].strip() if lines else ""
-        arguments = lines[1].strip() if len(lines) > 1 else ""
-        return (target_path or None), arguments
+        CoInitialize()
+        try:
+            try:
+                shell = comtypes.client.CreateObject("WScript.Shell", dynamic=True)
+                shortcut = shell.CreateShortcut(str(path))
+            except Exception:
+                return None, ""
+            try:
+                target_path = str(shortcut.TargetPath or "").strip()
+                arguments = str(shortcut.Arguments or "").strip()
+            except Exception:
+                return None, ""
+            return (target_path or None), arguments
+        finally:
+            try:
+                CoUninitialize()
+            except Exception:
+                pass
 
     def _launch_resolved_shortcut(self, target_path: str, arguments: str = "") -> bool:
         try:

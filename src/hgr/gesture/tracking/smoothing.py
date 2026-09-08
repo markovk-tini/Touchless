@@ -61,10 +61,28 @@ class OneEuroFilter:
 
 
 class AdaptiveLandmarkSmoother:
-    def __init__(self, alpha: float = 0.58, min_alpha: float = 0.18, max_alpha: float = 0.76):
+    # r45: added `motion_normalizer` and `base_weight` tunables so an
+    # opt-in aggressive Lite path can push toward a snappier fast-motion
+    # response. Defaults preserve pre-r45 behaviour byte-for-byte
+    # (0.040 / 0.48). All existing 3-arg callers keep the exact same
+    # numerics — the new kwargs are additive.
+    def __init__(
+        self,
+        alpha: float = 0.58,
+        min_alpha: float = 0.18,
+        max_alpha: float = 0.76,
+        motion_normalizer: float = 0.040,
+        base_weight: float = 0.48,
+    ):
         self.alpha = float(alpha)
         self.min_alpha = float(min_alpha)
         self.max_alpha = float(max_alpha)
+        # Clamp to safe ranges — zero normalizer would divide-by-zero;
+        # a base_weight outside [0,1] would push adaptive_alpha outside
+        # the [min,max] clamp intermittently.
+        self._motion_normalizer = max(1e-3, float(motion_normalizer))
+        self._base_weight = max(0.0, min(1.0, float(base_weight)))
+        self._adaptive_weight = 1.0 - self._base_weight
         self._state: np.ndarray | None = None
 
     def reset(self) -> None:
@@ -80,8 +98,10 @@ class AdaptiveLandmarkSmoother:
         weighted = delta.copy()
         weighted[:, 2] *= 0.60
         motion = float(np.median(np.linalg.norm(weighted, axis=1)))
-        adaptive_alpha = self.min_alpha + (self.max_alpha - self.min_alpha) * min(1.0, motion / 0.040)
-        adaptive_alpha = 0.52 * adaptive_alpha + 0.48 * self.alpha
+        adaptive_alpha = self.min_alpha + (self.max_alpha - self.min_alpha) * min(
+            1.0, motion / self._motion_normalizer
+        )
+        adaptive_alpha = self._adaptive_weight * adaptive_alpha + self._base_weight * self.alpha
         adaptive_alpha = max(self.min_alpha, min(self.max_alpha, adaptive_alpha))
         self._state = adaptive_alpha * current + (1.0 - adaptive_alpha) * self._state
         return self._state.copy()
