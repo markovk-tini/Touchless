@@ -594,7 +594,55 @@ class SettingsNavButton(QPushButton):
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
         self.setObjectName("settingsNavButton")
+        self._update_badge = False
         self.clicked.connect(lambda: self.parent_window.show_settings_section(self.page_index))
+
+    def set_update_badge(self, visible: bool) -> None:
+        """Show/hide the green "!" pip that marks a pending update."""
+        visible = bool(visible)
+        if visible == self._update_badge:
+            return
+        self._update_badge = visible
+        self.update()
+
+    def has_update_badge(self) -> bool:
+        return self._update_badge
+
+    def paintEvent(self, event):  # noqa: N802 (Qt API)
+        super().paintEvent(event)
+        if not self._update_badge:
+            return
+        # Painted rather than added as a child QLabel so the pip can
+        # overlap the button's rounded border and needs no layout
+        # changes to the nav column (which the walkthrough glow
+        # measures geometry against).
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            diameter = 16
+            rect = self.rect()
+            circle = QRect(
+                rect.right() - 10 - diameter,
+                rect.center().y() - diameter // 2,
+                diameter,
+                diameter,
+            )
+            painter.setPen(Qt.NoPen)
+            # Fixed green rather than config.accent_color: this pip
+            # means "action pending", and that reading has to survive a
+            # user who set their accent to red or grey.
+            painter.setBrush(QColor("#1DE9B6"))
+            painter.drawEllipse(circle)
+            glyph_font = self.font()
+            glyph_font.setBold(True)
+            glyph_font.setPixelSize(11)
+            painter.setFont(glyph_font)
+            # Dark glyph on the bright accent fill — a white "!" on
+            # #1DE9B6 is close to unreadable at 11 px.
+            painter.setPen(QColor("#06231C"))
+            painter.drawText(circle, Qt.AlignCenter, "!")
+        finally:
+            painter.end()
 
 
 class _WalkthroughEdgeGlowOverlay(QWidget):
@@ -709,6 +757,87 @@ class _WalkthroughEdgeGlowOverlay(QWidget):
                 grad.setColorAt(1.0, end)
                 painter.setBrush(grad)
                 painter.drawRect(band)
+        finally:
+            painter.end()
+
+
+class _UpdateNavHintArrow(QWidget):
+    """Floating "scroll down, there's an update" cue for the settings
+    nav column.
+
+    The Updates row sits near the bottom of the nav list, so on shorter
+    windows it's scrolled out of sight and its green "!" pip can't be
+    seen at all — the badge would silently do nothing for exactly the
+    users who most need the hint. This parks a matching pip at the
+    bottom edge of the nav viewport and bounces it gently until the
+    Updates row scrolls into view.
+
+    Mouse-transparent so it can't steal a click from the nav button
+    underneath it.
+    """
+
+    _WIDTH = 26
+    _DIAMETER = 16
+    _BOUNCE_PX = 3.0
+    # Extra pixels above/below the bounce range so antialiased ellipse
+    # edges are not clipped by this widget's rect at the top of the
+    # bounce (the flat-top circle the user screenshotted).
+    _PAD = 3
+    _HEIGHT = int(_PAD + _BOUNCE_PX + _DIAMETER + _BOUNCE_PX + _PAD)
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setStyleSheet("background: transparent;")
+        self.setFixedSize(self._WIDTH, self._HEIGHT)
+        self.setVisible(False)
+        self._phase = 0.0
+        self._bounce_offset = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(40)
+        self._timer.timeout.connect(self._tick)
+
+    def set_active(self, active: bool) -> None:
+        """Show + animate, or hide + stop. The timer is stopped when
+        hidden so an idle Settings page costs nothing."""
+        if active:
+            if not self._timer.isActive():
+                self._timer.start()
+            if not self.isVisible():
+                self.setVisible(True)
+            self.raise_()
+        else:
+            self._timer.stop()
+            if self.isVisible():
+                self.setVisible(False)
+
+    def _tick(self) -> None:
+        self._phase = (self._phase + 0.28) % (2.0 * math.pi)
+        self._bounce_offset = math.sin(self._phase) * self._BOUNCE_PX
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802 (Qt API)
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.translate(0.0, self._bounce_offset)
+            accent = QColor("#1DE9B6")
+            diameter = self._DIAMETER
+            center_x = self._WIDTH // 2
+            # Rest position sits _BOUNCE_PX below the top pad so an
+            # upward bounce cannot draw above y=0.
+            circle_y = int(self._PAD + self._BOUNCE_PX)
+            circle = QRect(center_x - diameter // 2, circle_y, diameter, diameter)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(accent)
+            painter.drawEllipse(circle)
+            glyph_font = self.font()
+            glyph_font.setBold(True)
+            glyph_font.setPixelSize(11)
+            painter.setFont(glyph_font)
+            painter.setPen(QColor("#06231C"))
+            painter.drawText(circle, Qt.AlignCenter, "!")
         finally:
             painter.end()
 
@@ -6478,6 +6607,9 @@ class MainWindow(QMainWindow):
         self.actions = SystemActions(open_settings_callback=self.show_settings_page)
         self.actions = SystemActions(open_settings_callback=self.show_settings_page)
         self._settings_nav_buttons: list[SettingsNavButton] = []
+        # Version the user has been told about but hasn't installed.
+        # Drives the Updates nav pip + the off-screen scroll arrow.
+        self._pending_update_version: str = ""
         self._camera_combo_lookup: dict[int, int] = {}
         self._microphone_combo_lookup: dict[str, int] = {}
         self._save_location_inputs: dict[str, QLineEdit] = {}
@@ -6661,6 +6793,17 @@ class MainWindow(QMainWindow):
             pass
 
     def _kick_off_update_check(self) -> None:
+        # Source-run QA: show a synthetic update prompt so the dialog,
+        # Settings "!" pip, and off-screen arrow can be exercised with
+        # a plain `python run_app.py`. Frozen/installed builds NEVER
+        # take this path — they keep the real GitHub / Store check.
+        # Opt out of the fake prompt with TOUCHLESS_SIMULATE_UPDATE=0.
+        if not getattr(sys, "frozen", False):
+            import os as _os
+            simulated = str(_os.environ.get("TOUCHLESS_SIMULATE_UPDATE", "1") or "1").strip()
+            if simulated.lower() not in ("0", "false", "off", "no"):
+                self._start_simulated_update_check(simulated)
+                return
         # Store builds delegate updates to the Microsoft Store — never
         # poll GitHub. Only 'website' (direct-download) builds run the
         # in-app GitHub auto-updater. build_channel() defaults to
@@ -6689,6 +6832,70 @@ class MainWindow(QMainWindow):
         self._update_checker.update_available.connect(self._on_update_available)
         self._update_checker.start()
 
+    @staticmethod
+    def _next_simulated_version(current: str) -> str:
+        """Bump the last numeric component of `current` so the fake
+        release reads like a plausible next version rather than an
+        obviously-bogus one ("1.1.9.1" -> "1.1.9.2")."""
+        parts = str(current or "").split(".")
+        for index in range(len(parts) - 1, -1, -1):
+            if parts[index].isdigit():
+                parts[index] = str(int(parts[index]) + 1)
+                return ".".join(parts)
+        return "9.9.9"
+
+    def _start_simulated_update_check(self, raw: str) -> None:
+        """Feed a synthetic ReleaseInfo through the real prompt path.
+
+        Everything downstream (dialog construction, tray balloon,
+        z-order handling, dismissal wiring, badge) is the production
+        code path — only the release metadata is fabricated, so this
+        exercises the flow rather than a parallel imitation of it.
+        """
+        try:
+            from ..updater.release_checker import ReleaseInfo
+            from ... import __version__ as _running
+        except Exception:
+            return
+        explicit = raw.lower() not in ("1", "true", "on", "yes")
+        version = raw if explicit else self._next_simulated_version(_running)
+        self._simulated_update_active = True
+        info = ReleaseInfo(
+            version=version,
+            body=(
+                "**Simulated update — nothing will be downloaded.**\n\n"
+                "Used to verify the update prompt, the green \"!\" badge on the "
+                "Updates row in Settings, and the bouncing arrow that appears "
+                "when that row is scrolled out of view.\n\n"
+                "- Close with the X (or Esc) and the prompt returns next launch.\n"
+                "- Click Later and it stays quiet, but the badge remains.\n"
+                "- Click Download Update and the badge clears."
+            ),
+            download_url="",
+            html_url="https://github.com/markovk-tini/Touchless/releases",
+            size_bytes=142_262_058,
+            update_kind="app-zip",
+        )
+        try:
+            self._on_update_available(info)
+        except Exception:
+            pass
+
+    def _on_simulated_download_requested(self) -> None:
+        """Stand-in for the Updater on a simulated run: report success
+        and close, so the badge-clearing path can be observed."""
+        dialog = getattr(self, "_update_dialog", None)
+        if dialog is None:
+            return
+        try:
+            dialog.set_progress(100, "Simulated update complete — badge cleared.")
+        except Exception:
+            pass
+        try:
+            QTimer.singleShot(1200, dialog.close)
+        except Exception:
+            pass
+
     def _on_update_available(self, info) -> None:
         # Skip-this-version: if the user clicked Later on this same
         # release (or one strictly newer that they later dismissed),
@@ -6700,6 +6907,15 @@ class MainWindow(QMainWindow):
         # auto-prompts work too (their earlier Later was effectively
         # withdrawn).
         manual = bool(getattr(self, "_in_manual_update_check", False))
+        simulated = bool(getattr(self, "_simulated_update_active", False))
+        # Record the pending update BEFORE any early return below. A
+        # previously-Later'd version still short-circuits the popup,
+        # and the Settings badge is the only cue those users get — so
+        # it has to be set even on the path that never shows a dialog.
+        try:
+            self._mark_update_pending(getattr(info, "version", "") or "")
+        except Exception:
+            pass
         try:
             # Hardening: use the SAME PEP 440 comparator the release
             # checker used to decide whether to fire. The legacy
@@ -6713,10 +6929,10 @@ class MainWindow(QMainWindow):
             # only when both strings are non-PEP 440.
             from ..updater.release_checker import _is_newer
             dismissed = str(getattr(self.config, "last_dismissed_update_version", "") or "").strip()
-            if dismissed and not manual:
+            if dismissed and not manual and not simulated:
                 if not _is_newer(info.version, dismissed):
                     return
-            if manual and dismissed:
+            if (manual or simulated) and dismissed:
                 # Withdraw the dismissal so the auto-check path also
                 # surfaces this version next launch, in case the
                 # download fails midway and they want a retry prompt.
@@ -6783,6 +6999,12 @@ class MainWindow(QMainWindow):
             self._update_dialog.dismissed.connect(
                 lambda v=info.version: self._on_update_dismissed(v)
             )
+            # Badge intentionally NOT cleared here: this path only hands
+            # off to the Store listing, so the update isn't installed
+            # yet and the cue should survive until it is.
+            self._update_dialog.deferred.connect(
+                lambda v=info.version: self._on_update_deferred(v)
+            )
             self._update_dialog.show()
             self._update_dialog.raise_()
             self._update_dialog.activateWindow()
@@ -6805,6 +7027,9 @@ class MainWindow(QMainWindow):
             bool(getattr(self.config, "auto_update_enabled", False))
             and getattr(info, "update_kind", "") == "app-zip"
             and not manual
+            # A simulated update has nothing to download, and the whole
+            # point of it is to look at the dialog.
+            and not bool(getattr(self, "_simulated_update_active", False))
         )
         if auto:
             # Rate-limiter: if the same version was auto-attempted on a
@@ -6863,9 +7088,23 @@ class MainWindow(QMainWindow):
             self._update_dialog = UpdateDialog(info, parent=self)
         except Exception:
             return
-        self._update_dialog.download_requested.connect(self._updater.start_download)
+        if bool(getattr(self, "_simulated_update_active", False)):
+            # Simulated run: never hand a fake URL to the Updater (it
+            # would fail the download and show an error instead of the
+            # badge-clearing behavior we're trying to verify).
+            self._update_dialog.download_requested.connect(
+                lambda *_a: self._on_simulated_download_requested()
+            )
+        else:
+            self._update_dialog.download_requested.connect(self._updater.start_download)
         self._update_dialog.dismissed.connect(
             lambda v=info.version: self._on_update_dismissed(v)
+        )
+        self._update_dialog.deferred.connect(
+            lambda v=info.version: self._on_update_deferred(v)
+        )
+        self._update_dialog.download_requested.connect(
+            lambda *_a: self._clear_update_pending()
         )
         self._updater.progress.connect(
             lambda pct, msg: self._update_dialog.set_progress(pct, msg)
@@ -6967,10 +7206,123 @@ class MainWindow(QMainWindow):
     def _on_update_dismissed(self, version: str) -> None:
         """User clicked Later. Persist the dismissed version so the
         next launch doesn't re-prompt for the same release. A newer
-        release will still trigger the dialog."""
+        release will still trigger the dialog.
+
+        The Settings badge deliberately SURVIVES this: "stop popping up
+        at me" is not "I don't want the update", so the quiet cue in
+        Settings stays until the update is actually installed.
+
+        Simulated source-run prompts do not persist — writing 1.1.9.2
+        during QA would suppress the real 1.1.9.2 prompt later."""
+        if not bool(getattr(self, "_simulated_update_active", False)):
+            try:
+                self.config.last_dismissed_update_version = str(version or "")
+                save_config(self.config)
+            except Exception:
+                pass
+        self._mark_update_pending(version)
+
+    def _on_update_deferred(self, version: str) -> None:
+        """User closed the prompt with the X or Esc without choosing.
+
+        Unlike Later this does NOT persist a dismissal, so the prompt
+        returns on the next launch until the update is installed. The
+        Settings badge is set either way."""
+        self._mark_update_pending(version)
+
+    # ------------------------------------------------------------------
+    # Pending-update cue (nav badge + off-screen arrow)
+    # ------------------------------------------------------------------
+
+    def _mark_update_pending(self, version: str) -> None:
+        """Record that `version` is available but not installed."""
+        self._pending_update_version = str(version or "")
+        self._refresh_update_badges()
+
+    def _clear_update_pending(self) -> None:
+        """Called once the user commits to downloading. The badge's job
+        is done at that point — the dialog itself now shows progress,
+        and after the relaunch the checker finds nothing newer."""
+        self._pending_update_version = ""
+        self._refresh_update_badges()
+
+    def _is_nav_button_in_view(self, button) -> bool:
+        """True when most of `button` is inside the nav scroll viewport.
+
+        A 1-pixel sliver at the bottom of a shrunken window does not
+        count: the pip on that sliver is unreadable, so the bounce cue
+        should still show. Compared in GLOBAL coordinates because
+        mapTo() across a QScrollArea does not reconcile the viewport's
+        scroll offset (same trap as _WalkthroughTargetGlow)."""
+        scroll = getattr(self, "_settings_nav_scroll", None)
+        if scroll is None or button is None:
+            return True
         try:
-            self.config.last_dismissed_update_version = str(version or "")
-            save_config(self.config)
+            viewport = scroll.viewport()
+            button_rect = QRect(button.mapToGlobal(QPoint(0, 0)), button.size())
+            viewport_rect = QRect(viewport.mapToGlobal(QPoint(0, 0)), viewport.size())
+            overlap = viewport_rect.intersected(button_rect)
+            if overlap.isEmpty():
+                return False
+            return overlap.height() >= max(16, button_rect.height() // 2)
+        except Exception:
+            return True
+
+    def _position_update_nav_hint(self) -> None:
+        """Park the arrow at the bottom-right of the nav viewport,
+        aligned with the pip on the Updates row, fully on-screen."""
+        hint = getattr(self, "_update_nav_hint", None)
+        scroll = getattr(self, "_settings_nav_scroll", None)
+        if hint is None or scroll is None:
+            return
+        try:
+            viewport = scroll.viewport()
+            vw = max(0, viewport.width())
+            vh = max(0, viewport.height())
+            hw = hint.width()
+            hh = hint.height()
+            if vw <= 0 or vh <= 0:
+                return
+            # Match SettingsNavButton's pip: circle sits
+            # `right - 10 - diameter` with diameter 16, so its center
+            # is 18 px in from the button's right edge.
+            x = vw - hw - 4
+            button = getattr(self, "_updates_nav_button", None)
+            if button is not None:
+                try:
+                    pip_center_in_button = button.width() - 10 - 8
+                    pip_global = button.mapToGlobal(QPoint(pip_center_in_button, 0))
+                    pip_local = viewport.mapFromGlobal(pip_global)
+                    x = pip_local.x() - hw // 2
+                except Exception:
+                    pass
+            y = vh - hh - 2
+            # Clamp so a shrink can't place any of the widget outside
+            # the viewport — that's what made the cue vanish.
+            x = max(0, min(x, max(0, vw - hw)))
+            y = max(0, min(y, max(0, vh - hh)))
+            hint.move(x, y)
+            hint.raise_()
+        except Exception:
+            pass
+
+    def _refresh_update_badges(self) -> None:
+        """Sync the nav pip + off-screen arrow to the pending state."""
+        pending = bool(getattr(self, "_pending_update_version", ""))
+        button = getattr(self, "_updates_nav_button", None)
+        if button is not None:
+            try:
+                button.set_update_badge(pending)
+            except Exception:
+                pass
+        hint = getattr(self, "_update_nav_hint", None)
+        if hint is None:
+            return
+        show_arrow = pending and not self._is_nav_button_in_view(button)
+        try:
+            if show_arrow:
+                self._position_update_nav_hint()
+            hint.set_active(show_arrow)
         except Exception:
             pass
 
@@ -7669,6 +8021,25 @@ class MainWindow(QMainWindow):
             nav_scroll.verticalScrollBar().valueChanged.connect(
                 lambda _v: self._update_walkthrough_glow_position()
             )
+        except Exception:
+            pass
+        # Pending-update cue. The nav button keeps the "!" pip; this
+        # floating arrow only appears while that button is scrolled out
+        # of the viewport, so it has to re-evaluate on every scroll.
+        self._updates_nav_button = updates_button
+        # Parent to the nav viewport so the cue lives in the same
+        # coordinate space it is parked in, and so a window shrink
+        # clips it to the sidebar instead of leaving it stranded
+        # below the settings page.
+        self._update_nav_hint = _UpdateNavHintArrow(nav_scroll.viewport())
+        try:
+            nav_scroll.verticalScrollBar().valueChanged.connect(
+                lambda _v: self._refresh_update_badges()
+            )
+        except Exception:
+            pass
+        try:
+            nav_scroll.viewport().installEventFilter(self)
         except Exception:
             pass
 
@@ -17363,6 +17734,14 @@ Admin elevation
             except Exception:
                 pass
         self.show_settings_section(section_index)
+        # Re-evaluate the pending-update cue once layout has settled.
+        # Done on the next tick because the arrow's position depends on
+        # the nav viewport geometry, which isn't final until Qt has
+        # laid the page out after the stack switch.
+        try:
+            QTimer.singleShot(0, self._refresh_update_badges)
+        except Exception:
+            pass
 
     def show_home_page(self) -> None:
         # Clear any active settings search so re-entering Settings
@@ -34000,6 +34379,17 @@ Admin elevation
                 QEvent.EnabledChange,
             ):
                 QTimer.singleShot(0, lambda b=obj: self._sync_button_visual_state(b))
+        # Pending-update bounce cue: the nav viewport shrinks when the
+        # user resizes the window, and the Updates row can slide out of
+        # view without a scroll event. Re-evaluate + re-clamp so the
+        # cue stays on screen.
+        if event.type() in (QEvent.Resize, QEvent.Show):
+            nav = getattr(self, "_settings_nav_scroll", None)
+            if nav is not None and obj is nav.viewport():
+                try:
+                    self._refresh_update_badges()
+                except Exception:
+                    pass
         return super().eventFilter(obj, event)
 
     def nativeEvent(self, event_type, message):  # noqa: N802
@@ -34050,6 +34440,13 @@ Admin elevation
         toast = getattr(self, "_update_toast_pill", None)
         if toast is not None and toast.isVisible():
             self._position_update_toast()
+        # Layout of the settings nav isn't final until after this
+        # event, so re-anchor the bounce cue on the next tick.
+        if getattr(self, "_pending_update_version", ""):
+            try:
+                QTimer.singleShot(0, self._refresh_update_badges)
+            except Exception:
+                pass
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt API name)
         """Hook the first VISIBLE show to schedule one-time post-
@@ -35665,6 +36062,17 @@ def _stop_screen_recording(self) -> bool:
                 QEvent.EnabledChange,
             ):
                 QTimer.singleShot(0, lambda b=obj: self._sync_button_visual_state(b))
+        # Pending-update bounce cue: the nav viewport shrinks when the
+        # user resizes the window, and the Updates row can slide out of
+        # view without a scroll event. Re-evaluate + re-clamp so the
+        # cue stays on screen.
+        if event.type() in (QEvent.Resize, QEvent.Show):
+            nav = getattr(self, "_settings_nav_scroll", None)
+            if nav is not None and obj is nav.viewport():
+                try:
+                    self._refresh_update_badges()
+                except Exception:
+                    pass
         return super().eventFilter(obj, event)
 
     def nativeEvent(self, event_type, message):  # noqa: N802
@@ -35711,6 +36119,15 @@ def _stop_screen_recording(self) -> bool:
         super().resizeEvent(event)
         self._update_home_status_card_width()
         self._reposition_walkthrough_edge_glow()
+        # Settings nav layout isn't final until after this event, so
+        # re-anchor the bounce cue on the next tick. Without this the
+        # cue stays at its old Y and gets clipped off when the window
+        # shrinks.
+        if getattr(self, "_pending_update_version", ""):
+            try:
+                QTimer.singleShot(0, self._refresh_update_badges)
+            except Exception:
+                pass
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         """Modern Qt edge-drag resize via QWindow.startSystemResize.

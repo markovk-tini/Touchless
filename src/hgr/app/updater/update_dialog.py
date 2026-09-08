@@ -38,12 +38,23 @@ from ..ui.window_chrome import apply_touchless_chrome, install_indigo_chrome
 class UpdateDialog(QDialog):
     """Modal-ish update prompt. Emits one of:
        - download_requested(ReleaseInfo): user clicked Download
-       - dismissed(): user clicked Later or closed the dialog
+       - dismissed(): user clicked Later — an explicit "stop asking
+         me about this version"
+       - deferred(): user closed the dialog with the title-bar X or
+         Esc without choosing anything
     The Updater listens for download_requested and drives the rest.
+
+    Why Later and X are two different signals: closing a window is not
+    an answer. Users reach for the X to get the prompt off screen right
+    now, so treating it as Later meant the update went quiet forever and
+    the only surviving cue was the Updates settings panel they had no
+    reason to open. Later suppresses re-prompting for this version; X
+    and Esc re-prompt on the next launch until the update is installed.
     """
 
     download_requested = Signal(object)   # ReleaseInfo
     dismissed = Signal()
+    deferred = Signal()
 
     def __init__(self, info: ReleaseInfo, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -132,6 +143,12 @@ class UpdateDialog(QDialog):
             "  border-radius: 5px;"
             "}"
         )
+        # How the user answered the prompt: "none" until they act, then
+        # "download" / "later" / "deferred". Guards the dismissal
+        # signals so a single close can't emit twice — the chrome X
+        # calls close() and Qt turns that into a reject(), so both
+        # closeEvent() and reject() run for one user action.
+        self._resolution = "none"
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -273,6 +290,7 @@ class UpdateDialog(QDialog):
         # Switch to "downloading" state — disable the buttons (so the
         # user doesn't double-tap), reveal the progress bar, emit
         # the signal that the Updater listens for.
+        self._resolution = "download"
         self.download_button.setEnabled(False)
         self.later_button.setEnabled(False)
         self.toggle_button.setEnabled(False)
@@ -282,13 +300,33 @@ class UpdateDialog(QDialog):
         self.download_requested.emit(self._info)
 
     def _on_later_clicked(self) -> None:
+        self._resolution = "later"
         self.dismissed.emit()
         self.reject()
 
+    def _emit_deferred_once(self) -> None:
+        """Fire deferred() for an unresolved close, at most once.
+
+        Skipped mid-download: the download disables the buttons, and
+        closing the window then must not look like the user declined
+        an update that is already being applied.
+        """
+        if self._resolution != "none":
+            return
+        if not self.download_button.isEnabled():
+            return
+        self._resolution = "deferred"
+        self.deferred.emit()
+
+    def reject(self) -> None:
+        # Esc routes here directly, and the chrome X arrives via
+        # close() -> closeEvent -> Qt's own reject(). _emit_deferred_once
+        # makes the duplicate harmless.
+        self._emit_deferred_once()
+        super().reject()
+
     def closeEvent(self, event) -> None:  # noqa: N802 — Qt API name
-        # Treat window-X same as Later only when we're not mid-download.
-        if self.download_button.isEnabled():
-            self.dismissed.emit()
+        self._emit_deferred_once()
         super().closeEvent(event)
 
     def showEvent(self, event) -> None:  # noqa: N802 — Qt API name

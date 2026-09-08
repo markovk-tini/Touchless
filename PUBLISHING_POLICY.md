@@ -36,6 +36,14 @@ are a physical walk-through per release. Both are stop-ship.
       frameless z-order bug) and `TouchlessTrayIcon.showMessage`
       (the tray-balloon fallback was previously a no-op because the
       wrapper had no such method).
+- [ ] `tests/test_update_dismiss_and_badge.py` must pass. It pins the
+      dismiss split: Later emits `dismissed` (suppresses this version),
+      the title-bar X and Esc emit `deferred` (re-prompts next launch),
+      and closing mid-download emits neither. Reason: through 1.1.9.1
+      the X emitted `dismissed`, so a user clearing the prompt off
+      their screen silently suppressed the update forever — the only
+      surviving cue was a Settings panel they had no reason to open.
+      The same file pins the green "!" nav pip actually rendering.
 - [ ] Version comparison test: `_is_newer("1.1.9", "1.1.9rc1")` returns
       True; `_is_newer("1.1.8.1", "1.1.8")` returns True. These pin the
       PEP 440 semantics we depend on.
