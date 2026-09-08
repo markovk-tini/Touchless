@@ -7194,6 +7194,13 @@ class MainWindow(QMainWindow):
             pass
 
     def _kick_off_update_check(self) -> None:
+        # macOS source runs: skip the Windows QA fake-update popup AND
+        # the auto GitHub prompt. The port is still tested via
+        # `./run_mac.sh`; a synthetic "new version" dialog is noise.
+        # Frozen Mac builds keep the real checker. Manual
+        # Settings → Check for Updates still works on both.
+        if sys.platform == "darwin" and not getattr(sys, "frozen", False):
+            return
         # Source-run QA: show a synthetic update prompt so the dialog,
         # Settings "!" pip, and off-screen arrow can be exercised with
         # a plain `python run_app.py`. Frozen/installed builds NEVER
@@ -11116,6 +11123,11 @@ class MainWindow(QMainWindow):
                         viewer.set_lite_mode_active(bool(self.config.lite_mode))
                     except Exception:
                         pass
+        if "mac_performance_boost" in applied_keys:
+            try:
+                QTimer.singleShot(0, self._apply_mac_performance_boost_to_worker)
+            except Exception:
+                pass
         if "gpu_mode" in applied_keys:
             button = getattr(self, "gpu_mode_button", None)
             if button is not None:
@@ -11574,21 +11586,23 @@ class MainWindow(QMainWindow):
         audio_header.setStyleSheet(text_qss + " QLabel { font-weight: 600; padding-top: 8px; }")
         body.addWidget(audio_header)
 
-        # ---- System audio (Python WASAPI loopback bridge) ----
+        # ---- System audio: WASAPI loopback on Windows, ScreenCaptureKit on Mac ----
         sys_current = bool(getattr(self.config, "clip_capture_system_audio", False))
         sys_row = QHBoxLayout()
         sys_row.setSpacing(10)
         sys_checkbox = QCheckBox("Record system audio (game, music, app sounds)")
         sys_checkbox.setStyleSheet(checkbox_qss)
-        sys_checkbox.setToolTip("Capture Windows loopback — no driver needed.")
+        if sys.platform == "darwin":
+            sys_checkbox.setToolTip(
+                "Captures what your speakers play. Uses Screen Recording — "
+                "no virtual audio driver to install."
+            )
+        else:
+            sys_checkbox.setToolTip("Capture Windows loopback — no driver needed.")
         sys_checkbox.setChecked(sys_current)
         self._register_general_baseline("clip_capture_system_audio", sys_current)
 
         def _on_sys_toggled(state: int) -> None:
-            # DEFERRED-SAVE: route through _on_general_control_changed
-            # so the floating Save Changes button lights up. Save +
-            # cache restart happens when the user clicks the button
-            # (handled in _apply_general_runtime_changes).
             self._on_general_control_changed("clip_capture_system_audio", bool(state))
 
         sys_checkbox.stateChanged.connect(_on_sys_toggled)
@@ -11597,77 +11611,91 @@ class MainWindow(QMainWindow):
         body.addLayout(sys_row)
         self._general_controls["clip_capture_system_audio"] = sys_checkbox
 
-        # ---- Sub-toggle: follow Windows master-volume slider ----
-        # Indented under the sys-audio checkbox because it only
-        # applies while sys-audio capture is on. Wired through the
-        # same deferred-save flow (_on_general_control_changed ->
-        # _apply_general_runtime_changes -> cache restart) so the
-        # floating Save Changes button lights up on toggle and the
-        # running cache picks up the new value on Save.
-        follow_current = bool(getattr(
-            self.config, "clip_audio_follows_master_volume", False
-        ))
-        follow_row = QHBoxLayout()
-        follow_row.setSpacing(10)
-        follow_row.setContentsMargins(22, 0, 0, 0)  # indent under parent
-        follow_checkbox = QCheckBox(
-            "Match clip volume to my Windows volume slider"
-        )
-        follow_checkbox.setStyleSheet(checkbox_qss)
-        follow_checkbox.setToolTip(
-            "On: clip audio follows your Windows volume slider. "
-            "Off: clip captures at full volume regardless."
-        )
-        follow_checkbox.setChecked(follow_current)
-        follow_checkbox.setEnabled(sys_current)
-        self._register_general_baseline(
-            "clip_audio_follows_master_volume", follow_current
-        )
-
-        def _on_follow_toggled(state: int) -> None:
-            # DEFERRED-SAVE: see _on_sys_toggled above.
-            self._on_general_control_changed(
-                "clip_audio_follows_master_volume", bool(state)
+        if sys.platform == "darwin":
+            mac_sys_note = QLabel(
+                "Speaker audio is captured with macOS Screen Recording "
+                "(the same permission clips already use). No BlackHole or "
+                "Loopback driver. Touchless's own sounds are left out."
+            )
+            mac_sys_note.setWordWrap(True)
+            mac_sys_note.setObjectName("cameraNote")
+            mac_sys_note.setStyleSheet(
+                text_qss + " QLabel { color: rgba(229, 246, 255, 0.72); "
+                "font-size: 12px; padding-left: 0px; }"
+            )
+            body.addWidget(mac_sys_note)
+        else:
+            # ---- Sub-toggle: follow Windows master-volume slider ----
+            # Indented under the sys-audio checkbox because it only
+            # applies while sys-audio capture is on. Wired through the
+            # same deferred-save flow (_on_general_control_changed ->
+            # _apply_general_runtime_changes -> cache restart) so the
+            # floating Save Changes button lights up on toggle and the
+            # running cache picks up the new value on Save.
+            follow_current = bool(getattr(
+                self.config, "clip_audio_follows_master_volume", False
+            ))
+            follow_row = QHBoxLayout()
+            follow_row.setSpacing(10)
+            follow_row.setContentsMargins(22, 0, 0, 0)  # indent under parent
+            follow_checkbox = QCheckBox(
+                "Match clip volume to my Windows volume slider"
+            )
+            follow_checkbox.setStyleSheet(checkbox_qss)
+            follow_checkbox.setToolTip(
+                "On: clip audio follows your Windows volume slider. "
+                "Off: clip captures at full volume regardless."
+            )
+            follow_checkbox.setChecked(follow_current)
+            follow_checkbox.setEnabled(sys_current)
+            self._register_general_baseline(
+                "clip_audio_follows_master_volume", follow_current
             )
 
-        follow_checkbox.stateChanged.connect(_on_follow_toggled)
-        # Keep the sub-toggle enabled state in sync with the parent
-        # sys-audio checkbox -- while sys-audio is off, the follow
-        # option has nothing to modulate.
-        sys_checkbox.stateChanged.connect(
-            lambda _s, cb=follow_checkbox: cb.setEnabled(bool(_s))
-        )
-        follow_row.addWidget(follow_checkbox)
-        follow_row.addStretch(1)
-        body.addLayout(follow_row)
-        self._general_controls["clip_audio_follows_master_volume"] = follow_checkbox
-
-        # Inline status line under the system-audio checkbox.
-        sys_status_label = QLabel("")
-        sys_status_label.setStyleSheet(
-            "color: #d97777; font-size: 11px; padding-left: 22px;"
-        )
-        sys_status_label.setWordWrap(True)
-        sys_status_label.hide()
-        body.addWidget(sys_status_label)
-
-        def _refresh_sys_status() -> None:
-            try:
-                fmt = self._probe_wasapi_loopback_format(force_refresh=True)
-            except Exception:
-                fmt = None
-            if sys_checkbox.isChecked() and fmt is None:
-                sys_status_label.setText(
-                    "⚠ No system-audio device detected — clips will be "
-                    "silent for system audio. Check that a playback "
-                    "device is set as default in Windows Sound settings."
+            def _on_follow_toggled(state: int) -> None:
+                # DEFERRED-SAVE: see _on_sys_toggled above.
+                self._on_general_control_changed(
+                    "clip_audio_follows_master_volume", bool(state)
                 )
-                sys_status_label.show()
-            else:
-                sys_status_label.hide()
 
-        sys_checkbox.stateChanged.connect(lambda _s: _refresh_sys_status())
-        _refresh_sys_status()
+            follow_checkbox.stateChanged.connect(_on_follow_toggled)
+            # Keep the sub-toggle enabled state in sync with the parent
+            # sys-audio checkbox -- while sys-audio is off, the follow
+            # option has nothing to modulate.
+            sys_checkbox.stateChanged.connect(
+                lambda _s, cb=follow_checkbox: cb.setEnabled(bool(_s))
+            )
+            follow_row.addWidget(follow_checkbox)
+            follow_row.addStretch(1)
+            body.addLayout(follow_row)
+            self._general_controls["clip_audio_follows_master_volume"] = follow_checkbox
+
+            # Inline status line under the system-audio checkbox.
+            sys_status_label = QLabel("")
+            sys_status_label.setStyleSheet(
+                "color: #d97777; font-size: 11px; padding-left: 22px;"
+            )
+            sys_status_label.setWordWrap(True)
+            sys_status_label.hide()
+            body.addWidget(sys_status_label)
+
+            def _refresh_sys_status() -> None:
+                try:
+                    fmt = self._probe_wasapi_loopback_format(force_refresh=True)
+                except Exception:
+                    fmt = None
+                if sys_checkbox.isChecked() and fmt is None:
+                    sys_status_label.setText(
+                        "⚠ No system-audio device detected — clips will be "
+                        "silent for system audio. Check that a playback "
+                        "device is set as default in Windows Sound settings."
+                    )
+                    sys_status_label.show()
+                else:
+                    sys_status_label.hide()
+
+            sys_checkbox.stateChanged.connect(lambda _s: _refresh_sys_status())
+            _refresh_sys_status()
 
         # ---- Microphone ----
         mic_current = bool(getattr(self.config, "clip_capture_microphone", False))
@@ -11675,7 +11703,11 @@ class MainWindow(QMainWindow):
         mic_row.setSpacing(10)
         mic_checkbox = QCheckBox("Record microphone (your voice / commentary)")
         mic_checkbox.setStyleSheet(checkbox_qss)
-        mic_checkbox.setToolTip("Include your mic; mixed with system audio.")
+        mic_checkbox.setToolTip(
+            "Include your microphone in clips and recordings."
+            if sys.platform == "darwin"
+            else "Include your mic; mixed with system audio."
+        )
         mic_checkbox.setChecked(mic_current)
         self._register_general_baseline("clip_capture_microphone", mic_current)
 
@@ -12099,11 +12131,56 @@ class MainWindow(QMainWindow):
         body.addLayout(lite_row)
         self._general_controls["lite_mode"] = lite_btn
 
+        # ---- Performance Boost (macOS) ----
+        if sys.platform == "darwin":
+            body.addWidget(
+                self._build_expandable_note(
+                    "Drops capture to 640×480 and uses lighter tracking for more fps.",
+                    "Built-in Mac cameras are already at 30 fps; the bottleneck is hand tracking, not the shutter. Performance Boost uses a smaller camera frame and the lite landmark model so more frames can finish each second. The live view looks a bit less sharp. Distinct from Lite Mode (same model, keeps 720p) and GPU Mode (Apple Neural Engine).",
+                    object_name="cameraNote",
+                )
+            )
+            boost_btn = QPushButton()
+            boost_btn.setCheckable(True)
+            boost_btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            boost_btn.setStyleSheet(camera_button_style)
+            boost_initial = bool(getattr(self.config, "mac_performance_boost", False))
+            boost_btn.setChecked(boost_initial)
+            boost_btn.setText(
+                "Performance Boost: ON" if boost_initial else "Performance Boost"
+            )
+            self._register_general_baseline("mac_performance_boost", boost_initial)
+
+            def _on_mac_boost_clicked(checked: bool) -> None:
+                boost_btn.setText(
+                    "Performance Boost: ON" if checked else "Performance Boost"
+                )
+                self._on_general_control_changed("mac_performance_boost", bool(checked))
+
+            boost_btn.clicked.connect(_on_mac_boost_clicked)
+            boost_row = QHBoxLayout()
+            boost_row.addWidget(boost_btn)
+            boost_row.addStretch(1)
+            body.addLayout(boost_row)
+            self._general_controls["mac_performance_boost"] = boost_btn
+
         # ---- GPU Mode ----
+        # Windows: ONNX + DirectML. macOS: ONNX + CoreML. MediaPipe
+        # Tasks GPU stays blocked on Darwin (CVPixelBuffer abort).
+        gpu_note_title = (
+            "Uses Apple's Neural Engine / GPU for faster hand tracking when available."
+            if sys.platform == "darwin"
+            else "Uses your graphics card for faster hand tracking when available."
+        )
+        gpu_note_body = (
+            "GPU Mode on Mac runs the same ONNX hand models as Windows, through CoreML instead of DirectML. MediaPipe's own GPU path crashes on Mac, so it is not used. If CoreML cannot load the models, Touchless stays on the CPU path."
+            if sys.platform == "darwin"
+            else "If your machine can run GPU Mode, Touchless uses the graphics card to speed up hand tracking. If not, Touchless quietly falls back to the regular path so gestures keep working."
+        )
         body.addWidget(
             self._build_expandable_note(
-                "Uses your graphics card for faster hand tracking when available.",
-                "If your machine can run GPU Mode, Touchless uses the graphics card to speed up hand tracking. If not, Touchless quietly falls back to the regular path so gestures keep working.",
+                gpu_note_title,
+                gpu_note_body,
                 object_name="cameraNote",
             )
         )
@@ -12115,15 +12192,6 @@ class MainWindow(QMainWindow):
         gpu_btn.setChecked(gpu_initial)
         gpu_btn.setText("GPU Mode: ON" if gpu_initial else "GPU Mode")
         self._register_general_baseline("gpu_mode", gpu_initial)
-
-        # GPU probe hover-tooltip removed: the multi-line
-        # path_summary() text rendered as a large dark rectangle
-        # over the button on hover, which read as a UI bug. The
-        # diagnostic info still lives in the engine logs; the
-        # button's behaviour is unchanged (runtime falls back to
-        # CPU MediaPipe transparently if the GPU path isn't
-        # reachable). The expandable note above already explains
-        # what the toggle does for users who want context.
 
         def _on_gpu_clicked(checked: bool) -> None:
             gpu_btn.setText("GPU Mode: ON" if checked else "GPU Mode")
@@ -14746,6 +14814,13 @@ class MainWindow(QMainWindow):
         )
 
         _short_shutter_details = QLabel(
+            "Built-in Mac cameras already use a short shutter — this does not "
+            "raise fps on a FaceTime camera. For USB webcams it forces a ~1/60s "
+            "exposure so the camera is not stuck gathering light. Picture may "
+            "look a little darker. For more fps on a MacBook, use Performance "
+            "Boost or GPU Mode in General → System Modes. Takes effect the "
+            "next time the camera reopens."
+            if sys.platform == "darwin" else
             "Some cameras slow down in dim rooms because they hold the "
             "shutter open longer to gather light. That can make video "
             "stutter and lag behind your hand. Turn this on to keep the "
@@ -16056,6 +16131,34 @@ class MainWindow(QMainWindow):
         # ffmpeg pipeline drain to wait through. 300 ms lets the
         # first engine result land + gives the bar's fill animation
         # a chance to visibly progress before dismissing.
+        def _finish():
+            try:
+                self.processing_overlay.complete_and_hide()
+            except Exception:
+                try:
+                    self.processing_overlay.hide_processing()
+                except Exception:
+                    pass
+        try:
+            QTimer.singleShot(300, _finish)
+        except Exception:
+            _finish()
+
+    def _apply_mac_performance_boost_to_worker(self) -> None:
+        worker = getattr(self, "_worker", None)
+        if worker is None or not hasattr(worker, "set_mac_performance_boost"):
+            return
+        on = bool(getattr(self.config, "mac_performance_boost", False))
+        label = "Loading Performance Boost" if on else "Restoring Default Mode"
+        try:
+            self.processing_overlay.show_processing(label)
+        except Exception:
+            pass
+        try:
+            worker.set_mac_performance_boost(on)
+        except Exception:
+            pass
+
         def _finish():
             try:
                 self.processing_overlay.complete_and_hide()
@@ -22300,20 +22403,20 @@ Admin elevation
         later launches — afterwards it's reachable from Settings ▸ General ▸
         Permissions. Skips entirely (and latches) when everything the app can
         verify is already granted, so a returning user with all grants in
-        place never sees it. In dev (source run) it always shows so the flow
-        is easy to iterate on, mirroring _maybe_show_privacy_prompt.
+        place never sees it. Source and frozen builds share that latch.
+        Iterate the flow with HGR_MAC_PERMS_ALWAYS_SHOW=1.
         """
         if sys.platform != "darwin":
             return
-        is_frozen = bool(getattr(sys, "frozen", False))
-        if is_frozen and bool(getattr(self.config, "mac_permissions_wizard_shown", False)):
+        always = bool(os.environ.get("HGR_MAC_PERMS_ALWAYS_SHOW"))
+        if not always and bool(getattr(self.config, "mac_permissions_wizard_shown", False)):
             return
         try:
             from .mac_permissions_window import (
                 MacPermissionsWizard,
                 has_all_critical_permissions,
             )
-            if is_frozen and has_all_critical_permissions():
+            if not always and has_all_critical_permissions():
                 # Nothing to ask for — latch so we don't re-check every launch.
                 self.config.mac_permissions_wizard_shown = True
                 try:
@@ -27865,15 +27968,10 @@ Admin elevation
         self._clip_cache_region = None
         self._clip_cache_backend = ""
 
-    # ---- macOS clip audio (rolling mic ring + mux-on-export) -----------
-    # Windows captures clip audio via WASAPI loopback + a live ffmpeg encoder
-    # (see _start_clip_cache_audio). None of that exists on macOS: there is no
-    # zero-setup system-audio loopback, and the ffmpeg clip path is skipped in
-    # favor of the Quartz video ring. So mac clip audio is MIC-ONLY, captured
-    # with the same proven-clean 48 kHz mono sounddevice callback the voice
-    # pipeline uses, into a wall-clock-stamped ring the exporter slices to the
-    # clip's [left, right] window and muxes in. All best-effort: any failure
-    # leaves the clip video-only (exactly today's behavior).
+    # ---- macOS clip audio (mic ring + ScreenCaptureKit system mix) ------
+    # Mic: ONE shared sounddevice InputStream (never dual-open).
+    # System/speaker audio: ScreenCaptureKit tap (not a CoreAudio input,
+    # so it does not contend with the mic). Mixed at mux time.
     def _start_clip_cache_audio_macos(self) -> None:
         """Clips want the shared mic ring iff 'Record microphone' is on. The
         actual stream is SHARED with screen recording (see _sync_mac_mic_ring)
@@ -27885,6 +27983,7 @@ Admin elevation
             return
         self._mac_mic_want_clip = bool(getattr(self.config, "clip_capture_microphone", False))
         self._sync_mac_mic_ring()
+        self._sync_mac_sys_ring()
 
     def _sync_mac_mic_ring(self) -> None:
         """Start/stop the ONE shared mic stream to match demand. It runs iff a
@@ -28002,6 +28101,78 @@ Admin elevation
         # recording still needs it (see _sync_mac_mic_ring).
         self._mac_mic_want_clip = False
         self._sync_mac_mic_ring()
+        self._sync_mac_sys_ring()
+
+    def _mac_sys_tap(self):
+        tap = getattr(self, "_mac_system_audio_tap", None)
+        if tap is None:
+            from ...platform_compat.mac_system_audio import MacSystemAudioTap
+            tap = MacSystemAudioTap()
+            self._mac_system_audio_tap = tap
+        return tap
+
+    def _sync_mac_sys_ring(self) -> None:
+        """Start/stop the ScreenCaptureKit speaker tap to match demand.
+
+        Independent of the mic InputStream — SCK is not a CoreAudio capture
+        device, so it cannot dual-open-contend with the shared mic ring.
+        """
+        if sys.platform != "darwin":
+            return
+        want_cfg = bool(getattr(self.config, "clip_capture_system_audio", False))
+        clip_on = getattr(self, "_mac_clip_capturer", None) is not None
+        rec_on = bool(getattr(self, "_mac_mic_want_record", False))
+        want = want_cfg and (clip_on or rec_on)
+        tap = getattr(self, "_mac_system_audio_tap", None)
+        if not want:
+            if tap is not None and getattr(tap, "running", False):
+                try:
+                    tap.stop()
+                except Exception:
+                    pass
+            return
+        try:
+            from ...platform_compat.mac_system_audio import mac_system_audio_available
+            if not mac_system_audio_available():
+                return
+        except Exception:
+            return
+        tap = self._mac_sys_tap()
+        try:
+            tap.set_unbounded(bool(getattr(self, "_mac_clip_audio_unbounded", False)))
+        except Exception:
+            pass
+        max_s = float(getattr(self, "_clip_cache_max_seconds", 305.0) or 305.0) + 5.0
+        try:
+            tap.start(max_seconds=max_s)
+            err = getattr(tap, "last_error", "") or ""
+            if err and not getattr(tap, "running", False):
+                sys.stderr.write(f"[mac-sys-audio] tap: {err}\n")
+                sys.stderr.flush()
+        except Exception as exc:
+            try:
+                sys.stderr.write(
+                    f"[mac-sys-audio] tap start exception: {type(exc).__name__}: {exc}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+    def _extract_mac_sys_audio(self, left: float, right: float):
+        tap = getattr(self, "_mac_system_audio_tap", None)
+        if tap is None:
+            return None
+        try:
+            return tap.extract(left, right)
+        except Exception:
+            return None
+
+    def _mix_mac_clip_and_sys(self, mic, sys_a):
+        try:
+            from ...platform_compat.mac_system_audio import mix_mac_pcm
+            return mix_mac_pcm(mic, sys_a)
+        except Exception:
+            return mic if mic is not None else sys_a
 
     def _stop_mac_mic_ring(self) -> None:
         """Stop + close the shared mic stream and clear the ring."""
@@ -28114,7 +28285,9 @@ Admin elevation
             if str(video_path.suffix).lower() != ".mp4":
                 return
             fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
-            audio = self._extract_mac_clip_audio(left, right)
+            mic = self._extract_mac_clip_audio(left, right)
+            sys_a = self._extract_mac_sys_audio(left, right)
+            audio = self._mix_mac_clip_and_sys(mic, sys_a)
             # Require at least ~50 ms so a near-empty ring doesn't produce a
             # broken 0-sample track.
             if audio is None or len(audio) < int(0.05 * fs):
@@ -34606,6 +34779,7 @@ Admin elevation
         self._mac_mic_want_record = True
         self._mac_clip_audio_unbounded = True
         self._sync_mac_mic_ring()
+        self._sync_mac_sys_ring()
 
         self._screen_record_process = process
         self._mac_record_stderr_file = stderr_file
@@ -35400,6 +35574,12 @@ Admin elevation
                             audio_full = self._extract_mac_clip_audio(
                                 video_wall_start, stop_wall
                             )
+                            sys_full = self._extract_mac_sys_audio(
+                                video_wall_start, stop_wall
+                            )
+                            audio_full = self._mix_mac_clip_and_sys(
+                                audio_full, sys_full
+                            )
                     except Exception:
                         audio_full = None
                     # Release the ring: recording no longer needs it, resume
@@ -35408,6 +35588,10 @@ Admin elevation
                     self._mac_clip_audio_unbounded = False
                     try:
                         self._sync_mac_mic_ring()
+                    except Exception:
+                        pass
+                    try:
+                        self._sync_mac_sys_ring()
                     except Exception:
                         pass
                     if path is not None and video_temp is not None:

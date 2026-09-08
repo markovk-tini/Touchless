@@ -1109,22 +1109,34 @@ def build_onnx_directml_runtime() -> _HandsModuleShim | None:
         return None
 
     providers_available = list(ort.get_available_providers())
-    if "DmlExecutionProvider" not in providers_available:
-        try:
-            sys.stderr.write(
-                "[onnx_runtime] DmlExecutionProvider not present. "
-                f"Available: {providers_available}. Falling back to CPU MediaPipe.\n"
-            )
-            sys.stderr.flush()
-        except Exception:
-            pass
-        return None
-
-    # Prefer DML; fall back to CPU within the *same session* if
-    # DML can't load this particular model. (CPU within ONNX is
-    # still the GPU-port path; if onnxruntime can't even DML it,
-    # the wider runtime falls through to MediaPipe-CPU.)
-    providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+    if sys.platform == "darwin":
+        if "CoreMLExecutionProvider" not in providers_available:
+            try:
+                sys.stderr.write(
+                    "[onnx_runtime] CoreMLExecutionProvider not present. "
+                    f"Available: {providers_available}. Falling back to CPU MediaPipe.\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return None
+        providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+    else:
+        if "DmlExecutionProvider" not in providers_available:
+            try:
+                sys.stderr.write(
+                    "[onnx_runtime] DmlExecutionProvider not present. "
+                    f"Available: {providers_available}. Falling back to CPU MediaPipe.\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return None
+        # Prefer DML; fall back to CPU within the *same session* if
+        # DML can't load this particular model. (CPU within ONNX is
+        # still the GPU-port path; if onnxruntime can't even DML it,
+        # the wider runtime falls through to MediaPipe-CPU.)
+        providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
     try:
         palm_session = ort.InferenceSession(str(palm_path), providers=providers)
         lm_session = ort.InferenceSession(str(lm_path), providers=providers)

@@ -904,6 +904,7 @@ class GestureWorker(QObject):
         self._applied_lite_mode: bool | None = None
         self._applied_gpu_mode: bool | None = None
         self._applied_low_fps_mode: bool | None = None
+        self._applied_mac_performance_boost: bool | None = None
         # r54 v9: pre-flight short-shutter idempotence latch. Tracks
         # which device_name the pre-flight fired for so we don't
         # re-arm on every camera-path re-check. Cleared on ffmpeg
@@ -4142,9 +4143,13 @@ class GestureWorker(QObject):
         low_fps = bool(getattr(self.config, "low_fps_mode", False)) or self._low_fps_auto_engaged
         lite = bool(getattr(self.config, "lite_mode", False))
         gpu = bool(getattr(self.config, "gpu_mode", False))
+        mac_boost = (
+            sys.platform == "darwin"
+            and bool(getattr(self.config, "mac_performance_boost", False))
+        )
         fullscreen_suppress = bool(self._gpu_suppressed_for_fullscreen)
         stable_frames_cfg = int(getattr(self.config, "stable_frames_required", 4))
-        return (low_fps, lite, gpu, fullscreen_suppress, stable_frames_cfg)
+        return (low_fps, lite, gpu, mac_boost, fullscreen_suppress, stable_frames_cfg)
 
     def _swap_engine_safely(self) -> None:
         # C23: reentrancy guard. _build_engine_guarded pumps Qt events
@@ -4996,6 +5001,10 @@ class GestureWorker(QObject):
     def _build_engine_for_fps_mode(self) -> GestureRecognitionEngine:
         self._low_fps_active = bool(getattr(self.config, "low_fps_mode", False)) or self._low_fps_auto_engaged
         lite_active = bool(getattr(self.config, "lite_mode", False))
+        mac_boost = (
+            sys.platform == "darwin"
+            and bool(getattr(self.config, "mac_performance_boost", False))
+        )
         # GPU Mode threads through to every detector flavour. The
         # runtime loader honours it best-effort and falls back to
         # CPU MediaPipe when no GPU path is reachable, so toggling
@@ -5023,7 +5032,7 @@ class GestureWorker(QObject):
                 prefer_gpu=prefer_gpu,
             )
             stable_frames = 1
-        elif lite_active:
+        elif lite_active or mac_boost:
             # Lite Mode (v1.1.7 C23): CPU-only. The previous version
             # silently set prefer_gpu=True so Lite would use ONNX +
             # DirectML on GPU-capable hardware — but that made two
@@ -5200,6 +5209,35 @@ class GestureWorker(QObject):
         # (Default ↔ Lite share the OpenCV cap under C24), so
         # without this the driver stays on the pre-toggle fps
         # request and Lite doesn't get its 60-fps bump.
+        try:
+            self._apply_default_capture_tuning((None, self._cap))
+        except Exception:
+            pass
+
+    def set_mac_performance_boost(self, enabled: bool) -> None:
+        """Darwin-only fps lever: 640×480 capture + lite landmark model.
+
+        No-op on Windows. Distinct from Lite Mode (which keeps 720p
+        capture) and from GPU Mode (CoreML / DirectML)."""
+        enabled = bool(enabled) and sys.platform == "darwin"
+        self.config.mac_performance_boost = enabled
+        prev_applied = self._applied_mac_performance_boost
+        try:
+            sys.stderr.write(
+                f"[perf-mode] set_mac_performance_boost({enabled}) "
+                f"running={self._running} applied_was={prev_applied} "
+                f"-> applying={prev_applied != enabled}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        if not self._running:
+            return
+        if prev_applied == enabled:
+            return
+        self._applied_mac_performance_boost = enabled
+        self._swap_engine_safely()
+        self._fps = 0.0
         try:
             self._apply_default_capture_tuning((None, self._cap))
         except Exception:
@@ -6045,6 +6083,89 @@ class GestureWorker(QObject):
         except Exception:
             pass
 
+    def _apply_macos_short_shutter(self, cap) -> tuple:
+        """AVFoundation short-shutter for the Camera Boost checkbox.
+
+        Windows writes DSHOW log2 EV (AUTO=1.0, EXPOSURE=-6). Those
+        units are meaningless on AVFoundation, so the checkbox did
+        nothing on Mac. Here:
+          1. OpenCV: AUTO_EXPOSURE=0 (manual) + EXPOSURE≈1/60s.
+          2. Device-level AVCaptureDevice custom exposure (FaceTime
+             often ignores OpenCV property writes).
+        Best-effort; logs the outcome. Returns (ok_auto, ok_exp).
+        """
+        ok_auto = None
+        ok_exp = None
+        try:
+            if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                ok_auto = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
+        except Exception as exc:
+            try:
+                sys.stderr.write(
+                    f"[r49-short-shutter] mac AUTO write: {type(exc).__name__}: {exc}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+        try:
+            if hasattr(cv2, "CAP_PROP_EXPOSURE"):
+                ok_exp = cap.set(cv2.CAP_PROP_EXPOSURE, 0.016)
+        except Exception as exc:
+            try:
+                sys.stderr.write(
+                    f"[r49-short-shutter] mac EXP write: {type(exc).__name__}: {exc}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+        try:
+            from AVFoundation import (  # type: ignore
+                AVCaptureDevice,
+                AVCaptureExposureModeCustom,
+            )
+            device = AVCaptureDevice.defaultDeviceWithMediaType_("vide")
+            if device is not None:
+                locked = device.lockForConfiguration_(None)
+                if isinstance(locked, tuple):
+                    locked = locked[0]
+                if locked:
+                    try:
+                        min_dur = device.activeFormat().minExposureDuration()
+                        from CoreMedia import CMTimeMake, CMTimeCompare  # type: ignore
+
+                        want = CMTimeMake(1, 60)
+                        duration = want
+                        try:
+                            if CMTimeCompare(want, min_dur) < 0:
+                                duration = min_dur
+                        except Exception:
+                            duration = want
+                        iso = float(device.ISO())
+                        min_iso = float(device.activeFormat().minISO())
+                        max_iso = float(device.activeFormat().maxISO())
+                        iso = max(min_iso, min(max_iso, iso))
+                        device.setExposureMode_(AVCaptureExposureModeCustom)
+                        device.setExposureModeCustomWithDuration_ISO_completionHandler_(
+                            duration, iso, None
+                        )
+                        sys.stderr.write(
+                            "[r49-short-shutter] mac AVCaptureDevice custom "
+                            f"exposure 1/60 ISO={iso:.0f}\n"
+                        )
+                        sys.stderr.flush()
+                    finally:
+                        device.unlockForConfiguration()
+        except Exception as exc:
+            try:
+                sys.stderr.write(
+                    f"[r49-short-shutter] mac AVCaptureDevice: "
+                    f"{type(exc).__name__}: {exc}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+        return ok_auto, ok_exp
+
     def _apply_default_capture_tuning(self, open_result) -> None:
         """Push a 30 fps + MJPG FOURCC hint into the OpenCV cap on
         initial open when we're in default mode (no perf toggle).
@@ -6117,8 +6238,11 @@ class GestureWorker(QObject):
         # MJPG FOURCC hint. Best-effort — many Windows OpenCV builds
         # silently keep YUY2. When it lands, the driver can hit higher
         # fps at the same resolution than YUY2 bandwidth would allow.
+        # Darwin: skip — AVFoundation FaceTime cameras do not speak
+        # MJPG FOURCC the way DSHOW does; the write is a no-op or
+        # can knock the session into a worse mode.
         try:
-            if hasattr(cv2, "CAP_PROP_FOURCC"):
+            if sys.platform != "darwin" and hasattr(cv2, "CAP_PROP_FOURCC"):
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         except Exception:
             pass
@@ -6126,12 +6250,30 @@ class GestureWorker(QObject):
         # requested rate is within their advertised range for the
         # current (fmt, resolution) combo. C25: Lite gets 60 fps
         # request (matches the mode's "fps boost" intent); Default
-        # keeps 30 fps.
+        # keeps 30 fps. Darwin: built-in cameras are 30 fps max at
+        # 720p — requesting 60 can make AVFoundation pick a worse
+        # mode (Lite dropped to ~11 fps because of this).
         try:
             if hasattr(cv2, "CAP_PROP_FPS"):
                 lite_active = bool(getattr(self.config, "lite_mode", False))
-                fps_target = 60.0 if lite_active else 30.0
+                if sys.platform == "darwin":
+                    fps_target = 30.0
+                else:
+                    fps_target = 60.0 if lite_active else 30.0
                 cap.set(cv2.CAP_PROP_FPS, fps_target)
+        except Exception:
+            pass
+        # Darwin Performance Boost: 640×480 capture (default is 720p).
+        # Smaller frames mean less MediaPipe work per tick.
+        try:
+            if sys.platform == "darwin":
+                mac_boost = bool(getattr(self.config, "mac_performance_boost", False))
+                if mac_boost:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                else:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         except Exception:
             pass
         # Small buffer size so a brief stall doesn't accumulate
@@ -6374,37 +6516,40 @@ class GestureWorker(QObject):
                 pass
             ok_auto = None
             ok_exp = None
-            # r51: two independent try blocks so an AUTO failure
-            # never suppresses the load-bearing EXPOSURE write. Per
-            # our field-log analysis, EXPOSURE is what actually
-            # changes fps on Realtek + Kiyo Pro; AUTO is a no-op on
-            # both (driver rejects). Losing EXPOSURE because AUTO
-            # threw on an unknown MSMF driver would defeat the whole
-            # feature.
-            try:
-                if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
-                    ok_auto = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
-            except Exception as _e:
+            if sys.platform == "darwin":
+                ok_auto, ok_exp = self._apply_macos_short_shutter(cap)
+            else:
+                # r51: two independent try blocks so an AUTO failure
+                # never suppresses the load-bearing EXPOSURE write. Per
+                # our field-log analysis, EXPOSURE is what actually
+                # changes fps on Realtek + Kiyo Pro; AUTO is a no-op on
+                # both (driver rejects). Losing EXPOSURE because AUTO
+                # threw on an unknown MSMF driver would defeat the whole
+                # feature.
                 try:
-                    sys.stderr.write(
-                        f"[r49-short-shutter] AUTO write exception: "
-                        f"{type(_e).__name__}: {_e}\n"
-                    )
-                    sys.stderr.flush()
-                except Exception:
-                    pass
-            try:
-                if hasattr(cv2, "CAP_PROP_EXPOSURE"):
-                    ok_exp = cap.set(cv2.CAP_PROP_EXPOSURE, -6.0)
-            except Exception as _e:
+                    if hasattr(cv2, "CAP_PROP_AUTO_EXPOSURE"):
+                        ok_auto = cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0)
+                except Exception as _e:
+                    try:
+                        sys.stderr.write(
+                            f"[r49-short-shutter] AUTO write exception: "
+                            f"{type(_e).__name__}: {_e}\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
                 try:
-                    sys.stderr.write(
-                        f"[r49-short-shutter] EXP write exception: "
-                        f"{type(_e).__name__}: {_e}\n"
-                    )
-                    sys.stderr.flush()
-                except Exception:
-                    pass
+                    if hasattr(cv2, "CAP_PROP_EXPOSURE"):
+                        ok_exp = cap.set(cv2.CAP_PROP_EXPOSURE, -6.0)
+                except Exception as _e:
+                    try:
+                        sys.stderr.write(
+                            f"[r49-short-shutter] EXP write exception: "
+                            f"{type(_e).__name__}: {_e}\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
             # v1.1.7.9 display-invariance: flag the display path to lift
             # the dark short-shutter frame back to natural brightness.
             self._short_shutter_active_for_display = True

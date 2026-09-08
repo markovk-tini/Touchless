@@ -260,15 +260,18 @@ class MacPermissionsWizard(QDialog):
         # which grant unblocks what they just tried to do.
         self._highlight = highlight if highlight in _ANCHORS else None
 
-        # DEV only: on the first wizard open of a source run, revert Touchless's
-        # own TCC grants so it starts disabled and Enable fires the REAL macOS
-        # prompt. Once-per-process so reopening from Settings doesn't wipe grants
+        # DEV only: revert Touchless's own TCC grants so the wizard starts
+        # disabled and Enable fires the REAL macOS prompt. Off by default
+        # so product testing isn't wiped on every launch. Opt in with
+        # HGR_MAC_PERMS_RESET=1 (bundle-scoped) or HGR_MAC_PERMS_RESET_ALL=1
+        # (global). Once-per-process so Settings reopen doesn't wipe grants
         # made this session. Never runs in a frozen/shipped build.
         global _reverted_this_process
         if (
             not getattr(sys, "frozen", False)
             and not _reverted_this_process
             and not os.environ.get("HGR_MAC_PERMS_NO_RESET")
+            and (os.environ.get("HGR_MAC_PERMS_RESET") or os.environ.get("HGR_MAC_PERMS_RESET_ALL"))
         ):
             revert_test_permissions()
             _reverted_this_process = True
@@ -412,7 +415,8 @@ class MacPermissionsWizard(QDialog):
         footer = QHBoxLayout()
         footer.setSpacing(10)
         footer.addStretch(1)
-        # Done: greyed out until a permission actually changes (see _refresh).
+        # Done: greyed until a permission changes this session, OR until
+        # every grantable row is already on (nothing left to do).
         self._done_btn = QPushButton("Done")
         self._done_btn.setObjectName("doneBtn")
         self._done_btn.setCursor(Qt.PointingHandCursor)
@@ -621,12 +625,19 @@ class MacPermissionsWizard(QDialog):
 
         if self._relaunch_btn is not None:
             self._relaunch_btn.setVisible(any_reopen)
-        # Done stays greyed until at least one permission differs from its
-        # state when the wizard opened.
+        # Done stays greyed until the user actually changes a permission,
+        # unless every grantable row is already granted — then there is
+        # nothing left to do and dismissing must be allowed (Automation
+        # is per-app and never flips here).
         done = getattr(self, "_done_btn", None)
         if done is not None:
             changed = any(
                 _status(row["key"]) != self._opening_states.get(row["key"])
                 for row in _ROWS
             )
-            done.setEnabled(changed)
+            all_granted = all(
+                _status(row["key"]) == "granted"
+                for row in _ROWS
+                if row["key"] != "automation"
+            )
+            done.setEnabled(changed or all_granted)

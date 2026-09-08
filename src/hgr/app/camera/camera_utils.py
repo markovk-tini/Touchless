@@ -321,6 +321,10 @@ _R50_PREMIUM_CAMERA_KEYWORDS = (
     "poly studio",
     "logitech mx brio",
     "sony imx",
+    "facetime",
+    "macbook",
+    "continuity",
+    "studio display",
 )
 _R50_GENERIC_UVC_KEYWORDS = (
     "full hd 1080p webcam",

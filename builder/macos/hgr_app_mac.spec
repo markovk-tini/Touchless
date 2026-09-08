@@ -83,7 +83,9 @@ hiddenimports += [
     "objc",
     "AppKit",
     "Foundation",
-    "Quartz",
+    "ScreenCaptureKit",
+    "CoreMedia",
+    "CoreAudio",
     # Iris ambient-tools deps that ARE cross-platform (kept ready for when the
     # Iris exclude flips on macOS):
     "mcp",
@@ -100,7 +102,7 @@ for _opt in ("mcp",):
     except Exception:
         pass
 # pyobjc framework submodules so lazy `from AppKit import X` resolves frozen.
-for _fw in ("objc", "AppKit", "Foundation", "Quartz"):
+for _fw in ("objc", "AppKit", "Foundation", "Quartz", "ScreenCaptureKit", "CoreMedia"):
     try:
         hiddenimports += collect_submodules(_fw)
     except Exception:

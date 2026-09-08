@@ -50,6 +50,7 @@ class GpuProbeResult:
     tasks_gpu_delegate_present: bool   # the enum exists, not necessarily that it works
     onnxruntime_importable: bool
     onnxruntime_directml_provider: bool  # true iff "DmlExecutionProvider" is in get_available_providers()
+    onnxruntime_coreml_provider: bool = False  # true iff CoreMLExecutionProvider is listed (macOS)
     onnxruntime_providers: tuple[str, ...] = ()  # full provider list ort returned (or empty if import failed)
     directml_dll_loadable: bool | None = None    # ctypes.WinDLL('DirectML.dll') succeeded; None on non-Windows
     directml_dll_error: str = ""                  # OS error string when WinDLL failed (eg "[WinError 5] Access is denied")
@@ -75,8 +76,16 @@ class GpuProbeResult:
         )
 
     @property
+    def _ort_coreml_path_ok(self) -> bool:
+        return self.onnxruntime_importable and self.onnxruntime_coreml_provider
+
+    @property
     def has_any_gpu_path(self) -> bool:
-        return self._tasks_gpu_path_ok or self._ort_dml_path_ok
+        return (
+            self._tasks_gpu_path_ok
+            or self._ort_dml_path_ok
+            or self._ort_coreml_path_ok
+        )
 
     def path_summary(self) -> str:
         """Human-readable one-liner for the Settings tooltip."""
@@ -85,6 +94,8 @@ class GpuProbeResult:
             parts.append("MediaPipe Tasks GPU delegate")
         if self._ort_dml_path_ok:
             parts.append("ONNX Runtime + DirectML")
+        if self._ort_coreml_path_ok:
+            parts.append("ONNX Runtime + CoreML")
         if parts:
             return "GPU paths available: " + ", ".join(parts)
         return self._failure_summary()
@@ -93,6 +104,18 @@ class GpuProbeResult:
         """Describe WHY no GPU path is reachable in one actionable line.
         Branches on what the probe actually found so the user gets a
         specific hint instead of the generic 'no GPU detected'."""
+        if sys.platform == "darwin":
+            if not self.onnxruntime_importable:
+                return (
+                    "No GPU inference path detected — ONNX Runtime failed to load."
+                )
+            if not self.onnxruntime_coreml_provider:
+                providers = ", ".join(self.onnxruntime_providers) or "<none>"
+                return (
+                    "No GPU inference path detected — CoreML is missing "
+                    f"(providers: {providers})."
+                )
+            return "No GPU inference path detected on this Mac."
         # Case A: ONNX wheel didn't even import. Almost always the
         # bundle is corrupt or AV ate the pyd.
         if not self.onnxruntime_importable:
@@ -139,6 +162,7 @@ class GpuProbeResult:
             f"  tasks GPU delegate enum present : {self.tasks_gpu_delegate_present}",
             f"  onnxruntime importable          : {self.onnxruntime_importable}",
             f"  onnxruntime DML provider listed : {self.onnxruntime_directml_provider}",
+            f"  onnxruntime CoreML provider     : {self.onnxruntime_coreml_provider}",
             f"  onnxruntime providers           : {providers_txt}",
             f"  DirectML.dll loadable           : {dml_loadable_txt}",
         ]
@@ -204,6 +228,15 @@ def probe_gpu_paths() -> GpuProbeResult:
     except Exception as exc:
         errors.append(f"mediapipe.tasks: {type(exc).__name__}: {exc!s}"[:160])
 
+    # macOS: the GPU delegate enum serialises, but ConvertToGpu then
+    # CHECK-fails on the camera ImageFrame format. Never report it as
+    # a usable path.
+    if sys.platform == "darwin":
+        tasks_gpu_present = False
+        errors.append(
+            "mediapipe.tasks GPU: disabled on macOS (CVPixelBuffer abort)"
+        )
+
     # 2. ONNX Runtime + DirectML provider path: importing
     # onnxruntime is cheap; listing available providers tells us
     # whether onnxruntime-directml is installed. The Cloudflare
@@ -211,6 +244,7 @@ def probe_gpu_paths() -> GpuProbeResult:
     # tends to be False on most user machines.
     ort_importable = False
     ort_dml = False
+    ort_coreml = False
     providers: list[str] = []
     try:
         import onnxruntime as ort
@@ -222,6 +256,7 @@ def probe_gpu_paths() -> GpuProbeResult:
             errors.append(f"onnxruntime.get_available_providers: {type(exc).__name__}: {exc!s}"[:160])
             providers = []
         ort_dml = "DmlExecutionProvider" in providers
+        ort_coreml = "CoreMLExecutionProvider" in providers
     except Exception as exc:
         errors.append(f"onnxruntime import: {type(exc).__name__}: {exc!s}"[:160])
 
@@ -268,6 +303,7 @@ def probe_gpu_paths() -> GpuProbeResult:
         tasks_gpu_delegate_present=tasks_gpu_present,
         onnxruntime_importable=ort_importable,
         onnxruntime_directml_provider=ort_dml,
+        onnxruntime_coreml_provider=ort_coreml,
         onnxruntime_providers=tuple(providers),
         directml_dll_loadable=directml_loadable,
         directml_dll_error=directml_err,

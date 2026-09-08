@@ -128,22 +128,15 @@ def _try_load_gpu_runtime() -> HandRuntime | None:
     from .gpu_probe import probe_gpu_paths
 
     probe = probe_gpu_paths()
-    if not probe.has_any_gpu_path:
-        _log_once(
-            "no_gpu_path",
-            "[hand_runtime] gpu_mode requested but no GPU inference path is reachable. "
-            "Falling back to MediaPipe CPU.\n"
-            f"{probe.diagnostic()}"
-        )
-        return None
 
     # Path 1 — MediaPipe Tasks API HandLandmarker with GPU delegate.
-    # Same models as solutions.hands so accuracy is identical;
-    # speedup comes from MediaPipe's Vulkan / OpenGL ES delegate
-    # when reachable. Construction failure (delegate can't reach a
-    # GPU context, .task asset missing, etc.) → return None and
-    # let the caller fall back to CPU MediaPipe.
-    if probe.mediapipe_tasks_importable and probe.tasks_gpu_delegate_present:
+    # NEVER on Darwin: ConvertToGpu CHECK-fails on the camera
+    # ImageFrame format (unsupported format: 1) and aborts the process.
+    if (
+        sys.platform != "darwin"
+        and probe.mediapipe_tasks_importable
+        and probe.tasks_gpu_delegate_present
+    ):
         try:
             from .tasks_runtime import build_tasks_gpu_runtime
 
@@ -170,38 +163,56 @@ def _try_load_gpu_runtime() -> HandRuntime | None:
                 f"{type(exc).__name__}: {exc!s}. Falling back to MediaPipe CPU.",
             )
 
-    # Path 2 — onnxruntime + DirectML on a custom palm-detect +
-    # landmark pipeline. Real Windows GPU path. We try this AFTER
-    # Tasks-API because Tasks-API would be lower-effort if it
-    # worked, but in practice on Windows it raises
-    # NotImplementedError so we end up here for any actual GPU.
-    if probe.onnxruntime_importable and probe.onnxruntime_directml_provider:
+    # Path 2 — onnxruntime: DirectML on Windows, CoreML on macOS.
+    # Same ONNX palm + landmark models as the Windows GPU path.
+    if probe._ort_coreml_path_ok or (
+        probe.onnxruntime_importable and probe.onnxruntime_directml_provider
+    ):
         try:
             from .onnx_runtime import build_onnx_directml_runtime
 
             hands_module = build_onnx_directml_runtime()
             if hands_module is not None:
+                backend = (
+                    "onnx-coreml" if sys.platform == "darwin" else "onnx-directml"
+                )
                 _log_once(
                     "onnx_directml_selected",
-                    "[hand_runtime] gpu_mode active: ONNX Runtime + DirectML "
+                    f"[hand_runtime] gpu_mode active: ONNX Runtime + "
+                    f"{'CoreML' if sys.platform == 'darwin' else 'DirectML'} "
                     "selected. Palm detection + hand landmark inference run on "
-                    "the GPU. Accuracy matches MediaPipe CPU (same model weights "
-                    "from OpenCV Zoo).",
+                    "the accelerator. Accuracy matches MediaPipe CPU (same model "
+                    "weights from OpenCV Zoo).",
                 )
                 hand_connections = getattr(hands_module, "HAND_CONNECTIONS", None)
                 return HandRuntime(
                     hands_module=hands_module,
                     drawing_utils=None,
                     hand_connections=hand_connections,
-                    backend="onnx-directml",
+                    backend=backend,
                 )
         except Exception as exc:
             _log_once(
                 "onnx_construction_fail",
-                f"[hand_runtime] ONNX/DirectML path construction failed: "
+                f"[hand_runtime] ONNX GPU path construction failed: "
                 f"{type(exc).__name__}: {exc!s}. Falling back to MediaPipe CPU.",
             )
 
+    if not probe.has_any_gpu_path:
+        _log_once(
+            "no_gpu_path",
+            "[hand_runtime] gpu_mode requested but no GPU inference path is reachable. "
+            "Falling back to MediaPipe CPU.\n"
+            f"{probe.diagnostic()}"
+        )
+    elif sys.platform == "darwin":
+        _log_once(
+            "no_gpu_path",
+            "[hand_runtime] gpu_mode requested on macOS — MediaPipe Tasks GPU "
+            "is blocked (CVPixelBuffer abort). ONNX CoreML was not usable. "
+            "Staying on MediaPipe CPU.\n"
+            f"{probe.diagnostic()}"
+        )
     return None
 
 

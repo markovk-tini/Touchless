@@ -272,8 +272,9 @@ class UpdateNavBadgeTests(unittest.TestCase):
         )
 
         os.environ.pop("TOUCHLESS_SIMULATE_UPDATE", None)
-        with patch.object(sys, "frozen", False, create=True):
-            MainWindow._kick_off_update_check(stub)
+        with patch.object(sys, "platform", "win32"):
+            with patch.object(sys, "frozen", False, create=True):
+                MainWindow._kick_off_update_check(stub)
         self.assertEqual(called["n"], 1, "source run must simulate by default")
 
         called["n"] = 0
@@ -295,6 +296,26 @@ class UpdateNavBadgeTests(unittest.TestCase):
             called["n"], 0,
             "frozen builds must never take the simulated-update path",
         )
+
+    def test_macos_source_run_skips_simulated_update(self) -> None:
+        """`./run_mac.sh` must not show the Windows QA fake-update popup."""
+        import sys
+        from unittest.mock import patch
+        from hgr.app.ui.main_window import MainWindow
+
+        class _Stub:
+            pass
+
+        stub = _Stub()
+        called = {"n": 0}
+        stub._start_simulated_update_check = lambda _raw: called.__setitem__(
+            "n", called["n"] + 1
+        )
+        os.environ.pop("TOUCHLESS_SIMULATE_UPDATE", None)
+        with patch.object(sys, "platform", "darwin"):
+            with patch.object(sys, "frozen", False, create=True):
+                MainWindow._kick_off_update_check(stub)
+        self.assertEqual(called["n"], 0, "macOS source run must not simulate")
 
 
 if __name__ == "__main__":

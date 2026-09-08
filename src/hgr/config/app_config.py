@@ -821,6 +821,11 @@ class AppConfig:
     # to disable itself with a tooltip when no GPU path is reachable
     # so the user isn't toggling a no-op.
     gpu_mode: bool = False
+    # Darwin-only: 640×480 AVFoundation capture + lite landmark model
+    # so the Mac can push more frames. No-op on Windows (the field is
+    # ignored by the engine). Distinct from Lite Mode (720p + lite
+    # model) and GPU Mode (CoreML / DirectML).
+    mac_performance_boost: bool = False
     # YouTube auto-pause: when True, the engine pauses the currently
     # playing YouTube tab once no hand has been visible for
     # `youtube_pause_when_user_leaves_seconds` seconds. Resumes
