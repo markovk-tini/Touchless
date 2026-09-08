@@ -106,7 +106,12 @@ def _window_pcm_ring(
 def mix_mac_pcm(
     mic: Optional[np.ndarray], sys_a: Optional[np.ndarray]
 ) -> Optional[np.ndarray]:
-    """Mix mic + system rings. Either side may be None / too short."""
+    """Mix mic + system rings. Either side may be None / too short.
+
+    End-aligned: both tracks share the same right edge (the clip/record
+    stop). Start-aligning a longer system buffer put old speaker audio
+    at the front; ffmpeg -shortest then kept that early half.
+    """
     def _ok(buf) -> bool:
         return buf is not None and getattr(buf, "size", 0) >= int(0.05 * _FS)
 
@@ -120,10 +125,30 @@ def mix_mac_pcm(
         return None
     n = max(len(mic), len(sys_a))
     out = np.zeros(n, dtype=np.float32)
-    out[: len(mic)] += mic
-    out[: len(sys_a)] += sys_a
+    out[n - len(mic) :] += mic
+    out[n - len(sys_a) :] += sys_a
     np.clip(out, -1.0, 1.0, out=out)
     return out
+
+
+def _asbd_field(asbd, name: str, index: int, default):
+    try:
+        val = getattr(asbd, name, None)
+        if val is not None:
+            return val
+    except Exception:
+        pass
+    try:
+        if isinstance(asbd, (tuple, list)) and len(asbd) > index:
+            return asbd[index]
+    except Exception:
+        pass
+    try:
+        if isinstance(asbd, dict):
+            return asbd.get(name, default)
+    except Exception:
+        pass
+    return default
 
 
 def _sbuf_to_mono_f32(sbuf) -> Optional[np.ndarray]:
@@ -144,17 +169,25 @@ def _sbuf_to_mono_f32(sbuf) -> Optional[np.ndarray]:
     except Exception:
         n = 0
     channels = 2
+    bits = 32
+    flags = 1  # kAudioFormatFlagIsFloat
+    sample_rate = float(_FS)
     try:
         fmt = CMSampleBufferGetFormatDescription(sbuf)
         asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)
         if asbd is not None:
-            ch = getattr(asbd, "mChannelsPerFrame", None)
-            if ch is None and isinstance(asbd, (tuple, list)) and len(asbd) > 3:
-                ch = asbd[3]
-            if ch is not None:
-                channels = max(1, int(ch))
+            # AudioStreamBasicDescription layout:
+            # 0 mSampleRate, 1 mFormatID, 2 mFormatFlags,
+            # 3 mBytesPerPacket, 4 mFramesPerPacket, 5 mBytesPerFrame,
+            # 6 mChannelsPerFrame, 7 mBitsPerChannel
+            sample_rate = float(_asbd_field(asbd, "mSampleRate", 0, _FS) or _FS)
+            flags = int(_asbd_field(asbd, "mFormatFlags", 2, 1) or 0)
+            channels = max(1, int(_asbd_field(asbd, "mChannelsPerFrame", 6, 2) or 2))
+            bits = int(_asbd_field(asbd, "mBitsPerChannel", 7, 32) or 32)
     except Exception:
         channels = 2
+        bits = 32
+        flags = 1
     raw = None
     try:
         block = CMSampleBufferGetDataBuffer(sbuf)
@@ -183,14 +216,36 @@ def _sbuf_to_mono_f32(sbuf) -> Optional[np.ndarray]:
         raw = None
     if not raw:
         return None
-    arr = np.frombuffer(raw, dtype=np.float32)
+    is_float = bool(flags & 1) or bits == 32
+    try:
+        if is_float and bits >= 32:
+            arr = np.frombuffer(raw, dtype=np.float32)
+        elif bits == 16:
+            arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        elif bits == 32 and not is_float:
+            arr = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            arr = np.frombuffer(raw, dtype=np.float32)
+    except Exception:
+        return None
     if arr.size == 0:
         return None
     if channels > 1 and arr.size % channels == 0:
         arr = arr.reshape(-1, channels).mean(axis=1)
     elif n > 0 and arr.size >= n:
         arr = arr[:n]
-    return np.ascontiguousarray(arr, dtype=np.float32)
+    arr = np.ascontiguousarray(arr, dtype=np.float32)
+    if sample_rate > 1.0 and abs(sample_rate - float(_FS)) > 1.0:
+        try:
+            ratio = float(_FS) / float(sample_rate)
+            new_n = max(1, int(round(arr.size * ratio)))
+            x_old = np.linspace(0.0, 1.0, arr.size, endpoint=False)
+            x_new = np.linspace(0.0, 1.0, new_n, endpoint=False)
+            arr = np.interp(x_new, x_old, arr).astype(np.float32)
+        except Exception:
+            pass
+    np.clip(arr, -1.0, 1.0, out=arr)
+    return arr
 
 
 class MacSystemAudioTap:
@@ -393,7 +448,9 @@ class MacSystemAudioTap:
             pass
         if CMTimeMake is not None:
             try:
-                cfg.setMinimumFrameInterval_(CMTimeMake(1, 1))
+                # 1 fps video interval batched audio into huge chunks and
+                # made timestamps drift. 30 fps keeps the tap realtime.
+                cfg.setMinimumFrameInterval_(CMTimeMake(1, 30))
             except Exception:
                 pass
         sink = sink_cls.alloc().init()

@@ -12135,8 +12135,8 @@ class MainWindow(QMainWindow):
         if sys.platform == "darwin":
             body.addWidget(
                 self._build_expandable_note(
-                    "Drops capture to 640×480 and uses lighter tracking for more fps.",
-                    "Built-in Mac cameras are already at 30 fps; the bottleneck is hand tracking, not the shutter. Performance Boost uses a smaller camera frame and the lite landmark model so more frames can finish each second. The live view looks a bit less sharp. Distinct from Lite Mode (same model, keeps 720p) and GPU Mode (Apple Neural Engine).",
+                    "Reopens the camera at 640×480 and uses the smallest tracker — more fps than Lite.",
+                    "Lite Mode keeps 720p and only lightens hand tracking. Performance Boost also reopens the camera at 640×480 and runs an even smaller inference frame, so it should be clearly faster than Lite. The live view looks less sharp. GPU Mode uses CoreML on that same smaller camera when models are present.",
                     object_name="cameraNote",
                 )
             )
@@ -14781,7 +14781,9 @@ class MainWindow(QMainWindow):
             )
         )
         self.camera_short_shutter_checkbox.setToolTip(
-            "Boost fps on older / cheaper cameras."
+            "On Mac: reopen at 640×480 + short shutter. On Windows: short shutter for cheap webcams."
+            if sys.platform == "darwin"
+            else "Boost fps on older / cheaper cameras."
         )
         self._camera_short_shutter_baseline = bool(
             getattr(self.config, "camera_force_short_shutter", False)
@@ -14814,12 +14816,12 @@ class MainWindow(QMainWindow):
         )
 
         _short_shutter_details = QLabel(
-            "Built-in Mac cameras already use a short shutter — this does not "
-            "raise fps on a FaceTime camera. For USB webcams it forces a ~1/60s "
-            "exposure so the camera is not stuck gathering light. Picture may "
-            "look a little darker. For more fps on a MacBook, use Performance "
-            "Boost or GPU Mode in General → System Modes. Takes effect the "
-            "next time the camera reopens."
+            "On Mac this reopens the camera at 640×480, locks autofocus, and "
+            "forces a short shutter (~1/90s). That is a real fps lever on "
+            "FaceTime and USB cameras — smaller frames mean faster tracking. "
+            "The live view looks a bit less sharp and may be a little darker. "
+            "Lite Mode keeps 720p and only lightens the tracker; Performance "
+            "Boost is even smaller inference on top of 640×480."
             if sys.platform == "darwin" else
             "Some cameras slow down in dim rooms because they hold the "
             "shutter open longer to gather light. That can make video "
@@ -16168,7 +16170,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         try:
-            QTimer.singleShot(300, _finish)
+            QTimer.singleShot(800, _finish)
         except Exception:
             _finish()
 
@@ -21677,7 +21679,10 @@ Admin elevation
                 pass
             if worker is not None and worker_cap is not None:
                 try:
-                    worker._apply_default_capture_tuning((None, worker_cap))
+                    if sys.platform == "darwin" and hasattr(worker, "_reopen_macos_camera"):
+                        worker._reopen_macos_camera()
+                    else:
+                        worker._apply_default_capture_tuning((None, worker_cap))
                 except Exception as _e:
                     try:
                         sys.stderr.write(
@@ -28271,6 +28276,21 @@ Admin elevation
         out[dst0:dst1] = full[src0:src1]
         return out
 
+    def _probe_media_seconds(self, path: Path) -> float:
+        """Best-effort duration of a just-written clip. 0.0 on failure."""
+        try:
+            cap = cv2.VideoCapture(str(path))
+            try:
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            finally:
+                cap.release()
+            if fps > 1.0 and frames > 1.0:
+                return frames / fps
+        except Exception:
+            pass
+        return 0.0
+
     def _mux_mac_clip_audio(self, video_path: Path, left: float, right: float) -> None:
         """Best-effort: mux the mic-ring window [left, right] into the exported
         clip, in place. Never raises; on any failure the clip stays video-only
@@ -28292,6 +28312,30 @@ Admin elevation
             # broken 0-sample track.
             if audio is None or len(audio) < int(0.05 * fs):
                 return
+            # End-anchor to the video duration. ffmpeg -apad -shortest keeps
+            # the START of a longer wav, which is what made speaker/mic
+            # audio play one clip-length early.
+            video_dur = self._probe_media_seconds(video_path)
+            if video_dur <= 0.05:
+                video_dur = max(0.05, float(right) - float(left))
+            want = int(round(video_dur * fs))
+            if want > 0 and len(audio) > want:
+                audio = audio[-want:]
+            elif want > 0 and len(audio) < want:
+                pad = np.zeros(want, dtype=np.float32)
+                pad[-len(audio):] = audio
+                audio = pad
+            try:
+                sys.stderr.write(
+                    f"[mac-clip-audio] mux left={left:.3f} right={right:.3f} "
+                    f"span={right - left:.3f}s video_dur={video_dur:.3f}s "
+                    f"mic={0 if mic is None else len(mic)/fs:.3f}s "
+                    f"sys={0 if sys_a is None else len(sys_a)/fs:.3f}s "
+                    f"out={len(audio)/fs:.3f}s\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
             import wave
             wav_path = Path(f"{video_path}.clipaudio.wav")
             with wave.open(str(wav_path), "wb") as wf:
@@ -33445,23 +33489,33 @@ Admin elevation
             and output_path.stat().st_size > 1024
         ):
             actual_seconds = written / float(output_fps) if output_fps > 0 else 0.0
-            # macOS clip audio: mux the mic-ring window matching this clip.
-            # right_edge = the spoken/anchor moment (end_ts) or the newest
-            # selected segment's end; left_edge spans the video's real length.
-            # Best-effort — leaves the clip video-only on any hiccup.
-            if sys.platform == "darwin" and bool(
-                getattr(self.config, "clip_capture_microphone", False)
+            # macOS clip audio: mux the mic/system rings to this clip.
+            # Use the selected segments' wall-clock span (not
+            # written/output_fps). A 2× actual_seconds window plus
+            # ffmpeg -shortest kept the FIRST half of the wav — audio
+            # played ~one clip-length early.
+            if sys.platform == "darwin" and (
+                bool(getattr(self.config, "clip_capture_microphone", False))
+                or bool(getattr(self.config, "clip_capture_system_audio", False))
             ):
                 try:
+                    first_meta, first_head, _first_tail = selected_segments[0]
+                    last_meta = selected_segments[-1][0]
+                    left_edge = float(first_meta.get("start_time", 0.0) or 0.0)
+                    first_end = float(first_meta.get("end_time", left_edge) or left_edge)
+                    first_frames = max(1, int(first_meta.get("frame_count", 0) or 0))
+                    if first_head and first_frames > 0 and first_end > left_edge:
+                        left_edge += (first_end - left_edge) * (
+                            float(first_head) / float(first_frames)
+                        )
                     if end_ts_f is not None:
                         right_edge = end_ts_f
                     else:
-                        right_edge = max(
-                            float(m.get("end_time", 0.0) or 0.0)
-                            for m, _h, _t in selected_segments
-                        )
+                        right_edge = float(last_meta.get("end_time", 0.0) or 0.0)
+                    if right_edge <= left_edge:
+                        right_edge = left_edge + max(0.05, float(actual_seconds))
                     self._mux_mac_clip_audio(
-                        output_path, right_edge - actual_seconds, right_edge
+                        output_path, left_edge, right_edge
                     )
                 except Exception:
                     pass

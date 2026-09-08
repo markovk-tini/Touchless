@@ -220,6 +220,8 @@ def try_open_camera(
     backend: int,
     read_attempts: int = 10,
     read_interval: float = 0.03,
+    capture_width: Optional[int] = None,
+    capture_height: Optional[int] = None,
 ) -> Optional[cv2.VideoCapture]:
     with _quiet_opencv_probe():
         # Construct via timeout-wrapped helper. Healthy cameras open
@@ -250,11 +252,15 @@ def try_open_camera(
         # their tuning are byte-for-byte unchanged.
         if platform.system() == "Darwin":
             try:
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                w = int(capture_width) if capture_width else 1280
+                h = int(capture_height) if capture_height else 720
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
                 if hasattr(cv2, "CAP_PROP_FPS"):
                     cap.set(cv2.CAP_PROP_FPS, 30)
-                _cam_log(f"open idx={index}: requested 1280x720@30 (AVFoundation perf cap)")
+                _cam_log(
+                    f"open idx={index}: requested {w}x{h}@30 (AVFoundation perf cap)"
+                )
             except Exception:
                 pass
 
@@ -560,7 +566,12 @@ def find_first_available_camera(max_index: int = 8) -> Tuple[Optional[int], Opti
     return selected.index, cap
 
 
-def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[CameraInfo], Optional[cv2.VideoCapture]]:
+def open_camera_by_index(
+    index: int,
+    max_index: int = 8,
+    capture_width: Optional[int] = None,
+    capture_height: Optional[int] = None,
+) -> Tuple[Optional[CameraInfo], Optional[cv2.VideoCapture]]:
     # On macOS this app only supports index 0 for direct camera access in order to avoid
     # unstable AVFoundation probing of non-existent indices.
     if platform.system() == "Darwin" and index != 0:
@@ -605,7 +616,13 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
         backends_to_try = _backend_candidates()
         eos_attempts = cold_start_attempts
     for backend in backends_to_try:
-        cap = try_open_camera(index, backend, read_attempts=eos_attempts)
+        cap = try_open_camera(
+            index,
+            backend,
+            read_attempts=eos_attempts,
+            capture_width=capture_width,
+            capture_height=capture_height,
+        )
         if cap is not None:
             info = CameraInfo(
                 index=index,
@@ -775,9 +792,19 @@ def open_phone_camera_url(url: str) -> Tuple[Optional[CameraInfo], Optional[cv2.
     return info, ThreadedCvCapture(cap)
 
 
-def open_preferred_or_first_available(preferred_index: Optional[int], max_index: int = 8) -> Tuple[Optional[CameraInfo], Optional[cv2.VideoCapture]]:
+def open_preferred_or_first_available(
+    preferred_index: Optional[int],
+    max_index: int = 8,
+    capture_width: Optional[int] = None,
+    capture_height: Optional[int] = None,
+) -> Tuple[Optional[CameraInfo], Optional[cv2.VideoCapture]]:
     if preferred_index is not None:
-        info, cap = open_camera_by_index(preferred_index, max_index=max_index)
+        info, cap = open_camera_by_index(
+            preferred_index,
+            max_index=max_index,
+            capture_width=capture_width,
+            capture_height=capture_height,
+        )
         if info is not None and cap is not None:
             return info, cap
 
@@ -791,7 +818,13 @@ def open_preferred_or_first_available(preferred_index: Optional[int], max_index:
     # full ~3 s window so a slow virtual camera (EOS Webcam Utility,
     # OBS Virtual Camera) doesn't time out on the connect step
     # after surviving the faster enumeration probe.
-    cap = try_open_camera(selected.index, selected.backend, read_attempts=100)
+    cap = try_open_camera(
+        selected.index,
+        selected.backend,
+        read_attempts=100,
+        capture_width=capture_width,
+        capture_height=capture_height,
+    )
     if cap is None:
         return None, None
     # Wrap in the threaded reader so behavior matches the preferred-

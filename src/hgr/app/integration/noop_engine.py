@@ -716,6 +716,13 @@ class GestureWorker(QObject):
     # Normal-mode confidence thresholds + stable-frame requirement
     # so the gesture decisions still feel as solid as before.
     _LITE_MODE_PROCESS_WIDTH = 384
+    # Darwin Performance Boost: smaller than Lite so the two modes
+    # are not the same engine. Lite keeps 720p capture; Boost reopens
+    # at 640×480 and runs inference at this width.
+    _MAC_BOOST_PROCESS_WIDTH = 256
+    # Darwin GPU: ONNX/CoreML plus a 480-px frame. Default GPU used
+    # 960 px on 720p — same work as Default, so fps stayed ~13-14.
+    _MAC_GPU_PROCESS_WIDTH = 480
     _FULLSCREEN_POLL_INTERVAL = 1.0
     # Drawing pen-lift hold duration. When the user opens their
     # thumb, the pen lifts after this many seconds of continuous
@@ -4203,9 +4210,14 @@ class GestureWorker(QObject):
             lite = bool(getattr(self.config, "lite_mode", False))
             gpu = bool(getattr(self.config, "gpu_mode", False))
             lowfps_cfg = bool(getattr(self.config, "low_fps_mode", False))
+            mac_boost = (
+                sys.platform == "darwin"
+                and bool(getattr(self.config, "mac_performance_boost", False))
+            )
             sys.stderr.write(
                 f"[perf-mode] _swap_engine_safely START "
-                f"lite={lite} gpu={gpu} low_fps_cfg={lowfps_cfg} "
+                f"lite={lite} gpu={gpu} boost={mac_boost} "
+                f"low_fps_cfg={lowfps_cfg} "
                 f"auto_engaged={self._low_fps_auto_engaged} "
                 f"-> low_fps_active will be {lowfps_cfg or self._low_fps_auto_engaged}\n"
             )
@@ -5032,6 +5044,36 @@ class GestureWorker(QObject):
                 prefer_gpu=prefer_gpu,
             )
             stable_frames = 1
+        elif sys.platform == "darwin" and (lite_active or mac_boost or prefer_gpu):
+            # Mac mode ladder (each step must be a real fps gain):
+            #   Lite: 720p capture, 384-px lite CPU model
+            #   GPU:  640×480 capture, 480-px CoreML (CPU lite fallback)
+            #   Boost: 640×480 capture, 256-px lite CPU model
+            # Lite stays CPU-only (same as Windows). GPU+Boost uses
+            # the smaller Boost width on the GPU path.
+            if lite_active:
+                prefer_gpu = False
+            if mac_boost:
+                process_width = self._MAC_BOOST_PROCESS_WIDTH
+            elif prefer_gpu:
+                process_width = self._MAC_GPU_PROCESS_WIDTH
+            else:
+                process_width = self._LITE_MODE_PROCESS_WIDTH
+            detector = HandDetector(
+                model_complexity=0,
+                max_process_width=process_width,
+                prefer_gpu=prefer_gpu,
+            )
+            stable_frames = 1
+            try:
+                sys.stderr.write(
+                    f"[perf-mode] darwin engine lite={lite_active} "
+                    f"gpu={prefer_gpu} boost={mac_boost} "
+                    f"process_width={process_width}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
         elif lite_active or mac_boost:
             # Lite Mode (v1.1.7 C23): CPU-only. The previous version
             # silently set prefer_gpu=True so Lite would use ONNX +
@@ -5144,6 +5186,107 @@ class GestureWorker(QObject):
             except Exception:
                 pass
 
+    def _darwin_capture_wh(self) -> tuple:
+        """AVFoundation size to request on the next Mac camera open.
+
+        Mid-session cap.set(WIDTH/HEIGHT) is ignored or renegotiates
+        into a worse ~11 fps mode. Callers that need a new size must
+        reopen via `_reopen_macos_camera`. Lite keeps 720p.
+        """
+        if sys.platform != "darwin":
+            return (1280, 720)
+        if (
+            bool(getattr(self.config, "mac_performance_boost", False))
+            or bool(getattr(self.config, "gpu_mode", False))
+            or bool(getattr(self.config, "camera_force_short_shutter", False))
+        ):
+            return (640, 480)
+        return (1280, 720)
+
+    def _darwin_open_kwargs(self) -> dict:
+        if sys.platform != "darwin":
+            return {}
+        width, height = self._darwin_capture_wh()
+        return {"capture_width": width, "capture_height": height}
+
+    def _macos_capture_size_matches(self, width: int, height: int) -> bool:
+        cap = self._cap
+        if cap is None:
+            return False
+        try:
+            current_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            current_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        except Exception:
+            return False
+        return abs(current_w - int(width)) <= 16 and abs(current_h - int(height)) <= 16
+
+    def _reopen_macos_camera(self) -> None:
+        """Release and reopen the AVFoundation cap at the desired size.
+
+        No-op on Windows. Logs the actual negotiated size so a remote
+        Mac test can confirm the mode took effect.
+        """
+        if sys.platform != "darwin" or not self._running:
+            return
+        info = self._camera_info
+        index = getattr(info, "index", None) if info is not None else None
+        if index is None or int(index) < 0:
+            return
+        width, height = self._darwin_capture_wh()
+        if self._macos_capture_size_matches(width, height):
+            try:
+                sys.stderr.write(
+                    f"[perf-camera] mac reopen skipped: already {width}x{height}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            try:
+                self._apply_default_capture_tuning((info, self._cap))
+            except Exception:
+                pass
+            return
+        old_cap = self._cap
+        self._cap = None
+        if old_cap is not None:
+            try:
+                old_cap.release()
+            except Exception:
+                pass
+        recovered = open_camera_by_index(
+            int(index),
+            max_index=self.config.camera_scan_limit,
+            capture_width=width,
+            capture_height=height,
+        )
+        if isinstance(recovered, tuple) and len(recovered) >= 2 and recovered[1] is not None:
+            self._cap = recovered[1]
+            if recovered[0] is not None:
+                self._camera_info = recovered[0]
+            try:
+                self._apply_default_capture_tuning(recovered)
+            except Exception:
+                pass
+            try:
+                actual_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                actual_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                sys.stderr.write(
+                    f"[perf-camera] mac reopened requested={width}x{height} "
+                    f"actual={actual_w}x{actual_h}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        try:
+            sys.stderr.write(
+                f"[perf-camera] mac reopen failed for {width}x{height}; "
+                "leaving cap unset for recovery\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+
     def set_lite_mode(self, enabled: bool) -> None:
         # Lite-model toggle. Compares against LAST APPLIED state, not
         # config — the UI updates config.lite_mode before calling this,
@@ -5167,6 +5310,10 @@ class GestureWorker(QObject):
         self._applied_lite_mode = enabled
         self._swap_engine_safely()
         self._fps = 0.0
+        if sys.platform == "darwin":
+            # Do not rewrite CAP_PROP_FPS/size on a live AVFoundation
+            # session — that renegotiation is what dropped Lite to ~11 fps.
+            return
         self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
         # C25: re-apply OpenCV capture tuning when a mode toggle
         # changes the target fps request. Noop when the current cap
@@ -5201,6 +5348,9 @@ class GestureWorker(QObject):
         self._applied_gpu_mode = enabled
         self._swap_engine_safely()
         self._fps = 0.0
+        if sys.platform == "darwin":
+            self._reopen_macos_camera()
+            return
         self._apply_perf_camera_path(want_ffmpeg=self._wants_ffmpeg_cap())
         # C25: re-apply OpenCV capture tuning when a mode toggle
         # changes the target fps request. Noop when the current cap
@@ -5238,6 +5388,9 @@ class GestureWorker(QObject):
         self._applied_mac_performance_boost = enabled
         self._swap_engine_safely()
         self._fps = 0.0
+        if sys.platform == "darwin":
+            self._reopen_macos_camera()
+            return
         try:
             self._apply_default_capture_tuning((None, self._cap))
         except Exception:
@@ -5713,7 +5866,11 @@ class GestureWorker(QObject):
         phone_url = str(getattr(self.config, "phone_camera_url", "") or "").strip()
         use_phone_url = bool(getattr(self.config, "phone_camera_enabled", False)) and phone_url
         if self.camera_index_override is not None:
-            result = open_camera_by_index(self.camera_index_override, max_index=self.config.camera_scan_limit)
+            result = open_camera_by_index(
+                self.camera_index_override,
+                max_index=self.config.camera_scan_limit,
+                **self._darwin_open_kwargs(),
+            )
             # Fallback: if the requested index doesn't open (the device
             # disappeared, the OpenCV backend that worked at scan time
             # rejects it now, etc.) fall back to whatever the preferred
@@ -5725,6 +5882,7 @@ class GestureWorker(QObject):
                 result = open_preferred_or_first_available(
                     self.config.preferred_camera_index,
                     max_index=self.config.camera_scan_limit,
+                    **self._darwin_open_kwargs(),
                 )
         elif phone_qr_capture is not None and phone_qr_capture.isOpened():
             info = SimpleNamespace(
@@ -5740,9 +5898,17 @@ class GestureWorker(QObject):
                 # Phone camera unreachable at startup â€” fall back to the last
                 # preferred local camera so the app can still run. The UI will
                 # reflect this via the live-status path (status_changed signal).
-                result = open_preferred_or_first_available(self.config.preferred_camera_index, max_index=self.config.camera_scan_limit)
+                result = open_preferred_or_first_available(
+                    self.config.preferred_camera_index,
+                    max_index=self.config.camera_scan_limit,
+                    **self._darwin_open_kwargs(),
+                )
         else:
-            result = open_preferred_or_first_available(self.config.preferred_camera_index, max_index=self.config.camera_scan_limit)
+            result = open_preferred_or_first_available(
+                self.config.preferred_camera_index,
+                max_index=self.config.camera_scan_limit,
+                **self._darwin_open_kwargs(),
+            )
         self._apply_low_fps_capture_tuning(result)
         # C20: default-mode tuning — nudge the OpenCV cap to 30 fps +
         # MJPG. No-op for Low FPS (already tuned above) and for Lite /
@@ -6122,8 +6288,17 @@ class GestureWorker(QObject):
             from AVFoundation import (  # type: ignore
                 AVCaptureDevice,
                 AVCaptureExposureModeCustom,
+                AVCaptureFocusModeLocked,
             )
-            device = AVCaptureDevice.defaultDeviceWithMediaType_("vide")
+            device = None
+            try:
+                devices = list(AVCaptureDevice.devicesWithMediaType_("vide") or [])
+            except Exception:
+                devices = []
+            if devices:
+                device = devices[0]
+            if device is None:
+                device = AVCaptureDevice.defaultDeviceWithMediaType_("vide")
             if device is not None:
                 locked = device.lockForConfiguration_(None)
                 if isinstance(locked, tuple):
@@ -6133,7 +6308,7 @@ class GestureWorker(QObject):
                         min_dur = device.activeFormat().minExposureDuration()
                         from CoreMedia import CMTimeMake, CMTimeCompare  # type: ignore
 
-                        want = CMTimeMake(1, 60)
+                        want = CMTimeMake(1, 90)
                         duration = want
                         try:
                             if CMTimeCompare(want, min_dur) < 0:
@@ -6143,14 +6318,20 @@ class GestureWorker(QObject):
                         iso = float(device.ISO())
                         min_iso = float(device.activeFormat().minISO())
                         max_iso = float(device.activeFormat().maxISO())
-                        iso = max(min_iso, min(max_iso, iso))
+                        iso = max(min_iso, min(max_iso, iso * 1.25))
+                        try:
+                            if device.isFocusModeSupported_(AVCaptureFocusModeLocked):
+                                device.setFocusMode_(AVCaptureFocusModeLocked)
+                        except Exception:
+                            pass
                         device.setExposureMode_(AVCaptureExposureModeCustom)
                         device.setExposureModeCustomWithDuration_ISO_completionHandler_(
                             duration, iso, None
                         )
                         sys.stderr.write(
                             "[r49-short-shutter] mac AVCaptureDevice custom "
-                            f"exposure 1/60 ISO={iso:.0f}\n"
+                            f"exposure 1/90 ISO={iso:.0f} af=locked "
+                            f"device={device.localizedName()!r}\n"
                         )
                         sys.stderr.flush()
                     finally:
@@ -6250,30 +6431,14 @@ class GestureWorker(QObject):
         # requested rate is within their advertised range for the
         # current (fmt, resolution) combo. C25: Lite gets 60 fps
         # request (matches the mode's "fps boost" intent); Default
-        # keeps 30 fps. Darwin: built-in cameras are 30 fps max at
-        # 720p — requesting 60 can make AVFoundation pick a worse
-        # mode (Lite dropped to ~11 fps because of this).
+        # keeps 30 fps. Darwin: do NOT write FPS or size on a live
+        # session — AVFoundation renegotiates into a ~11 fps mode.
+        # Size is requested in try_open_camera before the first read.
         try:
-            if hasattr(cv2, "CAP_PROP_FPS"):
+            if sys.platform != "darwin" and hasattr(cv2, "CAP_PROP_FPS"):
                 lite_active = bool(getattr(self.config, "lite_mode", False))
-                if sys.platform == "darwin":
-                    fps_target = 30.0
-                else:
-                    fps_target = 60.0 if lite_active else 30.0
+                fps_target = 60.0 if lite_active else 30.0
                 cap.set(cv2.CAP_PROP_FPS, fps_target)
-        except Exception:
-            pass
-        # Darwin Performance Boost: 640×480 capture (default is 720p).
-        # Smaller frames mean less MediaPipe work per tick.
-        try:
-            if sys.platform == "darwin":
-                mac_boost = bool(getattr(self.config, "mac_performance_boost", False))
-                if mac_boost:
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                else:
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         except Exception:
             pass
         # Small buffer size so a brief stall doesn't accumulate
@@ -8096,15 +8261,21 @@ class GestureWorker(QObject):
                     # Mode but engine is still 27ms" diagnostic.
                     _mode_lite = bool(getattr(self.config, "lite_mode", False))
                     _mode_gpu = bool(getattr(self.config, "gpu_mode", False))
+                    _mode_boost = (
+                        sys.platform == "darwin"
+                        and bool(getattr(self.config, "mac_performance_boost", False))
+                    )
                     _mode_lowfps = self._low_fps_active
                     _mode_tag = (
                         "LOW_FPS" if _mode_lowfps
-                        else ("LITE" if _mode_lite
-                              else ("GPU" if _mode_gpu else "NORMAL"))
+                        else ("BOOST" if _mode_boost
+                              else ("LITE" if _mode_lite
+                                    else ("GPU" if _mode_gpu else "NORMAL")))
                     )
                     sys.stderr.write(
                         f"[lite_mode/timing] mode={_mode_tag} "
-                        f"(lite={_mode_lite},gpu={_mode_gpu},lowfps={_mode_lowfps}) "
+                        f"(lite={_mode_lite},gpu={_mode_gpu},boost={_mode_boost},"
+                        f"lowfps={_mode_lowfps}) "
                         f"read={avg_read:.1f} "
                         f"prep={avg_prep:.1f} engine={avg_engine:.1f} "
                         f"vol={avg_vol:.1f} app={avg_app:.1f} "
