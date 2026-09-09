@@ -49,24 +49,23 @@ def test_boost_quiet_mac_pcm_raises_sck_level():
     assert float(np.max(np.abs(same))) == 0.5
 
 
-def test_assemble_pcm_ring_trims_overlap_not_duplicate():
+def test_assemble_pcm_ring_concat_ignores_stamp_overlap():
     fs = 48000
     a = np.full(fs, 0.2, dtype=np.float32)
-    # 0.1 s chunk whose start overlaps the first block by 50 ms.
+    # Stamps say this block overlaps the first by 50 ms; samples are sequential.
     b = np.full(int(0.1 * fs), 0.9, dtype=np.float32)
     chunks = [(1.0, a), (1.05, b)]
-    out = assemble_pcm_ring(chunks, fs, 0.0, 1.05)
+    out = assemble_pcm_ring(chunks, fs, 0.0, 1.1)
     assert out is not None
-    assert len(out) == int(round(1.05 * fs))
-    # Overlap trim keeps 0.9 only in the last 50 ms, not duplicated.
-    assert float(np.mean(out[-int(0.04 * fs) :])) > 0.7
-    assert float(np.mean(out[int(0.2 * fs) : int(0.8 * fs)])) < 0.3
+    assert len(out) == int(round(1.1 * fs))
+    assert float(np.mean(out[:fs])) < 0.3
+    assert float(np.mean(out[fs:])) > 0.7
 
 
-def test_assemble_pcm_ring_end_anchors_to_right():
+def test_assemble_pcm_ring_first_start_window():
     fs = 48000
     # 3 s ending at t=10: two seconds of 0.1 then a 1 s 0.9 marker.
-    # Window [7, 9] must drop the marker (it sits after right).
+    # Window [7, 9] is the first two seconds (first-start = 7).
     marker = np.full(fs, 0.9, dtype=np.float32)
     rest = np.full(2 * fs, 0.1, dtype=np.float32)
     chunks = [(10.0, np.concatenate([rest, marker]))]
@@ -74,3 +73,25 @@ def test_assemble_pcm_ring_end_anchors_to_right():
     assert out is not None
     assert len(out) == 2 * fs
     assert float(np.mean(out)) < 0.2
+
+
+def test_assemble_pcm_ring_stamp_lead_skips_early_audio():
+    fs = 48000
+    early = np.full(fs, 0.9, dtype=np.float32)
+    later = np.full(2 * fs, 0.1, dtype=np.float32)
+    chunks = [(10.0, np.concatenate([early, later]))]
+    out = assemble_pcm_ring(chunks, fs, 7.0, 9.0, stamp_lead_s=1.0)
+    assert out is not None
+    assert len(out) == 2 * fs
+    assert float(np.mean(out)) < 0.2
+
+
+def test_assemble_pcm_ring_ignores_sub_quarter_second_gap():
+    fs = 48000
+    a = np.full(fs, 0.5, dtype=np.float32)
+    b = np.full(fs, 0.5, dtype=np.float32)
+    # 80 ms stamp gap used to insert a click of zeros.
+    chunks = [(1.0, a), (2.08, b)]
+    out = assemble_pcm_ring(chunks, fs, 0.0, 2.0)
+    assert out is not None
+    assert float(np.min(np.abs(out))) > 0.4

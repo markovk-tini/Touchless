@@ -28138,12 +28138,14 @@ Admin elevation
             except Exception:
                 pass
 
-    def _extract_mac_sys_audio(self, left: float, right: float):
+    def _extract_mac_sys_audio(
+        self, left: float, right: float, *, stamp_lead_s: float = 0.0
+    ):
         tap = getattr(self, "_mac_system_audio_tap", None)
         if tap is None:
             return None
         try:
-            return tap.extract(left, right)
+            return tap.extract(left, right, stamp_lead_s=stamp_lead_s)
         except Exception:
             return None
 
@@ -28179,12 +28181,15 @@ Admin elevation
             except Exception:
                 pass
 
-    def _extract_mac_clip_audio(self, left: float, right: float):
+    def _extract_mac_clip_audio(
+        self, left: float, right: float, *, stamp_lead_s: float = 0.0
+    ):
         """Return a float32 mono buffer spanning the FULL [left, right] window.
 
-        Shared `assemble_pcm_ring` with the SCK tap: overlap-trim, ignore
-        sub-80 ms stamp jitter, end-anchor to `right`. Returns None only
-        if no real samples fall in the window."""
+        Shared `assemble_pcm_ring` with the SCK tap: concat in order, ignore
+        sub-250 ms stamp jitter, first-start slice. `stamp_lead_s` is clip-mux
+        only (cancels the 1–2 s stamp lead without ffmpeg adelay). Returns
+        None only if no real samples fall in the window."""
         fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
         lock = getattr(self, "_mac_clip_audio_lock", None)
         chunks_ref = getattr(self, "_mac_clip_audio_chunks", None)
@@ -28205,7 +28210,9 @@ Admin elevation
             return None
         try:
             from ...platform_compat.mac_system_audio import assemble_pcm_ring
-            return assemble_pcm_ring(chunks, fs, left, right)
+            return assemble_pcm_ring(
+                chunks, fs, left, right, stamp_lead_s=stamp_lead_s
+            )
         except Exception:
             return None
 
@@ -28238,21 +28245,40 @@ Admin elevation
             if str(video_path.suffix).lower() != ".mp4":
                 return
             fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
-            mic = self._extract_mac_clip_audio(left, right)
-            sys_a = self._extract_mac_sys_audio(left, right)
+            # WASAPI's clip_sys_audio_delay_ms (1000) is a Windows TCP-bridge
+            # residual. Applying it here plus ring end-anchor made Mac clips
+            # ~2 s late. Skip that delay; stamp_lead_s pulls the 1–2 s
+            # first-start lead without leading silence from adelay.
+            stamp_lead_s = 1.5
+            boost_quiet_mac_pcm = None
+            mac_clip_video_timescale = None
+            try:
+                from ...platform_compat.mac_system_audio import (
+                    MAC_CLIP_STAMP_LEAD_S,
+                    boost_quiet_mac_pcm as _boost_quiet_mac_pcm,
+                    mac_clip_video_timescale as _mac_clip_video_timescale,
+                )
+                stamp_lead_s = float(MAC_CLIP_STAMP_LEAD_S)
+                boost_quiet_mac_pcm = _boost_quiet_mac_pcm
+                mac_clip_video_timescale = _mac_clip_video_timescale
+            except Exception:
+                pass
+            mic = self._extract_mac_clip_audio(
+                left, right, stamp_lead_s=stamp_lead_s
+            )
+            sys_a = self._extract_mac_sys_audio(
+                left, right, stamp_lead_s=stamp_lead_s
+            )
             audio = self._mix_mac_clip_and_sys(mic, sys_a)
             # Require at least ~50 ms so a near-empty ring doesn't produce a
             # broken 0-sample track.
             if audio is None or len(audio) < int(0.05 * fs):
                 return
             try:
-                from ...platform_compat.mac_system_audio import (
-                    boost_quiet_mac_pcm,
-                    mac_clip_video_timescale,
-                )
-                audio = boost_quiet_mac_pcm(audio)
+                if boost_quiet_mac_pcm is not None:
+                    audio = boost_quiet_mac_pcm(audio)
             except Exception:
-                mac_clip_video_timescale = None  # type: ignore
+                pass
             # Keep the wall-clock wav. OpenCV mp4v/MJPG often tags ~20 fps
             # while Quartz wrote fewer frames, so probed duration is ~10 s
             # short. Trimming audio to that probe made the track lead picture.
@@ -28267,10 +28293,7 @@ Admin elevation
                     scale = float(mac_clip_video_timescale(video_dur, wall_span))
                 except Exception:
                     scale = 1.0
-            delay_ms = max(
-                0,
-                int(getattr(self.config, "clip_sys_audio_delay_ms", 1000) or 0),
-            )
+            delay_ms = 0
             try:
                 sys.stderr.write(
                     f"[mac-clip-audio] mux left={left:.3f} right={right:.3f} "
@@ -28278,7 +28301,8 @@ Admin elevation
                     f"itsscale={scale:.4f} "
                     f"mic={0 if mic is None else len(mic)/fs:.3f}s "
                     f"sys={0 if sys_a is None else len(sys_a)/fs:.3f}s "
-                    f"out={len(audio)/fs:.3f}s delay_ms={delay_ms}\n"
+                    f"out={len(audio)/fs:.3f}s delay_ms={delay_ms} "
+                    f"stamp_lead={stamp_lead_s:.3f}s\n"
                 )
                 sys.stderr.flush()
             except Exception:
@@ -28293,9 +28317,9 @@ Admin elevation
                 wf.writeframes(pcm16.tobytes())
             acodec = str(self._ffmpeg_capabilities.get("audio_encoder", "aac") or "aac")
             out_tmp = Path(f"{video_path}.withaudio.mp4")
-            # WASAPI needed ~1 s adelay so speaker audio didn't lead picture.
-            # SCK has the same class of capture delay on Mac.
-            af = f"adelay={delay_ms}:all=1,apad" if delay_ms > 0 else "apad"
+            # No adelay on Darwin clips — Windows WASAPI 1000 ms does not
+            # apply, and stamp_lead already shifts the wav content.
+            af = "apad"
             mux_cmd = [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(video_path), "-i", str(wav_path),

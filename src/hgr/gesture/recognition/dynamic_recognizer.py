@@ -40,23 +40,25 @@ class DynamicGestureRecognizer:
 
     def _effective_low_fps(self) -> bool:
         """True when swipes should use the relaxed (low-fps) gates — either the
-        engine forced low_fps_mode, OR the actual capture cadence is slow
-        (median inter-sample dt > ~0.055 s, i.e. under ~18 fps).
+        engine forced low_fps_mode, OR (Darwin only) actual capture cadence is
+        slow (median inter-sample dt > ~0.072 s, i.e. under ~14 fps).
 
         The swipe gates use a fixed-SAMPLE window, so at low fps that window
         spans too much wall-clock time and the duration/step gates silently
-        zero the score. macOS commonly runs in the ~13-17 fps 'dead zone' where
-        the engine's own low_fps auto-toggle (fps<12) hasn't engaged yet, so
-        swipes stop firing. Deriving this per-frame from the timestamps already
-        on the samples fixes that without waiting on the engine. At normal
-        ~30 fps (dt ~0.033 s) this returns False, so Windows behavior is
-        unchanged."""
+        zero the score. macOS can still dip into a ~12–14 fps band where
+        the engine's own low_fps auto-toggle (fps<12) hasn't engaged yet.
+        Deriving this per-frame from the timestamps already on the samples
+        fixes that without waiting on the engine. At normal ~30 fps
+        (dt ~0.033 s) this returns False, so Windows behavior is unchanged."""
         if self.low_fps_mode:
             return True
         # macOS-only: the dt-based auto-relax trades some precision (slow
         # motion can read as a swipe) for recall at the mac's low fps. Windows
         # keeps its exact tuned behavior (and its tests) — it engages the
         # relaxed gates only via the explicit engine low_fps_mode there.
+        # 0.055 s (~18 fps) was firing on the 15–18 fps band after the
+        # overlay fix, so casual hand drift scored as swipe_left/right.
+        # Only relax when we are actually in the engine's low-fps zone.
         if sys.platform != "darwin":
             return False
         recent = list(self.history)[-8:]
@@ -66,7 +68,7 @@ class DynamicGestureRecognizer:
             return False
         dts.sort()
         median_dt = dts[len(dts) // 2]
-        return median_dt > 0.055
+        return median_dt > 0.072
 
     def _fold_gate(self, finger) -> float:
         if finger.state == "closed":
@@ -166,7 +168,10 @@ class DynamicGestureRecognizer:
             horizontal_max_duration_gate = clamp01((1.25 - duration) / 0.50)
             positive_x_gate = clamp01((positive_x_steps - negative_x_steps - 0.4) / 1.2)
             negative_x_gate = clamp01((negative_x_steps - positive_x_steps - 0.4) / 1.2)
-            horizontal_commit_gate = clamp01((abs(horizontal) - 0.18) / 0.12)
+            # Darwin: need a bit more palm travel before commit. Windows
+            # low-fps keeps the original 0.18 floor.
+            commit_floor = 0.28 if sys.platform == "darwin" else 0.18
+            horizontal_commit_gate = clamp01((abs(horizontal) - commit_floor) / 0.12)
         else:
             horizontal_min_duration_gate = clamp01((duration - 0.12) / 0.08)
             horizontal_max_duration_gate = clamp01((0.78 - duration) / 0.30)
@@ -182,6 +187,13 @@ class DynamicGestureRecognizer:
             speed_floor_l = 0.40
             path_floor_r = 0.34
             path_floor_l = 0.32
+            if sys.platform == "darwin":
+                right_h_floor = 0.36
+                left_h_floor = 0.34
+                speed_floor_r = 0.52
+                speed_floor_l = 0.48
+                path_floor_r = 0.42
+                path_floor_l = 0.40
         else:
             # r52: loosened Normal-mode swipe geometry and speed
             # floors so an ordinary committed swipe registers on
@@ -197,6 +209,16 @@ class DynamicGestureRecognizer:
             speed_floor_l = 0.85
             path_floor_r = 0.60
             path_floor_l = 0.58
+            # Darwin: a little less twitchy than Windows r52. Still
+            # well below the old 0.67/0.61 floors so a committed swipe
+            # fires; idle drift should not.
+            if sys.platform == "darwin":
+                right_h_floor = 0.56
+                left_h_floor = 0.52
+                speed_floor_r = 1.05
+                speed_floor_l = 0.95
+                path_floor_r = 0.66
+                path_floor_l = 0.64
 
         def _horizontal_scores(pose_strength: float) -> tuple[float, float]:
             right = clamp01(
@@ -333,6 +355,8 @@ class DynamicGestureRecognizer:
         # dropped to "neutral". 0.48 still sits ~14 pts above the
         # neutral noise band.
         score_floor = 0.34 if effective_low_fps else 0.48
+        if sys.platform == "darwin":
+            score_floor = 0.42 if effective_low_fps else 0.54
         drawing_best_score = max(drawing_left, drawing_right)
         if drawing_best_score >= score_floor:
             self.last_one_pose_horizontal_label = (

@@ -26,6 +26,11 @@ import numpy as np
 
 _FS = 48000
 
+# Mic/SCK block stamps run ~1–2 s late vs clip wall times, so a
+# first-start slice plays early. Clip mux skips this much into the
+# ring. Screen recordings pass 0 — they already align to AVFoundation.
+MAC_CLIP_STAMP_LEAD_S = 1.5
+
 
 def mac_system_audio_available() -> bool:
     """True when this process can *try* ScreenCaptureKit audio (macOS 13+)."""
@@ -53,15 +58,16 @@ def assemble_pcm_ring(
     left: float,
     right: float,
     *,
-    jitter_s: float = 0.080,
+    stamp_lead_s: float = 0.0,
 ) -> Optional[np.ndarray]:
-    """Contiguous PCM for wall window [left, right], end-anchored.
+    """Contiguous PCM for wall window [left, right], first-start sliced.
 
-    Chunk `time.time()` stamps jitter. Placing each block independently
-    made static; a 20 ms gap threshold still inserted clicks. Treat
-    overlaps as duplicate samples (trim) and sub-`jitter_s` gaps as
-    scheduling noise (no silence). Then slice so the last sample lines
-    up with `right` (clip click / speech-end), not the oldest stamp.
+    Callbacks deliver sequential non-overlapping PCM. Timestamps jitter,
+    so treating stamp-overlap as duplicate samples deleted real audio
+    (clicks / static) and end-anchoring stacked with ffmpeg adelay to
+    push the track ~2 s late. Concatenate in arrival order, ignore
+    sub-quarter-second stamp gaps, then slice from the first block's
+    implied start plus optional `stamp_lead_s` (clip mux only).
     """
     if chunks is None or right <= left or int(fs) <= 0:
         return None
@@ -69,32 +75,26 @@ def assemble_pcm_ring(
     if total <= 0:
         return None
     pieces: list = []
+    first_start = None
     prev_t_end = None
-    last_t_end = None
     fs_f = float(fs)
-    min_overlap = -1.0 / fs_f
+    dropout_s = 0.25
     for (t_end, arr) in chunks:
         arr = np.asarray(arr, dtype=np.float32).reshape(-1)
         n = int(arr.size)
         if n == 0:
             continue
         t_end_f = float(t_end)
-        if prev_t_end is not None:
-            gap = (t_end_f - n / fs_f) - float(prev_t_end)
-            if gap < min_overlap:
-                skip = min(n, max(0, int(round(-gap * fs_f))))
-                if skip >= n:
-                    prev_t_end = t_end_f
-                    last_t_end = t_end_f
-                    continue
-                arr = arr[skip:]
-                n = int(arr.size)
-            elif gap > float(jitter_s):
+        t_start = t_end_f - n / fs_f
+        if first_start is None:
+            first_start = t_start
+        elif prev_t_end is not None:
+            gap = t_start - float(prev_t_end)
+            if gap > dropout_s:
                 pieces.append(np.zeros(int(round(gap * fs_f)), dtype=np.float32))
         pieces.append(arr)
         prev_t_end = t_end_f
-        last_t_end = t_end_f
-    if not pieces or last_t_end is None:
+    if not pieces or first_start is None:
         return None
     try:
         full = np.concatenate(pieces).astype(np.float32, copy=False)
@@ -102,8 +102,10 @@ def assemble_pcm_ring(
         return None
     if full.size == 0:
         return None
-    end_idx = full.size - int(round((float(last_t_end) - float(right)) * fs_f))
-    start_idx = end_idx - total
+    start_idx = int(
+        round((float(left) - float(first_start) + float(stamp_lead_s or 0.0)) * fs_f)
+    )
+    end_idx = start_idx + total
     out = np.zeros(total, dtype=np.float32)
     src0 = max(0, start_idx)
     src1 = min(full.size, end_idx)
@@ -118,7 +120,9 @@ def assemble_pcm_ring(
 
 
 def _window_pcm_ring(
-    chunks_ref, lock, fs: int, left: float, right: float
+    chunks_ref, lock, fs: int, left: float, right: float,
+    *,
+    stamp_lead_s: float = 0.0,
 ) -> Optional[np.ndarray]:
     """Lock + copy, then `assemble_pcm_ring`. Same helper as the mic ring."""
     if chunks_ref is None or right <= left:
@@ -131,7 +135,7 @@ def _window_pcm_ring(
             chunks = list(chunks_ref)
     except Exception:
         return None
-    return assemble_pcm_ring(chunks, fs, left, right)
+    return assemble_pcm_ring(chunks, fs, left, right, stamp_lead_s=stamp_lead_s)
 
 
 def mix_mac_pcm(
@@ -325,10 +329,10 @@ def _sbuf_to_mono_f32(sbuf) -> Optional[np.ndarray]:
         return None
     if arr.size == 0:
         return None
-    if channels > 1 and arr.size % channels == 0:
+    if n > 0 and channels > 1 and arr.size == n * channels:
         # Mean fold of a one-sided / low SCK buffer is ~half level.
         # Mid * sqrt(n) keeps mono-compatible level; clip later.
-        folded = arr.reshape(-1, channels).mean(axis=1)
+        folded = arr.reshape(n, channels).mean(axis=1)
         arr = folded * (min(int(channels), 2) ** 0.5)
     elif n > 0 and arr.size >= n:
         arr = arr[:n]
@@ -414,8 +418,17 @@ class MacSystemAudioTap:
         with self._lock:
             self._chunks.clear()
 
-    def extract(self, left: float, right: float) -> Optional[np.ndarray]:
-        return _window_pcm_ring(self._chunks, self._lock, self._fs, left, right)
+    def extract(
+        self,
+        left: float,
+        right: float,
+        *,
+        stamp_lead_s: float = 0.0,
+    ) -> Optional[np.ndarray]:
+        return _window_pcm_ring(
+            self._chunks, self._lock, self._fs, left, right,
+            stamp_lead_s=stamp_lead_s,
+        )
 
     def _push(self, mono: np.ndarray, t_end: Optional[float] = None) -> None:
         if mono is None or mono.size == 0:
