@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -24,6 +25,11 @@ def _migrate_legacy_config_dir() -> None:
 
 
 _migrate_legacy_config_dir()
+
+# Concurrent Settings / overlay saves used to race on the .tmp file:
+# thread B's os.replace ran after thread A had already renamed it away,
+# raising FileNotFoundError and dropping the write.
+_SAVE_CONFIG_LOCK = threading.Lock()
 
 ORIGINAL_PRIMARY_COLOR = "#0B3D91"
 ORIGINAL_ACCENT_COLOR = "#1DE9B6"
@@ -1221,32 +1227,33 @@ def save_config(config: AppConfig) -> None:
     temp file lives next to the destination so we stay on one volume.
     """
     import os as _os
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(asdict(config), indent=2)
     tmp_path = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
-    try:
-        # Write the full payload + flush + fsync the temp file before
-        # the rename, so a power-loss between write and rename leaves
-        # either old-or-new on disk, never a partial temp.
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-            fh.flush()
-            try:
-                _os.fsync(fh.fileno())
-            except (OSError, AttributeError):
-                # fsync isn't available on some Windows configs (rare);
-                # the rename below still provides atomicity vs. concurrent
-                # readers, and the write_text-style hazard is closed.
-                pass
-        _os.replace(tmp_path, CONFIG_PATH)
-    except Exception:
-        # Best-effort: if rename failed, drop the temp so it doesn't
-        # confuse the next save attempt.
+    with _SAVE_CONFIG_LOCK:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            # Write the full payload + flush + fsync the temp file before
+            # the rename, so a power-loss between write and rename leaves
+            # either old-or-new on disk, never a partial temp.
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                try:
+                    _os.fsync(fh.fileno())
+                except (OSError, AttributeError):
+                    # fsync isn't available on some Windows configs (rare);
+                    # the rename below still provides atomicity vs. concurrent
+                    # readers, and the write_text-style hazard is closed.
+                    pass
+            _os.replace(tmp_path, CONFIG_PATH)
         except Exception:
-            pass
-        raise
+            # Best-effort: if rename failed, drop the temp so it doesn't
+            # confuse the next save attempt.
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            raise
 
 # Author: Konstantin Markov

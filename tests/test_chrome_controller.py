@@ -74,6 +74,18 @@ class ChromeControllerTest(unittest.TestCase):
 
         self.assertEqual(target, "youtube")
 
+    def test_mac_is_running_uses_ttl_cache(self) -> None:
+        controller = ChromeController(executable_paths=())
+        controller._mac = True
+        controller._available = True
+        controller._mac_running_cache = None
+        controller._mac_running_cache_until = 0.0
+        with patch.object(controller, "_is_running_uncached", return_value=True) as probe:
+            self.assertTrue(controller.is_running())
+            self.assertTrue(controller.is_window_open())
+            self.assertTrue(controller.is_window_active())
+        self.assertEqual(probe.call_count, 1)
+
     def test_parse_voice_search_request_strips_google_chrome_tail_from_open_phrase(self) -> None:
         controller = ChromeController(executable_paths=())
         query = controller.parse_voice_search_request("Can you open youtube on google chrome")

@@ -131,6 +131,47 @@ def mix_mac_pcm(
     return out
 
 
+def boost_quiet_mac_pcm(
+    buf: Optional[np.ndarray],
+    *,
+    target_peak: float = 0.55,
+    max_gain: float = 12.0,
+    already_loud: float = 0.28,
+) -> Optional[np.ndarray]:
+    """Raise a quiet capture (typical SCK tap) without touching a loud mix."""
+    if buf is None or getattr(buf, "size", 0) == 0:
+        return buf
+    peak = float(np.max(np.abs(buf)))
+    if peak < 1e-5 or peak >= float(already_loud):
+        return buf
+    gain = min(float(max_gain), float(target_peak) / peak)
+    if gain <= 1.01:
+        return buf
+    out = (np.asarray(buf, dtype=np.float32) * np.float32(gain))
+    np.clip(out, -1.0, 1.0, out=out)
+    return out
+
+
+def mac_clip_video_timescale(video_dur: float, wall_span: float) -> float:
+    """Timestamp scale so a short OpenCV clip plays in wall-clock time.
+
+    Mac MJPG/mp4v writers often tag ~20 fps while Quartz capture is
+    slower, so ffprobe duration is ~10 s short of the audio window.
+    End-trimming audio to that probe made the soundtrack lead picture.
+    """
+    try:
+        v = float(video_dur)
+        w = float(wall_span)
+    except (TypeError, ValueError):
+        return 1.0
+    if v <= 0.05 or w <= 0.05:
+        return 1.0
+    scale = w / v
+    if 0.97 <= scale <= 1.03:
+        return 1.0
+    return min(max(scale, 0.5), 2.5)
+
+
 def _asbd_field(asbd, name: str, index: int, default):
     try:
         val = getattr(asbd, name, None)
@@ -231,7 +272,10 @@ def _sbuf_to_mono_f32(sbuf) -> Optional[np.ndarray]:
     if arr.size == 0:
         return None
     if channels > 1 and arr.size % channels == 0:
-        arr = arr.reshape(-1, channels).mean(axis=1)
+        # Mean fold of a one-sided / low SCK buffer is ~half level.
+        # Mid * sqrt(n) keeps mono-compatible level; clip later.
+        folded = arr.reshape(-1, channels).mean(axis=1)
+        arr = folded * (min(int(channels), 2) ** 0.5)
     elif n > 0 and arr.size >= n:
         arr = arr[:n]
     arr = np.ascontiguousarray(arr, dtype=np.float32)

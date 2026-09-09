@@ -4569,7 +4569,14 @@ class GestureWorker(QObject):
         Lite/Low-FPS enable/disable cycle — namely when the user
         toggles GPU. First swap into GPU is the last one that pays
         the ~2 s cost; every subsequent Default/Lite/Low-FPS toggle
-        is engine-only (~5-10 ms via the C17 cache HIT branch)."""
+        is engine-only (~5-10 ms via the C17 cache HIT branch).
+
+        Darwin never uses the ffmpeg-MJPG capture path. Returning True
+        here skipped AVFoundation capture tuning (including the 640×480
+        Camera Boost reopen) after GPU mode, which made GPU look dead.
+        """
+        if sys.platform == "darwin":
+            return False
         return bool(getattr(self.config, "gpu_mode", False))
 
     def _preflight_short_shutter_for_ffmpeg(
@@ -6324,16 +6331,25 @@ class GestureWorker(QObject):
                                 device.setFocusMode_(AVCaptureFocusModeLocked)
                         except Exception:
                             pass
-                        device.setExposureMode_(AVCaptureExposureModeCustom)
-                        device.setExposureModeCustomWithDuration_ISO_completionHandler_(
-                            duration, iso, None
-                        )
-                        sys.stderr.write(
-                            "[r49-short-shutter] mac AVCaptureDevice custom "
-                            f"exposure 1/90 ISO={iso:.0f} af=locked "
-                            f"device={device.localizedName()!r}\n"
-                        )
-                        sys.stderr.flush()
+                        if not device.isExposureModeSupported_(AVCaptureExposureModeCustom):
+                            sys.stderr.write(
+                                "[r49-short-shutter] mac AVCaptureDevice: "
+                                "custom exposure not supported on "
+                                f"{device.localizedName()!r}; "
+                                "640x480 reopen is the fps lever\n"
+                            )
+                            sys.stderr.flush()
+                        else:
+                            device.setExposureMode_(AVCaptureExposureModeCustom)
+                            device.setExposureModeCustomWithDuration_ISO_completionHandler_(
+                                duration, iso, None
+                            )
+                            sys.stderr.write(
+                                "[r49-short-shutter] mac AVCaptureDevice custom "
+                                f"exposure 1/90 ISO={iso:.0f} af=locked "
+                                f"device={device.localizedName()!r}\n"
+                            )
+                            sys.stderr.flush()
                     finally:
                         device.unlockForConfiguration()
         except Exception as exc:
@@ -9132,7 +9148,16 @@ class GestureWorker(QObject):
         Lite mode (model_complexity=0) is excluded regardless of
         backend â€” the lite landmark model produces visibly different
         coordinates that drop classifier scores ~0.05â€“0.10 below the
-        recorder's baseline."""
+        recorder's baseline.
+
+        Darwin is the exception: a second MediaPipe pass for custom
+        gestures costs 15-25 ms/frame on Apple Silicon and collapses
+        Lite / GPU / Boost to the same ~12 fps as Default whenever a
+        custom gesture exists (even one that never matches). Reuse
+        live-engine landmarks there; scores may sit a few points lower
+        than a complexity=1 recording."""
+        if sys.platform == "darwin":
+            return True
         try:
             engine = getattr(self, "engine", None)
             detector = getattr(engine, "detector", None) if engine is not None else None

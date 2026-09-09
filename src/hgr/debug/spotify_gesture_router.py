@@ -277,8 +277,13 @@ class SpotifyGestureRouter:
         try:
             if not controller._has_real_spotify_process():
                 try:
-                    _sys.stderr.write("[r51-spotify-gate] block: is_active=False AND _has_real_spotify_process=False\n")
-                    _sys.stderr.flush()
+                    import time as _time
+                    last = float(getattr(controller, "_r51_gate_log_at", 0.0) or 0.0)
+                    now = _time.monotonic()
+                    if now - last >= 2.0:
+                        controller._r51_gate_log_at = now
+                        _sys.stderr.write("[r51-spotify-gate] block: is_active=False AND _has_real_spotify_process=False\n")
+                        _sys.stderr.flush()
                 except Exception:
                     pass
                 return False

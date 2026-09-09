@@ -56,6 +56,13 @@ class ChromeController:
         self._executable_paths = executable_paths or self._default_executable_paths()
         self._handles_cache: list[int] = []
         self._handles_cache_until = 0.0
+        # macOS: is_window_open/active proxy through is_running(), and
+        # _build_debug_payload calls both every camera frame. An uncached
+        # psutil.process_iter is ~10 ms on Apple Silicon — two of them
+        # were ~20 ms of "overlay" time with a hand in frame.
+        self._mac_running_cache: bool | None = None
+        self._mac_running_cache_until: float = 0.0
+        self._mac_running_cache_ttl: float = 1.5
 
     @property
     def available(self) -> bool:
@@ -76,6 +83,17 @@ class ChromeController:
     def is_running(self) -> bool:
         if not self._available:
             return False
+        if self._mac:
+            now = time.monotonic()
+            if self._mac_running_cache is not None and now < self._mac_running_cache_until:
+                return self._mac_running_cache
+            value = self._is_running_uncached()
+            self._mac_running_cache = value
+            self._mac_running_cache_until = now + self._mac_running_cache_ttl
+            return value
+        return self._is_running_uncached()
+
+    def _is_running_uncached(self) -> bool:
         try:
             for proc in psutil.process_iter(["name"]):
                 name = (proc.info.get("name") or "").lower()
@@ -644,6 +662,9 @@ class ChromeController:
                     capture_output=True,
                     timeout=12,
                 )
+                if result.returncode == 0:
+                    self._mac_running_cache = True
+                    self._mac_running_cache_until = time.monotonic() + self._mac_running_cache_ttl
                 return result.returncode == 0
             except Exception:
                 return False

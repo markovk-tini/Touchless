@@ -110,6 +110,22 @@ def test_engine_landmarks_not_reused_on_onnx_or_lite() -> None:
     )
 
 
+def test_engine_landmarks_reused_on_darwin_onnx_and_lite(monkeypatch) -> None:
+    monkeypatch.setattr("hgr.app.integration.noop_engine.sys.platform", "darwin")
+    assert (
+        GestureWorker._custom_runner_can_use_engine_landmarks(
+            _fake_worker_backend("onnx-coreml", 1)
+        )
+        is True
+    )
+    assert (
+        GestureWorker._custom_runner_can_use_engine_landmarks(
+            _fake_worker_backend("mediapipe-cpu", 0)
+        )
+        is True
+    )
+
+
 def test_custom_mp_skip_reuses_cache_without_treating_as_lost() -> None:
     class _Runner:
         def extract_hands(self, frame):

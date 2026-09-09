@@ -22413,7 +22413,8 @@ Admin elevation
         """
         if sys.platform != "darwin":
             return
-        always = bool(os.environ.get("HGR_MAC_PERMS_ALWAYS_SHOW"))
+        import os as _os
+        always = bool(_os.environ.get("HGR_MAC_PERMS_ALWAYS_SHOW"))
         if not always and bool(getattr(self.config, "mac_permissions_wizard_shown", False)):
             return
         try:
@@ -28312,23 +28313,33 @@ Admin elevation
             # broken 0-sample track.
             if audio is None or len(audio) < int(0.05 * fs):
                 return
-            # End-anchor to the video duration. ffmpeg -apad -shortest keeps
-            # the START of a longer wav, which is what made speaker/mic
-            # audio play one clip-length early.
+            try:
+                from ...platform_compat.mac_system_audio import (
+                    boost_quiet_mac_pcm,
+                    mac_clip_video_timescale,
+                )
+                audio = boost_quiet_mac_pcm(audio)
+            except Exception:
+                mac_clip_video_timescale = None  # type: ignore
+            # Keep the wall-clock wav. OpenCV mp4v/MJPG often tags ~20 fps
+            # while Quartz wrote fewer frames, so probed duration is ~10 s
+            # short. Trimming audio to that probe made the track lead picture.
+            # Stretch video timestamps to the wall span instead.
+            wall_span = max(0.05, float(right) - float(left))
             video_dur = self._probe_media_seconds(video_path)
             if video_dur <= 0.05:
-                video_dur = max(0.05, float(right) - float(left))
-            want = int(round(video_dur * fs))
-            if want > 0 and len(audio) > want:
-                audio = audio[-want:]
-            elif want > 0 and len(audio) < want:
-                pad = np.zeros(want, dtype=np.float32)
-                pad[-len(audio):] = audio
-                audio = pad
+                video_dur = wall_span
+            scale = 1.0
+            if mac_clip_video_timescale is not None:
+                try:
+                    scale = float(mac_clip_video_timescale(video_dur, wall_span))
+                except Exception:
+                    scale = 1.0
             try:
                 sys.stderr.write(
                     f"[mac-clip-audio] mux left={left:.3f} right={right:.3f} "
-                    f"span={right - left:.3f}s video_dur={video_dur:.3f}s "
+                    f"span={wall_span:.3f}s video_dur={video_dur:.3f}s "
+                    f"itsscale={scale:.4f} "
                     f"mic={0 if mic is None else len(mic)/fs:.3f}s "
                     f"sys={0 if sys_a is None else len(sys_a)/fs:.3f}s "
                     f"out={len(audio)/fs:.3f}s\n"
@@ -28348,18 +28359,34 @@ Admin elevation
             out_tmp = Path(f"{video_path}.withaudio.mp4")
             # apad + -shortest: pad audio with trailing silence so -shortest
             # trims the PADDING to the video length, never the video itself.
+            # When the OpenCV file is shorter than the wall span, stretch
+            # timestamps (re-encode). -itsscale + copy is a no-op on many
+            # mp4v files, which would leave -shortest cutting the wav.
             mux_cmd = [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(video_path), "-i", str(wav_path),
-                "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+            ]
+            if abs(scale - 1.0) > 0.001:
+                mux_cmd.extend([
+                    "-filter_complex", f"[0:v]setpts=PTS*{scale:.6f}[v]",
+                    "-map", "[v]", "-map", "1:a",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                ])
+            else:
+                mux_cmd.extend([
+                    "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+                ])
+            mux_cmd.extend([
                 "-af", "apad", "-c:a", acodec, "-b:a", "192k", "-ar", str(fs),
                 "-shortest", str(out_tmp),
-            ]
+            ])
             proc = None
             try:
                 proc = subprocess.run(
                     mux_cmd, stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=180,
                 )
             except Exception:
                 proc = None
@@ -36695,7 +36722,8 @@ Admin elevation
                 # cosmetic curve, so this is OFF by default; opt in for testing
                 # with HGR_MAC_ROUNDED_CORNERS=1. (Revisit with a cheaper
                 # technique later.)
-                if os.environ.get("HGR_MAC_ROUNDED_CORNERS"):
+                import os as _os_round
+                if _os_round.environ.get("HGR_MAC_ROUNDED_CORNERS"):
                     def _round_corners():
                         try:
                             from .native_overlay import apply_macos_rounded_corners
