@@ -47,15 +47,81 @@ def _log(msg: str) -> None:
         pass
 
 
+def assemble_pcm_ring(
+    chunks,
+    fs: int,
+    left: float,
+    right: float,
+    *,
+    jitter_s: float = 0.080,
+) -> Optional[np.ndarray]:
+    """Contiguous PCM for wall window [left, right], end-anchored.
+
+    Chunk `time.time()` stamps jitter. Placing each block independently
+    made static; a 20 ms gap threshold still inserted clicks. Treat
+    overlaps as duplicate samples (trim) and sub-`jitter_s` gaps as
+    scheduling noise (no silence). Then slice so the last sample lines
+    up with `right` (clip click / speech-end), not the oldest stamp.
+    """
+    if chunks is None or right <= left or int(fs) <= 0:
+        return None
+    total = int(round((float(right) - float(left)) * float(fs)))
+    if total <= 0:
+        return None
+    pieces: list = []
+    prev_t_end = None
+    last_t_end = None
+    fs_f = float(fs)
+    min_overlap = -1.0 / fs_f
+    for (t_end, arr) in chunks:
+        arr = np.asarray(arr, dtype=np.float32).reshape(-1)
+        n = int(arr.size)
+        if n == 0:
+            continue
+        t_end_f = float(t_end)
+        if prev_t_end is not None:
+            gap = (t_end_f - n / fs_f) - float(prev_t_end)
+            if gap < min_overlap:
+                skip = min(n, max(0, int(round(-gap * fs_f))))
+                if skip >= n:
+                    prev_t_end = t_end_f
+                    last_t_end = t_end_f
+                    continue
+                arr = arr[skip:]
+                n = int(arr.size)
+            elif gap > float(jitter_s):
+                pieces.append(np.zeros(int(round(gap * fs_f)), dtype=np.float32))
+        pieces.append(arr)
+        prev_t_end = t_end_f
+        last_t_end = t_end_f
+    if not pieces or last_t_end is None:
+        return None
+    try:
+        full = np.concatenate(pieces).astype(np.float32, copy=False)
+    except Exception:
+        return None
+    if full.size == 0:
+        return None
+    end_idx = full.size - int(round((float(last_t_end) - float(right)) * fs_f))
+    start_idx = end_idx - total
+    out = np.zeros(total, dtype=np.float32)
+    src0 = max(0, start_idx)
+    src1 = min(full.size, end_idx)
+    if src1 <= src0:
+        return None
+    dst0 = src0 - start_idx
+    dst1 = dst0 + (src1 - src0)
+    if dst0 < 0 or dst1 > total or dst1 <= dst0:
+        return None
+    out[dst0:dst1] = full[src0:src1]
+    return out
+
+
 def _window_pcm_ring(
     chunks_ref, lock, fs: int, left: float, right: float
 ) -> Optional[np.ndarray]:
-    """Same contiguous-concat window as the mic ring. See main_window
-    `_extract_mac_clip_audio` — do not stamp each chunk independently."""
+    """Lock + copy, then `assemble_pcm_ring`. Same helper as the mic ring."""
     if chunks_ref is None or right <= left:
-        return None
-    total = int(round((right - left) * fs))
-    if total <= 0:
         return None
     try:
         if lock is not None:
@@ -65,42 +131,7 @@ def _window_pcm_ring(
             chunks = list(chunks_ref)
     except Exception:
         return None
-    if not chunks:
-        return None
-    first_t_end, first_arr = chunks[0]
-    first_start = first_t_end - len(first_arr) / fs
-    pieces: list = []
-    prev_t_end = None
-    for (t_end, arr) in chunks:
-        n = len(arr)
-        if n == 0:
-            continue
-        if prev_t_end is not None:
-            gap = (t_end - n / fs) - prev_t_end
-            if gap > 0.020:
-                pieces.append(np.zeros(int(round(gap * fs)), dtype=np.float32))
-        pieces.append(arr)
-        prev_t_end = t_end
-    if not pieces:
-        return None
-    try:
-        full = np.concatenate(pieces).astype(np.float32)
-    except Exception:
-        return None
-    if full.size == 0:
-        return None
-    out = np.zeros(total, dtype=np.float32)
-    start_idx = int(round((left - first_start) * fs))
-    src0 = max(0, start_idx)
-    src1 = min(full.size, start_idx + total)
-    if src1 <= src0:
-        return None
-    dst0 = src0 - start_idx
-    dst1 = dst0 + (src1 - src0)
-    if dst0 < 0 or dst1 > total or dst1 <= dst0:
-        return None
-    out[dst0:dst1] = full[src0:src1]
-    return out
+    return assemble_pcm_ring(chunks, fs, left, right)
 
 
 def mix_mac_pcm(
@@ -135,7 +166,7 @@ def boost_quiet_mac_pcm(
     buf: Optional[np.ndarray],
     *,
     target_peak: float = 0.55,
-    max_gain: float = 12.0,
+    max_gain: float = 4.0,
     already_loud: float = 0.28,
 ) -> Optional[np.ndarray]:
     """Raise a quiet capture (typical SCK tap) without touching a loud mix."""
@@ -170,6 +201,29 @@ def mac_clip_video_timescale(video_dur: float, wall_span: float) -> float:
     if 0.97 <= scale <= 1.03:
         return 1.0
     return min(max(scale, 0.5), 2.5)
+
+
+def _sbuf_unix_end(sbuf, n_samples: int, fs: int) -> float:
+    """Presentation time of the last sample, else wall-clock arrival."""
+    now = time.time()
+    dur = max(0, int(n_samples)) / float(fs) if fs else 0.0
+    try:
+        from CoreMedia import (  # type: ignore
+            CMSampleBufferGetPresentationTimeStamp,
+            CMTimeGetSeconds,
+        )
+        pts = CMSampleBufferGetPresentationTimeStamp(sbuf)
+        sec = float(CMTimeGetSeconds(pts) or 0.0)
+    except Exception:
+        return now
+    if sec <= 0.0:
+        return now
+    # Host/uptime clocks are small; unix seconds are ~1e9.
+    if sec > 1.0e9:
+        return sec + dur
+    if sec < 1.0e8:
+        return (now - time.monotonic()) + sec + dur
+    return now
 
 
 def _asbd_field(asbd, name: str, index: int, default):
@@ -363,14 +417,14 @@ class MacSystemAudioTap:
     def extract(self, left: float, right: float) -> Optional[np.ndarray]:
         return _window_pcm_ring(self._chunks, self._lock, self._fs, left, right)
 
-    def _push(self, mono: np.ndarray) -> None:
+    def _push(self, mono: np.ndarray, t_end: Optional[float] = None) -> None:
         if mono is None or mono.size == 0:
             return
-        t_end = time.time()
+        stamp = time.time() if t_end is None else float(t_end)
         with self._lock:
-            self._chunks.append((t_end, mono.copy()))
+            self._chunks.append((stamp, mono.copy()))
             if not self._unbounded:
-                cutoff = t_end - self._max_seconds
+                cutoff = stamp - self._max_seconds
                 while self._chunks and self._chunks[0][0] < cutoff:
                     self._chunks.popleft()
 
@@ -421,7 +475,12 @@ class MacSystemAudioTap:
                             return
                         mono = _sbuf_to_mono_f32(sbuf)
                         if mono is not None:
-                            owner._push(mono)
+                            owner._push(
+                                mono,
+                                t_end=_sbuf_unix_end(
+                                    sbuf, int(mono.size), int(owner._fs)
+                                ),
+                            )
                     except Exception:
                         pass
 

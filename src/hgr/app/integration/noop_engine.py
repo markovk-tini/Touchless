@@ -716,10 +716,6 @@ class GestureWorker(QObject):
     # Normal-mode confidence thresholds + stable-frame requirement
     # so the gesture decisions still feel as solid as before.
     _LITE_MODE_PROCESS_WIDTH = 384
-    # Darwin Performance Boost: smaller than Lite so the two modes
-    # are not the same engine. Lite keeps 720p capture; Boost reopens
-    # at 640×480 and runs inference at this width.
-    _MAC_BOOST_PROCESS_WIDTH = 256
     # Darwin GPU: ONNX/CoreML plus a 480-px frame. Default GPU used
     # 960 px on 720p — same work as Default, so fps stayed ~13-14.
     _MAC_GPU_PROCESS_WIDTH = 480
@@ -4150,10 +4146,7 @@ class GestureWorker(QObject):
         low_fps = bool(getattr(self.config, "low_fps_mode", False)) or self._low_fps_auto_engaged
         lite = bool(getattr(self.config, "lite_mode", False))
         gpu = bool(getattr(self.config, "gpu_mode", False))
-        mac_boost = (
-            sys.platform == "darwin"
-            and bool(getattr(self.config, "mac_performance_boost", False))
-        )
+        mac_boost = False
         fullscreen_suppress = bool(self._gpu_suppressed_for_fullscreen)
         stable_frames_cfg = int(getattr(self.config, "stable_frames_required", 4))
         return (low_fps, lite, gpu, mac_boost, fullscreen_suppress, stable_frames_cfg)
@@ -4210,10 +4203,7 @@ class GestureWorker(QObject):
             lite = bool(getattr(self.config, "lite_mode", False))
             gpu = bool(getattr(self.config, "gpu_mode", False))
             lowfps_cfg = bool(getattr(self.config, "low_fps_mode", False))
-            mac_boost = (
-                sys.platform == "darwin"
-                and bool(getattr(self.config, "mac_performance_boost", False))
-            )
+            mac_boost = False
             sys.stderr.write(
                 f"[perf-mode] _swap_engine_safely START "
                 f"lite={lite} gpu={gpu} boost={mac_boost} "
@@ -5020,10 +5010,7 @@ class GestureWorker(QObject):
     def _build_engine_for_fps_mode(self) -> GestureRecognitionEngine:
         self._low_fps_active = bool(getattr(self.config, "low_fps_mode", False)) or self._low_fps_auto_engaged
         lite_active = bool(getattr(self.config, "lite_mode", False))
-        mac_boost = (
-            sys.platform == "darwin"
-            and bool(getattr(self.config, "mac_performance_boost", False))
-        )
+        mac_boost = False
         # GPU Mode threads through to every detector flavour. The
         # runtime loader honours it best-effort and falls back to
         # CPU MediaPipe when no GPU path is reachable, so toggling
@@ -5051,21 +5038,17 @@ class GestureWorker(QObject):
                 prefer_gpu=prefer_gpu,
             )
             stable_frames = 1
-        elif sys.platform == "darwin" and (lite_active or mac_boost or prefer_gpu):
-            # Mac mode ladder (each step must be a real fps gain):
-            #   Lite: 720p capture, 384-px lite CPU model
-            #   GPU:  640×480 capture, 480-px CoreML (CPU lite fallback)
-            #   Boost: 640×480 capture, 256-px lite CPU model
-            # Lite stays CPU-only (same as Windows). GPU+Boost uses
-            # the smaller Boost width on the GPU path.
+        elif sys.platform == "darwin" and (lite_active or prefer_gpu):
+            # Mac ladder: Lite = 720p + 384-px CPU; GPU = 640×480 +
+            # 480-px CoreML. Performance Boost was dropped — FaceTime
+            # is 30 fps so a third 256-px mode did not raise actual fps.
             if lite_active:
                 prefer_gpu = False
-            if mac_boost:
-                process_width = self._MAC_BOOST_PROCESS_WIDTH
-            elif prefer_gpu:
-                process_width = self._MAC_GPU_PROCESS_WIDTH
-            else:
-                process_width = self._LITE_MODE_PROCESS_WIDTH
+            process_width = (
+                self._MAC_GPU_PROCESS_WIDTH
+                if prefer_gpu
+                else self._LITE_MODE_PROCESS_WIDTH
+            )
             detector = HandDetector(
                 model_complexity=0,
                 max_process_width=process_width,
@@ -5081,7 +5064,7 @@ class GestureWorker(QObject):
                 sys.stderr.flush()
             except Exception:
                 pass
-        elif lite_active or mac_boost:
+        elif lite_active:
             # Lite Mode (v1.1.7 C23): CPU-only. The previous version
             # silently set prefer_gpu=True so Lite would use ONNX +
             # DirectML on GPU-capable hardware — but that made two
@@ -5203,8 +5186,7 @@ class GestureWorker(QObject):
         if sys.platform != "darwin":
             return (1280, 720)
         if (
-            bool(getattr(self.config, "mac_performance_boost", False))
-            or bool(getattr(self.config, "gpu_mode", False))
+            bool(getattr(self.config, "gpu_mode", False))
             or bool(getattr(self.config, "camera_force_short_shutter", False))
         ):
             return (640, 480)
@@ -5372,36 +5354,21 @@ class GestureWorker(QObject):
             pass
 
     def set_mac_performance_boost(self, enabled: bool) -> None:
-        """Darwin-only fps lever: 640×480 capture + lite landmark model.
-
-        No-op on Windows. Distinct from Lite Mode (which keeps 720p
-        capture) and from GPU Mode (CoreML / DirectML)."""
-        enabled = bool(enabled) and sys.platform == "darwin"
-        self.config.mac_performance_boost = enabled
+        """Removed from the Mac UI. Kept as a no-op so old settings.json
+        and leftover Save-Changes keys cannot re-enable it."""
+        self.config.mac_performance_boost = False
+        if sys.platform != "darwin":
+            return
         prev_applied = self._applied_mac_performance_boost
-        try:
-            sys.stderr.write(
-                f"[perf-mode] set_mac_performance_boost({enabled}) "
-                f"running={self._running} applied_was={prev_applied} "
-                f"-> applying={prev_applied != enabled}\n"
-            )
-            sys.stderr.flush()
-        except Exception:
-            pass
+        if prev_applied is False:
+            return
+        self._applied_mac_performance_boost = False
         if not self._running:
             return
-        if prev_applied == enabled:
-            return
-        self._applied_mac_performance_boost = enabled
-        self._swap_engine_safely()
-        self._fps = 0.0
-        if sys.platform == "darwin":
+        if prev_applied is True:
+            self._swap_engine_safely()
+            self._fps = 0.0
             self._reopen_macos_camera()
-            return
-        try:
-            self._apply_default_capture_tuning((None, self._cap))
-        except Exception:
-            pass
 
     def set_force_ten_fps_test_mode(self, enabled: bool) -> None:
         self.config.force_ten_fps_test_mode = bool(enabled)
@@ -8277,10 +8244,7 @@ class GestureWorker(QObject):
                     # Mode but engine is still 27ms" diagnostic.
                     _mode_lite = bool(getattr(self.config, "lite_mode", False))
                     _mode_gpu = bool(getattr(self.config, "gpu_mode", False))
-                    _mode_boost = (
-                        sys.platform == "darwin"
-                        and bool(getattr(self.config, "mac_performance_boost", False))
-                    )
+                    _mode_boost = False
                     _mode_lowfps = self._low_fps_active
                     _mode_tag = (
                         "LOW_FPS" if _mode_lowfps

@@ -12131,38 +12131,11 @@ class MainWindow(QMainWindow):
         body.addLayout(lite_row)
         self._general_controls["lite_mode"] = lite_btn
 
-        # ---- Performance Boost (macOS) ----
+        # Performance Boost was a third Mac ladder (640×480 + 256 px).
+        # FaceTime is 30 fps, so Lite and GPU already sat on that cap
+        # and Boost felt identical. Keep Low FPS + Lite + GPU only.
         if sys.platform == "darwin":
-            body.addWidget(
-                self._build_expandable_note(
-                    "Reopens the camera at 640×480 and uses the smallest tracker — more fps than Lite.",
-                    "Lite Mode keeps 720p and only lightens hand tracking. Performance Boost also reopens the camera at 640×480 and runs an even smaller inference frame, so it should be clearly faster than Lite. The live view looks less sharp. GPU Mode uses CoreML on that same smaller camera when models are present.",
-                    object_name="cameraNote",
-                )
-            )
-            boost_btn = QPushButton()
-            boost_btn.setCheckable(True)
-            boost_btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-            boost_btn.setStyleSheet(camera_button_style)
-            boost_initial = bool(getattr(self.config, "mac_performance_boost", False))
-            boost_btn.setChecked(boost_initial)
-            boost_btn.setText(
-                "Performance Boost: ON" if boost_initial else "Performance Boost"
-            )
-            self._register_general_baseline("mac_performance_boost", boost_initial)
-
-            def _on_mac_boost_clicked(checked: bool) -> None:
-                boost_btn.setText(
-                    "Performance Boost: ON" if checked else "Performance Boost"
-                )
-                self._on_general_control_changed("mac_performance_boost", bool(checked))
-
-            boost_btn.clicked.connect(_on_mac_boost_clicked)
-            boost_row = QHBoxLayout()
-            boost_row.addWidget(boost_btn)
-            boost_row.addStretch(1)
-            body.addLayout(boost_row)
-            self._general_controls["mac_performance_boost"] = boost_btn
+            self.config.mac_performance_boost = False
 
         # ---- GPU Mode ----
         # Windows: ONNX + DirectML. macOS: ONNX + CoreML. MediaPipe
@@ -16150,7 +16123,8 @@ class MainWindow(QMainWindow):
         worker = getattr(self, "_worker", None)
         if worker is None or not hasattr(worker, "set_mac_performance_boost"):
             return
-        on = bool(getattr(self.config, "mac_performance_boost", False))
+        on = False
+        self.config.mac_performance_boost = False
         label = "Loading Performance Boost" if on else "Restoring Default Mode"
         try:
             self.processing_overlay.show_processing(label)
@@ -28208,18 +28182,9 @@ Admin elevation
     def _extract_mac_clip_audio(self, left: float, right: float):
         """Return a float32 mono buffer spanning the FULL [left, right] window.
 
-        The mic stream is a CONTIGUOUS sample flow; chunk boundaries are
-        arbitrary but the samples are gapless. So we concatenate the chunks in
-        order (NOT re-position each by its own timestamp — the callback's
-        time.time() carries scheduling jitter, and placing each block by that
-        jittery stamp leaves ~ms gaps/overlaps between every block = the
-        garbled/"static" artifact). We anchor only the FIRST chunk to the wall
-        clock, append the rest contiguously, and insert silence ONLY where a
-        real, large gap is detected (a genuinely dropped block). Then we window
-        [left, right] out of that stream, silence-padding the leading warmup and
-        trailing edge so the result is exactly the window length (== the video
-        length, so `-shortest` can never truncate the video). Returns None only
-        if NO real samples fall in the window."""
+        Shared `assemble_pcm_ring` with the SCK tap: overlap-trim, ignore
+        sub-80 ms stamp jitter, end-anchor to `right`. Returns None only
+        if no real samples fall in the window."""
         fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
         lock = getattr(self, "_mac_clip_audio_lock", None)
         chunks_ref = getattr(self, "_mac_clip_audio_chunks", None)
@@ -28238,44 +28203,11 @@ Admin elevation
             return None
         if not chunks:
             return None
-        # Build one contiguous stream. first_start = wall-clock time of its
-        # first sample. Insert silence only for gaps > ~20 ms (a real drop),
-        # never for the per-block sub-ms jitter.
-        first_t_end, first_arr = chunks[0]
-        first_start = first_t_end - len(first_arr) / fs
-        pieces: list = []
-        prev_t_end = None
-        for (t_end, arr) in chunks:
-            n = len(arr)
-            if n == 0:
-                continue
-            if prev_t_end is not None:
-                gap = (t_end - n / fs) - prev_t_end
-                if gap > 0.020:
-                    pieces.append(np.zeros(int(round(gap * fs)), dtype=np.float32))
-            pieces.append(arr)
-            prev_t_end = t_end
-        if not pieces:
-            return None
         try:
-            full = np.concatenate(pieces).astype(np.float32)
+            from ...platform_compat.mac_system_audio import assemble_pcm_ring
+            return assemble_pcm_ring(chunks, fs, left, right)
         except Exception:
             return None
-        if full.size == 0:
-            return None
-        # Window [left, right] out of `full` (full[0] is at first_start).
-        out = np.zeros(total, dtype=np.float32)
-        start_idx = int(round((left - first_start) * fs))
-        src0 = max(0, start_idx)
-        src1 = min(full.size, start_idx + total)
-        if src1 <= src0:
-            return None
-        dst0 = src0 - start_idx           # >0 when the window starts before capture
-        dst1 = dst0 + (src1 - src0)
-        if dst0 < 0 or dst1 > total or dst1 <= dst0:
-            return None
-        out[dst0:dst1] = full[src0:src1]
-        return out
 
     def _probe_media_seconds(self, path: Path) -> float:
         """Best-effort duration of a just-written clip. 0.0 on failure."""
@@ -28335,6 +28267,10 @@ Admin elevation
                     scale = float(mac_clip_video_timescale(video_dur, wall_span))
                 except Exception:
                     scale = 1.0
+            delay_ms = max(
+                0,
+                int(getattr(self.config, "clip_sys_audio_delay_ms", 1000) or 0),
+            )
             try:
                 sys.stderr.write(
                     f"[mac-clip-audio] mux left={left:.3f} right={right:.3f} "
@@ -28342,7 +28278,7 @@ Admin elevation
                     f"itsscale={scale:.4f} "
                     f"mic={0 if mic is None else len(mic)/fs:.3f}s "
                     f"sys={0 if sys_a is None else len(sys_a)/fs:.3f}s "
-                    f"out={len(audio)/fs:.3f}s\n"
+                    f"out={len(audio)/fs:.3f}s delay_ms={delay_ms}\n"
                 )
                 sys.stderr.flush()
             except Exception:
@@ -28357,11 +28293,9 @@ Admin elevation
                 wf.writeframes(pcm16.tobytes())
             acodec = str(self._ffmpeg_capabilities.get("audio_encoder", "aac") or "aac")
             out_tmp = Path(f"{video_path}.withaudio.mp4")
-            # apad + -shortest: pad audio with trailing silence so -shortest
-            # trims the PADDING to the video length, never the video itself.
-            # When the OpenCV file is shorter than the wall span, stretch
-            # timestamps (re-encode). -itsscale + copy is a no-op on many
-            # mp4v files, which would leave -shortest cutting the wav.
+            # WASAPI needed ~1 s adelay so speaker audio didn't lead picture.
+            # SCK has the same class of capture delay on Mac.
+            af = f"adelay={delay_ms}:all=1,apad" if delay_ms > 0 else "apad"
             mux_cmd = [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(video_path), "-i", str(wav_path),
@@ -28378,7 +28312,7 @@ Admin elevation
                     "-map", "0:v", "-map", "1:a", "-c:v", "copy",
                 ])
             mux_cmd.extend([
-                "-af", "apad", "-c:a", acodec, "-b:a", "192k", "-ar", str(fs),
+                "-af", af, "-c:a", acodec, "-b:a", "192k", "-ar", str(fs),
                 "-shortest", str(out_tmp),
             ])
             proc = None
