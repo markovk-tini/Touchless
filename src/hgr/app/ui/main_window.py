@@ -22703,6 +22703,11 @@ Admin elevation
         """
         import os as _os
         test_force = bool(_os.environ.get("TOUCHLESS_TEST_SPOTIFY_PROMPT"))
+        if sys.platform == "darwin" and not test_force:
+            # Mac transport is AppleScript; the Windows OAuth
+            # Allow/Don't Allow modal is the wrong prompt. Failures
+            # use the "Set up or reconnect Spotify" pill instead.
+            return
         if getattr(self, "_spotify_first_prompt_in_flight", False):
             if test_force:
                 try:
@@ -22808,6 +22813,10 @@ Admin elevation
                 _sys.stderr.flush()
             except Exception:
                 pass
+
+        if _sys.platform == "darwin" and not bool(_os.environ.get("TOUCHLESS_TEST_SPOTIFY_PROMPT")):
+            # AppleScript transport; don't fire the Windows OAuth modal.
+            return
 
         test_force = bool(_os.environ.get("TOUCHLESS_TEST_SPOTIFY_PROMPT"))
         if test_force:
@@ -23272,6 +23281,13 @@ Admin elevation
                 return
         except Exception:
             pass
+        if sys.platform == "darwin":
+            # Same copy as Windows: top-right reconnect overlay, not the
+            # OAuth Allow modal (Mac transport is AppleScript).
+            self._show_spotify_action_pill(
+                "Set up or reconnect Spotify to control your music with Touchless"
+            )
+            return
         pill = self._ensure_spotify_connect_pill()
         anim = self._ensure_spotify_connect_pill_fade()
         if anim is not None and anim.state() == QPropertyAnimation.Running:
@@ -28249,7 +28265,7 @@ Admin elevation
             # residual. Applying it here plus ring end-anchor made Mac clips
             # ~2 s late. Skip that delay; stamp_lead_s pulls the 1–2 s
             # first-start lead without leading silence from adelay.
-            stamp_lead_s = 1.5
+            stamp_lead_s = 2.5
             boost_quiet_mac_pcm = None
             mac_clip_video_timescale = None
             try:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 from PySide6.QtCore import QPropertyAnimation, QTimer, Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
@@ -192,7 +194,14 @@ class SpotifyConnectPromptOverlay(QWidget):
             self.move(x, y)
         self._opacity_effect.setOpacity(0.0)
         self.show()
-        self.raise_()
+        if sys.platform != "darwin":
+            self.raise_()
+        else:
+            try:
+                from ..app.ui.native_overlay import apply_overlay
+                apply_overlay(self)
+            except Exception:
+                pass
         self._fade.stop()
         self._fade.setStartValue(0.0)
         self._fade.setEndValue(1.0)

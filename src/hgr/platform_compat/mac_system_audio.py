@@ -28,8 +28,9 @@ _FS = 48000
 
 # Mic/SCK block stamps run ~1–2 s late vs clip wall times, so a
 # first-start slice plays early. Clip mux skips this much into the
-# ring. Screen recordings pass 0 — they already align to AVFoundation.
-MAC_CLIP_STAMP_LEAD_S = 1.5
+# ring. 1.5 s left the track ~1 s early; 2.5 s is that remainder.
+# Screen recordings pass 0 — they already align to AVFoundation.
+MAC_CLIP_STAMP_LEAD_S = 2.5
 
 
 def mac_system_audio_available() -> bool:
@@ -62,12 +63,12 @@ def assemble_pcm_ring(
 ) -> Optional[np.ndarray]:
     """Contiguous PCM for wall window [left, right], first-start sliced.
 
-    Callbacks deliver sequential non-overlapping PCM. Timestamps jitter,
-    so treating stamp-overlap as duplicate samples deleted real audio
-    (clicks / static) and end-anchoring stacked with ffmpeg adelay to
-    push the track ~2 s late. Concatenate in arrival order, ignore
-    sub-quarter-second stamp gaps, then slice from the first block's
-    implied start plus optional `stamp_lead_s` (clip mux only).
+    Callbacks deliver sequential PCM, but SCK/mic timestamps jitter.
+    A small negative gap is overlapping samples (concat played the
+    same audio twice). Crossfade that overlap instead of appending.
+    Ignore sub-quarter-second *positive* gaps (don't insert clicks).
+    Then slice from the first block's implied start plus optional
+    `stamp_lead_s` (clip mux only).
     """
     if chunks is None or right <= left or int(fs) <= 0:
         return None
@@ -79,6 +80,7 @@ def assemble_pcm_ring(
     prev_t_end = None
     fs_f = float(fs)
     dropout_s = 0.25
+    max_xfade = int(round(0.080 * fs_f))
     for (t_end, arr) in chunks:
         arr = np.asarray(arr, dtype=np.float32).reshape(-1)
         n = int(arr.size)
@@ -90,9 +92,21 @@ def assemble_pcm_ring(
             first_start = t_start
         elif prev_t_end is not None:
             gap = t_start - float(prev_t_end)
-            if gap > dropout_s:
+            if gap < -1.0 / fs_f and pieces:
+                skip = min(n, pieces[-1].size, max(0, int(round(-gap * fs_f))))
+                skip = min(skip, max_xfade)
+                if skip > 0:
+                    fade_out = np.linspace(1.0, 0.0, skip, dtype=np.float32)
+                    fade_in = np.linspace(0.0, 1.0, skip, dtype=np.float32)
+                    pieces[-1][-skip:] = (
+                        pieces[-1][-skip:] * fade_out + arr[:skip] * fade_in
+                    )
+                    arr = arr[skip:]
+                    n = int(arr.size)
+            elif gap > dropout_s:
                 pieces.append(np.zeros(int(round(gap * fs_f)), dtype=np.float32))
-        pieces.append(arr)
+        if n > 0:
+            pieces.append(arr)
         prev_t_end = t_end_f
     if not pieces or first_start is None:
         return None

@@ -19,6 +19,10 @@ class _FakeSpotifyController:
         self._active = True
         self._running = False
         self._window_active = False
+        self.latched: list[tuple[str, str]] = []
+
+    def _latch_transient_failure(self, category: str, prefix: str) -> None:
+        self.latched.append((category, prefix))
 
     def dispatch_async(self, callable_obj, *args, on_complete=None, **kwargs) -> None:
         result = callable_obj(*args, **kwargs)
@@ -178,6 +182,8 @@ class SpotifyGestureRouterTest(unittest.TestCase):
         self.assertEqual(controller.previous_calls, 0)
         self.assertEqual(fist_snapshot.last_action, "spotify_toggle_idle")
         self.assertEqual(swipe_snapshot.last_action, "spotify_previous_idle")
+        self.assertGreaterEqual(len(controller.latched), 2)
+        self.assertTrue(all(item[0] == "NO_ACTIVE_DEVICE" for item in controller.latched))
 
     def test_running_spotify_can_still_receive_controls_without_focus_gesture(self) -> None:
         router = SpotifyGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=0.9)
@@ -193,5 +199,15 @@ class SpotifyGestureRouterTest(unittest.TestCase):
         self.assertEqual(controller.next_calls, 1)
         self.assertEqual(fist_snapshot.last_action, "spotify_toggle")
         self.assertEqual(swipe_snapshot.last_action, "spotify_next")
+
+    def test_mac_running_spotify_passes_gate_without_web_api(self) -> None:
+        router = SpotifyGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=0.9)
+        controller = _FakeSpotifyController()
+        controller._mac = True
+        controller._active = False
+        controller._running = True
+        router.update(stable_label="neutral", dynamic_label="swipe_left", controller=controller, now=0.0)
+        self.assertEqual(controller.previous_calls, 1)
+        self.assertEqual(controller.latched, [])
 
 # Author: Konstantin Markov

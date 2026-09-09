@@ -10061,6 +10061,7 @@ class GestureWorker(QObject):
         if snapshot.action_counter != self._last_spotify_action_counter:
             self._last_spotify_action_counter = snapshot.action_counter
             if snapshot.last_action != "-":
+                self._last_spotify_action = snapshot.last_action
                 self.command_detected.emit(snapshot.control_text)
                 self._record_action(snapshot.last_action, snapshot.control_text)
 

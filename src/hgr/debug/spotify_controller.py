@@ -307,14 +307,22 @@ class SpotifyController:
                     break
                 time.sleep(0.1)
         script = (
-            'if application "Spotify" is running then\n'
-            f'\ttell application "Spotify" to {command}\n'
-            'end if'
+            'if application "Spotify" is not running then\n'
+            '\treturn "not-running"\n'
+            'end if\n'
+            f'tell application "Spotify" to {command}\n'
+            'return "ok"\n'
         )
-        ok, _out, err = self._mac_osascript(script)
+        ok, out, err = self._mac_osascript(script)
         if not ok:
             self._message = self._mac_error_message("spotify control failed", err)
-        return ok
+            self._latch_transient_failure("NO_ACTIVE_DEVICE", self._message)
+            return False
+        if out == "not-running":
+            self._message = "spotify not running"
+            self._latch_transient_failure("NO_ACTIVE_DEVICE", self._message)
+            return False
+        return True
 
     def _mac_player_state(self) -> dict[str, Any] | None:
         """Synthesize the Web-API-shaped /me/player dict from one guarded
@@ -585,6 +593,11 @@ class SpotifyController:
         return self._has_real_spotify_process()
 
     def _probe_real_spotify_process(self) -> bool:
+        if self._mac:
+            # Desktop app is "Spotify", not Spotify.exe. The Windows
+            # exe+size filter below always missed it, so swipe/fist
+            # gated as inactive and never reached AppleScript.
+            return self._is_running_uncached()
         try:
             for proc in psutil.process_iter(["name", "exe"]):
                 name = (proc.info.get("name") or "").lower()
@@ -842,6 +855,7 @@ class SpotifyController:
             ok, out, err = self._mac_osascript(script)
             if not ok or out == "not-running":
                 self._message = self._mac_error_message("spotify not running", err) if not ok else "spotify not running"
+                self._latch_transient_failure("NO_ACTIVE_DEVICE", self._message)
                 return False
             self._message = f"spotify repeat {'on' if out == 'true' else 'off'}"
             return True
@@ -877,6 +891,7 @@ class SpotifyController:
             ok, out, err = self._mac_osascript(script)
             if not ok or out == "not-running":
                 self._message = self._mac_error_message("spotify not running", err) if not ok else "spotify not running"
+                self._latch_transient_failure("NO_ACTIVE_DEVICE", self._message)
                 return False
             self._message = f"spotify shuffle {'on' if out == 'true' else 'off'}"
             return True
@@ -951,7 +966,13 @@ class SpotifyController:
             self._mac_running_cache = None  # re-check running state after focus/launch
             self._message = "spotify focused" if ok else "spotify focus failed"
             if ok:
-                self._notify_opened()
+                if not self._available:
+                    self._latch_transient_failure(
+                        "NO_ACTIVE_DEVICE", "spotify not installed"
+                    )
+                    self._notify_opened()
+            else:
+                self._latch_transient_failure("NO_ACTIVE_DEVICE", self._message)
             return ok
         if not self._available:
             self._message = "spotify unavailable on this platform"
@@ -2163,6 +2184,12 @@ class SpotifyController:
         aggregate cost is well under a microsecond."""
         if self._needs_reauth:
             return "NEEDS_REAUTH"
+        if self._mac and not (self._access_token or self._refresh_token):
+            # AppleScript transport does not need OAuth. Only treat
+            # "not installed" as the Windows NO_TOKENS reconnect pill.
+            if not self._available:
+                return "NO_TOKENS"
+            return "READY"
         if not self._client_id:
             return "NO_CLIENT_ID"
         if not (self._access_token or self._refresh_token):

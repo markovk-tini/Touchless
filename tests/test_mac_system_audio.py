@@ -3,6 +3,7 @@
 import numpy as np
 
 from hgr.platform_compat.mac_system_audio import (
+    MAC_CLIP_STAMP_LEAD_S,
     assemble_pcm_ring,
     boost_quiet_mac_pcm,
     mac_clip_video_timescale,
@@ -49,17 +50,19 @@ def test_boost_quiet_mac_pcm_raises_sck_level():
     assert float(np.max(np.abs(same))) == 0.5
 
 
-def test_assemble_pcm_ring_concat_ignores_stamp_overlap():
+def test_assemble_pcm_ring_crossfades_stamp_overlap():
     fs = 48000
     a = np.full(fs, 0.2, dtype=np.float32)
-    # Stamps say this block overlaps the first by 50 ms; samples are sequential.
+    # Stamps say this block overlaps the first by 50 ms.
     b = np.full(int(0.1 * fs), 0.9, dtype=np.float32)
     chunks = [(1.0, a), (1.05, b)]
-    out = assemble_pcm_ring(chunks, fs, 0.0, 1.1)
+    out = assemble_pcm_ring(chunks, fs, 0.0, 1.05)
     assert out is not None
-    assert len(out) == int(round(1.1 * fs))
-    assert float(np.mean(out[:fs])) < 0.3
-    assert float(np.mean(out[fs:])) > 0.7
+    assert len(out) == int(round(1.05 * fs))
+    # Overlap-add keeps ~1.05 s, not 1.1 s of doubled audio.
+    # Tail after the crossfade is the rest of the 0.9 block.
+    assert float(np.mean(out[-int(0.03 * fs) :])) > 0.7
+    assert float(np.mean(out[int(0.1 * fs) : int(0.8 * fs)])) < 0.3
 
 
 def test_assemble_pcm_ring_first_start_window():
@@ -95,3 +98,7 @@ def test_assemble_pcm_ring_ignores_sub_quarter_second_gap():
     out = assemble_pcm_ring(chunks, fs, 0.0, 2.0)
     assert out is not None
     assert float(np.min(np.abs(out))) > 0.4
+
+
+def test_mac_clip_stamp_lead_is_two_and_a_half_seconds():
+    assert abs(float(MAC_CLIP_STAMP_LEAD_S) - 2.5) < 1e-9

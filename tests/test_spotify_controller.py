@@ -226,4 +226,43 @@ class SpotifyControllerTest(unittest.TestCase):
         self.assertFalse(controller.remove_current_track_from_queue())
         self.assertIn("not supported", controller.message)
 
+    def test_mac_process_probe_matches_spotify_app_name(self) -> None:
+        controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
+        controller._mac = True
+
+        class _Proc:
+            info = {"name": "Spotify", "exe": "/Applications/Spotify.app/Contents/MacOS/Spotify"}
+
+        with patch("hgr.debug.spotify_controller.psutil.process_iter", return_value=[_Proc()]):
+            self.assertTrue(controller._probe_real_spotify_process())
+
+    def test_windows_process_probe_still_requires_spotify_exe(self) -> None:
+        controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
+        controller._mac = False
+
+        class _Proc:
+            info = {"name": "Spotify", "exe": None}
+
+        with patch("hgr.debug.spotify_controller.psutil.process_iter", return_value=[_Proc()]):
+            self.assertFalse(controller._probe_real_spotify_process())
+
+    def test_mac_applescript_readiness_without_oauth_tokens(self) -> None:
+        controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
+        controller._mac = True
+        controller._access_token = None
+        controller._refresh_token = None
+        controller._client_id = "test-client"
+        controller._needs_reauth = False
+        controller._available = True
+        self.assertEqual(controller.readiness_state(), "READY")
+        controller._available = False
+        self.assertEqual(controller.readiness_state(), "NO_TOKENS")
+
+    def test_mac_transport_fails_when_spotify_is_not_running(self) -> None:
+        controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
+        controller._mac = True
+        with patch.object(controller, "_mac_osascript", return_value=(True, "not-running", "")):
+            self.assertFalse(controller._mac_transport("playpause"))
+        self.assertEqual(controller.take_transient_failure()["category"], "NO_ACTIVE_DEVICE")
+
 # Author: Konstantin Markov
