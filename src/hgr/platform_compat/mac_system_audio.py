@@ -26,9 +26,10 @@ import numpy as np
 
 _FS = 48000
 
-# Mic/SCK block stamps run ~1–2 s late vs clip wall times, so a
-# first-start slice plays early. Clip mux skips this much into the
-# ring. 1.5 s left the track ~1 s early; 2.5 s is that remainder.
+# Mic/SCK block stamps run late vs clip wall times, so a first-start
+# slice plays early. Clip mux skips this much into the ring.
+# 1.5 s left the track ~1 s early. Overlap-add then compressed the
+# ring and jumped to ~5 s early — do not mix/trim on stamp overlap.
 # Screen recordings pass 0 — they already align to AVFoundation.
 MAC_CLIP_STAMP_LEAD_S = 2.5
 
@@ -63,10 +64,10 @@ def assemble_pcm_ring(
 ) -> Optional[np.ndarray]:
     """Contiguous PCM for wall window [left, right], first-start sliced.
 
-    Callbacks deliver sequential PCM, but SCK/mic timestamps jitter.
-    A small negative gap is overlapping samples (concat played the
-    same audio twice). Crossfade that overlap instead of appending.
-    Ignore sub-quarter-second *positive* gaps (don't insert clicks).
+    Callbacks deliver sequential unique PCM. Stamp overlap is jitter,
+    not duplicate samples — crossfading it mixed different audio
+    (static) and shortened the ring vs wall-clock (~5 s early).
+    Concatenate in arrival order. Ignore sub-quarter-second gaps.
     Then slice from the first block's implied start plus optional
     `stamp_lead_s` (clip mux only).
     """
@@ -80,7 +81,6 @@ def assemble_pcm_ring(
     prev_t_end = None
     fs_f = float(fs)
     dropout_s = 0.25
-    max_xfade = int(round(0.080 * fs_f))
     for (t_end, arr) in chunks:
         arr = np.asarray(arr, dtype=np.float32).reshape(-1)
         n = int(arr.size)
@@ -92,21 +92,12 @@ def assemble_pcm_ring(
             first_start = t_start
         elif prev_t_end is not None:
             gap = t_start - float(prev_t_end)
-            if gap < -1.0 / fs_f and pieces:
-                skip = min(n, pieces[-1].size, max(0, int(round(-gap * fs_f))))
-                skip = min(skip, max_xfade)
-                if skip > 0:
-                    fade_out = np.linspace(1.0, 0.0, skip, dtype=np.float32)
-                    fade_in = np.linspace(0.0, 1.0, skip, dtype=np.float32)
-                    pieces[-1][-skip:] = (
-                        pieces[-1][-skip:] * fade_out + arr[:skip] * fade_in
-                    )
-                    arr = arr[skip:]
-                    n = int(arr.size)
-            elif gap > dropout_s:
+            # Negative / small positive gaps are stamp jitter. Do not
+            # trim, crossfade, or insert silence — those desync and
+            # crackle. Only pad a real dropout.
+            if gap > dropout_s:
                 pieces.append(np.zeros(int(round(gap * fs_f)), dtype=np.float32))
-        if n > 0:
-            pieces.append(arr)
+        pieces.append(arr)
         prev_t_end = t_end_f
     if not pieces or first_start is None:
         return None

@@ -50,19 +50,20 @@ def test_boost_quiet_mac_pcm_raises_sck_level():
     assert float(np.max(np.abs(same))) == 0.5
 
 
-def test_assemble_pcm_ring_crossfades_stamp_overlap():
+def test_assemble_pcm_ring_concat_keeps_stamp_overlap_samples():
     fs = 48000
     a = np.full(fs, 0.2, dtype=np.float32)
-    # Stamps say this block overlaps the first by 50 ms.
+    # Stamps say this block overlaps the first by 50 ms; samples are
+    # still sequential. Crossfading them mixed 0.2 with 0.9 (static)
+    # and shortened the ring. Concat keeps both blocks.
     b = np.full(int(0.1 * fs), 0.9, dtype=np.float32)
     chunks = [(1.0, a), (1.05, b)]
     out = assemble_pcm_ring(chunks, fs, 0.0, 1.05)
     assert out is not None
     assert len(out) == int(round(1.05 * fs))
-    # Overlap-add keeps ~1.05 s, not 1.1 s of doubled audio.
-    # Tail after the crossfade is the rest of the 0.9 block.
-    assert float(np.mean(out[-int(0.03 * fs) :])) > 0.7
     assert float(np.mean(out[int(0.1 * fs) : int(0.8 * fs)])) < 0.3
+    # First 50 ms of b land at t=1.0s in the concat.
+    assert float(np.mean(out[fs : fs + int(0.04 * fs)])) > 0.7
 
 
 def test_assemble_pcm_ring_first_start_window():

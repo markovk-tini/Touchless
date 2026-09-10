@@ -28203,9 +28203,9 @@ Admin elevation
         """Return a float32 mono buffer spanning the FULL [left, right] window.
 
         Shared `assemble_pcm_ring` with the SCK tap: concat in order, ignore
-        sub-250 ms stamp jitter, first-start slice. `stamp_lead_s` is clip-mux
-        only (cancels the 1–2 s stamp lead without ffmpeg adelay). Returns
-        None only if no real samples fall in the window."""
+        sub-250 ms stamp jitter (no overlap mix/trim), first-start slice.
+        `stamp_lead_s` is clip-mux only. Returns None only if no real
+        samples fall in the window."""
         fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
         lock = getattr(self, "_mac_clip_audio_lock", None)
         chunks_ref = getattr(self, "_mac_clip_audio_chunks", None)
