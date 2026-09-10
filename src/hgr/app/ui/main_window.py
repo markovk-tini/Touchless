@@ -28262,10 +28262,9 @@ Admin elevation
                 return
             fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
             # WASAPI's clip_sys_audio_delay_ms (1000) is a Windows TCP-bridge
-            # residual. Applying it here plus ring end-anchor made Mac clips
-            # ~2 s late. Skip that delay; stamp_lead_s pulls the 1–2 s
-            # first-start lead without leading silence from adelay.
-            stamp_lead_s = 2.5
+            # residual. Do not apply it here. stamp_lead_s is signed: the
+            # previous +2.5 s skip made clips ~4 s early.
+            stamp_lead_s = -1.5
             boost_quiet_mac_pcm = None
             mac_clip_video_timescale = None
             try:

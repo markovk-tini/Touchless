@@ -26,12 +26,12 @@ import numpy as np
 
 _FS = 48000
 
-# Mic/SCK block stamps run late vs clip wall times, so a first-start
-# slice plays early. Clip mux skips this much into the ring.
-# 1.5 s left the track ~1 s early. Overlap-add then compressed the
-# ring and jumped to ~5 s early — do not mix/trim on stamp overlap.
-# Screen recordings pass 0 — they already align to AVFoundation.
-MAC_CLIP_STAMP_LEAD_S = 2.5
+# Positive stamp_lead skips newer ring samples and makes the
+# soundtrack *earlier* (clip t=0 plays a later wall time).
+# +2.5 s with clear concat was ~4 s early ≈ 1.5 s inherent
+# first-start lead + 2.5 s of this term. Negative delays the
+# track. Screen recordings pass 0.
+MAC_CLIP_STAMP_LEAD_S = -1.5
 
 
 def mac_system_audio_available() -> bool:
@@ -69,7 +69,9 @@ def assemble_pcm_ring(
     (static) and shortened the ring vs wall-clock (~5 s early).
     Concatenate in arrival order. Ignore sub-quarter-second gaps.
     Then slice from the first block's implied start plus optional
-    `stamp_lead_s` (clip mux only).
+    `stamp_lead_s`. Positive lead skips into the ring (soundtrack
+    plays early); negative includes older samples (delays it).
+    Clip mux only; screen recordings pass 0.
     """
     if chunks is None or right <= left or int(fs) <= 0:
         return None

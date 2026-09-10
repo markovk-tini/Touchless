@@ -79,7 +79,21 @@ def test_assemble_pcm_ring_first_start_window():
     assert float(np.mean(out)) < 0.2
 
 
-def test_assemble_pcm_ring_stamp_lead_skips_early_audio():
+def test_assemble_pcm_ring_negative_stamp_lead_includes_older_audio():
+    fs = 48000
+    early = np.full(fs, 0.9, dtype=np.float32)
+    later = np.full(2 * fs, 0.1, dtype=np.float32)
+    chunks = [(10.0, np.concatenate([early, later]))]
+    # first_start=7. Window [8, 10] at lead=0 is 2 s of 0.1.
+    # lead=-1 pulls in the 0.9 marker.
+    out = assemble_pcm_ring(chunks, fs, 8.0, 10.0, stamp_lead_s=-1.0)
+    assert out is not None
+    assert len(out) == 2 * fs
+    assert float(np.mean(out[:fs])) > 0.7
+    assert float(np.mean(out[fs:])) < 0.2
+
+
+def test_assemble_pcm_ring_positive_stamp_lead_skips_older_audio():
     fs = 48000
     early = np.full(fs, 0.9, dtype=np.float32)
     later = np.full(2 * fs, 0.1, dtype=np.float32)
@@ -101,5 +115,5 @@ def test_assemble_pcm_ring_ignores_sub_quarter_second_gap():
     assert float(np.min(np.abs(out))) > 0.4
 
 
-def test_mac_clip_stamp_lead_is_two_and_a_half_seconds():
-    assert abs(float(MAC_CLIP_STAMP_LEAD_S) - 2.5) < 1e-9
+def test_mac_clip_stamp_lead_delays_early_soundtrack():
+    assert abs(float(MAC_CLIP_STAMP_LEAD_S) - (-1.5)) < 1e-9
