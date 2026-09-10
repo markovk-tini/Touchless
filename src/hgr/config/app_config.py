@@ -879,6 +879,15 @@ class AppConfig:
     live_view_show_fps: bool = False
     live_view_show_latency: bool = False
     live_view_show_tracking_quality: bool = False
+    # Custom Gesture settings tab: green "!" until the user opens it
+    # once. Existing installs that already have recordings are treated
+    # as seen (see MainWindow) so we don't badge veterans.
+    custom_gesture_tab_seen: bool = False
+    # True after the in-tab custom-gesture tutorial is finished.
+    # Source `run_app.py` ignores the persisted value each launch so
+    # the tutorial button can be retested. Frozen builds hide the
+    # button after a successful save.
+    custom_gesture_tutorial_done: bool = False
 
 
 DEFAULT_CONFIG = AppConfig()

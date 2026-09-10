@@ -589,6 +589,12 @@ def install_indigo_chrome(dialog: QWidget, title_text: str) -> QWidget:
     outer.setSpacing(0)
     outer.addWidget(_IndigoTitleBar(dialog, title_text))
     body = QWidget(dialog)
+    body.setObjectName("indigoChromeBody")
+    body.setAttribute(Qt.WA_StyledBackground, True)
+    body.setAutoFillBackground(True)
+    body.setStyleSheet(
+        f"QWidget#indigoChromeBody {{ background-color: {_INDIGO_MSG_BG}; }}"
+    )
     outer.addWidget(body)
     return body
 

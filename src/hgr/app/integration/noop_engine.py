@@ -1357,7 +1357,7 @@ class GestureWorker(QObject):
         self._engine_runner._post_infer = self._attach_custom_hands_on_engine_thread
         self._engine_result_ready.connect(self._on_engine_result)
 
-        # Custom-gesture live runner â€” owns its own classifier + hold/
+        # Custom-gesture live runner — owns its own classifier + hold/
         # cooldown state and fires actions when the user holds a
         # registered custom pose. Initializes from disk so any gesture
         # the user previously saved is live immediately.
@@ -1370,22 +1370,6 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] runner init failed: {exc}")
             self._custom_gesture_runner = None
-        # Rate-limit the GPU/Lite private MediaPipe pass used when
-        # engine landmarks are not the recorder distribution. Runs on
-        # the engine thread (see _attach_custom_hands_on_engine_thread),
-        # every other inference, so the GUI camera tick stays free.
-        self._custom_runner_slow_path_skip_ratio = 2
-        # Start at 1 so the first GPU/Lite tick samples immediately
-        # ((1+1)%2==0) instead of skipping with an empty cache.
-        self._custom_runner_slow_path_counter = 1
-        self._last_custom_mp_hands: list | None = None
-
-        # Dynamic custom-gesture runtime. Parallel to the static
-        # runner above — same registry, same `fire_once` cooldown
-        # plumbing, but uses motion-based DTW matching instead of
-        # pose-similarity. Loads on construction; auto-reloads on
-        # registry-file mtime changes via maybe_reload_if_changed
-        # alongside the static runner each tick.
         try:
             from ...custom_gestures.dynamic_runtime import DynamicGestureRuntime
             self._dynamic_gesture_runtime = DynamicGestureRuntime()
@@ -1400,6 +1384,15 @@ class GestureWorker(QObject):
         except Exception as exc:
             print(f"[custom-gestures] pose sequence runtime init failed: {exc}")
             self._pose_sequence_runtime = None
+        # Rate-limit the GPU/Lite private MediaPipe pass used when
+        # engine landmarks are not the recorder distribution. Runs on
+        # the engine thread (see _attach_custom_hands_on_engine_thread),
+        # every other inference, so the GUI camera tick stays free.
+        self._custom_runner_slow_path_skip_ratio = 2
+        # Start at 1 so the first GPU/Lite tick samples immediately
+        # ((1+1)%2==0) instead of skipping with an empty cache.
+        self._custom_runner_slow_path_counter = 1
+        self._last_custom_mp_hands: list | None = None
         self._seq_suppress_dynamic_until = 0.0
         # When a custom horizontal swipe owns the live pose, builtin
         # swipe_left/right must not also dispatch (sandbox never had
@@ -2691,6 +2684,11 @@ class GestureWorker(QObject):
 
     def _utility_wheel_pose_active(self, hand_reading) -> bool:
         if hand_reading is None:
+            return False
+        if (
+            not self._profile_allows_pose("wheel_pose")
+            and not self._profile_allows_pose("screen_wheel")
+        ):
             return False
         fingers = hand_reading.fingers
         return (
@@ -8272,7 +8270,27 @@ class GestureWorker(QObject):
     def _tutorial_allowed_actions_for_step(self, step_key: str) -> frozenset[str]:
         return self._TUTORIAL_ALLOWED_ACTIONS.get(step_key, frozenset())
 
-    def _dispatch_action(self, action_id: str, now: float) -> bool:
+    def _profile_allows_pose(self, pose_id: str) -> bool:
+        if getattr(self, "_tutorial_mode_enabled", False):
+            return True
+        try:
+            from hgr.custom_gestures.profile_gate import pose_allowed_in_active_profile
+            return bool(pose_allowed_in_active_profile(pose_id))
+        except Exception:
+            return True
+
+    def _profile_allows_action(self, action_id: str) -> bool:
+        if getattr(self, "_tutorial_mode_enabled", False):
+            return True
+        try:
+            from hgr.custom_gestures.profile_gate import action_allowed_in_active_profile
+            return bool(action_allowed_in_active_profile(action_id, self.config))
+        except Exception:
+            return True
+
+    def _dispatch_action(
+        self, action_id: str, now: float, *, from_profile_override: bool = False
+    ) -> bool:
         """Fire a bound action by id, with a per-action_id cooldown so a
         held pose doesn't spam the action every frame. Returns True if
         the action was dispatched, False if it was suppressed by
@@ -8302,6 +8320,8 @@ class GestureWorker(QObject):
             )
             if action_id not in allowed:
                 return False
+        elif not from_profile_override and not self._profile_allows_action(action_id):
+            return False
         cooldown_state = getattr(self, "_action_dispatch_last_fire", None)
         if cooldown_state is None:
             cooldown_state = {}
@@ -8619,6 +8639,32 @@ class GestureWorker(QObject):
         pose_id = pose_id_for_static_label(hand_handedness, stable)
         if pose_id is None:
             return prediction
+        if not self._profile_allows_pose(pose_id):
+            return self._neutralize_prediction(prediction)
+        try:
+            from hgr.profiles.store import get_store
+            override = get_store().pose_action_override(pose_id)
+        except Exception:
+            override = None
+        if override:
+            kind = str((override or {}).get("kind") or "")
+            if kind == "bind":
+                action_id = str((override or {}).get("action_id") or "")
+                if action_id:
+                    try:
+                        self._dispatch_action(
+                            action_id, now, from_profile_override=True
+                        )
+                    except Exception:
+                        pass
+                return self._neutralize_prediction(prediction)
+            try:
+                from ...custom_gestures.action import fire_once
+                from ...custom_gestures.registry import Action
+                fire_once(f"pose:{pose_id}", Action.from_dict(override))
+            except Exception:
+                pass
+            return self._neutralize_prediction(prediction)
         cfg = self.config
         bound_action_id = action_bound_to_pose(cfg, pose_id)
         if bound_action_id is None:
@@ -8655,6 +8701,8 @@ class GestureWorker(QObject):
         "neutral" in that case; otherwise the prediction's label.
         """
         label = str(getattr(prediction, "dynamic_label", "neutral") or "neutral")
+        if label in {"swipe_left", "swipe_right"} and not self._profile_allows_pose(label):
+            return "neutral"
         if (
             getattr(self, "_suppress_builtin_horizontal_swipe", False)
             and label in {"swipe_left", "swipe_right"}
@@ -9022,16 +9070,18 @@ class GestureWorker(QObject):
         primary + secondary hand predictions to decide which mode
         is active (none / one-hand / two-hand) and emits an
         absolute (cumulative-since-overlay-shown) transform when a
-        pinch is held. Stays silent when no overlay is visible
-        anyway â€” main_window only forwards the signal when
-        DrawingOverlayWindow is showing.
-
-        Includes a sticky-active grace window so brief recogniser
-        flicker (foreshortened pinch landmarks bouncing between
-        labels for a frame or two) doesn't drop the grab and force
-        an anchor reset; and EMA-smooths the palm positions used
-        for the actual transform math so jittery landmarks don't
-        translate into a jittery on-screen drawing."""
+        pinch is live.
+        """
+        if (
+            not self._profile_allows_pose("right_pinch")
+            and not self._profile_allows_pose("left_pinch")
+        ):
+            if getattr(self, "_pinch_mode", "none") != "none":
+                try:
+                    self.reset_pinch_grab_state()
+                except Exception:
+                    pass
+            return
         primary_pred = getattr(result, "prediction", None)
         secondary_pred = getattr(result, "secondary_prediction", None)
         primary_pinch = (

@@ -2252,8 +2252,7 @@ class TutorialWindow(QDialog):
             (
                 "Replay this tutorial anytime",
                 "You can come back to this tour whenever you want — Settings → "
-                "Tutorial. Same place to record your own custom gesture under "
-                "Settings → Custom Gesture (Beta).",
+                "Tutorial.",
             ),
         ]
         tips_card = QFrame()

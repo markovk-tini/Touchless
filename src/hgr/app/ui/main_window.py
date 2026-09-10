@@ -113,6 +113,10 @@ SECTION_GENERAL = 10
 # first-run dialog plus the analytics opt-in toggle so users can
 # change their mind anytime.
 SECTION_ABOUT = 11
+# Profiles — dedicated layout tab (which customs are armed). Stack
+# index 12, added last like General/About so older SECTION_* ids stay
+# valid. Nav order places it after Custom Gesture.
+SECTION_PROFILES = 12
 
 # Ordered sequence the guided walkthrough visits. Click Next on
 # any page auto-navigates to the next entry — no "click on the X
@@ -4312,20 +4316,53 @@ class _TightWrapLabel(QLabel):
     consumes, so the parent layout sizes the slot exactly to the
     text — no leading / trailing whitespace block."""
 
+    def hasHeightForWidth(self):  # type: ignore[override]
+        return bool(self.wordWrap())
+
+    def heightForWidth(self, w):  # type: ignore[override]
+        if w is None or int(w) <= 32:
+            w = 520
+        return super().heightForWidth(int(w))
+
     def sizeHint(self):  # type: ignore[override]
         base = super().sizeHint()
         try:
-            w = self.width() if self.width() > 0 else base.width()
-            if self.wordWrap() and w > 0:
+            # Advertise width 0 so a long subtitle cannot force the
+            # settings stack wider than the viewport (horizontal
+            # scroll is permanently off). Height still tracks the
+            # wrapped text at the label's current width.
+            w = self.width()
+            # Never measure at width 0/1 — that is one-character-per-line
+            # and allocates a tall empty band under every wrapped subtitle.
+            if w <= 32:
+                w = 520
+            if self.wordWrap():
                 h = self.heightForWidth(w)
                 if h > 0:
-                    return QSize(base.width(), h)
+                    return QSize(0, h)
         except Exception:
             pass
-        return base
+        return QSize(0, base.height())
 
     def minimumSizeHint(self):  # type: ignore[override]
         return self.sizeHint()
+
+    def setText(self, text):  # type: ignore[override]
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(16777215)
+        super().setText(text)
+        self.updateGeometry()
+
+    def resizeEvent(self, event):  # type: ignore[override]
+        super().resizeEvent(event)
+        if not self.wordWrap():
+            return
+        w = self.width()
+        if w <= 32:
+            return
+        h = super().heightForWidth(w)
+        if h > 0 and self.height() != h:
+            self.setFixedHeight(h)
 
 
 class _CallbackLabel(QLabel):
@@ -5937,7 +5974,12 @@ class _CurrentSizedStack(QStackedWidget):
             if w.hasHeightForWidth():
                 hfw = w.heightForWidth(width)
                 if hfw > 0:
-                    return max(hfw, sh_h)
+                    # Prefer the width-specific wrap height. Word-wrap
+                    # labels often report a huge sizeHint (one word per
+                    # line, or heightForWidth(1)); max() with that
+                    # inflated the Profiles / Custom Gestures pages
+                    # into a long empty scroll.
+                    return hfw
         except Exception:
             pass
         try:
@@ -5950,7 +5992,9 @@ class _CurrentSizedStack(QStackedWidget):
             if lay.hasHeightForWidth():
                 hfw = lay.heightForWidth(width)
                 if hfw > 0:
-                    return max(hfw, sh_h)
+                    # Prefer wrap height. max() with sizeHint re-opens
+                    # the inflated one-word-per-line gap on Profiles.
+                    return hfw
         except Exception:
             pass
         try:
@@ -5988,13 +6032,15 @@ class _CurrentSizedStack(QStackedWidget):
                         total += max(0, sh.height())
                         counted += 1
                     continue
+                if item.spacerItem() is not None:
+                    continue
                 sh = item.sizeHint()
                 if sh.isValid() and sh.height() > 0:
                     total += sh.height()
                     counted += 1
             if counted > 1:
                 total += spacing * (counted - 1)
-            return max(total, sh_h)
+            return total if counted else sh_h
         except Exception:
             return sh_h
 
@@ -6003,34 +6049,39 @@ class _CurrentSizedStack(QStackedWidget):
         if w is None:
             return super().sizeHint()
         sh = w.sizeHint()
+        # Width follows the viewport we already have (0 until first
+        # layout). Advertising the child's unwrapped sizeHint width
+        # made Custom Gestures / Profiles clip past the window
+        # because horizontal scroll is AlwaysOff.
+        width = self.width() if self.width() > 0 else 0
         if not self._needs_accurate_height(w):
-            return sh
-        width = self.width() if self.width() > 0 else sh.width()
-        h = self._true_content_height(w, width)
+            return QSize(width, sh.height())
+        measure_w = width if width > 0 else sh.width()
+        h = self._true_content_height(w, measure_w)
         if h <= 0:
             h = sh.height()
-        return QSize(sh.width(), h)
+        return QSize(width, h)
 
     def minimumSizeHint(self):  # type: ignore[override]
         w = self.currentWidget()
         if w is None:
             return super().minimumSizeHint()
         if w.sizePolicy().verticalPolicy() == QSizePolicy.Ignored:
-            return QSize(w.minimumSizeHint().width(), 0)
+            return QSize(0, 0)
         if not self._needs_accurate_height(w):
-            return w.sizeHint()
+            return QSize(0, w.sizeHint().height())
         # For opt-in panels, minimumSizeHint MUST equal the true
         # content height. QScrollArea(widgetResizable=True) sizes
         # the inner widget to max(viewport, minSizeHint); if
         # minSizeHint is smaller than the content, Qt shrinks the
         # widget below its content and children get clipped instead
-        # of scrolled.
-        msh = w.minimumSizeHint()
+        # of scrolled. Width stays 0 so long wrapping copy cannot
+        # force the page wider than the settings column.
         width = self.width() if self.width() > 0 else w.sizeHint().width()
         h = self._true_content_height(w, width)
         if h <= 0:
             h = w.sizeHint().height()
-        return QSize(msh.width(), h)
+        return QSize(0, h)
 
     def event(self, e):  # type: ignore[override]
         result = super().event(e)
@@ -6246,6 +6297,22 @@ class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig):
         super().__init__()
         self.config = config
+        try:
+            from hgr.profiles.store import ensure_profiles
+            ensure_profiles(self.config)
+        except Exception:
+            pass
+        try:
+            self._maybe_latch_custom_gesture_tab_seen()
+        except Exception:
+            pass
+        try:
+            from hgr.custom_gestures.tutorial import (
+                apply_source_custom_gesture_onboarding,
+            )
+            apply_source_custom_gesture_onboarding(self.config)
+        except Exception:
+            pass
         # Install the global wheel-scroll guard FIRST, before any
         # settings widgets get instantiated. It intercepts wheel
         # events on QSlider/QComboBox/QSpinBox etc. so scrolling a
@@ -6344,6 +6411,7 @@ class MainWindow(QMainWindow):
         self.live_view_window: Optional[LiveViewWindow] = None
         self.tutorial_window: Optional[TutorialWindow] = None
         self.custom_gesture_sandbox_window = None
+        self._profile_bars: list = []
         self.is_custom_maximized = False
         self._restore_geometry = None
         self._discovered_cameras: list[CameraInfo] = []
@@ -7316,15 +7384,22 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         hint = getattr(self, "_update_nav_hint", None)
-        if hint is None:
-            return
-        show_arrow = pending and not self._is_nav_button_in_view(button)
-        try:
-            if show_arrow:
-                self._position_update_nav_hint()
-            hint.set_active(show_arrow)
-        except Exception:
-            pass
+        if hint is not None:
+            show_arrow = pending and not self._is_nav_button_in_view(button)
+            try:
+                if show_arrow:
+                    self._position_update_nav_hint()
+                hint.set_active(show_arrow)
+            except Exception:
+                pass
+        custom_btn = getattr(self, "_custom_gesture_nav_button", None)
+        if custom_btn is not None:
+            try:
+                custom_btn.set_update_badge(
+                    not bool(getattr(self.config, "custom_gesture_tab_seen", False))
+                )
+            except Exception:
+                pass
 
     def _on_installer_ready(self, path: str) -> None:
         # apply_update_and_exit dispatches based on the update kind
@@ -7745,6 +7820,7 @@ class MainWindow(QMainWindow):
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
         page.setObjectName("settingsPage")
+        self._profile_bars = []
         # Track the page on self so overlay positioning helpers (the
         # walkthrough pill + Next button) can map geometry into the
         # page's coord space.
@@ -7864,6 +7940,7 @@ class MainWindow(QMainWindow):
         general_button = SettingsNavButton("General", SECTION_GENERAL, self)
         gestures_button = SettingsNavButton("Control Guide", SECTION_GESTURES, self)
         custom_gesture_button = SettingsNavButton("Custom Gesture", SECTION_CUSTOM_GESTURE, self)
+        profiles_button = SettingsNavButton("Profiles", SECTION_PROFILES, self)
         gesture_binds_button = SettingsNavButton("Gesture Binds", SECTION_GESTURE_BINDS, self)
         camera_button = SettingsNavButton("Camera", SECTION_CAMERA, self)
         microphone_button = SettingsNavButton("Microphone", SECTION_MICROPHONE, self)
@@ -7881,6 +7958,7 @@ class MainWindow(QMainWindow):
             general_button,
             gestures_button,
             custom_gesture_button,
+            profiles_button,
             gesture_binds_button,
             camera_button,
             microphone_button,
@@ -7908,7 +7986,11 @@ class MainWindow(QMainWindow):
             ),
             custom_gesture_button: (
                 "custom gesture create record new beta sandbox edit user "
-                "personal recorded mine my own"
+                "personal recorded mine my own tutorial thumbs up"
+            ),
+            profiles_button: (
+                "profile profiles layout preset work home game armed enable "
+                "disable custom which gestures add remove edit"
             ),
             gesture_binds_button: (
                 "gesture binds bindings keybinds keybinding rebind reassign "
@@ -8027,6 +8109,7 @@ class MainWindow(QMainWindow):
         # floating arrow only appears while that button is scrolled out
         # of the viewport, so it has to re-evaluate on every scroll.
         self._updates_nav_button = updates_button
+        self._custom_gesture_nav_button = custom_gesture_button
         # Parent to the nav viewport so the cue lives in the same
         # coordinate space it is parked in, and so a window shrink
         # clips it to the sidebar instead of leaving it stranded
@@ -8100,6 +8183,7 @@ class MainWindow(QMainWindow):
         # first-run privacy dialog so users can review what gets
         # collected and toggle analytics opt-in anytime.
         self.settings_content_stack.addWidget(self._build_about_panel())
+        self.settings_content_stack.addWidget(self._build_profiles_panel())
 
         # Wrap the content stack in a scroll area so when the window
         # is too short the active panel scrolls instead of squashing
@@ -8330,6 +8414,22 @@ class MainWindow(QMainWindow):
                     self.settings_content_stack.currentIndex()
                 )
                 self._position_camera_save_floating_button()
+        except Exception:
+            pass
+
+        try:
+            vp_btn_prof = content_scroll.viewport()
+            prof_btn = getattr(self, "_profiles_save_button", None)
+            if prof_btn is not None:
+                prof_btn.setParent(vp_btn_prof)
+                prof_btn.setVisible(False)
+                self.settings_content_stack.currentChanged.connect(
+                    self._update_profiles_save_floating_visibility
+                )
+                self._update_profiles_save_floating_visibility(
+                    self.settings_content_stack.currentIndex()
+                )
+                self._position_profiles_save_floating_button()
         except Exception:
             pass
 
@@ -8601,14 +8701,15 @@ class MainWindow(QMainWindow):
             SECTION_GENERAL,         # 1 - General
             SECTION_GESTURES,        # 2 - Control Guide
             SECTION_CUSTOM_GESTURE,  # 3 - Custom Gesture
-            SECTION_GESTURE_BINDS,   # 4 - Gesture Binds
-            SECTION_CAMERA,          # 5 - Camera
-            SECTION_MICROPHONE,      # 6 - Microphone
-            SECTION_SAVE_LOCATIONS,  # 7 - Save Locations
-            SECTION_COLORS,          # 8 - Colors
-            SECTION_TUTORIAL,        # 9 - Tutorial
-            SECTION_UPDATES,         # 10 - Updates
-            SECTION_ABOUT,           # 11 - About & Privacy
+            SECTION_PROFILES,        # 4 - Profiles
+            SECTION_GESTURE_BINDS,   # 5 - Gesture Binds
+            SECTION_CAMERA,          # 6 - Camera
+            SECTION_MICROPHONE,      # 7 - Microphone
+            SECTION_SAVE_LOCATIONS,  # 8 - Save Locations
+            SECTION_COLORS,          # 9 - Colors
+            SECTION_TUTORIAL,        # 10 - Tutorial
+            SECTION_UPDATES,         # 11 - Updates
+            SECTION_ABOUT,           # 12 - About & Privacy
         )
         # 1. Gesture / voice cards inside the Control Guide. For each
         # GestureGuideCard / VoiceCommandCard in any panel, walk up
@@ -8672,7 +8773,8 @@ class MainWindow(QMainWindow):
         for nav_idx, section_id in enumerate(
             (SECTION_CAMERA, SECTION_MICROPHONE, SECTION_SAVE_LOCATIONS,
              SECTION_COLORS, SECTION_TUTORIAL, SECTION_UPDATES,
-             SECTION_INSTRUCTIONS, SECTION_GENERAL, SECTION_ABOUT)
+             SECTION_INSTRUCTIONS, SECTION_GENERAL, SECTION_ABOUT,
+             SECTION_PROFILES)
         ):
             panel = self.settings_content_stack.widget(section_id)
             if panel is None:
@@ -8976,6 +9078,13 @@ class MainWindow(QMainWindow):
                 "dynamic gesture recorder motion sequence temporal record new "
                 "custom animation swipe wave motion",
                 SECTION_CUSTOM_GESTURE,
+                None,
+            ),
+            (
+                "Profiles",
+                "profile profiles layout preset work home game armed enable "
+                "disable which gestures add remove edit",
+                SECTION_PROFILES,
                 None,
             ),
             # r53: Discord + Spotify setup wizards.
@@ -9311,6 +9420,7 @@ class MainWindow(QMainWindow):
         # its inner scroll), so this default is safely overridden
         # there.
         panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        panel.setMinimumWidth(0)
         panel_layout = QVBoxLayout(panel)
         panel_layout.setContentsMargins(16, 12, 16, 12)
         # Tight inter-row spacing. The header rows (title + subtitle)
@@ -9325,7 +9435,9 @@ class MainWindow(QMainWindow):
         # grow the label into a tall whitespace block when there's
         # spare vertical room, which is what produced the "title
         # floating in a giant empty area" look the user reported.
-        title_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        title_label.setMinimumWidth(0)
+        title_label.setWordWrap(True)
         title_label.setContentsMargins(0, 0, 0, 0)
         panel_layout.addWidget(title_label)
 
@@ -9340,7 +9452,8 @@ class MainWindow(QMainWindow):
             subtitle_label = _TightWrapLabel(subtitle)
             subtitle_label.setObjectName("settingsPanelSubtitle")
             subtitle_label.setWordWrap(True)
-            subtitle_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            subtitle_label.setMinimumWidth(0)
+            subtitle_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
             subtitle_label.setContentsMargins(0, 0, 0, 0)
             panel_layout.addWidget(subtitle_label)
         return panel, panel_layout
@@ -10366,6 +10479,7 @@ class MainWindow(QMainWindow):
             "save_camera_button",
             "save_microphone_button",
             "save_locations_button",
+            "_profiles_save_button",
         ):
             btn = getattr(self, attr, None)
             if btn is not None:
@@ -10373,6 +10487,10 @@ class MainWindow(QMainWindow):
                     self._set_settings_save_button_pending(btn, False)
                 except Exception:
                     pass
+        try:
+            self._revert_profiles_panel_edits()
+        except Exception:
+            pass
 
     def _update_general_save_state(self) -> None:
         dirty = bool(self._general_pending)
@@ -10513,6 +10631,90 @@ class MainWindow(QMainWindow):
         if on_camera:
             self._position_camera_save_floating_button()
             button.raise_()
+
+    def _position_profiles_save_floating_button(self) -> None:
+        button = getattr(self, "_profiles_save_button", None)
+        if button is None:
+            return
+        vp = button.parentWidget()
+        if vp is None:
+            return
+        hint = button.sizeHint()
+        btn_w = max(140, hint.width())
+        btn_h = max(36, hint.height())
+        button.resize(btn_w, btn_h)
+        pad_right = 28
+        # Align with the title row (panel top margin 12). A placeholder
+        # in that row keeps "Profiles" from running under the button.
+        pad_top = 12
+        x = max(0, vp.width() - btn_w - pad_right)
+        y = pad_top
+        button.move(x, y)
+        button.raise_()
+
+    def _update_profiles_save_floating_visibility(self, index: int) -> None:
+        button = getattr(self, "_profiles_save_button", None)
+        if button is None:
+            return
+        try:
+            on_profiles = (int(index) == SECTION_PROFILES)
+        except Exception:
+            on_profiles = False
+        button.setVisible(on_profiles)
+        if on_profiles:
+            self._position_profiles_save_floating_button()
+            button.raise_()
+
+    def _on_profiles_dirty_changed(self, dirty: bool) -> None:
+        self._set_settings_save_button_pending(
+            getattr(self, "_profiles_save_button", None), bool(dirty)
+        )
+        try:
+            self._position_profiles_save_floating_button()
+        except Exception:
+            pass
+
+    def _save_profiles_changes(self) -> None:
+        panel = getattr(self, "_profiles_panel", None)
+        if panel is None:
+            return
+        try:
+            inspect_edits = panel.take_pending_inspect()
+        except Exception:
+            inspect_edits = []
+        try:
+            panel.commit_draft()
+        except Exception:
+            return
+        try:
+            self._apply_queued_inspect_edits(inspect_edits)
+        except Exception:
+            pass
+        try:
+            from hgr.profiles.store import get_store
+            store = get_store()
+            for profile in store.list_profiles():
+                for pose_id in list((profile.pose_actions or {}).keys()):
+                    store.drop_pose_from_bindings(profile.id, pose_id)
+            store.apply_to_config(self.config)
+            save_config(self.config)
+        except Exception:
+            pass
+        try:
+            worker = getattr(self, "_worker", None)
+            if worker is not None and hasattr(worker, "reload_custom_gestures"):
+                worker.reload_custom_gestures()
+        except Exception:
+            pass
+        try:
+            self._populate_gesture_binds_table()
+            self._sync_gesture_binds_warnings_for_current_section()
+        except Exception:
+            pass
+        self._set_settings_save_button_pending(
+            getattr(self, "_profiles_save_button", None), False
+        )
+        self._on_profile_membership_changed()
 
     def _save_general_changes(self) -> None:
         """Apply every pending change to self.config in one shot,
@@ -12202,12 +12404,93 @@ class MainWindow(QMainWindow):
         self._custom_gestures_panel.export_one_requested.connect(
             self._export_one_custom_gesture
         )
+        self._custom_gestures_panel.tutorial_requested.connect(
+            lambda: self._open_custom_gesture_creator(tutorial=True)
+        )
         # Stretch=0 + trailing stretch so the panel sizes to its
         # natural content height (Save Locations pattern). The outer
         # settingsContentScroll handles overflow when content
         # exceeds the viewport.
         layout.addWidget(self._custom_gestures_panel, 0)
         layout.addStretch(1)
+        panel.setMinimumWidth(0)
+        panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
+        panel.setProperty("useAccurateHeight", True)
+        return panel
+
+    def _build_profiles_panel(self) -> QWidget:
+        panel, layout = self._make_content_panel(
+            "Profiles",
+            "A profile is a whitelist: only the gestures you add here fire "
+            "while it is active. Built-in poses and custom recordings both "
+            "belong. New profiles start empty. Click Save Changes (top-right) "
+            "when you add or remove gestures.",
+        )
+        title_item = layout.takeAt(0)
+        title_label = title_item.widget() if title_item is not None else None
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        if title_label is not None:
+            title_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            title_label.setWordWrap(False)
+            header.addWidget(title_label, 0, Qt.AlignVCenter)
+        header.addStretch(1)
+        self._profiles_save_slot = QWidget()
+        self._profiles_save_slot.setObjectName("profilesSaveSlot")
+        self._profiles_save_slot.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        header.addWidget(self._profiles_save_slot, 0, Qt.AlignVCenter)
+        layout.insertLayout(0, header)
+        layout.setSpacing(4)
+
+        self._profiles_save_button = QPushButton("Save Changes", panel)
+        self._profiles_save_button.setObjectName("settingsSaveButton")
+        self._profiles_save_button.setEnabled(False)
+        self._profiles_save_button.setProperty("pendingSave", False)
+        self._profiles_save_button.setCursor(Qt.PointingHandCursor)
+        self._profiles_save_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self._profiles_save_button.setVisible(False)
+        self._profiles_save_button.clicked.connect(self._save_profiles_changes)
+        try:
+            hint = self._profiles_save_button.sizeHint()
+            self._profiles_save_slot.setFixedSize(
+                max(140, int(hint.width())),
+                max(36, int(hint.height())),
+            )
+        except Exception:
+            self._profiles_save_slot.setFixedSize(140, 36)
+        try:
+            from PySide6.QtWidgets import QGraphicsDropShadowEffect
+            _shadow = QGraphicsDropShadowEffect(self._profiles_save_button)
+            _shadow.setBlurRadius(28)
+            _shadow.setOffset(0, 4)
+            _shadow.setColor(QColor(0, 0, 0, 200))
+            self._profiles_save_button.setGraphicsEffect(_shadow)
+        except Exception:
+            pass
+        from .profiles_panel import ProfilesPanel
+
+        self._profiles_panel = ProfilesPanel(
+            accent_color=self.config.accent_color or "#1DE9B6",
+            text_color=str(self.config.text_color or "#E5F6FF"),
+            confirm=TouchlessNotice.show_confirm,
+            warn=TouchlessNotice.show_warn,
+            parent=panel,
+        )
+        self._profiles_panel.profile_changed.connect(self._on_profile_changed)
+        self._profiles_panel.inspect_requested.connect(
+            self._open_profile_gesture_inspector
+        )
+        self._profiles_panel.membership_changed.connect(
+            self._on_profile_membership_changed
+        )
+        self._profiles_panel.dirty_changed.connect(self._on_profiles_dirty_changed)
+        layout.addWidget(self._profiles_panel, 0)
+        layout.addStretch(1)
+        panel.setMinimumWidth(0)
+        panel.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Maximum)
+        panel.setProperty("useAccurateHeight", True)
+        self._set_settings_save_button_pending(self._profiles_save_button, False)
         return panel
 
     # -------- Gesture Binds tab ------------------------------------------
@@ -12701,8 +12984,29 @@ class MainWindow(QMainWindow):
 
         # Conflict scan after the table rebuilds: highlights any pose
         # bound to 2+ actions in a yellow warning pill above the
-        # table.
-        self._refresh_gesture_binds_warnings()
+        # table. Skip the pill when another settings page is showing —
+        # it lives on the shared viewport.
+        self._sync_gesture_binds_warnings_for_current_section()
+
+    def _sync_gesture_binds_warnings_for_current_section(self) -> None:
+        """Show bind-table collisions only on Gesture Binds.
+
+        The warning pill is parented to the shared settings viewport, so
+        refreshing it from Profiles Save would paint a global duplicate
+        warning over the profile list.
+        """
+        try:
+            on_binds = (
+                self.settings_content_stack.currentIndex() == SECTION_GESTURE_BINDS
+            )
+        except Exception:
+            on_binds = False
+        if on_binds:
+            self._refresh_gesture_binds_warnings()
+            return
+        warning = getattr(self, "_gesture_binds_pill_warning", None)
+        if warning is not None:
+            warning.setVisible(False)
 
     def _refresh_gesture_binds_warnings(self) -> None:
         """Scan the effective binding map (saved + pending changes) and
@@ -13121,6 +13425,11 @@ class MainWindow(QMainWindow):
         cleaned = {k: v for k, v in current.items() if defaults.get(k) != v}
         self.config.gesture_bindings = cleaned
         try:
+            from hgr.profiles.store import get_store
+            get_store().write_bindings(cleaned)
+        except Exception:
+            pass
+        try:
             save_config(self.config)
         except Exception as exc:
             TouchlessNotice.show_warn(self, "Save failed", f"Could not write settings: {exc}")
@@ -13169,6 +13478,11 @@ class MainWindow(QMainWindow):
             self._clear_gesture_bind_pending()
         self._gesture_binds_pending_changes.clear()
         self.config.gesture_bindings = {}
+        try:
+            from hgr.profiles.store import get_store
+            get_store().write_bindings({})
+        except Exception:
+            pass
         try:
             save_config(self.config)
         except Exception as exc:
@@ -13331,30 +13645,335 @@ class MainWindow(QMainWindow):
         popup.show()
         self._gesture_binds_hover_popup = popup
 
-    def _open_custom_gesture_creator(self) -> None:
+    def _refresh_profile_bars(self) -> None:
+        panel = getattr(self, "_profiles_panel", None)
+        if panel is None:
+            return
+        try:
+            panel.refresh()
+        except Exception:
+            pass
+
+    def _on_profile_membership_changed(self) -> None:
+        try:
+            if getattr(self, "_custom_gestures_panel", None) is not None:
+                self._custom_gestures_panel.refresh_cards()
+        except Exception:
+            pass
+
+    def _on_profile_changed(self, profile_id: str) -> None:
+        """Switch the live bind table + custom arming to another profile.
+
+        Persist the outgoing layout first, unless the store already
+        moved (New / Delete did that). Unsaved bind clicks are dropped.
+        """
+        from hgr.profiles.store import get_store
+        store = get_store()
+        target = str(profile_id or "").strip()
+        if not target:
+            return
+        pending = getattr(self, "_gesture_binds_pending_changes", None)
+        if pending:
+            pending.clear()
+        if getattr(self, "_gesture_binds_pending_action", None):
+            try:
+                self._clear_gesture_bind_pending()
+            except Exception:
+                pass
+        if target != store.active_profile_id:
+            try:
+                store.write_bindings(dict(getattr(self.config, "gesture_bindings", None) or {}))
+            except Exception:
+                pass
+            store.set_active(target)
+        try:
+            store.apply_to_config(self.config)
+            save_config(self.config)
+        except Exception:
+            pass
+        try:
+            self._populate_gesture_binds_table()
+            self._set_settings_save_button_pending(
+                getattr(self, "_gesture_binds_save_button", None), False
+            )
+            self._sync_gesture_binds_warnings_for_current_section()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_custom_gestures_panel", None) is not None:
+                self._custom_gestures_panel.refresh_cards()
+        except Exception:
+            pass
+        self._refresh_profile_bars()
+
+    def _open_profile_gesture_inspector(self, item) -> None:
+        """Show image, description, and the custom-gesture action editor."""
+        from hgr.config.gesture_bindings import (
+            action_bound_to_pose,
+            gesture_bind_actions,
+        )
+        from hgr.custom_gestures.registry import Action, GestureRegistry
+        from hgr.profiles.catalog import KIND_CUSTOM
+        from hgr.profiles.store import get_store
+        from .gesture_inspect_dialog import GestureInspectDialog
+
+        previous = getattr(self, "_gesture_inspect_dialog", None)
+        if previous is not None:
+            try:
+                previous.close()
+            except Exception:
+                pass
+        accent = str(self.config.accent_color or "#1DE9B6")
+        text = str(self.config.text_color or "#E5F6FF")
+        initial_action = None
+        bound_action_id = None
+        bind_actions = [
+            (aid, label) for aid, label, _default in gesture_bind_actions()
+        ]
+        if getattr(item, "kind", "") == KIND_CUSTOM:
+            try:
+                registry = GestureRegistry()
+                registry.load()
+                existing = registry.get(item.id)
+                if existing is not None:
+                    initial_action = existing.action
+            except Exception:
+                initial_action = None
+        else:
+            initial_action = None
+            bound_action_id = None
+            try:
+                pid = None
+                panel = getattr(self, "_profiles_panel", None)
+                if panel is not None:
+                    pid = getattr(panel, "_pending_active_id", None)
+                store = get_store()
+                pid = pid or store.active_profile_id
+                override = store.pose_action_for(pid, item.id)
+                if override and str(override.get("kind") or "") == "bind":
+                    bound_action_id = str(override.get("action_id") or "")
+                elif override:
+                    initial_action = Action.from_dict(override)
+            except Exception:
+                initial_action = None
+            if not bound_action_id:
+                try:
+                    bound_action_id = action_bound_to_pose(self.config, item.id)
+                except Exception:
+                    bound_action_id = None
+        try:
+            queued = self._profiles_panel.pending_inspect_for(item)
+        except Exception:
+            queued = None
+        if isinstance(queued, dict):
+            qtype = str(queued.get("type") or "")
+            if qtype == "action" and queued.get("action") is not None:
+                initial_action = queued.get("action")
+            elif qtype == "bind":
+                bound_action_id = str(queued.get("action_id") or bound_action_id or "")
+                initial_action = None
+        dialog = GestureInspectDialog(
+            item,
+            accent_color=accent,
+            text_color=text,
+            initial_action=initial_action,
+            bound_action_id=bound_action_id,
+            bind_actions=bind_actions,
+            parent=self,
+        )
+        dialog.saved.connect(
+            lambda payload, it=item: self._apply_profile_inspect_save(it, payload)
+        )
+        self._gesture_inspect_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _apply_profile_inspect_save(self, item, payload) -> None:
+        panel = getattr(self, "_profiles_panel", None)
+        if panel is None:
+            return
+        try:
+            panel.queue_inspect_save(item, payload or {})
+        except Exception:
+            return
+        try:
+            panel.refresh()
+        except Exception:
+            pass
+
+    def _apply_queued_inspect_edits(self, edits) -> None:
+        from hgr.custom_gestures.registry import GestureRegistry
+        from hgr.profiles.catalog import KIND_CUSTOM
+        from hgr.profiles.store import get_store
+
+        if not edits:
+            return
+        store = get_store()
+        registry = GestureRegistry()
+        registry.load()
+        registry_changed = False
+        for profile_id, kind, item_id, payload in edits:
+            ptype = str((payload or {}).get("type") or "")
+            if kind == KIND_CUSTOM:
+                action = (payload or {}).get("action")
+                if action is None:
+                    continue
+                existing = registry.get(item_id)
+                if existing is None:
+                    continue
+                try:
+                    registry.replace_metadata(
+                        existing.name,
+                        name=existing.name,
+                        action=action,
+                        description=existing.description,
+                        image_filename=str(
+                            getattr(existing, "image_filename", "") or ""
+                        ),
+                    )
+                    registry_changed = True
+                except Exception:
+                    continue
+                continue
+            if ptype == "bind":
+                action_id = str((payload or {}).get("action_id") or "")
+                if not action_id:
+                    continue
+                try:
+                    from hgr.config.gesture_bindings import default_pose_for_action
+                    if default_pose_for_action(action_id) == item_id:
+                        store.set_pose_action_for(profile_id, item_id, None)
+                    else:
+                        store.set_pose_action_for(
+                            profile_id,
+                            item_id,
+                            {"kind": "bind", "action_id": action_id},
+                        )
+                    store.drop_pose_from_bindings(profile_id, item_id)
+                except Exception:
+                    pass
+            elif ptype == "action":
+                action = (payload or {}).get("action")
+                if action is None:
+                    continue
+                try:
+                    store.set_pose_action_for(
+                        profile_id, item_id, action.to_dict()
+                    )
+                    store.drop_pose_from_bindings(profile_id, item_id)
+                except Exception:
+                    pass
+        if registry_changed:
+            try:
+                registry.save()
+            except Exception:
+                pass
+
+    def _edit_profile_builtin_gesture(self, pose_id: str) -> None:
+        """Kept for older signal wiring; inspect dialog is the editor now."""
+        _ = pose_id
+
+    def _on_custom_gesture_saved(self, name: str) -> None:
+        try:
+            from hgr.profiles.store import get_store
+            get_store().enable_custom_on_active(str(name or ""))
+        except Exception:
+            pass
+        if bool(getattr(self, "_custom_gesture_tutorial_active", False)):
+            self._custom_gesture_tutorial_active = False
+            try:
+                self.config.custom_gesture_tutorial_done = True
+                save_config(self.config)
+            except Exception:
+                pass
+            try:
+                self._custom_gestures_panel.set_tutorial_complete(True)
+            except Exception:
+                pass
+        try:
+            self._custom_gestures_panel.refresh_cards()
+        except Exception:
+            pass
+        self._refresh_profile_bars()
+
+    def _maybe_latch_custom_gesture_tab_seen(self) -> None:
+        """Veterans who already recorded customs should not get the !."""
+        # Source `run_app.py` always shows the badge for testing.
+        if not getattr(sys, "frozen", False):
+            return
+        if bool(getattr(self.config, "custom_gesture_tab_seen", False)):
+            return
+        try:
+            from hgr.custom_gestures.registry import GestureRegistry
+            registry = GestureRegistry()
+            registry.load()
+            if not registry.list():
+                return
+        except Exception:
+            return
+        self.config.custom_gesture_tab_seen = True
+        try:
+            save_config(self.config)
+        except Exception:
+            pass
+
+    def _mark_custom_gesture_tab_seen(self) -> None:
+        if bool(getattr(self.config, "custom_gesture_tab_seen", False)):
+            self._refresh_update_badges()
+            return
+        self.config.custom_gesture_tab_seen = True
+        try:
+            save_config(self.config)
+        except Exception:
+            pass
+        self._refresh_update_badges()
+
+    def _open_custom_gesture_creator(self, tutorial: bool = False) -> None:
         from PySide6.QtWidgets import QDialog
         from .custom_gestures_recorder import RecordingWindow
         from .custom_gestures_wizard import CreateGestureWizard
-        from hgr.custom_gestures.registry import GestureRegistry, MAX_CUSTOM_GESTURES
+        from hgr.custom_gestures.registry import GestureRegistry, slot_limit
 
         # Enforce the custom-gesture cap before opening the wizard so
         # the user can't sink time into recording a gesture that can't
         # be saved.
         registry = GestureRegistry()
         registry.load()
-        if len(registry.list()) >= MAX_CUSTOM_GESTURES:
+        limit = slot_limit()
+        if len(registry.list()) >= limit:
             TouchlessNotice.show_info(
                 self,
                 "Custom gesture limit",
-                f"Touchless currently supports up to {MAX_CUSTOM_GESTURES} "
+                f"Touchless currently supports up to {limit} "
                 f"custom gestures. Delete one of your existing gestures to "
-                f"make room for a new one.",
+                f"make room for a new one. Gestures you already saved keep working.",
             )
             return
 
         accent = self.config.accent_color or "#1DE9B6"
-        wizard = CreateGestureWizard(accent_color=accent, parent=self)
+        self._custom_gesture_tutorial_active = bool(tutorial)
+        if tutorial:
+            from hgr.custom_gestures.tutorial import (
+                TUTORIAL_ACTION_KIND,
+                TUTORIAL_ACTION_VALUE,
+                TUTORIAL_POSE_DESCRIPTION,
+                TUTORIAL_POSE_NAME,
+            )
+            wizard = CreateGestureWizard(
+                accent_color=accent,
+                parent=self,
+                tutorial_mode=True,
+                initial_name=TUTORIAL_POSE_NAME,
+                initial_description=TUTORIAL_POSE_DESCRIPTION,
+                initial_action_kind=TUTORIAL_ACTION_KIND,
+                initial_action_value=TUTORIAL_ACTION_VALUE,
+                initial_gesture_type="static",
+            )
+        else:
+            wizard = CreateGestureWizard(accent_color=accent, parent=self)
         if wizard.exec() != QDialog.DialogCode.Accepted or wizard.result_payload is None:
+            self._custom_gesture_tutorial_active = False
             return
         result = wizard.result_payload
         gesture_type = wizard.gesture_type()
@@ -13399,6 +14018,7 @@ class MainWindow(QMainWindow):
                     action=result.action,
                     parent=self,
                     config=self.config,
+                    tutorial_mode=bool(tutorial),
                 )
         except Exception as exc:
             import traceback
@@ -13410,8 +14030,9 @@ class MainWindow(QMainWindow):
                 f"{type(exc).__name__}: {exc}\n\n"
                 "Full traceback printed to the terminal.",
             )
+            self._custom_gesture_tutorial_active = False
             return
-        recorder.saved.connect(lambda _name: self._custom_gestures_panel.refresh_cards())
+        recorder.saved.connect(lambda name: self._on_custom_gesture_saved(name))
         # Freeze the live pipeline while the recorder is modal: the
         # recorder runs its own MediaPipe pass on the worker's raw
         # frames, so a parallel pass in the worker is pure duplicate
@@ -13432,6 +14053,7 @@ class MainWindow(QMainWindow):
                     worker.set_pipeline_frozen(False)
                 except Exception:
                     pass
+            self._custom_gesture_tutorial_active = False
 
     def _open_custom_gesture_sandbox(self) -> None:
         from .custom_gestures_sandbox import SandboxWindow
@@ -13578,7 +14200,7 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QFileDialog
         from hgr.custom_gestures.registry import (
             GestureRegistry,
-            MAX_CUSTOM_GESTURES,
+            slot_limit,
         )
         from hgr.custom_gestures.sharing import (
             BundleError,
@@ -13615,12 +14237,13 @@ class MainWindow(QMainWindow):
         # the cap, rather than partially importing (which would leave
         # the user guessing which gestures made the cut).
         new_names = [g.name for g in peeked if g.name not in existing_names]
-        if len(existing_names) + len(new_names) > MAX_CUSTOM_GESTURES:
-            room = max(0, MAX_CUSTOM_GESTURES - len(existing_names))
+        limit = slot_limit()
+        if len(existing_names) + len(new_names) > limit:
+            room = max(0, limit - len(existing_names))
             TouchlessNotice.show_info(
                 self,
                 "Custom gesture limit",
-                f"Touchless currently supports up to {MAX_CUSTOM_GESTURES} "
+                f"Touchless currently supports up to {limit} "
                 f"custom gestures. This pack would add {len(new_names)} new "
                 f"gesture(s), but you only have room for {room} more. "
                 f"Delete some existing gestures and try again.",
@@ -13660,6 +14283,13 @@ class MainWindow(QMainWindow):
             f"Last action: imported {imported} gesture(s)"
             + (f", skipped {skipped} conflict(s)" if skipped else "")
         )
+        try:
+            from hgr.profiles.store import get_store
+            store = get_store()
+            for name in new_names:
+                store.enable_custom_on_active(name)
+        except Exception:
+            pass
         try:
             self._custom_gestures_panel.refresh_cards()
         except Exception:
@@ -13769,6 +14399,11 @@ class MainWindow(QMainWindow):
             return
         registry.save()
         self._custom_gestures_panel.refresh_cards()
+        try:
+            if getattr(self, "_profiles_panel", None) is not None:
+                self._profiles_panel.refresh()
+        except Exception:
+            pass
 
     def _build_colors_panel(self) -> QWidget:
         panel, layout = self._make_content_panel(
@@ -18005,7 +18640,11 @@ Admin elevation
                     pass
             else:
                 scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                # Settings never scroll sideways — wrap / stack
+                # controls instead. AsNeeded here used to grow a
+                # hidden horizontal range and clip Custom Gestures
+                # / Profiles against the window edge.
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
                 # v1.1.7 round-19: DON'T force-show the scrollbars
                 # here. Coming off an OFF-list panel we hid them via
                 # setVisible(False); force-visible(True) overrides
@@ -18024,7 +18663,7 @@ Admin elevation
                     if vb is not None:
                         vb.setVisible(vb.maximum() > 0)
                     if hb is not None:
-                        hb.setVisible(hb.maximum() > 0)
+                        hb.setVisible(False)
                 except Exception:
                     pass
             scroll.verticalScrollBar().setValue(0)
@@ -18113,6 +18752,14 @@ Admin elevation
         # settings page entry.
         if index == SECTION_UPDATES:
             self._ensure_updates_history_loaded()
+        if index == SECTION_CUSTOM_GESTURE:
+            self._mark_custom_gesture_tab_seen()
+        if index == SECTION_PROFILES:
+            try:
+                if getattr(self, "_profiles_panel", None) is not None:
+                    self._profiles_panel.refresh()
+            except Exception:
+                pass
         # Refresh the Gesture Binds poses list each time the section is
         # shown so custom gestures recorded during this session appear
         # without requiring a restart.
@@ -18565,13 +19212,22 @@ Admin elevation
         QScrollArea#saveLocationsScroll QScrollBar::sub-page:vertical {{
             background: transparent;
         }}
-        QComboBox#settingsCameraCombo QAbstractItemView, QComboBox#settingsMicrophoneCombo QAbstractItemView, QComboBox#homeRuntimeDeviceCombo QAbstractItemView {{
+        QComboBox#settingsCameraCombo QAbstractItemView, QComboBox#settingsMicrophoneCombo QAbstractItemView, QComboBox#homeRuntimeDeviceCombo QAbstractItemView, QComboBox#profileCombo QAbstractItemView {{
             background-color: rgba(15,23,42,0.98);
             color: {self.config.text_color};
             border: 1px solid rgba(29,233,182,0.35);
             selection-background-color: {self.config.primary_color};
             selection-color: {self.config.text_color};
             outline: 0;
+        }}
+        QComboBox#profileCombo {{
+            background-color: rgba(255,255,255,0.08);
+            color: {self.config.text_color};
+            border: 1px solid rgba(29,233,182,0.35);
+            border-radius: 8px;
+            padding: 4px 10px;
+            min-height: 22px;
+            min-width: 0px;
         }}
         QPushButton {{
             background-color: {self.config.primary_color};
@@ -18705,6 +19361,14 @@ Admin elevation
                button, which the user flagged as 'a black rectangle
                appearing on hover/click'. */
             outline: none;
+        }}
+        /* Custom Gestures + Profiles pack several actions into a
+           narrow column. The 110px floor above clips Export / Edit
+           past the window; widget-level min-width:0 loses to this
+           selector, so zero it here. */
+        QStackedWidget#settingsContentStack QWidget#customGesturesPanel QPushButton,
+        QStackedWidget#settingsContentStack QWidget#profilesPanel QPushButton {{
+            min-width: 0px !important;
         }}
         /* Back button: kept primary-blue per the b5 design — it's a
            "leave this page" affordance so it pops against the rest
@@ -18984,6 +19648,8 @@ Admin elevation
             self._revert_colors_panel_edits()
         elif section_id == SECTION_GESTURE_BINDS:
             self._revert_gesture_binds_panel_edits()
+        elif section_id == SECTION_PROFILES:
+            self._revert_profiles_panel_edits()
 
     def _revert_camera_panel_edits(self) -> None:
         combo = getattr(self, "camera_combo", None)
@@ -19126,6 +19792,27 @@ Admin elevation
                 self._set_settings_save_button_pending(button, False)
             except Exception:
                 pass
+
+    def _revert_profiles_panel_edits(self) -> None:
+        dialog = getattr(self, "_gesture_inspect_dialog", None)
+        if dialog is not None:
+            try:
+                dialog.close()
+            except Exception:
+                pass
+            self._gesture_inspect_dialog = None
+        panel = getattr(self, "_profiles_panel", None)
+        if panel is not None:
+            try:
+                panel.discard_draft()
+            except Exception:
+                pass
+        try:
+            self._set_settings_save_button_pending(
+                getattr(self, "_profiles_save_button", None), False
+            )
+        except Exception:
+            pass
 
     def _revert_colors_panel_edits(self) -> None:
         # Colors are special: ColorPickerButton writes to self.config
@@ -34278,6 +34965,10 @@ Admin elevation
                     self._position_camera_save_floating_button()
                 except Exception:
                     pass
+                try:
+                    self._position_profiles_save_floating_button()
+                except Exception:
+                    pass
         # Walk-through overlay: re-anchor the pill + Next button
         # whenever the page or content stack resizes / moves so the
         # overlay stays parked over the active panel's top-right.
@@ -35959,6 +36650,10 @@ def _stop_screen_recording(self) -> bool:
                 # Camera floating Save button — same story, same viewport.
                 try:
                     self._position_camera_save_floating_button()
+                except Exception:
+                    pass
+                try:
+                    self._position_profiles_save_floating_button()
                 except Exception:
                     pass
         # Walk-through overlay: re-anchor the pill + Next button

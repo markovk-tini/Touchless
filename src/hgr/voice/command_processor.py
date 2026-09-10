@@ -95,6 +95,8 @@ TOUCHLESS_TAB_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("gesture guide", "gestures"),
     ("gesture binds", "gesture_binds"),
     ("gesture bindings", "gesture_binds"),
+    ("profiles", "profiles"),
+    ("profile", "profiles"),
     ("save locations", "save_locations"),
     ("save location", "save_locations"),
     ("instructions", "instructions"),
@@ -1706,10 +1708,12 @@ class VoiceCommandProcessor:
             from ..app.ui import main_window as _mw
         except Exception:
             return None
+
         mapping = {
             "instructions": getattr(_mw, "SECTION_INSTRUCTIONS", None),
             "gestures": getattr(_mw, "SECTION_GESTURES", None),
             "custom_gestures": getattr(_mw, "SECTION_CUSTOM_GESTURE", None),
+            "profiles": getattr(_mw, "SECTION_PROFILES", None),
             "gesture_binds": getattr(_mw, "SECTION_GESTURE_BINDS", None),
             "camera": getattr(_mw, "SECTION_CAMERA", None),
             "microphone": getattr(_mw, "SECTION_MICROPHONE", None),
