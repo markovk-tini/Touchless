@@ -117,3 +117,23 @@ def test_assemble_pcm_ring_ignores_sub_quarter_second_gap():
 
 def test_mac_clip_stamp_lead_delays_early_soundtrack():
     assert abs(float(MAC_CLIP_STAMP_LEAD_S) - (-1.5)) < 1e-9
+
+
+def test_looks_like_mp4_rejects_ffmpeg_log(tmp_path):
+    from hgr.platform_compat.mac_system_audio import looks_like_mp4
+
+    log = tmp_path / "Touchless_Recording_1.mp4.ffmpeg.log"
+    log.write_text(
+        "ffmpeg version\n  Duration: N/A, start: 31133.913833, bitrate: N/A\n",
+        encoding="utf-8",
+    )
+    assert looks_like_mp4(log) is False
+
+    tiny = tmp_path / "tiny.mp4"
+    tiny.write_bytes(b"not a video")
+    assert looks_like_mp4(tiny) is False
+
+    mp4 = tmp_path / "Touchless_Recording_1.mp4"
+    # ISO-BMFF: 4-byte box size + 'ftyp'
+    mp4.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+    assert looks_like_mp4(mp4) is True

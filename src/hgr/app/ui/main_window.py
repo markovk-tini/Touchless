@@ -6862,6 +6862,9 @@ class MainWindow(QMainWindow):
         self._screen_record_process: subprocess.Popen | None = None
         self._screen_record_wasapi_writer = None
         self._screen_record_path: Path | None = None
+        self._mac_record_video_temp: Path | None = None
+        self._mac_record_ffmpeg_log: Path | None = None
+        self._mac_record_stderr_file = None
         # Bumped from 12 → 24 fps. The previous rate made clip
         # playback look like a slideshow (the user described it as
         # "very laggy"); 24 is cinema-standard and feels smooth
@@ -25545,6 +25548,8 @@ Admin elevation
         max_count = 0
         try:
             for entry in target_dir.iterdir():
+                if ext and entry.suffix.lower() != str(ext).lower():
+                    continue
                 m = pattern.match(entry.stem)
                 if m:
                     try:
@@ -34740,6 +34745,69 @@ Admin elevation
             )
         except Exception:
             pass
+
+    def _mac_recording_work_paths(self, output_path: Path) -> tuple[Path, Path]:
+        """Keep ffmpeg video-temp + diagnostic log out of the user save folder.
+
+        Sidecars named `<output>.mp4.ffmpeg.log` used to land next to the
+        recording. Finder sorts the log as newest, so "save" looked like a
+        text run-log instead of a video.
+        """
+        from ...config.app_config import CONFIG_DIR
+        work_dir = CONFIG_DIR / "record_tmp"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(output_path).stem or "recording"
+        return work_dir / f"{stem}.video.mp4", work_dir / f"{stem}.ffmpeg.log"
+
+    def _cleanup_mac_recording_sidecars(self, output_path: Path | None) -> None:
+        """Remove leftover ffmpeg sidecars from the user-visible save folder."""
+        if output_path is None:
+            return
+        base = Path(output_path)
+        for extra in (
+            Path(f"{base}.ffmpeg.log"),
+            Path(f"{base}.video.mp4"),
+            Path(f"{base}.audio.wav"),
+        ):
+            try:
+                extra.unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            for extra in base.parent.iterdir():
+                name = extra.name.lower()
+                if (
+                    name.endswith(".mp4.ffmpeg.log")
+                    or name.endswith(".mp4.video.mp4")
+                    or name.endswith(".mp4.audio.wav")
+                ):
+                    extra.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _close_mac_record_ffmpeg_log(self) -> None:
+        handle = getattr(self, "_mac_record_stderr_file", None)
+        self._mac_record_stderr_file = None
+        if handle is None:
+            return
+        try:
+            handle.flush()
+        except Exception:
+            pass
+        try:
+            handle.close()
+        except Exception:
+            pass
+
+    def _mac_recording_is_playable(self, path: Path | None) -> bool:
+        if path is None:
+            return False
+        try:
+            from ...platform_compat.mac_system_audio import looks_like_mp4
+            return bool(looks_like_mp4(path))
+        except Exception:
+            return False
+
     def _start_screen_recording_ffmpeg_mac(self) -> bool:
         """macOS screen recording: ffmpeg avfoundation for VIDEO, sounddevice
         for AUDIO, muxed on stop.
@@ -34775,12 +34843,13 @@ Admin elevation
         # unusual and was in play when playback came out ~2x fast).
         fps = 30.0
         output_path = self._record_output_specs()[0][0]
+        self._cleanup_mac_recording_sidecars(output_path)
 
-        # Video captures to a temp; the sounddevice mic buffer is muxed in on
-        # stop. output_path stays the FINAL name so the rest of the save flow
-        # (save-prompt, last-action label) is unchanged.
-        video_temp = Path(f"{output_path}.video.mp4")
-        log_path = Path(f"{output_path}.ffmpeg.log")
+        # Video captures to a temp under ~/.touchless/record_tmp; the
+        # sounddevice mic buffer is muxed in on stop. output_path stays
+        # the FINAL name in the user save folder so the rest of the save
+        # flow (save-prompt, last-action label) is unchanged.
+        video_temp, log_path = self._mac_recording_work_paths(output_path)
 
         def build_video() -> list[str]:
             cmd = [
@@ -34838,6 +34907,7 @@ Admin elevation
         self._screen_record_process = process
         self._mac_record_stderr_file = stderr_file
         self._mac_record_video_temp = video_temp
+        self._mac_record_ffmpeg_log = log_path
         self._screen_record_backend = "ffmpeg"
         self._screen_record_region = None
         self._screen_record_path = output_path
@@ -34886,14 +34956,11 @@ Admin elevation
         The mic buffer is true-rate PCM (sounddevice), so there's no time
         compression to fix. Video is stream-copied (pristine); audio encoded to
         aac once. Falls back to the silent video if there's no audio or the mux
-        fails. Returns True if final_path ends up valid."""
+        fails.         Returns True if final_path ends up valid."""
         import os as _os
 
         def _ok(p) -> bool:
-            try:
-                return p is not None and Path(p).exists() and Path(p).stat().st_size > 1024
-            except Exception:
-                return False
+            return self._mac_recording_is_playable(p)
 
         if not _ok(video_temp):
             return False
@@ -34907,8 +34974,12 @@ Admin elevation
             except Exception:
                 return False
 
-        # Offset via the common mach clock.
-        v_start = self._avfoundation_input_start(Path(f"{final_path}.ffmpeg.log"))
+        # Offset via the common mach clock. Log lives under
+        # ~/.touchless/record_tmp, not next to the user mp4.
+        log_path = getattr(self, "_mac_record_ffmpeg_log", None)
+        if log_path is None:
+            log_path = Path(f"{final_path}.ffmpeg.log")
+        v_start = self._avfoundation_input_start(log_path)
         offset = None
         if v_start is not None and first_perf is not None:
             offset = float(first_perf) - float(v_start)   # >0: audio started later
@@ -34924,7 +34995,8 @@ Admin elevation
 
         try:
             import wave
-            wav_path = Path(f"{final_path}.audio.wav")
+            wav_dir = Path(video_temp).parent
+            wav_path = wav_dir / f"{Path(final_path).stem}.audio.wav"
             with wave.open(str(wav_path), "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
@@ -35617,11 +35689,13 @@ Admin elevation
                     wall_minus_mach = stop_wall - time.perf_counter()
                     video_temp = getattr(self, "_mac_record_video_temp", None)
                     self._mac_record_video_temp = None
+                    self._close_mac_record_ffmpeg_log()
                     audio_full = None
                     try:
+                        log_path = getattr(self, "_mac_record_ffmpeg_log", None)
                         v_start = (
-                            self._avfoundation_input_start(Path(f"{path}.ffmpeg.log"))
-                            if path is not None else None
+                            self._avfoundation_input_start(log_path)
+                            if log_path is not None else None
                         )
                         if v_start is not None:
                             video_wall_start = float(v_start) + wall_minus_mach
@@ -35660,24 +35734,25 @@ Admin elevation
             elif writer is not None:
                 writer.release()
         finally:
-            # macOS: close the ffmpeg stderr log file handle opened by
-            # _spawn_ffmpeg_to_logfile (no-op on Windows / other backends).
-            _rec_log = getattr(self, "_mac_record_stderr_file", None)
-            if _rec_log is not None:
-                try:
-                    _rec_log.close()
-                except Exception:
-                    pass
-                self._mac_record_stderr_file = None
+            self._close_mac_record_ffmpeg_log()
+            self._cleanup_mac_recording_sidecars(path)
             try:
                 self.processing_overlay.hide_processing()
             except Exception:
                 pass
-            if path is not None and path.exists() and path.stat().st_size > 1024:
+            if self._mac_recording_is_playable(path):
                 self.last_action_label.setText(f"Last action: saved screen recording to {path}")
                 self._queue_post_action_save_prompt("screen_recordings", path)
             elif path is not None:
                 self.last_action_label.setText("Last action: screen recording failed to save")
+                try:
+                    log_path = getattr(self, "_mac_record_ffmpeg_log", None)
+                    if log_path is not None and Path(log_path).exists():
+                        tail = Path(log_path).read_text(encoding="utf-8", errors="replace")[-400:]
+                        sys.stderr.write(f"[screen-record] save failed; ffmpeg log tail:\n{tail}\n")
+                        sys.stderr.flush()
+                except Exception:
+                    pass
             else:
                 self.last_action_label.setText("Last action: screen recording stopped")
         return True

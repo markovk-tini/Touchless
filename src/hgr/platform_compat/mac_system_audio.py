@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -32,6 +33,24 @@ _FS = 48000
 # first-start lead + 2.5 s of this term. Negative delays the
 # track. Screen recordings pass 0.
 MAC_CLIP_STAMP_LEAD_S = -1.5
+
+
+def looks_like_mp4(path) -> bool:
+    """True when `path` is an ISO-BMFF / mp4 file, not a text log.
+
+    ffmpeg screen-record used to write `<output>.mp4.ffmpeg.log` into
+    the user save folder. A size check alone treated that log as a
+    saved recording. MP4 always starts with a 4-byte size then `ftyp`.
+    """
+    try:
+        p = Path(path)
+        if not p.is_file() or p.stat().st_size < 64:
+            return False
+        with p.open("rb") as fh:
+            head = fh.read(12)
+        return len(head) >= 8 and head[4:8] == b"ftyp"
+    except Exception:
+        return False
 
 
 def mac_system_audio_available() -> bool:
