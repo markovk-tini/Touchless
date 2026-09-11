@@ -316,11 +316,9 @@ class SpotifyController:
         ok, out, err = self._mac_osascript(script)
         if not ok:
             self._message = self._mac_error_message("spotify control failed", err)
-            self._latch_transient_failure("NO_ACTIVE_DEVICE", self._message)
             return False
         if out == "not-running":
             self._message = "spotify not running"
-            self._latch_transient_failure("NO_ACTIVE_DEVICE", self._message)
             return False
         return True
 
@@ -2184,12 +2182,6 @@ class SpotifyController:
         aggregate cost is well under a microsecond."""
         if self._needs_reauth:
             return "NEEDS_REAUTH"
-        if self._mac and not (self._access_token or self._refresh_token):
-            # AppleScript transport does not need OAuth. Only treat
-            # "not installed" as the Windows NO_TOKENS reconnect pill.
-            if not self._available:
-                return "NO_TOKENS"
-            return "READY"
         if not self._client_id:
             return "NO_CLIENT_ID"
         if not (self._access_token or self._refresh_token):

@@ -146,12 +146,6 @@ class SpotifyGestureRouter:
         elif stable_label == "fist":
             if not self._can_control_without_focus(controller):
                 self._control_text = "spotify inactive on device"
-                try:
-                    latch = getattr(controller, "_latch_transient_failure", None)
-                    if callable(latch):
-                        latch("NO_ACTIVE_DEVICE", self._control_text)
-                except Exception:
-                    pass
                 self._set_action("spotify_toggle_idle")
                 return
             # Fire HTTP call on a background thread so the gesture
@@ -168,12 +162,6 @@ class SpotifyGestureRouter:
         elif stable_label == "ok":
             if not self._can_control_without_focus(controller):
                 self._control_text = "spotify inactive on device"
-                try:
-                    latch = getattr(controller, "_latch_transient_failure", None)
-                    if callable(latch):
-                        latch("NO_ACTIVE_DEVICE", self._control_text)
-                except Exception:
-                    pass
                 self._set_action("spotify_shuffle_idle")
                 return
             controller.dispatch_async(
@@ -205,12 +193,6 @@ class SpotifyGestureRouter:
             self._dynamic_cooldown_until = now + self.dynamic_cooldown_seconds
             self._dynamic_latched_label = dynamic_label
             self._control_text = "spotify inactive on device"
-            try:
-                latch = getattr(controller, "_latch_transient_failure", None)
-                if callable(latch):
-                    latch("NO_ACTIVE_DEVICE", self._control_text)
-            except Exception:
-                pass
             if dynamic_label == "swipe_left":
                 self._set_action("spotify_previous_idle")
             elif dynamic_label == "swipe_right":

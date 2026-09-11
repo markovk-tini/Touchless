@@ -254,15 +254,18 @@ class SpotifyControllerTest(unittest.TestCase):
         controller._client_id = "test-client"
         controller._needs_reauth = False
         controller._available = True
-        self.assertEqual(controller.readiness_state(), "READY")
+        # Connect toast is OAuth, not "Spotify.app is running".
+        self.assertEqual(controller.readiness_state(), "NO_TOKENS")
         controller._available = False
         self.assertEqual(controller.readiness_state(), "NO_TOKENS")
+        controller._access_token = "tok"
+        self.assertEqual(controller.readiness_state(), "READY")
 
     def test_mac_transport_fails_when_spotify_is_not_running(self) -> None:
         controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
         controller._mac = True
         with patch.object(controller, "_mac_osascript", return_value=(True, "not-running", "")):
             self.assertFalse(controller._mac_transport("playpause"))
-        self.assertEqual(controller.take_transient_failure()["category"], "NO_ACTIVE_DEVICE")
+        self.assertIsNone(controller.take_transient_failure())
 
 # Author: Konstantin Markov

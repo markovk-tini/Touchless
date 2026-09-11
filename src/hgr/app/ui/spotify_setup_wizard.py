@@ -35,6 +35,7 @@ auth attempt because _load_credentials reads config fresh each call).
 from __future__ import annotations
 
 from typing import Optional
+import sys
 
 from PySide6.QtCore import Qt, QSize, QTimer, QUrl
 from PySide6.QtGui import QClipboard, QDesktopServices, QGuiApplication
@@ -232,6 +233,14 @@ class SpotifySetupWizard(QDialog):
             1: (680, 900),   # paste values — Step 1 fallback nav, URI list, Steps 2+3
             2: (560, 400),   # collect Client ID — title + body + input + tip
         }
+        if sys.platform == "darwin":
+            # 13" Mac available height is often < 800 after the menu
+            # bar and dock. Page 1 at 900 overflowed; shorter + scroll.
+            self._page_sizes = {
+                0: (540, 440),
+                1: (640, 560),
+                2: (540, 360),
+            }
         # r51: was apply_touchless_chrome (DWM caption color, Win11
         # only — dad on Win10 saw white/black chrome). Now uses the
         # frameless indigo bar so it renders identically on Win10
@@ -304,12 +313,24 @@ class SpotifySetupWizard(QDialog):
         # Mount the first page now so it actually has a parent before
         # the dialog is shown.
         self._content_layout.addWidget(self._pages[0])
-        root.addWidget(self._content_frame, 0, Qt.AlignTop)
-        # Slack absorber between the content area and the nav row.
-        # Any vertical room left after the page sits at its natural
-        # sizeHint goes here, so the nav row stays pinned at the
-        # bottom and content stays pinned at the top.
-        root.addStretch(1)
+        if sys.platform == "darwin":
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setWidget(self._content_frame)
+            scroll.setStyleSheet(
+                "QScrollArea { background: transparent; border: none; }"
+            )
+            self._scroll = scroll
+            root.addWidget(scroll, 1)
+        else:
+            root.addWidget(self._content_frame, 0, Qt.AlignTop)
+            # Slack absorber between the content area and the nav row.
+            # Any vertical room left after the page sits at its natural
+            # sizeHint goes here, so the nav row stays pinned at the
+            # bottom and content stays pinned at the top.
+            root.addStretch(1)
 
         nav_row = QHBoxLayout()
         nav_row.setContentsMargins(0, 0, 0, 0)
@@ -356,6 +377,18 @@ class SpotifySetupWizard(QDialog):
             # Clear any prior fixed size latch before switching pages —
             # if we don't, Qt keeps the previous page's maximum.
             self.setMaximumSize(16777215, 16777215)
+            if sys.platform == "darwin":
+                screen = QGuiApplication.primaryScreen()
+                avail_h = h
+                if screen is not None:
+                    geo = screen.availableGeometry()
+                    w = min(w, max(480, int(geo.width()) - 48))
+                    avail_h = max(320, int(geo.height()) - 96)
+                    h = min(h, avail_h)
+                self.setMinimumSize(min(w, 480), 280)
+                self.setMaximumHeight(avail_h)
+                self.resize(w, h)
+                return
             self.setMinimumSize(w, h)
             self.resize(max(self.width(), w), max(self.height(), h))
         except Exception:

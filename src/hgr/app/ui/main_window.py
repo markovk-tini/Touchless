@@ -12485,6 +12485,7 @@ class MainWindow(QMainWindow):
                 pass
             return
         dialog = SpotifySetupWizard(self.config, parent=self)
+        self._hide_spotify_connect_overlay()
         if dialog.exec() == QDialog.Accepted:
             # The engine's existing SpotifyController instance loaded
             # the OLD client_id (or the embedded default) at init. The
@@ -22487,6 +22488,15 @@ Admin elevation
         if bool(getattr(self, "_spotify_prompt_suppressed_session", False)):
             return
         overlay = getattr(self, "_spotify_prompt_overlay", None)
+        if overlay is not None and overlay.isVisible():
+            return
+        try:
+            now = time.monotonic()
+            until = float(getattr(self, "_spotify_prompt_reshow_until", 0.0) or 0.0)
+            if now < until:
+                return
+        except Exception:
+            pass
         if overlay is None:
             try:
                 from ...debug.spotify_connect_prompt_overlay import (
@@ -22525,14 +22535,34 @@ Admin elevation
         before dismissing, latch a session-scoped suppression flag so
         _show_spotify_action_pill early-returns for the rest of this
         process lifetime. No persistence — restart clears the latch."""
+        try:
+            self._spotify_prompt_reshow_until = time.monotonic() + 30.0
+        except Exception:
+            self._spotify_prompt_reshow_until = 0.0
         if bool(suppress_session):
             self._spotify_prompt_suppressed_session = True
 
+    def _hide_spotify_connect_overlay(self) -> None:
+        overlay = getattr(self, "_spotify_prompt_overlay", None)
+        if overlay is None:
+            return
+        hide_now = getattr(overlay, "hide_immediately", None)
+        try:
+            if callable(hide_now):
+                hide_now()
+            else:
+                overlay.hide()
+        except Exception:
+            pass
+
     def _open_spotify_setup_wizard_from_pill(self) -> None:
-        """Link click-target from the SpotifyConnectPromptOverlay. The
-        pill fades itself synchronously after emitting linkClicked, so
-        opening the wizard (which uses .exec()) here is safe — no
-        blocking of the pill's fade path."""
+        """Link click-target from the SpotifyConnectPromptOverlay.
+
+        Hide the toast immediately. The wizard uses exec(); a still-
+        visible Tool overlay stays on top and cannot be dismissed
+        while that modal is up.
+        """
+        self._hide_spotify_connect_overlay()
         try:
             self._open_spotify_setup_wizard()
         except Exception:
@@ -22662,6 +22692,11 @@ Admin elevation
         except Exception:
             failure = None
         if not failure:
+            return
+        category = str(failure.get("category") or "")
+        # Closed / inactive Spotify is not "not connected". Fist and
+        # swipe already no-op; don't open the setup toast for that.
+        if category == "NO_ACTIVE_DEVICE":
             return
         # v1.1.7.11 rebuild: single general message everywhere.
         self._show_spotify_action_pill(

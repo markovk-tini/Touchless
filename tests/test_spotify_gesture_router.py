@@ -182,8 +182,9 @@ class SpotifyGestureRouterTest(unittest.TestCase):
         self.assertEqual(controller.previous_calls, 0)
         self.assertEqual(fist_snapshot.last_action, "spotify_toggle_idle")
         self.assertEqual(swipe_snapshot.last_action, "spotify_previous_idle")
-        self.assertGreaterEqual(len(controller.latched), 2)
-        self.assertTrue(all(item[0] == "NO_ACTIVE_DEVICE" for item in controller.latched))
+        # Closed Spotify is not "not connected" — don't latch a
+        # reconnect toast. Right-hand two / voice still opens it.
+        self.assertEqual(controller.latched, [])
 
     def test_running_spotify_can_still_receive_controls_without_focus_gesture(self) -> None:
         router = SpotifyGestureRouter(static_hold_seconds=0.5, static_cooldown_seconds=1.5, dynamic_cooldown_seconds=0.9)

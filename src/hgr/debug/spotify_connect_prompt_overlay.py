@@ -213,10 +213,25 @@ class SpotifyConnectPromptOverlay(QWidget):
             return
         self._begin_fade_out()
 
-    def _on_link_clicked(self, _href: str) -> None:
+    def hide_immediately(self) -> None:
+        """Drop the toast now (wizard is about to exec() and would
+        freeze a fading Tool window on top of the dialog)."""
         self._auto_dismiss.stop()
+        self._fade.stop()
+        self._fading_out = False
+        if self.isVisible():
+            self.hide()
+            try:
+                suppress = bool(self._suppress_checkbox.isChecked())
+            except Exception:
+                suppress = False
+            self.dismissed.emit(suppress)
+
+    def _on_link_clicked(self, _href: str) -> None:
+        # Hide before the wizard exec() so the toast isn't stuck on
+        # top of a modal dialog with no way to dismiss it.
+        self.hide_immediately()
         self.linkClicked.emit()
-        self._begin_fade_out()
 
     def _on_close_clicked(self) -> None:
         self._auto_dismiss.stop()
