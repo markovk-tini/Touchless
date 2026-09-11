@@ -28187,10 +28187,15 @@ Admin elevation
         except Exception:
             return None
 
-    def _mix_mac_clip_and_sys(self, mic, sys_a):
+    def _mix_mac_clip_and_sys(self, mic, sys_a, **kwargs):
         try:
-            from ...platform_compat.mac_system_audio import mix_mac_pcm
-            return mix_mac_pcm(mic, sys_a)
+            from ...platform_compat.mac_system_audio import (
+                MAC_MIX_MIC_GAIN,
+                mix_mac_pcm,
+            )
+            if "mic_gain" not in kwargs:
+                kwargs["mic_gain"] = MAC_MIX_MIC_GAIN
+            return mix_mac_pcm(mic, sys_a, **kwargs)
         except Exception:
             return mic if mic is not None else sys_a
 
@@ -28288,15 +28293,18 @@ Admin elevation
             # previous +2.5 s skip made clips ~4 s early.
             stamp_lead_s = -1.5
             boost_quiet_mac_pcm = None
+            polish_mac_pcm = None
             mac_clip_video_timescale = None
             try:
                 from ...platform_compat.mac_system_audio import (
                     MAC_CLIP_STAMP_LEAD_S,
                     boost_quiet_mac_pcm as _boost_quiet_mac_pcm,
                     mac_clip_video_timescale as _mac_clip_video_timescale,
+                    polish_mac_pcm as _polish_mac_pcm,
                 )
                 stamp_lead_s = float(MAC_CLIP_STAMP_LEAD_S)
                 boost_quiet_mac_pcm = _boost_quiet_mac_pcm
+                polish_mac_pcm = _polish_mac_pcm
                 mac_clip_video_timescale = _mac_clip_video_timescale
             except Exception:
                 pass
@@ -28314,6 +28322,8 @@ Admin elevation
             try:
                 if boost_quiet_mac_pcm is not None:
                     audio = boost_quiet_mac_pcm(audio)
+                if polish_mac_pcm is not None:
+                    audio = polish_mac_pcm(audio, fs=fs)
             except Exception:
                 pass
             # Keep the wall-clock wav. OpenCV mp4v/MJPG often tags ~20 fps
@@ -35728,6 +35738,7 @@ Admin elevation
                             try:
                                 from ...platform_compat.mac_system_audio import (
                                     boost_quiet_mac_pcm,
+                                    polish_mac_pcm,
                                 )
                                 # SCK tap is typically ~half the live
                                 # speaker level. Clips already boost;
@@ -35738,6 +35749,7 @@ Admin elevation
                                     max_gain=3.5,
                                     already_loud=0.50,
                                 )
+                                audio_full = polish_mac_pcm(audio_full)
                             except Exception:
                                 pass
                     except Exception:

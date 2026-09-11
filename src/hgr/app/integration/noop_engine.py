@@ -2276,6 +2276,20 @@ class GestureWorker(QObject):
             max(0.0, min(1.0, mapped_y)),
         )
 
+    def _darwin_rest_snap_drawing_cursor(self, prev_norm, mapped) -> None:
+        """Freeze hover tremor on Mac. Never call this while inking.
+
+        A per-frame 0.35% deadzone during `draw` turned small circles
+        into polygons: FaceTime steps of a few pixels were discarded.
+        """
+        if sys.platform != "darwin" or prev_norm is None or mapped is None:
+            return
+        lx, ly = prev_norm
+        dx = mapped[0] - lx
+        dy = mapped[1] - ly
+        if (dx * dx + dy * dy) < (0.0035 * 0.0035):
+            self._drawing_cursor_norm = prev_norm
+
     def _update_drawing_controls(self, prediction, hand_reading, hand_handedness: str | None, now: float) -> None:
         if not self._drawing_mode_enabled:
             self._drawing_cursor_norm = None
@@ -2314,9 +2328,10 @@ class GestureWorker(QObject):
             oef_max_dt = None
             if sys.platform == "darwin":
                 # Irregular Mac capture dt made OneEuro treat landmark
-                # jitter as motion (cursor crawl). Heavier rest cutoff,
-                # clamp dt, keep beta high enough for strokes.
-                min_cutoff = 0.20
+                # jitter as motion (cursor crawl). Clamp dt; keep
+                # min_cutoff near Windows (0.35) so slow curves don't
+                # collapse into straight segments. 0.20 did that.
+                min_cutoff = 0.32
                 beta = 0.50
                 oef_max_dt = 0.045
             self._drawing_oef_x = OneEuroFilter(
@@ -2349,21 +2364,13 @@ class GestureWorker(QObject):
             )
         else:
             mapped = self._map_drawing_control_box(smooth_x, smooth_y)
-        if (
-            sys.platform == "darwin"
-            and self._drawing_cursor_norm is not None
-        ):
-            lx, ly = self._drawing_cursor_norm
-            dx = mapped[0] - lx
-            dy = mapped[1] - ly
-            # ~0.35% of the canvas — hold-still tremor on FaceTime.
-            if (dx * dx + dy * dy) < (0.0035 * 0.0035):
-                mapped = (lx, ly)
+        prev_norm = self._drawing_cursor_norm
         self._drawing_cursor_norm = mapped
         if self._drawing_lift_pose_active(hand_reading):
             self._drawing_tool = "hover"
             self._drawing_control_text = f"drawing hover ({self._drawing_render_target})"
             self._camera_draw_last_point = None
+            self._darwin_rest_snap_drawing_cursor(prev_norm, mapped)
             return
         # Pen-lift trigger: open the thumb for >= 0.20 s and the
         # pen lifts. Detection requires multiple corroborating
@@ -2483,6 +2490,7 @@ class GestureWorker(QObject):
 
         self._drawing_control_text = f"drawing hover ({self._drawing_render_target})"
         self._camera_draw_last_point = None
+        self._darwin_rest_snap_drawing_cursor(prev_norm, mapped)
 
     def _reset_drawing_wheel(self, *, clear_cooldown: bool = False) -> None:
         self._drawing_wheel_visible = False
@@ -3424,8 +3432,6 @@ class GestureWorker(QObject):
             p_prev = self._camera_draw_last_point
             try:
                 min_move = float(self._DRAWING_MIN_MOVE_PX)
-                if sys.platform == "darwin":
-                    min_move = 6.0
                 dx = float(point[0] - p_prev[0])
                 dy = float(point[1] - p_prev[1])
                 if (dx * dx + dy * dy) < (min_move * min_move):

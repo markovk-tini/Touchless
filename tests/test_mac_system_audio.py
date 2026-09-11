@@ -4,10 +4,12 @@ import numpy as np
 
 from hgr.platform_compat.mac_system_audio import (
     MAC_CLIP_STAMP_LEAD_S,
+    MAC_MIX_MIC_GAIN,
     assemble_pcm_ring,
     boost_quiet_mac_pcm,
     mac_clip_video_timescale,
     mix_mac_pcm,
+    polish_mac_pcm,
 )
 
 
@@ -150,3 +152,44 @@ def test_looks_like_mp4_rejects_ffmpeg_log(tmp_path):
     # ISO-BMFF: 4-byte box size + 'ftyp'
     mp4.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
     assert looks_like_mp4(mp4) is True
+
+
+def test_mix_mac_pcm_ducks_room_mic_when_both_present():
+    fs = 48000
+    mic = np.ones(fs, dtype=np.float32) * 0.5
+    sys_a = np.ones(fs, dtype=np.float32) * 0.2
+    unducked = mix_mac_pcm(mic, sys_a)
+    ducked = mix_mac_pcm(mic, sys_a, mic_gain=MAC_MIX_MIC_GAIN)
+    assert unducked is not None and ducked is not None
+    assert abs(float(np.mean(unducked)) - 0.7) < 0.02
+    # 0.5 * 0.32 + 0.2 = 0.36
+    assert abs(float(np.mean(ducked)) - (0.5 * MAC_MIX_MIC_GAIN + 0.2)) < 0.02
+    # Mic-only still full level (no SCK to comb against).
+    mic_only = mix_mac_pcm(mic, None, mic_gain=MAC_MIX_MIC_GAIN)
+    assert abs(float(np.mean(mic_only)) - 0.5) < 0.01
+
+
+def test_polish_mac_pcm_fades_edges_keeps_middle():
+    fs = 48000
+    buf = np.full(fs, 0.6, dtype=np.float32)
+    out = polish_mac_pcm(buf, fs=fs, fade_s=0.010)
+    assert out is not None
+    n = int(0.010 * fs)
+    assert float(out[0]) < 0.02
+    assert float(out[-1]) < 0.02
+    assert abs(float(np.mean(out[n * 2 : -n * 2])) - 0.6) < 0.02
+
+
+def test_assemble_pcm_ring_dropout_pad_keeps_duration():
+    fs = 48000
+    a = np.full(fs, 0.5, dtype=np.float32)
+    b = np.full(fs, 0.5, dtype=np.float32)
+    # 400 ms gap is a real dropout (> 250 ms).
+    chunks = [(1.0, a), (2.4, b)]
+    out = assemble_pcm_ring(chunks, fs, 0.0, 2.4)
+    assert out is not None
+    assert len(out) == int(round(2.4 * fs))
+    # Gap is near-silent; we fade 5 ms into it, so don't require a
+    # perfectly empty middle sample.
+    mid = out[fs + int(0.1 * fs) : fs + int(0.3 * fs)]
+    assert float(np.max(np.abs(mid))) < 0.05

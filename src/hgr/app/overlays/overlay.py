@@ -392,6 +392,14 @@ class ScreenDrawOverlay(QWidget):
     # the radius produces zero ink regardless of duration.
     _DRAW_ANCHOR_RADIUS_PX_SQ = 64.0  # 8 px squared
 
+    def _draw_anchor_radius_sq(self) -> float:
+        # 8 px still-anchor plus Mac cursor quantization made small
+        # circles fail (octagons / no curve). 4 px still kills hold
+        # tremor without flattening a ~30 px loop.
+        if sys.platform == "darwin":
+            return 16.0
+        return self._DRAW_ANCHOR_RADIUS_PX_SQ
+
     def draw_to(self, pos: QPointF) -> None:
         self._ensure_canvas_size()
         if self._last_draw_point is None:
@@ -414,7 +422,7 @@ class ScreenDrawOverlay(QWidget):
             self._draw_still_anchor = anchor
         dx = float(pos.x()) - float(anchor.x())
         dy = float(pos.y()) - float(anchor.y())
-        if (dx * dx + dy * dy) < self._DRAW_ANCHOR_RADIUS_PX_SQ:
+        if (dx * dx + dy * dy) < self._draw_anchor_radius_sq():
             self._cursor_pos = QPointF(pos)
             self._cursor_mode = "draw"
             self.update()

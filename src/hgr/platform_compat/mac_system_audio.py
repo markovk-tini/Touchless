@@ -33,6 +33,9 @@ _FS = 48000
 # first-start lead + 2.5 s of this term. Negative delays the
 # track. Screen recordings pass 0.
 MAC_CLIP_STAMP_LEAD_S = -1.5
+# Room mic on top of SCK re-records speakers (comb / static).
+# Duck only when both tracks mix; mic-only is unchanged.
+MAC_MIX_MIC_GAIN = 0.32
 
 
 def looks_like_mp4(path) -> bool:
@@ -117,7 +120,21 @@ def assemble_pcm_ring(
             # trim, crossfade, or insert silence — those desync and
             # crackle. Only pad a real dropout.
             if gap > dropout_s:
-                pieces.append(np.zeros(int(round(gap * fs_f)), dtype=np.float32))
+                n_pad = int(round(gap * fs_f))
+                n_f = min(int(round(0.005 * fs_f)), max(1, n_pad // 4))
+                # Hard splice of audio|zeros|audio is a click.
+                # Fade the adjacent 5 ms; keep the gap as silence.
+                if pieces and n_f > 1:
+                    prev = np.array(pieces[-1], dtype=np.float32, copy=True)
+                    k = min(n_f, int(prev.size))
+                    if k > 1:
+                        prev[-k:] *= np.linspace(1.0, 0.0, k, dtype=np.float32)
+                    pieces[-1] = prev
+                pieces.append(np.zeros(n_pad, dtype=np.float32))
+                arr = np.array(arr, dtype=np.float32, copy=True)
+                k = min(n_f, int(arr.size))
+                if k > 1:
+                    arr[:k] *= np.linspace(0.0, 1.0, k, dtype=np.float32)
         pieces.append(arr)
         prev_t_end = t_end_f
     if not pieces or first_start is None:
@@ -165,13 +182,20 @@ def _window_pcm_ring(
 
 
 def mix_mac_pcm(
-    mic: Optional[np.ndarray], sys_a: Optional[np.ndarray]
+    mic: Optional[np.ndarray],
+    sys_a: Optional[np.ndarray],
+    *,
+    mic_gain: float = 1.0,
 ) -> Optional[np.ndarray]:
     """Mix mic + system rings. Either side may be None / too short.
 
     End-aligned: both tracks share the same right edge (the clip/record
     stop). Start-aligning a longer system buffer put old speaker audio
     at the front; ffmpeg -shortest then kept that early half.
+
+    `mic_gain` applies only when BOTH tracks are present. The room mic
+    re-records speakers on top of the SCK tap; equal mix comb-filters
+    into static. Ducking the mic keeps voice faintly and the tap clean.
     """
     def _ok(buf) -> bool:
         return buf is not None and getattr(buf, "size", 0) >= int(0.05 * _FS)
@@ -186,8 +210,22 @@ def mix_mac_pcm(
         return None
     n = max(len(mic), len(sys_a))
     out = np.zeros(n, dtype=np.float32)
-    out[n - len(mic) :] += mic
-    out[n - len(sys_a) :] += sys_a
+    fade_n = int(0.008 * _FS)
+
+    def _add(buf, gain: float) -> None:
+        b = np.asarray(buf, dtype=np.float32).reshape(-1)
+        start = n - int(b.size)
+        need_fade = start > 0 and fade_n > 1
+        g = float(gain)
+        if g != 1.0 or need_fade:
+            b = np.multiply(b, np.float32(g), dtype=np.float32)
+            if need_fade:
+                fn = min(fade_n, int(b.size))
+                b[:fn] *= np.linspace(0.0, 1.0, fn, dtype=np.float32)
+        out[start : start + int(b.size)] += b
+
+    _add(mic, float(mic_gain))
+    _add(sys_a, 1.0)
     np.clip(out, -1.0, 1.0, out=out)
     return out
 
@@ -208,9 +246,49 @@ def boost_quiet_mac_pcm(
     gain = min(float(max_gain), float(target_peak) / peak)
     if gain <= 1.01:
         return buf
-    out = (np.asarray(buf, dtype=np.float32) * np.float32(gain))
+    out = np.asarray(buf, dtype=np.float32) * np.float32(gain)
+    return _soft_clip_mac_pcm(out)
+
+
+def _soft_clip_mac_pcm(buf: np.ndarray, threshold: float = 0.90) -> np.ndarray:
+    """Compress only the last 10% of full scale — no hard-clip tick."""
+    out = np.asarray(buf, dtype=np.float32)
+    if out.size == 0:
+        return out
+    thr = np.float32(threshold)
+    ax = np.abs(out)
+    over = ax > thr
+    if not np.any(over):
+        np.clip(out, -1.0, 1.0, out=out)
+        return out
+    if out.base is not None:
+        out = np.array(out, dtype=np.float32, copy=True)
+        ax = np.abs(out)
+        over = ax > thr
+    sign = np.sign(out)
+    headroom = np.float32(1.0) - thr
+    excess = ax - thr
+    out[over] = sign[over] * (thr + headroom * np.tanh(excess[over] / headroom))
     np.clip(out, -1.0, 1.0, out=out)
     return out
+
+
+def polish_mac_pcm(
+    buf: Optional[np.ndarray],
+    *,
+    fs: int = _FS,
+    fade_s: float = 0.010,
+) -> Optional[np.ndarray]:
+    """Fade edges and soft-clip rails so mux/boost don't tick or pop."""
+    if buf is None or getattr(buf, "size", 0) == 0:
+        return buf
+    out = np.array(buf, dtype=np.float32, copy=True)
+    n_fade = int(round(float(fs) * float(fade_s)))
+    if n_fade > 1 and out.size > 2 * n_fade:
+        ramp = np.linspace(0.0, 1.0, n_fade, dtype=np.float32)
+        out[:n_fade] *= ramp
+        out[-n_fade:] *= ramp[::-1]
+    return _soft_clip_mac_pcm(out)
 
 
 def mac_clip_video_timescale(video_dur: float, wall_span: float) -> float:
