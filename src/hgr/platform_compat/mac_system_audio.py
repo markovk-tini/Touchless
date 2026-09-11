@@ -35,7 +35,7 @@ _FS = 48000
 MAC_CLIP_STAMP_LEAD_S = -1.5
 # Room mic on top of SCK re-records speakers (comb / static).
 # Duck only when both tracks mix; mic-only is unchanged.
-MAC_MIX_MIC_GAIN = 0.32
+MAC_MIX_MIC_GAIN = 0.12
 
 
 def looks_like_mp4(path) -> bool:
@@ -83,6 +83,7 @@ def assemble_pcm_ring(
     right: float,
     *,
     stamp_lead_s: float = 0.0,
+    pad_to_window: bool = True,
 ) -> Optional[np.ndarray]:
     """Contiguous PCM for wall window [left, right], first-start sliced.
 
@@ -94,6 +95,11 @@ def assemble_pcm_ring(
     `stamp_lead_s`. Positive lead skips into the ring (soundtrack
     plays early); negative includes older samples (delays it).
     Clip mux only; screen recordings pass 0.
+
+    `pad_to_window=False` returns only the concat samples that fall in
+    the window (no leading/trailing zeros). Recording mux stretches
+    that true sample count onto probed video duration so packed
+    dropouts don't play future audio (~1 s early by the end).
     """
     if chunks is None or right <= left or int(fs) <= 0:
         return None
@@ -154,6 +160,8 @@ def assemble_pcm_ring(
     src1 = min(full.size, end_idx)
     if src1 <= src0:
         return None
+    if not pad_to_window:
+        return np.array(full[src0:src1], dtype=np.float32, copy=True)
     dst0 = src0 - start_idx
     dst1 = dst0 + (src1 - src0)
     if dst0 < 0 or dst1 > total or dst1 <= dst0:
@@ -166,6 +174,7 @@ def _window_pcm_ring(
     chunks_ref, lock, fs: int, left: float, right: float,
     *,
     stamp_lead_s: float = 0.0,
+    pad_to_window: bool = True,
 ) -> Optional[np.ndarray]:
     """Lock + copy, then `assemble_pcm_ring`. Same helper as the mic ring."""
     if chunks_ref is None or right <= left:
@@ -178,7 +187,33 @@ def _window_pcm_ring(
             chunks = list(chunks_ref)
     except Exception:
         return None
-    return assemble_pcm_ring(chunks, fs, left, right, stamp_lead_s=stamp_lead_s)
+    return assemble_pcm_ring(
+        chunks, fs, left, right,
+        stamp_lead_s=stamp_lead_s,
+        pad_to_window=pad_to_window,
+    )
+
+
+def mac_mux_atempo_factor(audio_dur: float, video_dur: float) -> float:
+    """atempo so PCM lasting `audio_dur` fills `video_dur` (pitch kept).
+
+    Packed rings (ignored callback gaps / xruns) play future content:
+    start is on time, then audio leads by ~1 s. Factor < 1 slows it
+    back onto the picture. Huge mismatches are left alone.
+    """
+    try:
+        a = float(audio_dur)
+        v = float(video_dur)
+    except (TypeError, ValueError):
+        return 1.0
+    if a < 0.25 or v < 0.25:
+        return 1.0
+    tempo = a / v
+    if abs(tempo - 1.0) < 0.004:
+        return 1.0
+    if tempo < 0.88 or tempo > 1.12:
+        return 1.0
+    return min(2.0, max(0.5, tempo))
 
 
 def mix_mac_pcm(
@@ -279,10 +314,19 @@ def polish_mac_pcm(
     fs: int = _FS,
     fade_s: float = 0.010,
 ) -> Optional[np.ndarray]:
-    """Fade edges and soft-clip rails so mux/boost don't tick or pop."""
+    """Fade edges, kill 1-sample clicks, and soft-clip rails."""
     if buf is None or getattr(buf, "size", 0) == 0:
         return buf
     out = np.array(buf, dtype=np.float32, copy=True)
+    if out.size >= 5:
+        d = np.diff(out)
+        # Opposite-sign jumps on both sides of a sample = a tick, not
+        # a musical transient (those last several samples).
+        mag = np.minimum(np.abs(d[:-1]), np.abs(d[1:]))
+        clicks = (d[:-1] * d[1:] < 0.0) & (mag > np.float32(0.35))
+        idx = np.where(clicks)[0] + 1
+        if idx.size:
+            out[idx] = 0.5 * (out[idx - 1] + out[idx + 1])
     n_fade = int(round(float(fs) * float(fade_s)))
     if n_fade > 1 and out.size > 2 * n_fade:
         ramp = np.linspace(0.0, 1.0, n_fade, dtype=np.float32)
@@ -450,8 +494,7 @@ def _sbuf_to_mono_f32(sbuf) -> Optional[np.ndarray]:
             arr = np.interp(x_new, x_old, arr).astype(np.float32)
         except Exception:
             pass
-    np.clip(arr, -1.0, 1.0, out=arr)
-    return arr
+    return _soft_clip_mac_pcm(arr)
 
 
 class MacSystemAudioTap:
@@ -528,10 +571,12 @@ class MacSystemAudioTap:
         right: float,
         *,
         stamp_lead_s: float = 0.0,
+        pad_to_window: bool = True,
     ) -> Optional[np.ndarray]:
         return _window_pcm_ring(
             self._chunks, self._lock, self._fs, left, right,
             stamp_lead_s=stamp_lead_s,
+            pad_to_window=pad_to_window,
         )
 
     def _push(self, mono: np.ndarray, t_end: Optional[float] = None) -> None:

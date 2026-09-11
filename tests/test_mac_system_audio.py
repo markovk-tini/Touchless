@@ -8,6 +8,7 @@ from hgr.platform_compat.mac_system_audio import (
     assemble_pcm_ring,
     boost_quiet_mac_pcm,
     mac_clip_video_timescale,
+    mac_mux_atempo_factor,
     mix_mac_pcm,
     polish_mac_pcm,
 )
@@ -162,7 +163,7 @@ def test_mix_mac_pcm_ducks_room_mic_when_both_present():
     ducked = mix_mac_pcm(mic, sys_a, mic_gain=MAC_MIX_MIC_GAIN)
     assert unducked is not None and ducked is not None
     assert abs(float(np.mean(unducked)) - 0.7) < 0.02
-    # 0.5 * 0.32 + 0.2 = 0.36
+    # 0.5 * mic_gain + 0.2
     assert abs(float(np.mean(ducked)) - (0.5 * MAC_MIX_MIC_GAIN + 0.2)) < 0.02
     # Mic-only still full level (no SCK to comb against).
     mic_only = mix_mac_pcm(mic, None, mic_gain=MAC_MIX_MIC_GAIN)
@@ -193,3 +194,33 @@ def test_assemble_pcm_ring_dropout_pad_keeps_duration():
     # perfectly empty middle sample.
     mid = out[fs + int(0.1 * fs) : fs + int(0.3 * fs)]
     assert float(np.max(np.abs(mid))) < 0.05
+
+
+def test_assemble_pcm_ring_unpadded_is_shorter_than_window_when_packed():
+    fs = 48000
+    # 0.9 s of samples stamped as covering 1.0 s (typical xrun pack).
+    a = np.full(int(0.9 * fs), 0.4, dtype=np.float32)
+    chunks = [(1.0, a)]
+    padded = assemble_pcm_ring(chunks, fs, 0.0, 1.0)
+    unpadded = assemble_pcm_ring(chunks, fs, 0.0, 1.0, pad_to_window=False)
+    assert padded is not None and unpadded is not None
+    assert len(padded) == fs
+    assert len(unpadded) == int(0.9 * fs)
+
+
+def test_mac_mux_atempo_slows_packed_audio_onto_video():
+    # 59 s of samples vs 60 s picture → slow down ~1.7% (the ~1 s early case).
+    tempo = mac_mux_atempo_factor(59.0, 60.0)
+    assert abs(tempo - (59.0 / 60.0)) < 1e-6
+    assert tempo < 1.0
+    assert mac_mux_atempo_factor(60.0, 60.0) == 1.0
+    assert mac_mux_atempo_factor(60.0, 1.0) == 1.0  # implausible, skip
+
+
+def test_polish_mac_pcm_removes_one_sample_click():
+    fs = 48000
+    buf = np.full(4000, 0.1, dtype=np.float32)
+    buf[2000] = 0.95
+    out = polish_mac_pcm(buf, fs=fs, fade_s=0.0)
+    assert out is not None
+    assert float(out[2000]) < 0.3

@@ -28072,6 +28072,15 @@ Admin elevation
                         mono = arr
                     mono = mono.copy()
                     t_end = time.time() - float(getattr(self, "_mac_clip_audio_latency", 0.0))
+                    try:
+                        adc = float(getattr(time_info, "inputBufferAdcTime", 0.0) or 0.0)
+                        cur = float(getattr(time_info, "currentTime", 0.0) or 0.0)
+                        if adc > 0.0 and cur > 0.0:
+                            t_end = time.time() - cur + adc + (
+                                float(frames) / float(fs)
+                            )
+                    except Exception:
+                        pass
                     lock = getattr(self, "_mac_clip_audio_lock", None)
                     chunks = getattr(self, "_mac_clip_audio_chunks", None)
                     if lock is None or chunks is None:
@@ -28089,7 +28098,7 @@ Admin elevation
 
             stream = sd.InputStream(
                 samplerate=fs, channels=1, dtype="float32",
-                device=device, blocksize=0, callback=_cb,
+                device=device, blocksize=1024, callback=_cb,
             )
             try:
                 self._mac_clip_audio_latency = float(getattr(stream, "latency", 0.0) or 0.0)
@@ -28177,13 +28186,18 @@ Admin elevation
                 pass
 
     def _extract_mac_sys_audio(
-        self, left: float, right: float, *, stamp_lead_s: float = 0.0
+        self, left: float, right: float, *, stamp_lead_s: float = 0.0,
+        pad_to_window: bool = True,
     ):
         tap = getattr(self, "_mac_system_audio_tap", None)
         if tap is None:
             return None
         try:
-            return tap.extract(left, right, stamp_lead_s=stamp_lead_s)
+            return tap.extract(
+                left, right,
+                stamp_lead_s=stamp_lead_s,
+                pad_to_window=pad_to_window,
+            )
         except Exception:
             return None
 
@@ -28225,14 +28239,17 @@ Admin elevation
                 pass
 
     def _extract_mac_clip_audio(
-        self, left: float, right: float, *, stamp_lead_s: float = 0.0
+        self, left: float, right: float, *, stamp_lead_s: float = 0.0,
+        pad_to_window: bool = True,
     ):
         """Return a float32 mono buffer spanning the FULL [left, right] window.
 
         Shared `assemble_pcm_ring` with the SCK tap: concat in order, ignore
         sub-250 ms stamp jitter (no overlap mix/trim), first-start slice.
         `stamp_lead_s` is clip-mux only. Returns None only if no real
-        samples fall in the window."""
+        samples fall in the window. Recording mux passes pad_to_window=False
+        so atempo can stretch the true sample count onto video duration.
+        """
         fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
         lock = getattr(self, "_mac_clip_audio_lock", None)
         chunks_ref = getattr(self, "_mac_clip_audio_chunks", None)
@@ -28254,7 +28271,9 @@ Admin elevation
         try:
             from ...platform_compat.mac_system_audio import assemble_pcm_ring
             return assemble_pcm_ring(
-                chunks, fs, left, right, stamp_lead_s=stamp_lead_s
+                chunks, fs, left, right,
+                stamp_lead_s=stamp_lead_s,
+                pad_to_window=pad_to_window,
             )
         except Exception:
             return None
@@ -28268,10 +28287,30 @@ Admin elevation
                 frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
             finally:
                 cap.release()
-            if fps > 1.0 and frames > 1.0:
+            # avfoundation sometimes reports a 1e6 fps timebase; frames/fps
+            # then looks like milliseconds and atempo never fires.
+            if 1.0 < fps < 120.0 and frames > 1.0:
                 return frames / fps
         except Exception:
             pass
+        probe = getattr(self, "_ffprobe_path", None)
+        if probe:
+            try:
+                proc = subprocess.run(
+                    [
+                        str(probe), "-v", "error",
+                        "-show_entries", "format=duration",
+                        "-of", "default=noprint_wrappers=1:nokey=1",
+                        str(path),
+                    ],
+                    capture_output=True, text=True, timeout=20,
+                    stdin=subprocess.DEVNULL,
+                )
+                val = float((proc.stdout or "").strip().splitlines()[0])
+                if val > 0.05:
+                    return val
+            except Exception:
+                pass
         return 0.0
 
     def _mux_mac_clip_audio(self, video_path: Path, left: float, right: float) -> None:
@@ -35039,9 +35078,25 @@ Admin elevation
                 return False
 
         acodec = str(self._ffmpeg_capabilities.get("audio_encoder", "aac") or "aac")
-        # adelay shifts real audio later (removing a lead); apad pads the tail so
-        # -shortest trims padding, never real audio. -c:v copy keeps video pristine.
-        af = f"adelay={delay_ms}:all=1,apad" if delay_ms > 0 else "apad"
+        # Packed rings play future audio (start ok, ~1 s early by the
+        # end). atempo stretches the true sample count onto probed
+        # video duration; apad lets -shortest trim padding not speech.
+        tempo = 1.0
+        v_dur = 0.0
+        try:
+            from ...platform_compat.mac_system_audio import mac_mux_atempo_factor
+            v_dur = float(self._probe_media_seconds(Path(video_temp)) or 0.0)
+            a_dur = float(len(audio_full)) / float(fs)
+            tempo = float(mac_mux_atempo_factor(a_dur, v_dur))
+        except Exception:
+            tempo = 1.0
+        af_parts = []
+        if delay_ms > 0:
+            af_parts.append(f"adelay={delay_ms}:all=1")
+        if abs(tempo - 1.0) >= 0.004:
+            af_parts.append(f"atempo={tempo:.6f}")
+        af_parts.append("apad")
+        af = ",".join(af_parts)
         mux_cmd = [
             self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(video_temp), "-i", str(wav_path),
@@ -35052,6 +35107,8 @@ Admin elevation
         try:
             sys.stderr.write(
                 f"[screen-record] mux: audio delay {delay_ms}ms "
+                f"atempo={tempo:.6f} v_dur={v_dur:.3f}s "
+                f"a_dur={len(audio_full)/fs:.3f}s "
                 f"(offset={offset} v_start={v_start} first_perf={first_perf}) "
                 f"acodec={acodec} samples={len(audio_full)}\n"
             )
@@ -35727,10 +35784,12 @@ Admin elevation
                         if v_start is not None:
                             video_wall_start = float(v_start) + wall_minus_mach
                             audio_full = self._extract_mac_clip_audio(
-                                video_wall_start, stop_wall
+                                video_wall_start, stop_wall,
+                                pad_to_window=False,
                             )
                             sys_full = self._extract_mac_sys_audio(
-                                video_wall_start, stop_wall
+                                video_wall_start, stop_wall,
+                                pad_to_window=False,
                             )
                             audio_full = self._mix_mac_clip_and_sys(
                                 audio_full, sys_full
