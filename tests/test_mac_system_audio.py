@@ -50,6 +50,19 @@ def test_boost_quiet_mac_pcm_raises_sck_level():
     assert float(np.max(np.abs(same))) == 0.5
 
 
+def test_boost_quiet_mac_pcm_lifts_half_volume_recording():
+    # Screen recordings were ~half live level (peak ~0.35). Default
+    # already_loud=0.28 skipped that. Recording mux uses 0.50 / 0.85.
+    half = np.full(4800, 0.35, dtype=np.float32)
+    boosted = boost_quiet_mac_pcm(
+        half, target_peak=0.85, max_gain=3.5, already_loud=0.50
+    )
+    assert boosted is not None
+    peak = float(np.max(np.abs(boosted)))
+    assert peak > 0.70
+    assert peak <= 0.86
+
+
 def test_assemble_pcm_ring_concat_keeps_stamp_overlap_samples():
     fs = 48000
     a = np.full(fs, 0.2, dtype=np.float32)

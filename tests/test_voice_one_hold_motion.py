@@ -42,6 +42,7 @@ class VoiceOneHoldMotionTest(unittest.TestCase):
         self.worker._voice_listening = False
         self.worker._dictation_active = False
         self.worker._selection_prompt_active = False
+        self.worker._save_prompt_active = False
         self.worker._voice_hold_origin_xy = None
         self.worker._voice_hold_origin_scale = 1.0
         self.worker._left_hand_reading = None
@@ -84,6 +85,38 @@ class VoiceOneHoldMotionTest(unittest.TestCase):
         GestureWorker._handle_left_hand_voice(self.worker, prediction, 1.6)
 
         self.worker._start_voice_command.assert_called_once_with()
+
+
+class LeftFistVoiceCancelTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.worker = GestureWorker.__new__(GestureWorker)
+        self.worker._voice_candidate = "neutral"
+        self.worker._voice_candidate_since = 0.0
+        self.worker._voice_cooldown_until = 0.0
+        self.worker._voice_latched_label = None
+        self.worker._voice_listening = False
+        self.worker._dictation_active = False
+        self.worker._selection_prompt_active = False
+        self.worker._save_prompt_active = True
+        self.worker._apply_gesture_binding_remap = (
+            lambda prediction, _hand, _now: prediction
+        )
+        self.worker._reset_voice_candidate = Mock()
+        self.worker._cancel_all_voice_stages = Mock()
+
+    def test_left_fist_cancels_save_prompt_after_short_hold(self) -> None:
+        prediction = SimpleNamespace(stable_label="fist")
+        GestureWorker._handle_left_hand_voice(self.worker, prediction, 1.0)
+        self.worker._cancel_all_voice_stages.assert_not_called()
+        GestureWorker._handle_left_hand_voice(self.worker, prediction, 1.40)
+        self.worker._cancel_all_voice_stages.assert_called_once_with()
+
+    def test_left_fist_does_nothing_when_voice_idle(self) -> None:
+        self.worker._save_prompt_active = False
+        prediction = SimpleNamespace(stable_label="fist")
+        GestureWorker._handle_left_hand_voice(self.worker, prediction, 1.0)
+        GestureWorker._handle_left_hand_voice(self.worker, prediction, 1.40)
+        self.worker._cancel_all_voice_stages.assert_not_called()
 
 
 if __name__ == "__main__":

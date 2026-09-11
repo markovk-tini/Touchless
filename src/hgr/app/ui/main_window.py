@@ -2956,8 +2956,17 @@ def _build_gesture_guide_static_cards() -> list[GestureGuideCard]:
             gesture_key="four",
             image_name="Left Hand Four.png",
         ),
-        # r53: Left Hand Fist card removed — dictation retired, so its
-        # cancel-voice action has nothing to cancel.
+        GestureGuideCard(
+            title="Left Hand Fist",
+            action="Cancel voice listening or a save-location prompt",
+            how_to=(
+                "How To: Face your left palm toward the monitor and close all five fingers into a tight fist. "
+                "Hold briefly. If a save prompt is up, the file stays in the default folder.\n\n"
+                "Requirements: A voice command, dictation, or save-location prompt must be active."
+            ),
+            gesture_key="fist",
+            image_name="Fist.png",
+        ),
         GestureGuideCard(
             title="Right Hand Two",
             action="Open or focus Spotify (requires Spotify Premium)",
@@ -25662,6 +25671,14 @@ Admin elevation
             except Exception:
                 pass
 
+        # Left-fist / overlay cancel: keep the file in the default
+        # folder. Spoken "cancel/delete/nevermind" still discards.
+        if bool((payload or {}).get("canceled")):
+            if source_path.exists():
+                self.last_action_label.setText(f"Last action: saved {label} to {source_path}")
+                _show_saved_pill(source_path)
+            return
+
         if decision.action == "discard":
             if self._discard_saved_output(source_path):
                 self.last_action_label.setText(f"Last action: discarded {label}")
@@ -35708,6 +35725,21 @@ Admin elevation
                             audio_full = self._mix_mac_clip_and_sys(
                                 audio_full, sys_full
                             )
+                            try:
+                                from ...platform_compat.mac_system_audio import (
+                                    boost_quiet_mac_pcm,
+                                )
+                                # SCK tap is typically ~half the live
+                                # speaker level. Clips already boost;
+                                # recordings were muxed raw.
+                                audio_full = boost_quiet_mac_pcm(
+                                    audio_full,
+                                    target_peak=0.85,
+                                    max_gain=3.5,
+                                    already_loud=0.50,
+                                )
+                            except Exception:
+                                pass
                     except Exception:
                         audio_full = None
                     # Release the ring: recording no longer needs it, resume

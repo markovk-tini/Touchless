@@ -2309,20 +2309,32 @@ class GestureWorker(QObject):
         # Filtering happens BEFORE the remap so filter tuning is
         # independent of the box gain.
         if getattr(self, "_drawing_oef_x", None) is None:
+            min_cutoff = self._DRAWING_OEF_MIN_CUTOFF
+            beta = self._DRAWING_OEF_BETA
+            oef_max_dt = None
+            if sys.platform == "darwin":
+                # Irregular Mac capture dt made OneEuro treat landmark
+                # jitter as motion (cursor crawl). Heavier rest cutoff,
+                # clamp dt, keep beta high enough for strokes.
+                min_cutoff = 0.20
+                beta = 0.50
+                oef_max_dt = 0.045
             self._drawing_oef_x = OneEuroFilter(
-                min_cutoff=self._DRAWING_OEF_MIN_CUTOFF, beta=self._DRAWING_OEF_BETA
+                min_cutoff=min_cutoff, beta=beta
             )
             self._drawing_oef_y = OneEuroFilter(
-                min_cutoff=self._DRAWING_OEF_MIN_CUTOFF, beta=self._DRAWING_OEF_BETA
+                min_cutoff=min_cutoff, beta=beta
             )
+            self._drawing_oef_max_dt = oef_max_dt
         # Re-seed the filters whenever the cursor was just lost (drawing
         # mode entered or hand re-acquired) so it doesn't crawl in from
         # a stale position.
         if self._drawing_cursor_norm is None:
             self._drawing_oef_x.reset()
             self._drawing_oef_y.reset()
-        smooth_x = self._drawing_oef_x.update(raw_x, now)
-        smooth_y = self._drawing_oef_y.update(raw_y, now)
+        oef_max_dt = getattr(self, "_drawing_oef_max_dt", None)
+        smooth_x = self._drawing_oef_x.update(raw_x, now, max_dt=oef_max_dt)
+        smooth_y = self._drawing_oef_y.update(raw_y, now, max_dt=oef_max_dt)
         # CAMERA ("switch view") draws on the camera feed the user is looking
         # at, so the ink must land exactly under the fingertip: map the
         # (smoothed) raw fingertip 1:1 to the canvas, with NO control-box gain.
@@ -2331,12 +2343,23 @@ class GestureWorker(QObject):
         # whole desktop (the camera isn't visible), so it keeps the control-box
         # remap that lets a forearm-sized patch cover the screen.
         if self._drawing_render_target == "camera":
-            self._drawing_cursor_norm = (
+            mapped = (
                 max(0.0, min(1.0, smooth_x)),
                 max(0.0, min(1.0, smooth_y)),
             )
         else:
-            self._drawing_cursor_norm = self._map_drawing_control_box(smooth_x, smooth_y)
+            mapped = self._map_drawing_control_box(smooth_x, smooth_y)
+        if (
+            sys.platform == "darwin"
+            and self._drawing_cursor_norm is not None
+        ):
+            lx, ly = self._drawing_cursor_norm
+            dx = mapped[0] - lx
+            dy = mapped[1] - ly
+            # ~0.35% of the canvas — hold-still tremor on FaceTime.
+            if (dx * dx + dy * dy) < (0.0035 * 0.0035):
+                mapped = (lx, ly)
+        self._drawing_cursor_norm = mapped
         if self._drawing_lift_pose_active(hand_reading):
             self._drawing_tool = "hover"
             self._drawing_control_text = f"drawing hover ({self._drawing_render_target})"
@@ -3400,9 +3423,12 @@ class GestureWorker(QObject):
             # up as micro-strokes when the user paused their hand.
             p_prev = self._camera_draw_last_point
             try:
+                min_move = float(self._DRAWING_MIN_MOVE_PX)
+                if sys.platform == "darwin":
+                    min_move = 6.0
                 dx = float(point[0] - p_prev[0])
                 dy = float(point[1] - p_prev[1])
-                if (dx * dx + dy * dy) < (self._DRAWING_MIN_MOVE_PX * self._DRAWING_MIN_MOVE_PX):
+                if (dx * dx + dy * dy) < (min_move * min_move):
                     return
             except Exception:
                 pass
@@ -9670,8 +9696,12 @@ class GestureWorker(QObject):
         # a chance to run before any mode-specific branch returns early. This keeps the
         # left-fist cancel gesture available even while drawing / mouse / volume mode is
         # still active underneath the prompt.
-        if self._save_prompt_active and self._left_hand_prediction is not None:
-            self._handle_left_hand_voice(self._left_hand_prediction, now)
+        if self._save_prompt_active:
+            left_pred = self._left_hand_prediction
+            if hand_handedness == "Left" and prediction is not None:
+                left_pred = prediction
+            if left_pred is not None:
+                self._handle_left_hand_voice(left_pred, now)
             if self._save_prompt_active:
                 return
 
@@ -9771,28 +9801,13 @@ class GestureWorker(QObject):
                 self._spotify_control_text = self._drawing_control_text
                 return
             self._update_drawing_controls(prediction, hand_reading, hand_handedness, now)
-            # Swipe gating used to require self._drawing_tool == "hover",
-            # which meant a swipe right after the user lifted their pen
-            # was silently ignored: the draw-pose grace window
-            # (~0.40 s) keeps the tool sticky on "draw" until grace
-            # expires, so dynamic_label=swipe_right would arrive while
-            # tool was still "draw" and skip the handler. The cooldown
-            # below already prevents repeated swipes from firing within
-            # 1.2 s, and the dynamic_label classifier only emits
-            # swipe_left/right on real swipe motion (much larger than
-            # any drawing stroke), so we trust the dynamic_label
-            # decision regardless of current tool. Commit any in-flight
-            # stroke and cancel grace so the swipe motion doesn't get
-            # reinterpreted as draw/erase frames during its arc.
+            # Hover + swipe: left undoes the last mark, right clears.
+            # Open-hand swipes fire while the pen is lifted; index-only
+            # swipes still work as a fallback (and while drawing).
             if (
                 hand_handedness == "Right"
                 and hand_reading is not None
                 and now >= self._drawing_swipe_cooldown_until
-                # r53 v2: drawing undo/clear stays index-only ("one").
-                # Builtin swipe_left/right (Spotify skip, HUD, etc.)
-                # are open-hand only, so they no longer share this
-                # label. Read the one-pose swipe from the recognizer.
-                and self._drawing_draw_pose_active(prediction, hand_reading)
             ):
                 one_pose_swipe = "neutral"
                 try:
@@ -9803,7 +9818,20 @@ class GestureWorker(QObject):
                     )
                 except Exception:
                     one_pose_swipe = "neutral"
-                if one_pose_swipe in {"swipe_left", "swipe_right"}:
+                dyn = self._effective_dynamic_label(prediction)
+                hovering = (
+                    str(self._drawing_tool or "") == "hover"
+                    or self._drawing_lift_pose_active(hand_reading)
+                )
+                swipe = "neutral"
+                if hovering and dyn in {"swipe_left", "swipe_right"}:
+                    swipe = dyn
+                elif one_pose_swipe in {"swipe_left", "swipe_right"} and (
+                    hovering
+                    or self._drawing_draw_pose_active(prediction, hand_reading)
+                ):
+                    swipe = one_pose_swipe
+                if swipe in {"swipe_left", "swipe_right"}:
                     if (
                         self._drawing_render_target == "camera"
                         and self._camera_draw_active_stroke_points
@@ -9813,7 +9841,7 @@ class GestureWorker(QObject):
                     self._drawing_draw_grace_until = 0.0
                     self._drawing_erase_grace_until = 0.0
                     self._drawing_draw_active_streak = 0
-                    if self._perform_drawing_swipe_action(one_pose_swipe):
+                    if self._perform_drawing_swipe_action(swipe):
                         self._drawing_swipe_cooldown_until = now + 1.2
                     self._chrome_control_text = self._drawing_control_text
                     self._spotify_control_text = self._drawing_control_text
@@ -11595,13 +11623,37 @@ class GestureWorker(QObject):
         # helper docstring for why this is the chokepoint.
         prediction = self._apply_gesture_binding_remap(prediction, "Left", now)
         stable_label = prediction.stable_label
-        # r53 v7: dictation temporarily retired. "two" is no longer a
-        # voice trigger — it now belongs to the instant-clip handler
-        # (see _handle_left_hand_clip_gesture below). "fist" no longer
-        # cancels voice / dismisses low-fps toast either, per user
-        # request that left-fist do nothing at all. Only "one" remains
-        # as a left-hand voice trigger.
+        # r53: Left-fist cancel is restored. Dictation stays retired;
+        # "two" is still instant-clip. Fist cancels an in-progress
+        # voice command, dictation, save-location prompt, or file
+        # picker. A canceled save prompt keeps the file in the default
+        # folder (MainWindow treats canceled=True as action=default).
         trigger_labels = {"one"}
+
+        if stable_label == "fist":
+            voice_busy = (
+                self._voice_listening
+                or self._dictation_active
+                or bool(getattr(self, "_save_prompt_active", False))
+                or bool(getattr(self, "_selection_prompt_active", False))
+            )
+            if not voice_busy:
+                self._reset_voice_candidate(now)
+                if self._voice_latched_label == "fist":
+                    self._voice_latched_label = None
+                return
+            if self._voice_candidate != "fist":
+                self._voice_candidate = "fist"
+                self._voice_candidate_since = now
+                return
+            if now < self._voice_cooldown_until:
+                return
+            if now - self._voice_candidate_since < 0.35:
+                return
+            self._voice_latched_label = "fist"
+            self._voice_cooldown_until = now + 1.0
+            self._cancel_all_voice_stages()
+            return
 
         if self._voice_latched_label == "fist":
             self._voice_latched_label = None

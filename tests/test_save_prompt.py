@@ -21,6 +21,17 @@ class SavePromptProcessorTest(unittest.TestCase):
         self.assertEqual(decision.action, "default")
         self.assertEqual(decision.reason, "silence")
 
+    def test_empty_cancel_payload_keeps_default_folder(self) -> None:
+        """Left-fist cancel emits success=False and empty text.
+
+        Spoken 'cancel/delete/nevermind' still discards; gesture cancel
+        must not go through that path.
+        """
+        processor = SavePromptProcessor()
+        decision = processor.parse("", success=False)
+        self.assertEqual(decision.action, "default")
+        self.assertNotEqual(decision.action, "discard")
+
     def test_parse_cancel_discards_output(self) -> None:
         processor = SavePromptProcessor()
 

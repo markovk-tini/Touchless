@@ -37,7 +37,7 @@ class OneEuroFilter:
         tau = 1.0 / (2.0 * math.pi * max(cutoff, 1e-6))
         return 1.0 / (1.0 + tau / max(dt, 1e-6))
 
-    def update(self, x: float, t: float) -> float:
+    def update(self, x: float, t: float, *, max_dt: float | None = None) -> float:
         x = float(x)
         t = float(t)
         if self._x_prev is None or self._t_prev is None:
@@ -48,6 +48,10 @@ class OneEuroFilter:
         dt = t - self._t_prev
         if dt <= 0.0:
             dt = 1e-3
+        # A dropped frame makes dt huge, so alpha jumps and landmark
+        # jitter is treated as real motion (cursor crawl / drift).
+        if max_dt is not None and dt > float(max_dt):
+            dt = float(max_dt)
         dx = (x - self._x_prev) / dt
         a_d = self._alpha(self.d_cutoff, dt)
         dx_hat = a_d * dx + (1.0 - a_d) * self._dx_prev

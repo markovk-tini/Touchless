@@ -48,8 +48,12 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
         "Left Hand Four.png",
         "Face your left palm toward the monitor. Extend the index, middle, ring, and pinky fingers and fold the thumb across the palm. Hold for ~1s.",
     ),
-    # r53: left_fist retired (was Cancel voice/dictation). Left hand
-    # fist gesture no longer surfaced in bindings, guide, or picker.
+    (
+        "left_fist",
+        "Left Hand Fist",
+        "Fist.png",
+        "Face your left palm toward the monitor and close all five fingers into a tight, compact fist. Hold briefly to cancel voice listening or a save-location prompt (the file stays in the default folder).",
+    ),
     (
         "right_two",
         "Right Hand Two",
@@ -116,9 +120,9 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
 # Each action: (action_id, display_label, default_pose_id).
 _GESTURE_BIND_ACTIONS: list[tuple[str, str, str]] = [
     ("voice_command_listen", "Start voice command listening", "left_one"),
+    ("voice_cancel", "Cancel voice or save prompt", "left_fist"),
     # r53: dictation_toggle temporarily removed; left_two now hosts
-    # instant_clip (moved from right_one). voice_cancel row also
-    # removed since its only default (left_fist) is retired.
+    # instant_clip (moved from right_one).
     ("mouse_mode_toggle", "Toggle mouse mode on/off", "left_three"),
     ("drawing_mode_toggle", "Toggle drawing mode on/off", "left_four"),
     ("open_spotify", "Open or focus Spotify", "right_two"),
@@ -158,7 +162,7 @@ STATIC_POSE_LABEL_MAP: dict[str, tuple[str, str]] = {
     "left_two":   ("Left",  "two"),
     "left_three": ("Left",  "three"),
     "left_four":  ("Left",  "four"),
-    # r53: "left_fist" removed — no active binding.
+    "left_fist":  ("Left",  "fist"),
     "right_one":  ("Right", "one"),
     "right_two":  ("Right", "two"),
     "right_fist": ("Right", "fist"),
