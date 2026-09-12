@@ -22261,20 +22261,26 @@ Admin elevation
             self._spotify_auth_signals_wired = False
 
     def _open_spotify_authorize_url(self, url: str) -> None:
-        """GUI-thread browser open for the Spotify PKCE authorize URL."""
+        """GUI-thread browser open for the Spotify PKCE authorize URL.
+
+        One opener only. On Mac, QDesktopServices and `open` both
+        launch the default browser, so calling both opened two tabs.
+        """
         target = str(url or "").strip()
         if not target:
             return
+        opened = False
         try:
-            QDesktopServices.openUrl(QUrl(target))
+            opened = bool(QDesktopServices.openUrl(QUrl(target)))
+        except Exception:
+            opened = False
+        if opened:
+            return
+        try:
+            from ...utils.subprocess_utils import launch_external
+            launch_external(target)
         except Exception:
             pass
-        if sys.platform == "darwin":
-            try:
-                from ...utils.subprocess_utils import launch_external
-                launch_external(target)
-            except Exception:
-                pass
 
     def _on_spotify_auth_done(self, ok: bool, message: str) -> None:
         if ok:

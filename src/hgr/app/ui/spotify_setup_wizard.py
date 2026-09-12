@@ -198,7 +198,7 @@ class _CappedScrollArea(QScrollArea):
     """
 
     def sizeHint(self) -> QSize:  # type: ignore[override]
-        return QSize(600, 200)
+        return QSize(600, 280)
 
     def minimumSizeHint(self) -> QSize:  # type: ignore[override]
         return QSize(400, 80)
@@ -253,9 +253,9 @@ class SpotifySetupWizard(QDialog):
             # 13" Mac available height is often < 800 after the menu
             # bar and dock. Page 1 at 900 overflowed; shorter + scroll.
             self._page_sizes = {
-                0: (540, 400),
-                1: (620, 440),
-                2: (540, 340),
+                0: (540, 420),
+                1: (630, 500),
+                2: (540, 350),
             }
         # r51: was apply_touchless_chrome (DWM caption color, Win11
         # only — dad on Win10 saw white/black chrome). Now uses the
