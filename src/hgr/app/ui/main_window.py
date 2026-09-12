@@ -6628,6 +6628,10 @@ class MainWindow(QMainWindow):
     # _LocalServer._command). The slot runs on the GUI thread where
     # the voice processor + UI live and the dispatch is safe.
     _phone_text_command_signal = Signal(str)
+    # Spotify PKCE: worker thread must not use QTimer.singleShot (no
+    # event loop on that thread — see _clip_export_finished_signal).
+    _spotify_auth_url_signal = Signal(str)
+    _spotify_auth_done_signal = Signal(bool, str)
 
     def __init__(self, config: AppConfig):
         super().__init__()
@@ -12485,8 +12489,14 @@ class MainWindow(QMainWindow):
                 pass
             return
         dialog = SpotifySetupWizard(self.config, parent=self)
+        self._spotify_setup_wizard_open = True
         self._hide_spotify_connect_overlay()
-        if dialog.exec() == QDialog.Accepted:
+        accepted = False
+        try:
+            accepted = dialog.exec() == QDialog.Accepted
+        finally:
+            self._spotify_setup_wizard_open = False
+        if accepted:
             # The engine's existing SpotifyController instance loaded
             # the OLD client_id (or the embedded default) at init. The
             # new client_id is in config — force the controller to
@@ -12508,7 +12518,7 @@ class MainWindow(QMainWindow):
             # Auto-fire the Connect-Spotify flow so the user lands on
             # the browser-based authorize step immediately instead of
             # having to click Connect Spotify as a separate action.
-            QTimer.singleShot(50, self._on_connect_spotify_clicked)
+            QTimer.singleShot(150, self._on_connect_spotify_clicked)
 
     # ----- Discord (Settings → General) -----------------------------------
 
@@ -22212,21 +22222,59 @@ Admin elevation
         controller = getattr(worker, "spotify_controller", None) if worker is not None else None
         if controller is None:
             controller = _SpotifyController()
+        try:
+            reload_fn = getattr(controller, "_load_credentials", None)
+            if callable(reload_fn):
+                reload_fn()
+        except Exception:
+            pass
         if hasattr(self, "last_action_label"):
             self.last_action_label.setText("Last action: opening Spotify authorisation in your browser…")
+        self._ensure_spotify_auth_signals()
 
         def _run_auth():
             try:
-                ok = controller.authorize_full_scopes()
+                ok = controller.authorize_full_scopes(
+                    open_url=lambda url: self._spotify_auth_url_signal.emit(str(url)),
+                )
             except Exception as exc:
                 ok = False
                 try:
                     print(f"[spotify] authorize_full_scopes raised: {exc}")
                 except Exception:
                     pass
-            QTimer.singleShot(0, lambda: self._on_spotify_auth_done(ok, getattr(controller, "message", "")))
+            try:
+                self._spotify_auth_done_signal.emit(bool(ok), str(getattr(controller, "message", "") or ""))
+            except Exception:
+                pass
 
         threading.Thread(target=_run_auth, name="spotify-authorize", daemon=True).start()
+
+    def _ensure_spotify_auth_signals(self) -> None:
+        if bool(getattr(self, "_spotify_auth_signals_wired", False)):
+            return
+        try:
+            self._spotify_auth_url_signal.connect(self._open_spotify_authorize_url)
+            self._spotify_auth_done_signal.connect(self._on_spotify_auth_done)
+            self._spotify_auth_signals_wired = True
+        except Exception:
+            self._spotify_auth_signals_wired = False
+
+    def _open_spotify_authorize_url(self, url: str) -> None:
+        """GUI-thread browser open for the Spotify PKCE authorize URL."""
+        target = str(url or "").strip()
+        if not target:
+            return
+        try:
+            QDesktopServices.openUrl(QUrl(target))
+        except Exception:
+            pass
+        if sys.platform == "darwin":
+            try:
+                from ...utils.subprocess_utils import launch_external
+                launch_external(target)
+            except Exception:
+                pass
 
     def _on_spotify_auth_done(self, ok: bool, message: str) -> None:
         if ok:
@@ -22487,8 +22535,12 @@ Admin elevation
         # Session suppress latch — user opted out for this run.
         if bool(getattr(self, "_spotify_prompt_suppressed_session", False)):
             return
+        if bool(getattr(self, "_spotify_setup_wizard_open", False)):
+            return
         overlay = getattr(self, "_spotify_prompt_overlay", None)
-        if overlay is not None and overlay.isVisible():
+        if overlay is not None and (
+            overlay.isVisible() or bool(getattr(overlay, "_fading_out", False))
+        ):
             return
         try:
             now = time.monotonic()
@@ -22629,6 +22681,12 @@ Admin elevation
         controller = getattr(worker, "spotify_controller", None) if worker is not None else None
         if controller is None:
             return
+        # Mac skip/pause/swipe is AppleScript to Spotify.app. That is
+        # already "connected" — no developer OAuth. Closed-app gestures
+        # are a silent no-op, not a setup failure. Never show this
+        # overlay on Mac (the wizard remains in Settings).
+        if bool(getattr(controller, "_mac", False)) or sys.platform == "darwin":
+            return
         state_fn = getattr(controller, "readiness_state", None)
         if callable(state_fn):
             try:
@@ -22645,6 +22703,15 @@ Admin elevation
         if state == "READY":
             return
         test_force = bool(_os.environ.get("TOUCHLESS_TEST_SPOTIFY_PROMPT"))
+        # Closed Spotify is not a connect problem. A leftover
+        # command_attempted latch must not keep the overlay up after
+        # the user quits Spotify.app.
+        if not test_force:
+            try:
+                if not bool(controller.is_running()):
+                    return
+            except Exception:
+                pass
         attempted = bool(getattr(controller, "command_attempted_since_launch", False))
         if not (attempted or test_force):
             return
@@ -22684,6 +22751,8 @@ Admin elevation
         controller = getattr(worker, "spotify_controller", None) if worker is not None else None
         if controller is None:
             return
+        if bool(getattr(controller, "_mac", False)) or sys.platform == "darwin":
+            return
         take_fn = getattr(controller, "take_transient_failure", None)
         if not callable(take_fn):
             return
@@ -22712,16 +22781,20 @@ Admin elevation
         controller = getattr(worker, "spotify_controller", None) if worker is not None else None
         if controller is None:
             return
+        self._ensure_spotify_auth_signals()
 
         def _auth_worker() -> None:
             try:
-                ok = bool(controller.authorize_full_scopes(timeout_seconds=180.0))
+                ok = bool(controller.authorize_full_scopes(
+                    timeout_seconds=180.0,
+                    open_url=lambda url: self._spotify_auth_url_signal.emit(str(url)),
+                ))
                 msg = controller.message or ("connected" if ok else "auth cancelled")
             except Exception as exc:
                 ok = False
                 msg = f"auth error: {exc}"
             try:
-                QTimer.singleShot(0, lambda: self._on_spotify_auth_done(ok, msg))
+                self._spotify_auth_done_signal.emit(bool(ok), str(msg or ""))
             except Exception:
                 pass
 
@@ -23329,11 +23402,7 @@ Admin elevation
         except Exception:
             pass
         if sys.platform == "darwin":
-            # Same copy as Windows: top-right reconnect overlay, not the
-            # OAuth Allow modal (Mac transport is AppleScript).
-            self._show_spotify_action_pill(
-                "Set up or reconnect Spotify to control your music with Touchless"
-            )
+            # AppleScript transport does not need the OAuth overlay.
             return
         pill = self._ensure_spotify_connect_pill()
         anim = self._ensure_spotify_connect_pill_fade()

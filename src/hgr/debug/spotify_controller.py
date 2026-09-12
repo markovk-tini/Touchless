@@ -190,6 +190,11 @@ class SpotifyController:
         # a machine with no tokens never ambushes the user with a
         # popup they didn't ask for. See record_command_attempt().
         self._command_attempted_since_launch: bool = False
+        # True when client_id came from the in-app wizard, env, or a
+        # local .env — not the shipped embedded default. On Mac that
+        # is "connected to Spotify developer": AppleScript transport
+        # does not need OAuth tokens.
+        self._user_provided_client_id: bool = False
         self._load_credentials()
         self._load_tokens()
         # v1.1.7.3 (dad rig 2026-08-19): proactive refresh at startup.
@@ -222,6 +227,65 @@ class SpotifyController:
         except Exception:
             pass
 
+    def _open_auth_browser(self, url: str) -> bool:
+        """Open the Spotify authorize URL.
+
+        webbrowser.open() is unreliable from the authorize worker
+        thread on macOS (often returns True and launches nothing).
+        Use `open` via launch_external there; Windows keeps webbrowser.
+        """
+        if self._mac:
+            try:
+                if launch_external(url):
+                    return True
+            except Exception:
+                pass
+        import webbrowser
+        try:
+            return bool(webbrowser.open(url))
+        except Exception:
+            return False
+
+    def _auth_callback_ports(self, port: int) -> tuple[bool, list[int]]:
+        """Ports to bind for the PKCE loopback server.
+
+        The baked-in default URI is http://127.0.0.1:5000/callback.
+        That is NOT an explicit user redirect — on macOS, AirPlay
+        Receiver commonly owns 5000, so we must try 5001-5004 (the
+        same URIs the setup wizard tells the user to register).
+        Only a custom REDIRECT_URI from env/.env is pinned to one port.
+        """
+        requested = int(port)
+        fallback = [requested, 5001, 5002, 5003, 5004]
+        ports: list[int] = []
+        for candidate in fallback:
+            if candidate not in ports:
+                ports.append(int(candidate))
+        uri = str(self._redirect_uri or "")
+        if uri and uri != _DEFAULT_SPOTIFY_REDIRECT_URI:
+            parsed = urllib_parse.urlparse(uri)
+            only = int(parsed.port or requested)
+            return True, [only]
+        return False, ports
+
+    def _log_auth(self, msg: str) -> None:
+        line = f"[spotify-auth] {msg}\n"
+        try:
+            import sys as _sys
+            _sys.stderr.write(line)
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        if not self._mac:
+            return
+        try:
+            path = Path.home() / ".touchless" / "spotify-auth.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(time.strftime("%Y-%m-%d %H:%M:%S ") + line)
+        except Exception:
+            pass
+
     @property
     def available(self) -> bool:
         return self._available
@@ -238,6 +302,16 @@ class SpotifyController:
         already authorised in a previous run."""
         return bool(self._refresh_token) or bool(self._access_token)
 
+    @property
+    def has_spotify_developer_setup(self) -> bool:
+        """True when Touchless is already linked to the user's Spotify
+        developer app (wizard / env / .env) or has OAuth tokens.
+
+        On Mac, AppleScript transport needs neither tokens nor the
+        connect overlay once this is True.
+        """
+        return bool(self._user_provided_client_id) or self.has_authorization
+
     def set_opened_listener(self, callback) -> None:
         """Register a callback fired right after a user action opens/focuses
         Spotify while the Web API is NOT connected. Used to surface the
@@ -249,6 +323,10 @@ class SpotifyController:
         Spotify (an authorized user needs no prompt)."""
         cb = self._on_opened_listener
         if cb is None or self.has_authorization:
+            return
+        # Mac AppleScript transport does not need the OAuth/developer
+        # overlay when Spotify.app is installed.
+        if self._mac and self._available:
             return
         try:
             cb()
@@ -292,6 +370,23 @@ class SpotifyController:
             return f"{prefix}: allow Touchless to control Spotify in System Settings > Privacy & Security > Automation"
         return prefix
 
+    def _mac_spotify_app_running(self) -> bool:
+        """True only when Spotify.app itself is running.
+
+        Does not launch Spotify. Helper processes (Spotify Helper,
+        updater) must not count — after Cmd+Q those often linger and
+        used to make swipe/fist look controllable.
+        """
+        ok, out, _ = self._mac_osascript('application "Spotify" is running')
+        return bool(ok) and out.lower() == "true"
+
+    def _mac_mark_not_running(self) -> None:
+        now = time.monotonic()
+        self._mac_running_cache = False
+        self._mac_running_cache_until = now + self._mac_running_cache_ttl
+        self._has_real_spotify_cache = False
+        self._has_real_spotify_cache_until = now + self._has_real_spotify_cache_seconds
+
     def _mac_transport(self, command: str, *, launch: bool = False) -> bool:
         """Send a transport verb (playpause/play/pause/next track/previous
         track). launch=True opens+focuses Spotify first (for explicit play)."""
@@ -301,8 +396,7 @@ class SpotifyController:
             except Exception:
                 pass
             for _ in range(20):  # ~2s for Spotify to accept Apple Events
-                ok, out, _ = self._mac_osascript('application "Spotify" is running')
-                if ok and out == "true":
+                if self._mac_spotify_app_running():
                     self._mac_running_cache = None  # force gates to re-check
                     break
                 time.sleep(0.1)
@@ -319,6 +413,7 @@ class SpotifyController:
             return False
         if out == "not-running":
             self._message = "spotify not running"
+            self._mac_mark_not_running()
             return False
         return True
 
@@ -394,6 +489,8 @@ class SpotifyController:
         return player
 
     def _is_running_uncached(self) -> bool:
+        if self._mac:
+            return self._mac_spotify_app_running()
         try:
             for proc in psutil.process_iter(["name"]):
                 name = (proc.info.get("name") or "").lower()
@@ -592,10 +689,10 @@ class SpotifyController:
 
     def _probe_real_spotify_process(self) -> bool:
         if self._mac:
-            # Desktop app is "Spotify", not Spotify.exe. The Windows
-            # exe+size filter below always missed it, so swipe/fist
-            # gated as inactive and never reached AppleScript.
-            return self._is_running_uncached()
+            # Desktop app is "Spotify", not Spotify.exe. Use
+            # AppleScript's "is running" so Spotify Helper / updater
+            # processes left after Cmd+Q do not count as the app.
+            return self._mac_spotify_app_running()
         try:
             for proc in psutil.process_iter(["name", "exe"]):
                 name = (proc.info.get("name") or "").lower()
@@ -853,7 +950,8 @@ class SpotifyController:
             ok, out, err = self._mac_osascript(script)
             if not ok or out == "not-running":
                 self._message = self._mac_error_message("spotify not running", err) if not ok else "spotify not running"
-                self._latch_transient_failure("NO_ACTIVE_DEVICE", self._message)
+                if out == "not-running":
+                    self._mac_mark_not_running()
                 return False
             self._message = f"spotify repeat {'on' if out == 'true' else 'off'}"
             return True
@@ -889,7 +987,8 @@ class SpotifyController:
             ok, out, err = self._mac_osascript(script)
             if not ok or out == "not-running":
                 self._message = self._mac_error_message("spotify not running", err) if not ok else "spotify not running"
-                self._latch_transient_failure("NO_ACTIVE_DEVICE", self._message)
+                if out == "not-running":
+                    self._mac_mark_not_running()
                 return False
             self._message = f"spotify shuffle {'on' if out == 'true' else 'off'}"
             return True
@@ -1556,7 +1655,13 @@ class SpotifyController:
         self._last_transient_failure = None
         return f
 
-    def authorize_full_scopes(self, *, port: int = 5000, timeout_seconds: float = 180.0) -> bool:
+    def authorize_full_scopes(
+        self,
+        *,
+        port: int = 5000,
+        timeout_seconds: float = 180.0,
+        open_url: Callable[[str], None] | None = None,
+    ) -> bool:
         """Open Spotify's OAuth flow in the user's browser using
         PKCE (Proof Key for Code Exchange). PKCE eliminates the
         need for a client_secret — each authorization derives proof
@@ -1577,13 +1682,8 @@ class SpotifyController:
         user / tester running from a terminal can diagnose. Surfaces
         Spotify-specific error codes verbatim (user_not_listed,
         invalid_redirect_uri, etc.)."""
-        import sys as _sys
         def _log(msg: str) -> None:
-            try:
-                _sys.stderr.write(f"[spotify-auth] {msg}\n")
-                _sys.stderr.flush()
-            except Exception:
-                pass
+            self._log_auth(msg)
 
         if not self._client_id:
             self._message = "spotify client id not configured"
@@ -1592,18 +1692,18 @@ class SpotifyController:
         import http.server
         import socketserver
         import threading
-        import webbrowser
 
         _log(f"starting PKCE flow with client_id={self._client_id[:8]}…")
         # Determine redirect URI + port list to try. If the caller
         # passed an explicit redirect_uri via .env, honour it exactly
         # (no port fallback — they're telling us they registered that
         # specific URI). Otherwise try a small range of localhost
-        # ports so a busy 5000 (Discord RPC, OBS dock, dev server)
+        # ports so a busy 5000 (Discord, OBS, AirPlay Receiver)
         # doesn't completely break OAuth for the user.
-        fallback_ports = [port, 5001, 5002, 5003, 5004]
-        explicit_redirect = bool(self._redirect_uri)
+        explicit_redirect, ports_to_try = self._auth_callback_ports(port)
         redirect_uri = self._redirect_uri or f"http://127.0.0.1:{port}/callback"
+        if not explicit_redirect:
+            redirect_uri = f"http://127.0.0.1:{ports_to_try[0]}/callback"
         state = secrets.token_urlsafe(16)
         # PKCE: generate a high-entropy code_verifier (43-128 chars,
         # URL-safe) and derive the challenge as base64url(SHA256(verifier)).
@@ -1659,10 +1759,14 @@ class SpotifyController:
         host = urllib_parse.urlparse(redirect_uri).hostname or "127.0.0.1"
         httpd = None
         bound_port = None
-        ports_to_try = [port] if explicit_redirect else fallback_ports
+        server_cls = socketserver.TCPServer
+        if self._mac:
+            class _ReusableServer(socketserver.TCPServer):
+                allow_reuse_address = True
+            server_cls = _ReusableServer
         for candidate_port in ports_to_try:
             try:
-                httpd = socketserver.TCPServer((host, candidate_port), _Handler)
+                httpd = server_cls((host, candidate_port), _Handler)
                 bound_port = candidate_port
                 _log(f"callback server bound to {host}:{candidate_port}")
                 break
@@ -1676,7 +1780,7 @@ class SpotifyController:
             tried = ", ".join(str(p) for p in ports_to_try)
             self._message = (
                 f"spotify auth: no callback port available (tried {tried}). "
-                "Close apps using these ports (Discord, OBS, dev servers) and "
+                "Close apps using these ports (Discord, OBS, AirPlay Receiver) and "
                 "try again."
             )
             _log(f"FAIL: every candidate port busy ({tried})")
@@ -1685,7 +1789,8 @@ class SpotifyController:
         # The Spotify Dev Dashboard must list ALL fallback URIs as
         # registered redirect URIs (5000..5004) or Spotify rejects
         # the authorize call with invalid_redirect_uri.
-        if not explicit_redirect and bound_port != port:
+        parsed_port = urllib_parse.urlparse(redirect_uri).port
+        if bound_port != parsed_port:
             redirect_uri = f"http://127.0.0.1:{bound_port}/callback"
             auth_params["redirect_uri"] = redirect_uri
             auth_url = f"{SPOTIFY_AUTH_URL}?{urllib_parse.urlencode(auth_params)}"
@@ -1695,9 +1800,17 @@ class SpotifyController:
         server_thread.start()
         try:
             _log("opening Spotify authorize URL in default browser")
-            opened = webbrowser.open(auth_url)
+            opened = False
+            if callable(open_url):
+                try:
+                    open_url(auth_url)
+                    opened = True
+                except Exception as exc:
+                    _log(f"open_url callback failed ({exc}); falling back")
             if not opened:
-                _log("WARNING: webbrowser.open returned False — browser may not have launched")
+                opened = self._open_auth_browser(auth_url)
+            if not opened:
+                _log("WARNING: browser launch returned False — browser may not have launched")
             done.wait(timeout=timeout_seconds)
         finally:
             httpd.shutdown()
@@ -1944,6 +2057,7 @@ class SpotifyController:
             self._client_id = user_client_id
             self._client_secret = None
             self._redirect_uri = _DEFAULT_SPOTIFY_REDIRECT_URI
+            self._user_provided_client_id = True
             return
         env_client_id = (
             os.getenv("TOUCHLESS_SPOTIFY_CLIENT_ID")
@@ -1956,6 +2070,7 @@ class SpotifyController:
             self._client_id = env_client_id
             self._client_secret = env_client_secret  # may be None — fine for PKCE
             self._redirect_uri = env_redirect_uri or _DEFAULT_SPOTIFY_REDIRECT_URI
+            self._user_provided_client_id = True
             return
 
         for path in self._env_paths:
@@ -1965,6 +2080,7 @@ class SpotifyController:
                 self._client_id = values["CLIENT_ID"]
                 self._client_secret = values.get("CLIENT_SECRET")  # optional
                 self._redirect_uri = values.get("REDIRECT_URI", _DEFAULT_SPOTIFY_REDIRECT_URI)
+                self._user_provided_client_id = True
                 return
 
         # Fall through to embedded defaults so shipped builds (with
@@ -2182,6 +2298,12 @@ class SpotifyController:
         aggregate cost is well under a microsecond."""
         if self._needs_reauth:
             return "NEEDS_REAUTH"
+        # Mac play/pause/skip is AppleScript to Spotify.app. That works
+        # without a developer client_id or OAuth tokens — those are
+        # Windows Web API requirements. If Spotify.app is installed,
+        # transport is already connected.
+        if self._mac and self._available:
+            return "READY"
         if not self._client_id:
             return "NO_CLIENT_ID"
         if not (self._access_token or self._refresh_token):

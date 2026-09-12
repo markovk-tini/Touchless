@@ -1892,9 +1892,18 @@ class TutorialWindow(QDialog):
             return
         try:
             dialog = SpotifySetupWizard(self.config, parent=self)
-            dialog.exec()
+            accepted = dialog.exec() == QDialog.Accepted
         except Exception:
-            pass
+            return
+        if not accepted:
+            return
+        host = self.parent()
+        while host is not None:
+            handler = getattr(host, "_on_connect_spotify_clicked", None)
+            if callable(handler):
+                QTimer.singleShot(50, handler)
+                return
+            host = host.parent()
 
     def _open_full_instructions_dialog(self) -> None:
         """Pop the current step's full instruction text into a tall

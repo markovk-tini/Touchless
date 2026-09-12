@@ -226,15 +226,20 @@ class SpotifyControllerTest(unittest.TestCase):
         self.assertFalse(controller.remove_current_track_from_queue())
         self.assertIn("not supported", controller.message)
 
-    def test_mac_process_probe_matches_spotify_app_name(self) -> None:
+    def test_mac_process_probe_uses_applescript_not_helper_name(self) -> None:
         controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
         controller._mac = True
 
-        class _Proc:
-            info = {"name": "Spotify", "exe": "/Applications/Spotify.app/Contents/MacOS/Spotify"}
+        class _Helper:
+            info = {"name": "Spotify Helper", "exe": "/Applications/Spotify.app/Contents/Frameworks/Spotify Helper.app/Contents/MacOS/Spotify Helper"}
 
-        with patch("hgr.debug.spotify_controller.psutil.process_iter", return_value=[_Proc()]):
-            self.assertTrue(controller._probe_real_spotify_process())
+        with patch("hgr.debug.spotify_controller.psutil.process_iter", return_value=[_Helper()]):
+            with patch.object(controller, "_mac_osascript", return_value=(True, "false", "")):
+                self.assertFalse(controller._probe_real_spotify_process())
+                self.assertFalse(controller._is_running_uncached())
+            with patch.object(controller, "_mac_osascript", return_value=(True, "true", "")):
+                self.assertTrue(controller._probe_real_spotify_process())
+                self.assertTrue(controller._is_running_uncached())
 
     def test_windows_process_probe_still_requires_spotify_exe(self) -> None:
         controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
@@ -252,12 +257,15 @@ class SpotifyControllerTest(unittest.TestCase):
         controller._access_token = None
         controller._refresh_token = None
         controller._client_id = "test-client"
+        controller._user_provided_client_id = False
         controller._needs_reauth = False
         controller._available = True
-        # Connect toast is OAuth, not "Spotify.app is running".
-        self.assertEqual(controller.readiness_state(), "NO_TOKENS")
+        # Spotify.app installed → AppleScript transport is connected.
+        # Developer OAuth is not required for skip/pause/swipe.
+        self.assertEqual(controller.readiness_state(), "READY")
         controller._available = False
         self.assertEqual(controller.readiness_state(), "NO_TOKENS")
+        controller._available = True
         controller._access_token = "tok"
         self.assertEqual(controller.readiness_state(), "READY")
 
@@ -266,6 +274,40 @@ class SpotifyControllerTest(unittest.TestCase):
         controller._mac = True
         with patch.object(controller, "_mac_osascript", return_value=(True, "not-running", "")):
             self.assertFalse(controller._mac_transport("playpause"))
+            self.assertFalse(controller.toggle_repeat_track())
+            self.assertFalse(controller.toggle_shuffle())
         self.assertIsNone(controller.take_transient_failure())
+        self.assertFalse(controller._mac_running_cache)
+
+    def test_mac_auth_browser_uses_launch_external(self) -> None:
+        controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
+        controller._mac = True
+        with patch("hgr.debug.spotify_controller.launch_external", return_value=True) as mock_open:
+            self.assertTrue(controller._open_auth_browser("https://accounts.spotify.com/authorize"))
+        mock_open.assert_called_once_with("https://accounts.spotify.com/authorize")
+
+    def test_windows_auth_browser_uses_webbrowser(self) -> None:
+        controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
+        controller._mac = False
+        with patch("hgr.debug.spotify_controller.launch_external") as mock_open:
+            with patch("webbrowser.open", return_value=True) as mock_web:
+                self.assertTrue(controller._open_auth_browser("https://accounts.spotify.com/authorize"))
+        mock_web.assert_called_once()
+        mock_open.assert_not_called()
+
+    def test_default_redirect_uses_port_fallback(self) -> None:
+        controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
+        controller._redirect_uri = "http://127.0.0.1:5000/callback"
+        explicit, ports = controller._auth_callback_ports(5000)
+        self.assertFalse(explicit)
+        self.assertEqual(ports, [5000, 5001, 5002, 5003, 5004])
+
+    def test_custom_redirect_pins_single_port(self) -> None:
+        controller = SpotifyController(env_paths=(), token_paths=(), executable_paths=())
+        controller._redirect_uri = "http://127.0.0.1:7777/callback"
+        explicit, ports = controller._auth_callback_ports(5000)
+        self.assertTrue(explicit)
+        self.assertEqual(ports, [7777])
+
 
 # Author: Konstantin Markov

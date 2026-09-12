@@ -126,17 +126,8 @@ class SpotifyGestureRouter:
 
         self._static_cooldown_until = now + self.static_cooldown_seconds
         self._static_latched_label = stable_label
-        # Signal the controller that the user actively tried to use
-        # Spotify — MainWindow's reauth-toast gate keys off this so
-        # a cold launch with no tokens never popups until the user
-        # has actually gestured. Bounded to <2 flips/sec by the hold
-        # + cooldown gates above; a single bool write and safe if the
-        # method is missing on an older controller build.
-        try:
-            controller.record_command_attempt()
-        except Exception:
-            pass
         if stable_label == "two":
+            self._note_command_attempt(controller)
             self._control_text = "opening spotify"
             self._set_action("spotify_focus")
             controller.dispatch_async(
@@ -148,6 +139,7 @@ class SpotifyGestureRouter:
                 self._control_text = "spotify inactive on device"
                 self._set_action("spotify_toggle_idle")
                 return
+            self._note_command_attempt(controller)
             # Fire HTTP call on a background thread so the gesture
             # worker doesn't block on the 50-300 ms Spotify Web API
             # roundtrip. Action label is set OPTIMISTICALLY; the
@@ -164,6 +156,7 @@ class SpotifyGestureRouter:
                 self._control_text = "spotify inactive on device"
                 self._set_action("spotify_shuffle_idle")
                 return
+            self._note_command_attempt(controller)
             controller.dispatch_async(
                 controller.toggle_shuffle,
                 on_complete=self._spotify_result_callback("shuffle"),
@@ -185,10 +178,6 @@ class SpotifyGestureRouter:
 
         if now < self._dynamic_cooldown_until:
             return
-        try:
-            controller.record_command_attempt()
-        except Exception:
-            pass
         if not self._can_control_without_focus(controller):
             self._dynamic_cooldown_until = now + self.dynamic_cooldown_seconds
             self._dynamic_latched_label = dynamic_label
@@ -201,6 +190,7 @@ class SpotifyGestureRouter:
                 self._set_action("spotify_repeat_idle")
             return
 
+        self._note_command_attempt(controller)
         self._dynamic_cooldown_until = now + self.dynamic_cooldown_seconds
         self._dynamic_latched_label = dynamic_label
         # Fire HTTP/AppleScript on a background thread — dynamic
@@ -229,6 +219,16 @@ class SpotifyGestureRouter:
             self._control_text = "spotify repeat toggle"
             self._set_action("spotify_repeat")
 
+    @staticmethod
+    def _note_command_attempt(controller: SpotifyController) -> None:
+        # Signal that the user actually dispatched a Spotify control.
+        # Idle fist/ok/swipe (Spotify closed) must NOT flip this —
+        # MainWindow's connect toast keys off it.
+        try:
+            controller.record_command_attempt()
+        except Exception:
+            pass
+
     def _can_control_without_focus(self, controller: SpotifyController) -> bool:
         # Stricter than the old is_running() catch-all: a Spotify
         # protocol handler / helper process leaves is_running() True
@@ -246,6 +246,9 @@ class SpotifyGestureRouter:
         # stderr write per gesture commit at most.
         import sys as _sys
         try:
+            # Mac: AppleScript "Spotify is running", not helper
+            # processes. Closed app must fail this gate so swipe/fist
+            # stay silent and do not arm the connect overlay.
             if getattr(controller, "_mac", False) and bool(controller.is_running()):
                 try:
                     _sys.stderr.write("[r51-spotify-gate] pass: mac is_running=True\n")

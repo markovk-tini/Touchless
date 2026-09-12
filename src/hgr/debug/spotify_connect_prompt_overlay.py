@@ -43,12 +43,10 @@ class SpotifyConnectPromptOverlay(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowFlags(
-            Qt.Tool
-            | Qt.FramelessWindowHint
-            | Qt.WindowStaysOnTopHint
-            | Qt.NoDropShadowWindowHint
-        )
+        flags = Qt.Tool | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint
+        if sys.platform != "darwin":
+            flags |= Qt.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setStyleSheet("background: transparent;")
@@ -194,14 +192,11 @@ class SpotifyConnectPromptOverlay(QWidget):
             self.move(x, y)
         self._opacity_effect.setOpacity(0.0)
         self.show()
+        # Do not apply_overlay() here. That native HUD path uses
+        # NSStatusWindowLevel + setCanHide_(False), so this toast
+        # sits above modal dialogs and Qt hide()/X cannot dismiss it.
         if sys.platform != "darwin":
             self.raise_()
-        else:
-            try:
-                from ..app.ui.native_overlay import apply_overlay
-                apply_overlay(self)
-            except Exception:
-                pass
         self._fade.stop()
         self._fade.setStartValue(0.0)
         self._fade.setEndValue(1.0)
@@ -219,8 +214,14 @@ class SpotifyConnectPromptOverlay(QWidget):
         self._auto_dismiss.stop()
         self._fade.stop()
         self._fading_out = False
-        if self.isVisible():
-            self.hide()
+        try:
+            from ..app.ui.native_overlay import hide_overlay
+            hide_overlay(self)
+        except Exception:
+            pass
+        was_visible = self.isVisible()
+        self.hide()
+        if was_visible:
             try:
                 suppress = bool(self._suppress_checkbox.isChecked())
             except Exception:
@@ -234,8 +235,7 @@ class SpotifyConnectPromptOverlay(QWidget):
         self.linkClicked.emit()
 
     def _on_close_clicked(self) -> None:
-        self._auto_dismiss.stop()
-        self._begin_fade_out()
+        self.hide_immediately()
 
     def _begin_fade_out(self) -> None:
         if self._fading_out:
@@ -249,6 +249,11 @@ class SpotifyConnectPromptOverlay(QWidget):
 
     def _on_fade_finished(self) -> None:
         if self._fading_out:
+            try:
+                from ..app.ui.native_overlay import hide_overlay
+                hide_overlay(self)
+            except Exception:
+                pass
             self.hide()
             self._fading_out = False
             try:

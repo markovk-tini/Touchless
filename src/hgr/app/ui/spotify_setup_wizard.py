@@ -188,6 +188,22 @@ class _CopyRow(QWidget):
             pass
 
 
+class _CappedScrollArea(QScrollArea):
+    """QScrollArea whose sizeHint is NOT the inner page height.
+
+    Stock QScrollArea.sizeHint() is the contained widget's size, so a
+    tall paste-values page still forced the dialog under the Mac dock
+    and the Next button off-screen. Cap the hint so the dialog can
+    stay within availableGeometry while the page scrolls.
+    """
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(600, 200)
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        return QSize(400, 80)
+
+
 class SpotifySetupWizard(QDialog):
     """Three-page guided wizard.
 
@@ -237,9 +253,9 @@ class SpotifySetupWizard(QDialog):
             # 13" Mac available height is often < 800 after the menu
             # bar and dock. Page 1 at 900 overflowed; shorter + scroll.
             self._page_sizes = {
-                0: (540, 440),
-                1: (640, 560),
-                2: (540, 360),
+                0: (540, 400),
+                1: (620, 440),
+                2: (540, 340),
             }
         # r51: was apply_touchless_chrome (DWM caption color, Win11
         # only — dad on Win10 saw white/black chrome). Now uses the
@@ -288,8 +304,12 @@ class SpotifySetupWizard(QDialog):
         )
 
         root = QVBoxLayout(body)
-        root.setContentsMargins(28, 24, 28, 24)
-        root.setSpacing(16)
+        if sys.platform == "darwin":
+            root.setContentsMargins(20, 16, 20, 12)
+            root.setSpacing(10)
+        else:
+            root.setContentsMargins(28, 24, 28, 24)
+            root.setSpacing(16)
 
         # Pages built once and stashed. We swap them in/out of a
         # single QFrame container instead of using QStackedWidget —
@@ -314,11 +334,13 @@ class SpotifySetupWizard(QDialog):
         # the dialog is shown.
         self._content_layout.addWidget(self._pages[0])
         if sys.platform == "darwin":
-            scroll = QScrollArea()
+            scroll = _CappedScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.NoFrame)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
             scroll.setWidget(self._content_frame)
+            scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             scroll.setStyleSheet(
                 "QScrollArea { background: transparent; border: none; }"
             )
@@ -383,11 +405,12 @@ class SpotifySetupWizard(QDialog):
                 if screen is not None:
                     geo = screen.availableGeometry()
                     w = min(w, max(480, int(geo.width()) - 48))
-                    avail_h = max(320, int(geo.height()) - 96)
+                    avail_h = max(300, int(geo.height()) - 48)
                     h = min(h, avail_h)
                 self.setMinimumSize(min(w, 480), 280)
-                self.setMaximumHeight(avail_h)
+                self.setMaximumSize(max(w, 480), avail_h)
                 self.resize(w, h)
+                self._keep_on_screen()
                 return
             self.setMinimumSize(w, h)
             self.resize(max(self.width(), w), max(self.height(), h))
@@ -414,6 +437,28 @@ class SpotifySetupWizard(QDialog):
         # r51: the frameless indigo bar is painted at construction
         # time, no HWND-dependent DWM call needed. Left as a no-op
         # placeholder so any downstream showEvent hooks stay stable.
+
+    def _keep_on_screen(self) -> None:
+        """Pin the dialog inside availableGeometry so Back/Next stay
+        above the Mac dock."""
+        if sys.platform != "darwin":
+            return
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = screen.availableGeometry()
+        margin = 12
+        max_w = max(480, geo.width() - 2 * margin)
+        max_h = max(300, geo.height() - 2 * margin)
+        self.setMaximumSize(max_w, max_h)
+        w = min(max(self.width(), 480), max_w)
+        h = min(max(self.height(), 300), max_h)
+        self.resize(w, h)
+        x = geo.x() + max(margin, (geo.width() - w) // 2)
+        y = geo.y() + margin
+        if y + h > geo.bottom() - margin:
+            y = max(geo.y() + margin, geo.bottom() - h - margin)
+        self.move(x, y)
 
     # ---- page builders ------------------------------------------------
 
@@ -502,27 +547,18 @@ class SpotifySetupWizard(QDialog):
         return page
 
     def _trigger_reconnect_from_wizard(self) -> None:
-        """v1.1.7.11: fire the PKCE reconnect flow on the parent
-        MainWindow (same method the removed 'Connect Spotify' Settings
-        button used) and close the wizard immediately — the browser
-        auth screen takes over from here."""
-        try:
-            parent = self.parent()
-            handler = getattr(parent, "_on_connect_spotify_clicked", None)
-            if callable(handler):
-                handler()
-        except Exception:
-            pass
-        try:
-            self.accept()
-        except Exception:
-            pass
+        """Same as Windows Finish: close the wizard, then the caller
+        starts PKCE (`_on_connect_spotify_clicked`). Starting auth
+        while this modal is still exec()'ing binds the callback port
+        so the post-close attempt never opens the browser.
+        """
+        self.accept()
 
     def _build_page_values(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(12)
+        lay.setSpacing(8 if sys.platform == "darwin" else 12)
 
         title = QLabel("Paste these into the Spotify Dashboard")
         title.setObjectName("wizardTitle")

@@ -202,6 +202,42 @@ def apply_overlay(widget) -> bool:
     return False
 
 
+def hide_overlay(widget) -> None:
+    """Undo macOS apply_overlay so Qt hide() actually takes the window
+    off screen.
+
+    apply_overlay sets setCanHide_(False) and NSStatusWindowLevel so
+    HUD overlays survive app switch. That also means hide() leaves the
+    NSWindow up — a clickable toast then sits on top of modal dialogs
+    and its X does nothing. Call this before hide() for those toasts.
+    """
+    if widget is None or _SYSTEM != "Darwin" or not _HAS_MAC:
+        return
+    if objc is None or ctypes is None:
+        return
+    try:
+        widget.winId()
+        ns_view = objc.objc_object(c_void_p=ctypes.c_void_p(int(widget.winId())))
+        ns_window = ns_view.window()
+        if ns_window is None:
+            return
+        try:
+            ns_window.setCanHide_(True)
+        except Exception:
+            pass
+        try:
+            ns_window.orderOut_(None)
+        except Exception:
+            pass
+        try:
+            if NSFloatingWindowLevel is not None:
+                ns_window.setLevel_(int(NSFloatingWindowLevel))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _apply_macos_overlay(widget) -> bool:
     if not _HAS_MAC or objc is None or ctypes is None:
         return False
