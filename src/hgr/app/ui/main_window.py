@@ -28352,13 +28352,14 @@ Admin elevation
         self, left: float, right: float, *, stamp_lead_s: float = 0.0,
         pad_to_window: bool = True,
     ):
-        """Return a float32 mono buffer spanning the FULL [left, right] window.
+        """Return a float32 mono buffer for wall window [left, right].
 
         Shared `assemble_pcm_ring` with the SCK tap: concat in order, ignore
         sub-250 ms stamp jitter (no overlap mix/trim), first-start slice.
-        `stamp_lead_s` is clip-mux only. Returns None only if no real
-        samples fall in the window. Recording mux passes pad_to_window=False
-        so atempo can stretch the true sample count onto video duration.
+        `stamp_lead_s` is 0 for clip and recording mux. Returns None
+        only if no real samples fall in the window. Both muxes pass
+        pad_to_window=False so atempo can stretch the true sample
+        count onto the picture.
         """
         fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
         lock = getattr(self, "_mac_clip_audio_lock", None)
@@ -28438,30 +28439,31 @@ Admin elevation
                 return
             fs = int(getattr(self, "_mac_clip_audio_fs", 48000))
             # WASAPI's clip_sys_audio_delay_ms (1000) is a Windows TCP-bridge
-            # residual. Do not apply it here. stamp_lead_s is signed: the
-            # previous +2.5 s skip made clips ~4 s early.
-            stamp_lead_s = -1.5
+            # residual. Do not apply it here. stamp_lead stays 0: a constant
+            # -1.5 s delay made 30 s clips late, while padded PCM still
+            # drifted early on 60 s clips. Match recording mux instead.
+            stamp_lead_s = 0.0
             boost_quiet_mac_pcm = None
             polish_mac_pcm = None
-            mac_clip_video_timescale = None
+            mac_clip_mux_plan = None
             try:
                 from ...platform_compat.mac_system_audio import (
                     MAC_CLIP_STAMP_LEAD_S,
                     boost_quiet_mac_pcm as _boost_quiet_mac_pcm,
-                    mac_clip_video_timescale as _mac_clip_video_timescale,
+                    mac_clip_mux_plan as _mac_clip_mux_plan,
                     polish_mac_pcm as _polish_mac_pcm,
                 )
                 stamp_lead_s = float(MAC_CLIP_STAMP_LEAD_S)
                 boost_quiet_mac_pcm = _boost_quiet_mac_pcm
                 polish_mac_pcm = _polish_mac_pcm
-                mac_clip_video_timescale = _mac_clip_video_timescale
+                mac_clip_mux_plan = _mac_clip_mux_plan
             except Exception:
                 pass
             mic = self._extract_mac_clip_audio(
-                left, right, stamp_lead_s=stamp_lead_s
+                left, right, stamp_lead_s=stamp_lead_s, pad_to_window=False,
             )
             sys_a = self._extract_mac_sys_audio(
-                left, right, stamp_lead_s=stamp_lead_s
+                left, right, stamp_lead_s=stamp_lead_s, pad_to_window=False,
             )
             audio = self._mix_mac_clip_and_sys(mic, sys_a)
             # Require at least ~50 ms so a near-empty ring doesn't produce a
@@ -28475,32 +28477,44 @@ Admin elevation
                     audio = polish_mac_pcm(audio, fs=fs)
             except Exception:
                 pass
-            # Keep the wall-clock wav. OpenCV mp4v/MJPG often tags ~20 fps
-            # while Quartz wrote fewer frames, so probed duration is ~10 s
-            # short. Trimming audio to that probe made the track lead picture.
-            # Stretch video timestamps to the wall span instead.
+            # Unpadded PCM + atempo onto the play clock. OpenCV mp4v/MJPG
+            # often tags ~20 fps while Quartz wrote fewer frames; stretching
+            # video to the wall span keeps that clock, then audio follows it.
             wall_span = max(0.05, float(right) - float(left))
             video_dur = self._probe_media_seconds(video_path)
             if video_dur <= 0.05:
                 video_dur = wall_span
+            a_dur = float(len(audio)) / float(fs)
             scale = 1.0
-            if mac_clip_video_timescale is not None:
+            tempo = 1.0
+            if mac_clip_mux_plan is not None:
                 try:
-                    scale = float(mac_clip_video_timescale(video_dur, wall_span))
+                    scale, tempo = mac_clip_mux_plan(a_dur, video_dur, wall_span)
+                    scale = float(scale)
+                    tempo = float(tempo)
                 except Exception:
                     scale = 1.0
+                    tempo = 1.0
             delay_ms = 0
+            mux_line = (
+                f"[mac-clip-audio] mux left={left:.3f} right={right:.3f} "
+                f"span={wall_span:.3f}s video_dur={video_dur:.3f}s "
+                f"itsscale={scale:.4f} atempo={tempo:.6f} "
+                f"mic={0 if mic is None else len(mic)/fs:.3f}s "
+                f"sys={0 if sys_a is None else len(sys_a)/fs:.3f}s "
+                f"out={a_dur:.3f}s delay_ms={delay_ms} "
+                f"stamp_lead={stamp_lead_s:.3f}s\n"
+            )
             try:
-                sys.stderr.write(
-                    f"[mac-clip-audio] mux left={left:.3f} right={right:.3f} "
-                    f"span={wall_span:.3f}s video_dur={video_dur:.3f}s "
-                    f"itsscale={scale:.4f} "
-                    f"mic={0 if mic is None else len(mic)/fs:.3f}s "
-                    f"sys={0 if sys_a is None else len(sys_a)/fs:.3f}s "
-                    f"out={len(audio)/fs:.3f}s delay_ms={delay_ms} "
-                    f"stamp_lead={stamp_lead_s:.3f}s\n"
-                )
+                sys.stderr.write(mux_line)
                 sys.stderr.flush()
+            except Exception:
+                pass
+            try:
+                log_path = Path.home() / ".touchless" / "mac-clip-mux.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(mux_line)
             except Exception:
                 pass
             import wave
@@ -28514,25 +28528,33 @@ Admin elevation
             acodec = str(self._ffmpeg_capabilities.get("audio_encoder", "aac") or "aac")
             out_tmp = Path(f"{video_path}.withaudio.mp4")
             # No adelay on Darwin clips — Windows WASAPI 1000 ms does not
-            # apply, and stamp_lead already shifts the wav content.
-            af = "apad"
+            # apply. Packed-ring rate is corrected with atempo, not a
+            # constant stamp_lead. Honor any non-1.0 plan (a 1 s pack
+            # on 5 min is only 0.33%, below the old 0.4% skip).
+            af_parts = []
+            if abs(tempo - 1.0) >= 1e-6:
+                af_parts.append(f"atempo={tempo:.6f}")
+            af_parts.append("apad")
+            af = ",".join(af_parts)
             mux_cmd = [
                 self._ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(video_path), "-i", str(wav_path),
             ]
             if abs(scale - 1.0) > 0.001:
                 mux_cmd.extend([
-                    "-filter_complex", f"[0:v]setpts=PTS*{scale:.6f}[v]",
-                    "-map", "[v]", "-map", "1:a",
+                    "-filter_complex",
+                    f"[0:v]setpts=PTS*{scale:.6f}[v];[1:a]{af}[a]",
+                    "-map", "[v]", "-map", "[a]",
                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                     "-pix_fmt", "yuv420p",
                 ])
             else:
                 mux_cmd.extend([
                     "-map", "0:v", "-map", "1:a", "-c:v", "copy",
+                    "-af", af,
                 ])
             mux_cmd.extend([
-                "-af", af, "-c:a", acodec, "-b:a", "192k", "-ar", str(fs),
+                "-c:a", acodec, "-b:a", "192k", "-ar", str(fs),
                 "-shortest", str(out_tmp),
             ])
             proc = None
@@ -35203,7 +35225,7 @@ Admin elevation
         af_parts = []
         if delay_ms > 0:
             af_parts.append(f"adelay={delay_ms}:all=1")
-        if abs(tempo - 1.0) >= 0.004:
+        if abs(tempo - 1.0) >= 1e-6:
             af_parts.append(f"atempo={tempo:.6f}")
         af_parts.append("apad")
         af = ",".join(af_parts)

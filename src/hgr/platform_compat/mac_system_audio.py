@@ -29,10 +29,11 @@ _FS = 48000
 
 # Positive stamp_lead skips newer ring samples and makes the
 # soundtrack *earlier* (clip t=0 plays a later wall time).
-# +2.5 s with clear concat was ~4 s early ≈ 1.5 s inherent
-# first-start lead + 2.5 s of this term. Negative delays the
-# track. Screen recordings pass 0.
-MAC_CLIP_STAMP_LEAD_S = -1.5
+# Negative delays it. Clips and recordings both pass 0 now:
+# a constant -1.5 s made 30 s clips ~1 s late, while packed
+# PCM still drifted ~1 s early by the end of a 60 s clip.
+# Rate is corrected with atempo (see mac_clip_mux_plan).
+MAC_CLIP_STAMP_LEAD_S = 0.0
 # Room mic on top of SCK re-records speakers (comb / static).
 # Duck only when both tracks mix; mic-only is unchanged.
 MAC_MIX_MIC_GAIN = 0.12
@@ -94,11 +95,11 @@ def assemble_pcm_ring(
     Then slice from the first block's implied start plus optional
     `stamp_lead_s`. Positive lead skips into the ring (soundtrack
     plays early); negative includes older samples (delays it).
-    Clip mux only; screen recordings pass 0.
+    Clip and recording mux both pass 0.
 
     `pad_to_window=False` returns only the concat samples that fall in
-    the window (no leading/trailing zeros). Recording mux stretches
-    that true sample count onto probed video duration so packed
+    the window (no leading/trailing zeros). Clip and recording mux
+    stretch that true sample count onto the picture so packed
     dropouts don't play future audio (~1 s early by the end).
     """
     if chunks is None or right <= left or int(fs) <= 0:
@@ -200,6 +201,9 @@ def mac_mux_atempo_factor(audio_dur: float, video_dur: float) -> float:
     Packed rings (ignored callback gaps / xruns) play future content:
     start is on time, then audio leads by ~1 s. Factor < 1 slows it
     back onto the picture. Huge mismatches are left alone.
+
+    Skip only tiny skews: the old 0.4% relative deadband hid a 1 s
+    pack on a 5 min clip (0.33%). Require both < 0.4% and < 120 ms.
     """
     try:
         a = float(audio_dur)
@@ -209,7 +213,7 @@ def mac_mux_atempo_factor(audio_dur: float, video_dur: float) -> float:
     if a < 0.25 or v < 0.25:
         return 1.0
     tempo = a / v
-    if abs(tempo - 1.0) < 0.004:
+    if abs(tempo - 1.0) < 0.004 and abs(a - v) < 0.12:
         return 1.0
     if tempo < 0.88 or tempo > 1.12:
         return 1.0
@@ -353,6 +357,30 @@ def mac_clip_video_timescale(video_dur: float, wall_span: float) -> float:
     if 0.97 <= scale <= 1.03:
         return 1.0
     return min(max(scale, 0.5), 2.5)
+
+
+def mac_clip_mux_plan(
+    audio_dur: float, video_dur: float, wall_span: float
+) -> tuple:
+    """(itsscale, atempo) so a Mac clip's picture and soundtrack share one clock.
+
+    Same plan for 30 / 60 / 120 / 300 s. Under-tagged OpenCV video is
+    stretched to the wall window; true (unpadded) PCM is then atempo'd
+    onto that play length so packed rings don't start late and finish
+    early.
+    """
+    scale = mac_clip_video_timescale(video_dur, wall_span)
+    try:
+        w = float(wall_span)
+        v = float(video_dur)
+    except (TypeError, ValueError):
+        w = 0.0
+        v = 0.0
+    if abs(float(scale) - 1.0) <= 0.001:
+        target = v if v > 0.05 else w
+    else:
+        target = w if w > 0.05 else v
+    return float(scale), float(mac_mux_atempo_factor(audio_dur, target))
 
 
 def _sbuf_unix_end(sbuf, n_samples: int, fs: int) -> float:

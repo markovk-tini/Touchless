@@ -7,6 +7,7 @@ from hgr.platform_compat.mac_system_audio import (
     MAC_MIX_MIC_GAIN,
     assemble_pcm_ring,
     boost_quiet_mac_pcm,
+    mac_clip_mux_plan,
     mac_clip_video_timescale,
     mac_mux_atempo_factor,
     mix_mac_pcm,
@@ -131,8 +132,27 @@ def test_assemble_pcm_ring_ignores_sub_quarter_second_gap():
     assert float(np.min(np.abs(out))) > 0.4
 
 
-def test_mac_clip_stamp_lead_delays_early_soundtrack():
-    assert abs(float(MAC_CLIP_STAMP_LEAD_S) - (-1.5)) < 1e-9
+def test_mac_clip_stamp_lead_is_zero():
+    # Constant delay made 30 s clips late; rate is atempo's job.
+    assert abs(float(MAC_CLIP_STAMP_LEAD_S) - 0.0) < 1e-9
+
+
+def test_mac_clip_mux_plan_locks_av_across_preset_lengths():
+    # 1 s of packed samples on every clip preset: start stays at t=0
+    # and atempo fills the picture so the end is not ~1 s early.
+    for wall in (30.0, 60.0, 120.0, 300.0):
+        packed = wall - 1.0
+        scale, tempo = mac_clip_mux_plan(packed, wall, wall)
+        assert scale == 1.0
+        assert abs(tempo - (packed / wall)) < 1e-6
+        assert abs(packed / tempo - wall) < 1e-6
+
+
+def test_mac_clip_mux_plan_stretches_video_then_atempo_audio_to_wall():
+    # OpenCV under-tags 50 s for a 60 s window; PCM is 1 s short.
+    scale, tempo = mac_clip_mux_plan(59.0, 50.0, 60.0)
+    assert abs(scale - 1.2) < 1e-6
+    assert abs(tempo - (59.0 / 60.0)) < 1e-6
 
 
 def test_looks_like_mp4_rejects_ffmpeg_log(tmp_path):
@@ -215,6 +235,9 @@ def test_mac_mux_atempo_slows_packed_audio_onto_video():
     assert tempo < 1.0
     assert mac_mux_atempo_factor(60.0, 60.0) == 1.0
     assert mac_mux_atempo_factor(60.0, 1.0) == 1.0  # implausible, skip
+    # 1 s pack on 5 min is 0.33% — still correct it (120 ms floor).
+    assert abs(mac_mux_atempo_factor(299.0, 300.0) - (299.0 / 300.0)) < 1e-6
+    assert mac_mux_atempo_factor(60.0, 60.05) == 1.0  # 50 ms, ignore
 
 
 def test_polish_mac_pcm_removes_one_sample_click():
