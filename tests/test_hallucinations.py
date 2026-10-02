@@ -1,86 +1,27 @@
-"""Standalone test of the whisper hallucination filter."""
-import re
+"""Case table for the whisper hallucination filter.
 
-_DICTATION_HALLUCINATION_STOPWORDS = {
-    "the", "you", "and", "a", "to", "of", "is", "it", "so", "i",
-    "uh", "um", "ah", "oh", "mm", "mhm", "hmm", "hm", "eh",
-    "thanks", "thank", "bye", "okay", "ok",
-}
+This file used to be a hand-run script: it carried its OWN copy of
+`_strip_whisper_hallucinations` plus the three stopword/stock-phrase
+constants, ran a case table at import time, and printed a "N passed, M
+failed" tally. Two things were wrong with that.
 
-_DICTATION_TRAILING_HALLUCINATIONS = {"the", "you", "and", "a"}
+It collected no tests -- every top-level statement ran at import and the
+assertions were `print` calls, so pytest exited 5 ("no tests ran") and a
+suite gate counted the file as a failure while the table's real result
+was only ever visible to whoever ran the file by hand.
 
-_WHISPER_STOCK_HALLUCINATIONS = (
-    "good afternoon, everyone",
-    "good afternoon everyone",
-    "good morning, everyone",
-    "good morning everyone",
-    "thank you for watching",
-    "thanks for watching",
-    "please subscribe",
-    "like and subscribe",
-    "don't forget to subscribe",
-    "bye-bye",
-    "bye bye",
-)
+Worse, it exercised the copy. The production filter lives in
+`hgr.app.integration.noop_engine`, and a duplicated implementation can
+stay green while the shipped one rots -- the table would have reported 28
+passes no matter what production did. So import the real function. (It
+was verified identical to the copy on all 28 cases before the copy was
+deleted, so this conversion changed no expectation.)
+"""
+from __future__ import annotations
 
-_WHISPER_STOCK_PATTERNS = tuple(
-    re.compile(r"\b" + re.escape(phrase) + r"\.?", re.IGNORECASE)
-    for phrase in _WHISPER_STOCK_HALLUCINATIONS
-)
+import unittest
 
-
-def _strip_whisper_hallucinations(text: str) -> str:
-    stripped = text.strip()
-    if not stripped:
-        return ""
-
-    stock_hit = False
-    for pattern in _WHISPER_STOCK_PATTERNS:
-        new_stripped, n = pattern.subn("", stripped)
-        if n > 0:
-            stock_hit = True
-            stripped = new_stripped
-    if stock_hit:
-        stripped = re.sub(r"\s+", " ", stripped)
-        stripped = re.sub(r"\s*[,.;:!?\-]+\s*$", "", stripped)
-        stripped = re.sub(r"(?<=[.!?])\s*[,.;:!?\-]+", "", stripped)
-        stripped = stripped.strip()
-
-    if not stripped:
-        return ""
-
-    tokens = stripped.split()
-
-    def _norm(tok):
-        return tok.lower().strip(".,!?;:\"'")
-
-    filtered = []
-    for tok in tokens:
-        rstripped = tok.rstrip(".,!?;:\"'")
-        if len(rstripped) >= 2 and rstripped.endswith("-") and not rstripped.endswith("--"):
-            continue
-        filtered.append(tok)
-    tokens = filtered
-
-    cleaned = [t for t in (_norm(tok) for tok in tokens) if t]
-    if cleaned and len(cleaned) <= 2 and all(tok in _DICTATION_HALLUCINATION_STOPWORDS for tok in cleaned):
-        return ""
-
-    deduped = []
-    for tok in tokens:
-        key = _norm(tok)
-        if deduped and key and key == _norm(deduped[-1]):
-            continue
-        deduped.append(tok)
-    tokens = deduped
-
-    while len(tokens) >= 3:
-        tail = _norm(tokens[-1])
-        if tail in _DICTATION_TRAILING_HALLUCINATIONS:
-            tokens.pop()
-        else:
-            break
-    return " ".join(tokens).strip()
+from hgr.app.integration.noop_engine import _strip_whisper_hallucinations
 
 
 cases = [
@@ -122,24 +63,23 @@ cases = [
     ("a- b- c- d", "d", "multiple fragments"),
 ]
 
-passes = 0
-fails = 0
-for inp, expected, desc in cases:
-    got = _strip_whisper_hallucinations(inp)
-    ok = got == expected
-    status = "PASS" if ok else "FAIL"
-    if ok:
-        passes += 1
-    else:
-        fails += 1
-    marker = "  " if ok else "!!"
-    print(f"{marker} {status}: {desc}")
-    print(f"     in:  {inp!r}")
-    print(f"     out: {got!r}")
-    if not ok:
-        print(f"     exp: {expected!r}")
 
-print()
-print(f"{passes} passed, {fails} failed, {passes + fails} total")
+class WhisperHallucinationFilterTest(unittest.TestCase):
+    def test_case_table(self) -> None:
+        """One subTest per row, so a regression names the row it broke
+        instead of stopping at the first mismatch."""
+        for text, expected, description in cases:
+            with self.subTest(case=description, text=text):
+                self.assertEqual(_strip_whisper_hallucinations(text), expected)
+
+    def test_table_is_not_empty(self) -> None:
+        """Guard the guard: an empty table would make `test_case_table`
+        pass vacuously, which is the failure mode this file just came
+        out of."""
+        self.assertGreaterEqual(len(cases), 28)
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 # Author: Konstantin Markov

@@ -205,9 +205,29 @@ try:
 except Exception:
     _br = "?"
 try:
+    from hgr import __version__ as _ver
+except Exception:
+    _ver = "?"
+# r24: stamp the BINARY, not just the round. A field bundle used to be
+# impossible to attribute to a build -- r21, r22 and r23 all logged
+# "build round 57", because BUILD_ROUND was wired into the camera-caps
+# cache key and so could not be bumped. A tester could therefore report
+# on a stale install and we would debug code that was never running.
+# Size plus mtime of the running exe identify it exactly, for one stat().
+try:
+    _exe = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__)
+    _est = _exe.stat()
+    _exe_id = (
+        f"{_exe.name}:{_est.st_size}:"
+        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(_est.st_mtime))}"
+    )
+except Exception:
+    _exe_id = "unknown"
+try:
     _banner = (
         f"\n===== Touchless startup: {time.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"build round {_br} python {sys.version.split()[0]} frozen={getattr(sys, 'frozen', False)} =====\n"
+        f"v{_ver} build round {_br} python {sys.version.split()[0]} "
+        f"frozen={getattr(sys, 'frozen', False)} exe={_exe_id} =====\n"
     )
     sys.stderr.write(_banner)
     sys.stderr.flush()

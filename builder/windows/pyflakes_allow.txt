@@ -1,0 +1,10 @@
+# pyflakes undefined-name allowlist for builder/windows/pyflakes_gate.py
+# Format: <path with forward slashes> undefined name '<Name>'   (no line number)
+# Every entry below is a string / `from __future__ import annotations`
+# annotation that is never evaluated at runtime. Do NOT add a real
+# runtime reference here -- fix the import instead.
+src/hgr/app/ui/main_window.py undefined name 'QIcon'
+src/hgr/app/ui/window_chrome.py undefined name 'QPoint'
+src/hgr/custom_gestures/dynamic_runtime.py undefined name 'List'
+src/hgr/live_api/cortex/event_bus.py undefined name 'Any'
+src/hgr/live_api/cortex/event_bus.py undefined name 'Dict'

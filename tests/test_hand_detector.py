@@ -26,8 +26,27 @@ class _FakeHands:
         return
 
 
-def _fake_runtime():
-    return SimpleNamespace(hands_module=SimpleNamespace(Hands=_FakeHands))
+def _fake_runtime(*args, **kwargs):
+    """Stand in for `load_hand_runtime`, matching the real HandRuntime shape.
+
+    Takes *args/**kwargs because the loader's signature grows: it gained
+    `prefer_gpu` when GPU Mode landed, and this fake -- which took no
+    arguments -- began raising `TypeError: _fake_runtime() got an
+    unexpected keyword argument 'prefer_gpu'` on every case. A fake that
+    pins its caller's exact argument list breaks on changes that are none
+    of its business.
+
+    All four `HandRuntime` fields are present for the same reason: r25
+    made the engine read `detector.runtime.backend` to decide whether GPU
+    mode is really active, and a fake missing the field would have made
+    that silently fall back rather than fail loudly.
+    """
+    return SimpleNamespace(
+        hands_module=SimpleNamespace(Hands=_FakeHands),
+        drawing_utils=None,
+        hand_connections=None,
+        backend="mediapipe-cpu",
+    )
 
 
 def _make_result(*, with_hand: bool):

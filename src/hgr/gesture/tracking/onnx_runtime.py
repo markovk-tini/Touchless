@@ -33,6 +33,7 @@ math to onnxruntime instead of cv2.dnn.
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -41,6 +42,8 @@ from typing import Any
 
 import cv2
 import numpy as np
+
+_TICK_DEBUG = os.environ.get("HGR_TICK_DEBUG", "0") == "1"
 
 
 # ---------------------------------------------------------------
@@ -515,10 +518,53 @@ class _OnnxHands:
     # visible hitch, so only the single best sub-threshold candidate is
     # ever tried per frame. Candidates are score-sorted, so that is the
     # one most likely to be the hand we're chasing.
-    _REACQUIRE_SCORE_FLOOR = 0.50
-    _REACQUIRE_WINDOW_FRAMES = 20   # ~0.4 s at 50 fps
-    _STALE_ROI_RETRY_FRAMES = 5     # ~0.1 s of ROI retries
-    _MAX_RELAXED_CANDIDATES_PER_FRAME = 1
+    # v1.1.9.2 fast-motion tracking-loss fix. 01d5f81 added an
+    # additive re-acquire path over v1.1.7-modes-working: hold the
+    # previous frame's ROI for STALE frames and relax palm-detect to
+    # FLOOR for WINDOW frames after a track loss. The audit vs 05e9f6b
+    # confirmed NO existing tunable was tightened — the regression is
+    # this new machinery itself. During fast waves the hand exits the
+    # stale ROI immediately, so the retry burns landmark inference on
+    # an empty crop AND palm-detect fires anyway (2× cost per lost
+    # frame) — which drops effective fps exactly when we need frames
+    # the most. The relaxed 0.50 palm floor also admits motion-blur
+    # false positives that can lock Stage-1 onto a non-hand blob.
+    # v1.1.7 dropped tracks immediately and re-ran a strict palm-detect
+    # the next frame — user-endorsed baseline. Neutralize the four
+    # constants (do NOT rip out the code) so re-enabling for a future
+    # controlled experiment is a one-line diff:
+    #   * FLOOR=1.0 → __init__ min() clamp keeps _reacquire_score_
+    #     threshold = min_detection_confidence (Stage-2 stays strict).
+    #   * MAX_RELAXED=0 → sub-strict landmark loop breaks before spend.
+    #   * STALE=0, WINDOW=0 → Stage-3 ternary collapses to
+    #     _tracked_palms=[] on loss (identical to v1.1.7).
+    # Does NOT touch stable_frames / smoother / miss_tolerance
+    # (feedback_gpu_tracking_baseline) or any v1.1.7 tunable.
+    # v1.1.9.2: partial restore. Field feedback 2026-09-13:
+    # swipes felt hard to trigger in GPU mode because the tracker
+    # would drop the hand mid-swipe (motion blur → landmark
+    # confidence dip → tracked_palms=[]) and palm-detect on the
+    # next frame needed the hand centered again. User had to
+    # "swipe almost all the way across the camera view" to get
+    # both endpoints re-detected.
+    #
+    # Restore _STALE_ROI_RETRY_FRAMES=2 to bridge a 2-frame
+    # (~30-60 ms) landmark dip with cheap retries on the same ROI
+    # — enough to survive a swipe's motion-blur mid-flight without
+    # forcing a full palm-detect scan. Keep the other three
+    # neutralized so we don't reintroduce the 20-frame relaxed-
+    # threshold fps regression (see previous audit):
+    #   * _MAX_RELAXED_CANDIDATES_PER_FRAME=0 — sub-strict palms
+    #     never spend a landmark inference (was the biggest
+    #     per-lost-frame cost).
+    #   * _REACQUIRE_WINDOW_FRAMES=0 — palm-detect never uses the
+    #     relaxed floor (motion-blur false-positive risk).
+    #   * _REACQUIRE_SCORE_FLOOR=1.0 — __init__ clamp keeps
+    #     reacquire_score_threshold = min_detection_confidence.
+    _REACQUIRE_SCORE_FLOOR = 1.0
+    _REACQUIRE_WINDOW_FRAMES = 0
+    _STALE_ROI_RETRY_FRAMES = 2
+    _MAX_RELAXED_CANDIDATES_PER_FRAME = 0
 
     def __init__(
         self,
@@ -716,18 +762,18 @@ class _OnnxHands:
             self._gate_fire_tp0 = 0
             self._gate_fire_tp1 = 0
             self._gate_fire_tpN = 0
-            sys.stderr.write(
-                f"[onnx_runtime] palm avg={palm_avg:.1f} p50={palm_p50:.1f} "
-                f"p95={palm_p95:.1f} max={palm_max:.1f}ms ({len(palm_samples)}) "
-                f"landmark avg={lm_avg:.1f} p50={lm_p50:.1f} "
-                f"p95={lm_p95:.1f} max={lm_max:.1f}ms ({len(lm_samples)}) "
-                f"track1[attempts={stage1_a} ok={stage1_ok} "
-                f"lost_crop_or_None={stage1_lc} lost_conf={stage1_lp}] "
-                f"gate[scan={gate_scan} no_surv={gate_nos} dis={gate_dis}] "
-                f"tp_at_fire[0={tp0} 1={tp1} N={tpN}] "
-                f"reacq={reacq}\n"
-            )
-            sys.stderr.flush()
+            if _TICK_DEBUG:
+                sys.stderr.write(
+                    f"[onnx_runtime] palm avg={palm_avg:.1f} p50={palm_p50:.1f} "
+                    f"p95={palm_p95:.1f} max={palm_max:.1f}ms ({len(palm_samples)}) "
+                    f"landmark avg={lm_avg:.1f} p50={lm_p50:.1f} "
+                    f"p95={lm_p95:.1f} max={lm_max:.1f}ms ({len(lm_samples)}) "
+                    f"track1[attempts={stage1_a} ok={stage1_ok} "
+                    f"lost_crop_or_None={stage1_lc} lost_conf={stage1_lp}] "
+                    f"gate[scan={gate_scan} no_surv={gate_nos} dis={gate_dis}] "
+                    f"tp_at_fire[0={tp0} 1={tp1} N={tpN}] "
+                    f"reacq={reacq}\n"
+                )
         except Exception:
             pass
 
@@ -1021,9 +1067,23 @@ class _OnnxHands:
         # close — Python GC + the session's internal CUDA / DML
         # context destructors handle cleanup. We null our refs so
         # the user's handle becomes obviously unusable.
-        self._palm = None  # type: ignore[assignment]
-        self._tracked_palms = []
-        self._landmarker = None  # type: ignore[assignment]
+        #
+        # v1.1.9.2 (r11): acquire self._lock BEFORE nulling refs.
+        # process() runs on the worker thread inside `with self._lock`;
+        # close() previously fired from the main thread with no lock
+        # coordination. When the deferred engine swap tore down the
+        # old ONNX session while the worker was still mid-session.run()
+        # → dereferencing a freed DmlExecutionProvider tensor →
+        # native access violation at 0x0. The reference rig rarely
+        # saw this because inference completes faster than swap
+        # scheduling; dad's older hardware widens the race window.
+        # Symmetric lock use eliminates the race entirely — swap
+        # waits until any in-flight inference returns, and the next
+        # inference sees palm=None and short-circuits cleanly.
+        with self._lock:
+            self._palm = None  # type: ignore[assignment]
+            self._tracked_palms = []
+            self._landmarker = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------
@@ -1128,6 +1188,32 @@ def build_onnx_directml_runtime() -> _HandsModuleShim | None:
     try:
         palm_session = ort.InferenceSession(str(palm_path), providers=providers)
         lm_session = ort.InferenceSession(str(lm_path), providers=providers)
+        # Say which provider each session ACTUALLY bound.
+        #
+        # `providers` above is a preference ORDER, not a requirement.
+        # When the DML EP cannot claim the graph -- adapter enumeration
+        # fails, D3D12 device creation is refused, an op has no DML
+        # kernel -- ONNX Runtime silently falls back to the next entry
+        # and the session runs on the CPU. Nothing in the app asked:
+        # `get_providers()` had zero callers in the repo. So "GPU mode
+        # does nothing" was unanswerable from a field bundle, because
+        # the app genuinely did not know whether it was on the GPU.
+        # One unconditional line fixes that.
+        try:
+            _pp = list(palm_session.get_providers())
+            _lp = list(lm_session.get_providers())
+            _dml = ("DmlExecutionProvider" in _pp
+                    and "DmlExecutionProvider" in _lp)
+            _verdict = ("DirectML ACTIVE" if _dml
+                        else "CPU FALLBACK (DirectML did not bind)")
+            print(
+                f"[onnx_runtime] session providers: palm={_pp} "
+                f"landmark={_lp} -> {_verdict}",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
     except Exception as exc:
         try:
             sys.stderr.write(

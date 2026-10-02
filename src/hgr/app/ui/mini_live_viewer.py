@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import cv2
@@ -498,17 +499,17 @@ class MiniLiveViewer(QWidget):
             return
         kept = max(0, self._c16_slot_calls - self._c16_drops_backlog - self._c16_drops_age)
         avg_lag = (self._c16_lag_sum_ms / kept) if kept > 0 else 0.0
-        try:
-            import sys as _sys
-            _sys.stderr.write(
-                f"[mini_viewer_c16] slot rate: {self._c16_slot_calls / elapsed:.1f} /s "
-                f"(kept={kept}, drop_backlog={self._c16_drops_backlog}, "
-                f"drop_age={self._c16_drops_age}) | "
-                f"capture→slot lag avg={avg_lag:.1f}ms max={self._c16_lag_max_ms:.1f}ms\n"
-            )
-            _sys.stderr.flush()
-        except Exception:
-            pass
+        if os.environ.get("HGR_TICK_DEBUG", "0") == "1":
+            try:
+                import sys as _sys
+                _sys.stderr.write(
+                    f"[mini_viewer_c16] slot rate: {self._c16_slot_calls / elapsed:.1f} /s "
+                    f"(kept={kept}, drop_backlog={self._c16_drops_backlog}, "
+                    f"drop_age={self._c16_drops_age}) | "
+                    f"capture→slot lag avg={avg_lag:.1f}ms max={self._c16_lag_max_ms:.1f}ms\n"
+                )
+            except Exception:
+                pass
         self._c16_slot_calls = 0
         self._c16_drops_backlog = 0
         self._c16_drops_age = 0

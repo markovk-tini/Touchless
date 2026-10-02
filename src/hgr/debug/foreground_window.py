@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import platform
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -48,8 +49,13 @@ if _IS_WINDOWS:
     _user32.MonitorFromWindow.restype = ctypes.c_void_p
     _user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
     _user32.GetMonitorInfoW.restype = wintypes.BOOL
+    _user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    _user32.GetWindowLongW.restype = ctypes.c_long
 
     _MONITOR_DEFAULTTONEAREST = 2
+    _GWL_STYLE = -16
+    _WS_CAPTION = 0x00C00000
+    _WS_THICKFRAME = 0x00040000
 
 
 def _process_name_for_pid(pid: int) -> str:
@@ -157,11 +163,23 @@ def find_chrome_youtube_windows() -> list[WindowInfo]:
 
 
 def is_foreground_fullscreen() -> bool:
-    """True when the foreground window's rect matches its monitor's rect.
+    """True when the foreground window is a REAL borderless / exclusive
+    fullscreen app (a game, a video player in fullscreen mode) — not a
+    normal maximized Win32 window (Chrome, VS Code, Explorer, etc.).
 
-    Catches borderless and exclusive fullscreen apps (games, video players) that
-    typically starve other processes for CPU/GPU. Pure user32 calls — cheap
-    enough to poll at ~1Hz from the hot frame loop.
+    v1.1.9.2 fix: previously any window whose rect equalled-or-overshot
+    the monitor rect returned True, which caught every maximized Win32
+    window (their GetWindowRect commonly reports left=-8 / right=mon.right+8
+    because of the invisible resize-border padding). That produced a
+    latched `_gpu_suppressed_for_fullscreen = True` the first time a
+    user maximized Chrome, pinning Touchless in CPU MediaPipe at
+    ~22-25 fps until they un-maximized. Two guards fix it:
+      * skip our own process (Touchless maximized should never suppress
+        itself),
+      * reject any window that still has a caption or resize frame —
+        genuine borderless fullscreen has neither WS_CAPTION nor
+        WS_THICKFRAME.
+    Games + fullscreen video players stay detected correctly.
     """
     if not _IS_WINDOWS:
         return False
@@ -173,6 +191,24 @@ def is_foreground_fullscreen() -> bool:
         shell = int(_user32.GetShellWindow() or 0)
         if hwnd == desktop or hwnd == shell:
             return False
+        # Skip our own foreground window — Touchless-maximized should
+        # never trigger fullscreen suppression on itself.
+        try:
+            pid_dw = wintypes.DWORD(0)
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_dw))
+            if int(pid_dw.value) == os.getpid():
+                return False
+        except Exception:
+            pass
+        # Reject normal chrome-having windows: real borderless fullscreen
+        # has neither WS_CAPTION (title bar) nor WS_THICKFRAME (resize
+        # border). Every regular maximized Win32 window has one or both.
+        try:
+            style = int(_user32.GetWindowLongW(hwnd, _GWL_STYLE))
+            if style & (_WS_CAPTION | _WS_THICKFRAME):
+                return False
+        except Exception:
+            pass
         rect = wintypes.RECT()
         if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             return False

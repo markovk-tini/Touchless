@@ -53,7 +53,7 @@ sign code artifact-signing ^
   --artifact-signing-endpoint "https://eus.codesigning.azure.net/" ^
   --azure-credential-type azure-cli ^
   --description "%DESC%" ^
-  --description-url "https://touchless.app" ^
+  --description-url "https://touchless-control.com" ^
   --verbosity Information ^
   "%TARGET%"
 

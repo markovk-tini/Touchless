@@ -1,9 +1,24 @@
 from __future__ import annotations
 
 import json
+import threading as _threading
+import time as _time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# v1.1.9.2 (r17): single-process lock around save_config's tmp-write +
+# rename so parallel savers (r49 short-shutter save, overlay-toggle
+# save, spotify-first-active save, Save Changes UI dispatch, ...) can
+# race on `settings.json` without hitting WinError 32 on the rename.
+# Dad's r16 log at 10:49:26 + 10:51:12 showed the raw save_config
+# raising PermissionError from a "hgr-save-config-overlay" thread —
+# two writers landed the tmp within a few tens of ms, and Windows'
+# post-close AV scan held the handle past the second writer's replace.
+# Single lock, per-writer tmp suffix, 3x retry with backoff around the
+# rename covers all three failure modes (co-writer, AV handle-hold,
+# transient IO).
+_SAVE_CONFIG_LOCK = _threading.Lock()
 
 APP_NAME = "Touchless"
 CONFIG_DIR = Path.home() / ".touchless"
@@ -203,6 +218,30 @@ class AppConfig:
     # it while the engine is running starts/stops the cache in-place
     # via _apply_general_runtime_changes.
     clip_cache_enabled: bool = True
+    # r20: set once, the first time the app resolves a clip-cache
+    # default for this machine. The always-on recorder hands ffmpeg a
+    # full-desktop BGRA frame 20 times a second; on a large desktop
+    # driven by a small GPU that costs more CPU than the gesture
+    # pipeline can spare, so the default is seeded off there. The
+    # latch means the app decides at most once and never overrides a
+    # choice the user has made since.
+    clip_cache_default_seeded: bool = False
+    # r20d: why the seeding above turned the recorder off, in the user's
+    # terms. Persisted rather than held in memory because the Settings
+    # panel is built during startup, BEFORE the seeding runs, so an
+    # in-memory reason could never reach the tooltip on any launch.
+    # Empty means the app did not turn it off.
+    clip_cache_seeded_off_note: str = ""
+    # r20: cached answer from MainWindow._detect_ffmpeg_capabilities.
+    # That probe spawns eight ffmpeg.exe processes on the GUI thread at
+    # every launch -- about 2.6 s on the dev rig, ~10 s on an older
+    # machine running Norton, which also means eight fresh antivirus
+    # evaluations each time. The answer only changes when the GPU, its
+    # driver, or the bundled ffmpeg binary changes, and the key
+    # fingerprints exactly those. A key mismatch, an empty key, or a
+    # runtime encoder demotion forces one full re-probe next launch.
+    ffmpeg_caps_cache_key: str = ""
+    ffmpeg_caps_cache: Dict[str, object] = field(default_factory=dict)
     # User's own Spotify Developer client_id. Optional — when empty,
     # Touchless uses its embedded default client_id which is capped
     # at 5 testers by Spotify's developer policy (Spotify killed the
@@ -606,6 +645,13 @@ class AppConfig:
     # registry write happens through autostart.py, NOT through
     # this field directly -- the field is just a UI baseline.
     auto_start_on_login: bool = False
+    # v1.1.9.2 (r17): opt-out for the in-app "Save debug bundle before
+    # closing?" prompt that fires on every clean close of Touchless.
+    # Default False = prompt every close (user asked for this UX). The
+    # dialog's "Don't ask again" checkbox flips this True; Settings
+    # exposes a "Ask to save debug bundle when Touchless closes"
+    # checkbox that reverses it.
+    skip_debug_bundle_prompt_on_close: bool = False
     drawings_save_dir: str = field(default_factory=lambda: str(default_save_directory("drawings")))
     screenshots_save_dir: str = field(default_factory=lambda: str(default_save_directory("screenshots")))
     screen_recordings_save_dir: str = field(default_factory=lambda: str(default_save_directory("screen_recordings")))
@@ -725,6 +771,40 @@ class AppConfig:
     # generic UVC won't have the classifier silently re-enable it.
     # Default False; UI toggle handler sets this to True.
     camera_force_short_shutter_user_chose: bool = False
+    # r55 (v1.1.9.2 r18): explicit "we wrote CAP_PROP_EXPOSURE=-6 to
+    # THIS camera" marker, persisted by the two short-shutter ON writers
+    # (r49 apply in _apply_default_capture_tuning, ffmpeg preflight).
+    # Format "<index>|<lower-cased friendly name>"; "" = nothing latched.
+    # On a later launch where short shutter is OFF the engine undoes
+    # the UVC-level latch on a THROWAWAY cap before its reader thread
+    # exists (GestureWorker._r55_restore_before_open) and clears this
+    # only after a verified readback. Deliberately NOT derived from
+    # camera_force_short_shutter_user_chose (PERFORMANCE_CHECKPOINT §3.3
+    # / §3.8 / §3.9).
+    camera_short_shutter_latched_for: str = ""
+    # r55: launches that tried and failed to verify the restore above.
+    # Bounded so an opaque driver never costs a throwaway open forever.
+    camera_short_shutter_restore_attempts: int = 0
+    # r20: per-camera memory of HARD ffmpeg-MJPG capture failures, keyed
+    # "<lower-cased dshow device name>|<w>x<h>" and valued with a strike
+    # count. Two strikes make the app skip the ffmpeg attempt for that
+    # device+size and go straight to the OpenCV cap. Only a genuine
+    # format rejection counts; a silent hang (another process holding
+    # the DirectShow handle) never does, so a momentarily-busy good
+    # camera is never demoted. See hgr.app.camera.ffmpeg_memo, which
+    # holds all of the logic and is pure/testable. Kill switch:
+    # HGR_FFMPEG_MEMO=0. Deliberately NOT derived from any user toggle
+    # (PERFORMANCE_CHECKPOINT 3.3 / 3.8 / 3.9) -- written only from an
+    # observed failure.
+    camera_ffmpeg_hard_failures: Dict[str, int] = field(default_factory=dict)
+    # r21: what each camera says it can do, learned once with a single
+    # `ffmpeg -list_options` call and then reused forever. Keyed by the
+    # lower-cased DirectShow device name. This is what lets mode
+    # switching be instant: instead of discovering a camera's limits by
+    # failing at 60 fps and then at 30, we ask the driver up front and
+    # open exactly what it advertises. An entry also records the app
+    # build that probed it, so a new ffmpeg earns one fresh look.
+    camera_capabilities: Dict[str, object] = field(default_factory=dict)
     # r50: cameras (by lower-cased display_name) for which the
     # short-shutter classifier's first-fire acknowledgement pill has
     # already shown. Kept narrow -- just a set of name strings, NOT a
@@ -846,6 +926,16 @@ class AppConfig:
     # never repeats; the user can still connect later via the
     # button at the bottom of the Instructions panel.
     spotify_first_active_prompt_shown: bool = False
+    # v1.1.9.2 (r8): epoch seconds when the user last clicked "Don't
+    # Allow" on the first-active connect prompt. Used to enforce a
+    # 24 h persistent cooldown so the modal never re-fires on the
+    # very next launch — the existing "auth missing → clear latch"
+    # logic in _maybe_show_spotify_first_active_prompt would
+    # otherwise clear spotify_first_active_prompt_shown and let the
+    # modal re-fire (which combined with the debug-frame trigger was
+    # the spam pattern the user reported). Reset to 0.0 when the
+    # user manually opens the Spotify setup wizard.
+    spotify_first_prompt_declined_at: float = 0.0
     # General-tab overlay toggles. Default On for the visible
     # surfaces (camera view + popups) so first-time users see the
     # full app; Off for the gaming auto-disable knobs since they're
@@ -1219,30 +1309,55 @@ def save_config(config: AppConfig) -> None:
     import os as _os
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(asdict(config), indent=2)
-    tmp_path = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
+    # v1.1.9.2 (r17): per-writer tmp so a crashed writer only orphans
+    # its own tmp, not the shared "settings.json.tmp". Combined with
+    # the module-level _SAVE_CONFIG_LOCK below, this also lets two
+    # co-writers each finish their fsync without stepping on the
+    # other's file.
     try:
-        # Write the full payload + flush + fsync the temp file before
-        # the rename, so a power-loss between write and rename leaves
-        # either old-or-new on disk, never a partial temp.
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-            fh.flush()
-            try:
-                _os.fsync(fh.fileno())
-            except (OSError, AttributeError):
-                # fsync isn't available on some Windows configs (rare);
-                # the rename below still provides atomicity vs. concurrent
-                # readers, and the write_text-style hazard is closed.
-                pass
-        _os.replace(tmp_path, CONFIG_PATH)
+        _tag = f".{_os.getpid()}.{_threading.get_ident()}"
     except Exception:
-        # Best-effort: if rename failed, drop the temp so it doesn't
-        # confuse the next save attempt.
+        _tag = ""
+    tmp_path = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + _tag + ".tmp")
+    with _SAVE_CONFIG_LOCK:
         try:
-            if tmp_path.exists():
-                tmp_path.unlink()
+            # Write the full payload + flush + fsync the temp file before
+            # the rename, so a power-loss between write and rename leaves
+            # either old-or-new on disk, never a partial temp.
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                try:
+                    _os.fsync(fh.fileno())
+                except (OSError, AttributeError):
+                    # fsync isn't available on some Windows configs (rare);
+                    # the rename below still provides atomicity vs. concurrent
+                    # readers, and the write_text-style hazard is closed.
+                    pass
+            # 3x retry around the atomic rename to survive the AV
+            # scan-window on Windows: real-time protection may still
+            # hold a handle on the just-closed tmp for ~100 ms after
+            # fsync returns. Without this loop the raw PermissionError
+            # (WinError 32) surfaces to the caller and the save is lost.
+            _last_exc: Exception | None = None
+            for _attempt in range(3):
+                try:
+                    _os.replace(tmp_path, CONFIG_PATH)
+                    _last_exc = None
+                    break
+                except PermissionError as _e:
+                    _last_exc = _e
+                    _time.sleep(0.1)
+            if _last_exc is not None:
+                raise _last_exc
         except Exception:
-            pass
-        raise
+            # Best-effort: if rename failed, drop the temp so it doesn't
+            # confuse the next save attempt.
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            raise
 
 # Author: Konstantin Markov

@@ -7,6 +7,8 @@ import socket
 import subprocess
 import sys
 import threading
+
+from ..utils.subprocess_utils import hidden_subprocess_kwargs
 import time
 import urllib.error
 import urllib.request
@@ -108,7 +110,7 @@ def _detect_nvidia_gpu() -> bool:
             timeout=4.0,
             encoding="utf-8",
             errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            **hidden_subprocess_kwargs(),
         )
     except (subprocess.SubprocessError, OSError):
         return False
@@ -127,7 +129,7 @@ def _detect_vulkan() -> bool:
             timeout=4.0,
             encoding="utf-8",
             errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            **hidden_subprocess_kwargs(),
         )
     except (subprocess.SubprocessError, OSError):
         return False
@@ -261,7 +263,6 @@ class LlamaServer:
             ]
             if self._backend in {"cuda", "vulkan"}:
                 args.extend(["-ngl", str(self._gpu_layers)])
-            creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             try:
                 self._process = subprocess.Popen(
                     args,
@@ -272,7 +273,7 @@ class LlamaServer:
                     encoding="utf-8",
                     errors="replace",
                     bufsize=1,
-                    creationflags=creation_flags,
+                    **hidden_subprocess_kwargs(),
                 )
             except OSError as exc:
                 self._message = f"failed to launch llama-server: {exc}"

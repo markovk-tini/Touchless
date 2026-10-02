@@ -157,4 +157,56 @@ def make_pose(name: str, *, rotation_degrees: float = 0.0, spread: str = 'normal
         params['spread'] = spread
     return make_landmarks(**params)
 
+
+def seed_worker_defaults(worker) -> int:
+    r"""Give a `GestureWorker.__new__` stub the constant defaults `__init__`
+    would have set. Returns how many were added.
+
+    Tests build the worker with `GestureWorker.__new__(GestureWorker)`
+    because `__init__` needs a Qt application, then hand-seed the handful
+    of attributes the method under test touches. That list silently goes
+    stale: production grows one more `self._x` read, and the case dies with
+    `AttributeError` instead of testing anything. `test_low_fps_mode` sat
+    red that way through several rounds while looking like a real failure.
+
+    So read the defaults from the source of truth. Every `self.X = <lit>`
+    and `self.X: T = <lit>` in `__init__` whose value is a literal gets
+    copied across -- the annotated form matters, because that is exactly
+    how `_open_action_last_diag_label` is declared, and an `\s*=` grep
+    misses it.
+
+    Attributes the caller already set are left alone, so an explicit
+    fixture value always wins over the production default. Only literals
+    are copied: anything built by a call (Qt objects, locks, deques) is
+    skipped, so this cannot accidentally construct machinery a unit test
+    did not ask for.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from hgr.app.integration.noop_engine import GestureWorker
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(GestureWorker.__init__)))
+    added = 0
+    for node in ast.walk(tree):
+        target = value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        if not isinstance(target, ast.Attribute):
+            continue
+        if not (isinstance(target.value, ast.Name) and target.value.id == "self"):
+            continue
+        try:
+            literal = ast.literal_eval(value)
+        except (ValueError, TypeError, SyntaxError):
+            continue          # not a literal -- leave it to the fixture
+        if not hasattr(worker, target.attr):
+            setattr(worker, target.attr, literal)
+            added += 1
+    return added
+
+
 # Author: Konstantin Markov

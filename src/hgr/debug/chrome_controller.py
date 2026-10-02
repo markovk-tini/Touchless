@@ -49,6 +49,7 @@ class ChromeController:
         self._executable_paths = executable_paths or self._default_executable_paths()
         self._handles_cache: list[int] = []
         self._handles_cache_until = 0.0
+        self._handles_refresh_in_flight = False
 
     @property
     def available(self) -> bool:
@@ -95,7 +96,7 @@ class ChromeController:
             self._message = "chrome already focused"
             return True
 
-        handles = self._chrome_window_handles()
+        handles = self._chrome_window_handles(refresh=True)
         launched_fresh = False
         if not handles:
             if not self.launch_chrome():
@@ -450,12 +451,46 @@ class ChromeController:
             return None
         return int(foreground) if foreground else None
 
-    def _chrome_window_handles(self) -> list[int]:
+    def _chrome_window_handles(self, *, refresh: bool = False) -> list[int]:
         if not self._available:
             return []
         now = time.monotonic()
-        if now < self._handles_cache_until:
+        if not refresh and now < self._handles_cache_until:
             return list(self._handles_cache)
+        if not refresh:
+            # Camera-tick callers (debug payload, gesture gates) used
+            # to block 50-200 ms on process_iter + EnumWindows every TTL
+            # miss — a split-second freeze about every 5 s while a
+            # hand is tracked. Keep the last answer and refresh off
+            # this thread. Launch / focus paths pass refresh=True.
+            self._schedule_handles_refresh()
+            return list(self._handles_cache)
+        handles = self._scan_chrome_window_handles()
+        self._handles_cache = list(handles)
+        self._handles_cache_until = time.monotonic() + 5.0
+        return handles
+
+    def _schedule_handles_refresh(self) -> None:
+        if self._handles_refresh_in_flight:
+            return
+        self._handles_refresh_in_flight = True
+        self._handles_cache_until = time.monotonic() + 5.0
+
+        def _worker() -> None:
+            try:
+                handles = self._scan_chrome_window_handles()
+                self._handles_cache = list(handles)
+            except Exception:
+                pass
+            finally:
+                self._handles_refresh_in_flight = False
+                self._handles_cache_until = time.monotonic() + 5.0
+
+        threading.Thread(
+            target=_worker, daemon=True, name="chrome-hwnd-scan"
+        ).start()
+
+    def _scan_chrome_window_handles(self) -> list[int]:
         try:
             chrome_pids = {
                 int(proc.info["pid"])
@@ -465,8 +500,6 @@ class ChromeController:
         except Exception:
             chrome_pids = set()
         if not chrome_pids:
-            self._handles_cache = []
-            self._handles_cache_until = now + 5.0
             return []
 
         user32 = ctypes.windll.user32
@@ -489,12 +522,7 @@ class ChromeController:
         try:
             user32.EnumWindows(_enum_windows, 0)
         except Exception:
-            handles = []
-        self._handles_cache = list(handles)
-        # r42: raised TTL 1.0s -> 5.0s so opening a new app (Spotify
-        # etc.) that adds ~10-20 processes doesn't force a hot-path
-        # frame to run psutil.process_iter + EnumWindows every second.
-        self._handles_cache_until = now + 5.0
+            return []
         return handles
 
     def _invalidate_handles_cache(self) -> None:
@@ -538,10 +566,10 @@ class ChromeController:
 
     def _wait_for_window_handles(self, timeout_seconds: float = 4.0) -> list[int]:
         deadline = time.monotonic() + timeout_seconds
-        handles = self._chrome_window_handles()
+        handles = self._chrome_window_handles(refresh=True)
         while not handles and time.monotonic() < deadline:
             time.sleep(0.2)
-            handles = self._chrome_window_handles()
+            handles = self._chrome_window_handles(refresh=True)
         return handles
 
     def _activate_window_handle(self, hwnd: int) -> bool:

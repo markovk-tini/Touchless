@@ -11,7 +11,12 @@ from typing import List, Optional, Tuple
 
 import cv2
 
-from .threaded_cv_capture import ThreadedCvCapture
+from .threaded_cv_capture import (
+    DSHOW_GRAPH_LOCK,
+    ThreadedCvCapture,
+    release_capture_serialised,
+    wait_for_pending_releases,
+)
 
 
 def _cv2_open_with_timeout(
@@ -49,12 +54,52 @@ def _cv2_open_with_timeout(
     the open dance (cap.isOpened(), the read_attempts warmup loop).
     """
     result: list[Optional[cv2.VideoCapture]] = [None]
+    abandoned: list[bool] = [False]
+    state = threading.Lock()  # r18: atomic abandon/hand-over decision
+    lock_busy: list[bool] = [False]
+
+    # r18: never build a new DirectShow graph while a previous capture's
+    # deferred release still owns the device slot (bounded wait).
+    if not wait_for_pending_releases(min(float(timeout_seconds), 5.0)):
+        try:
+            sys.stderr.write(
+                f"[camera_utils] refusing cv2.VideoCapture(index={index}): a previous "
+                f"capture is still releasing\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return None
 
     def _worker() -> None:
+        # r18: construct under the process-wide DirectShow lock so a
+        # concurrent release / rebuild on another thread cannot corrupt
+        # OpenCV's shared videoInput state. The lock wait is BOUNDED so
+        # a worker that the caller abandons never parks the lock for
+        # the driver's 60-120 s. If the caller already gave up, the
+        # late-born capture is released right here (still under the
+        # lock) instead of leaking a second live graph on the slot.
+        if not DSHOW_GRAPH_LOCK.acquire(timeout=float(timeout_seconds)):
+            lock_busy[0] = True
+            return
+        cap = None
         try:
-            result[0] = cv2.VideoCapture(index, backend)
+            if abandoned[0]:
+                return
+            cap = cv2.VideoCapture(index, backend)
+            with state:
+                late = abandoned[0]
+                if not late:
+                    result[0] = cap
+            if late:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
         except Exception:
-            result[0] = None
+            pass
+        finally:
+            DSHOW_GRAPH_LOCK.release()
 
     thread = threading.Thread(
         target=_worker,
@@ -64,6 +109,25 @@ def _cv2_open_with_timeout(
     thread.start()
     thread.join(timeout=float(timeout_seconds))
     if thread.is_alive():
+        with state:
+            abandoned[0] = True
+            leaked = result[0]
+            result[0] = None
+        if leaked is not None:
+            # The constructor actually finished between the join timeout
+            # and the abandon flag: use it rather than leaking it.
+            return leaked
+        if lock_busy[0]:
+            try:
+                sys.stderr.write(
+                    f"[camera_utils] cv2.VideoCapture(index={index}, backend={backend}) "
+                    f"skipped: DirectShow graph lock busy for {timeout_seconds:.1f}s "
+                    f"(another construction/release in flight)\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return None
         try:
             sys.stderr.write(
                 f"[camera_utils] cv2.VideoCapture(index={index}, backend={backend}) "
@@ -207,7 +271,7 @@ def try_open_camera(
             return None
         if not cap.isOpened():
             try:
-                cap.release()
+                release_capture_serialised(cap)
             except Exception:
                 pass
             return None
@@ -219,10 +283,154 @@ def try_open_camera(
             time.sleep(read_interval)
 
         try:
-            cap.release()
+            release_capture_serialised(cap)
         except Exception:
             pass
         return None
+
+
+def try_open_msmf_mjpg(
+    index: int,
+    *,
+    width: int,
+    height: int,
+    fps: int = 60,
+    open_timeout_seconds: float = 4.5,
+    read_interval: float = 0.05,
+) -> Optional["ThreadedCvCapture"]:
+    """Open a camera via CAP_MSMF pinned to MJPG at the requested size.
+
+    Uses the 3-arg cv2.VideoCapture(idx, backend, params) constructor
+    (OpenCV 4.5+) to pass FOURCC / frame size / fps BEFORE MSMF's
+    IMFSourceReader negotiates the media type. MSMF ignores post-open
+    cap.set() writes for FOURCC (unlike DShow, which at least accepts
+    the write while silently keeping YUY2), so the params-list is the
+    only API path that actually pins MJPG on this backend.
+
+    Why this exists (v1.1.9.2): user's Kiyo Pro delivers only 30 fps
+    to ffmpeg-DShow at 1280x720 MJPG but 60 fps to Windows Camera via
+    MSMF. Direct ffmpeg command from cmd line confirms the DShow
+    ceiling. MSMF-MJPG through OpenCV's 3-arg constructor is the only
+    Windows path that both bypasses DShow's throttle AND gets the
+    camera-side gamma/AWB post that DShow raw YUY2 skips (which is
+    also what makes Default-mode look dim vs the Windows Camera app).
+
+    Returns a ThreadedCvCapture wrapping the opened cv2.VideoCapture,
+    or None if construction failed or no frame arrived within the
+    open_timeout_seconds budget. Callers should fall through to the
+    ffmpeg-DShow / OpenCV-DShow path on None.
+    """
+    def _diag(msg: str) -> None:
+        try:
+            sys.stderr.write(f"[msmf-mjpg-diag] {msg}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    if not sys.platform.startswith("win"):
+        _diag("non-windows platform — skip")
+        return None
+    msmf = getattr(cv2, "CAP_MSMF", None)
+    if msmf is None:
+        _diag("cv2.CAP_MSMF unavailable in this OpenCV build")
+        return None
+    try:
+        params = [
+            int(cv2.CAP_PROP_FOURCC), int(cv2.VideoWriter_fourcc(*"MJPG")),
+            int(cv2.CAP_PROP_FRAME_WIDTH), int(width),
+            int(cv2.CAP_PROP_FRAME_HEIGHT), int(height),
+            int(cv2.CAP_PROP_FPS), int(fps),
+        ]
+    except Exception as exc:
+        _diag(f"params-list build failed: {exc!r}")
+        return None
+    _diag(
+        f"attempting cv2.VideoCapture(idx={index}, CAP_MSMF, params) — "
+        f"target {width}x{height}@{fps}fps MJPG"
+    )
+    with _quiet_opencv_probe():
+        _t0 = time.monotonic()
+        try:
+            if not DSHOW_GRAPH_LOCK.acquire(timeout=6.0):
+                return None
+            try:
+                cap = cv2.VideoCapture(int(index), int(msmf), params)
+            finally:
+                DSHOW_GRAPH_LOCK.release()
+        except Exception as exc:
+            _diag(f"VideoCapture constructor threw: {exc!r}")
+            return None
+        _construct_ms = (time.monotonic() - _t0) * 1000.0
+        if cap is None:
+            _diag(f"VideoCapture returned None after {_construct_ms:.0f}ms")
+            return None
+        if not cap.isOpened():
+            _diag(
+                f"cap.isOpened()==False after constructor ({_construct_ms:.0f}ms) "
+                "— MSMF media-type negotiation likely rejected MJPG"
+            )
+            try:
+                release_capture_serialised(cap)
+            except Exception:
+                pass
+            return None
+        # Log what backend actually reports the frame size / FOURCC as —
+        # MSMF may silently keep NV12 even after MJPG in the params-list.
+        try:
+            _rw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            _rh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            _rf = cap.get(cv2.CAP_PROP_FPS)
+            _rc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
+            _rc_str = "".join(chr((_rc_int >> (8 * i)) & 0xFF) for i in range(4))
+        except Exception:
+            _rw = _rh = 0
+            _rf = 0.0
+            _rc_str = "?"
+        _diag(
+            f"cap opened in {_construct_ms:.0f}ms, driver reports "
+            f"{_rw}x{_rh} @ {_rf:.1f}fps fourcc={_rc_str!r}"
+        )
+        # First-frame verify. MSMF can return isOpened()=True on a cap
+        # that never actually delivers frames (media-type negotiation
+        # succeeded but the source is stuck). Bounded 4.5 s covers the
+        # documented 2-4 s IMFSourceReader cold-start without letting a
+        # genuinely broken open hang the mode swap.
+        deadline = time.monotonic() + float(open_timeout_seconds)
+        first_ok = False
+        _read_attempts = 0
+        _last_exc = None
+        while time.monotonic() < deadline:
+            try:
+                ok, _frame = cap.read()
+            except Exception as exc:
+                ok = False
+                _last_exc = exc
+            _read_attempts += 1
+            if ok:
+                first_ok = True
+                break
+            time.sleep(float(read_interval))
+        _read_ms = (time.monotonic() - _t0) * 1000.0
+        if not first_ok:
+            _diag(
+                f"no first frame in {_read_ms:.0f}ms after "
+                f"{_read_attempts} read attempts "
+                f"(last exc: {_last_exc!r})"
+            )
+            try:
+                release_capture_serialised(cap)
+            except Exception:
+                pass
+            return None
+        try:
+            sys.stderr.write(
+                f"[msmf-mjpg] opened idx={index} at {_rw}x{_rh}@{_rf:.1f}fps "
+                f"fourcc={_rc_str!r} (MSMF, total {_read_ms:.0f}ms)\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return ThreadedCvCapture(cap)
 
 
 def request_camera_access_main_thread(max_index: int = 4) -> tuple[bool, str]:
@@ -233,7 +441,7 @@ def request_camera_access_main_thread(max_index: int = 4) -> tuple[bool, str]:
     for backend in _backend_candidates():
         cap = try_open_camera(0, backend, read_attempts=12)
         if cap is not None:
-            cap.release()
+            release_capture_serialised(cap)
             return True, "Camera access confirmed on camera 0."
 
     return False, (
@@ -399,7 +607,7 @@ def list_available_cameras(max_index: int = 8) -> List[CameraInfo]:
             cap = try_open_camera(index, backend)
             if cap is None:
                 continue
-            cap.release()
+            release_capture_serialised(cap)
             # Prefer Qt's friendly device name at the matching index (e.g.
             # "Iriun Webcam"), and only fall back to "Camera N (Backend)"
             # when Qt either couldn't enumerate or returned fewer entries.
@@ -450,7 +658,11 @@ def list_available_cameras(max_index: int = 8) -> List[CameraInfo]:
         dshow_devices: list[str] = []
         try:
             from .ffmpeg_capture import list_dshow_video_devices
-            dshow_devices = list_dshow_video_devices()
+            # r20: ground truth, not the short-lived cache. This path
+            # runs when the normal probe found nothing, and the caller
+            # maps the camera index POSITIONALLY into this list -- a
+            # stale list after a replug would open the wrong device.
+            dshow_devices = list_dshow_video_devices(use_cache=False)
         except Exception as _exc:
             try:
                 _sys.stderr.write(
@@ -535,6 +747,20 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
     else:
         backends_to_try = _backend_candidates()
         eos_attempts = cold_start_attempts
+    # r20: keep the real device label on the CameraInfo we hand back.
+    # The short-shutter classifier (classify_camera_shutter_hint) and the
+    # r55 cross-session marker are both keyed on this name, and
+    # "Camera N (DirectShow)" matches nothing in either keyword list --
+    # so on a generic UVC webcam the classifier that exists precisely for
+    # that camera has been returning None and the -6/Manual exposure latch
+    # was never un-stuck. Qt already enumerated these names for
+    # _is_eos_camera_at_index below, so this costs nothing new. Falls back
+    # to the old string whenever Qt cannot enumerate.
+    try:
+        _qt_names = _qt_video_device_names()
+    except Exception:
+        _qt_names = []
+    _friendly = _qt_names[index] if 0 <= index < len(_qt_names) else ""
     for backend in backends_to_try:
         cap = try_open_camera(index, backend, read_attempts=eos_attempts)
         if cap is not None:
@@ -542,7 +768,12 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
                 index=index,
                 backend=backend,
                 backend_name=backend_name(backend),
-                display_name=f"Camera {index} ({backend_name(backend)})",
+                # The "(Camera N)" suffix is the shape
+                # resolve_dshow_device_for_index already strips.
+                display_name=(
+                    f"{_friendly} (Camera {index})" if _friendly
+                    else f"Camera {index} ({backend_name(backend)})"
+                ),
             )
             # Wrap the synchronous cv2.VideoCapture in a reader-thread
             # shim. The wrapper does two things:
@@ -588,16 +819,12 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
             if device_name:
                 try:
                     from .ffmpeg_capture import open_ffmpeg_cap_with_fps_fallback
-                    # C27: 640x480 to match Default's OpenCV cap res.
-                    # Higher res introduced a persistent 1-2 s live-
-                    # viewer lag through the frame-copy pipeline.
-                    # v1.1.7.1: luma_min_threshold=50 auto-downshifts
-                    # 60→30 fps when the driver responds to the higher
-                    # rate by cutting shutter below usable brightness
-                    # (HP HD Camera and similar built-in webcams that
-                    # can't sustain 60 fps in indoor lighting).
+                    # Same 1280x720 pin as GPU ffmpeg — 640x480@60 is
+                    # not native on Kiyo Pro and DShow latches ~20 fps.
+                    # luma_min_threshold=50 auto-downshifts 60→30 if
+                    # the driver cuts shutter below usable brightness.
                     ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                        device_name, width=640, height=480,
+                        device_name, width=1280, height=720,
                         luma_min_threshold=50.0,
                     )
                 except Exception:
@@ -626,22 +853,21 @@ def open_camera_by_index(index: int, max_index: int = 8) -> Tuple[Optional[Camer
     if platform.system() == "Windows":
         try:
             from .ffmpeg_capture import list_dshow_video_devices, open_ffmpeg_cap_with_fps_fallback
-            dshow_devices = list_dshow_video_devices()
+            # r20: ground truth, not the short-lived cache. This path
+            # runs when the normal probe found nothing, and the caller
+            # maps the camera index POSITIONALLY into this list -- a
+            # stale list after a replug would open the wrong device.
+            dshow_devices = list_dshow_video_devices(use_cache=False)
         except Exception:
             dshow_devices = []
         if 0 <= index < len(dshow_devices):
             device_name = str(dshow_devices[index] or "").strip()
             if device_name:
                 try:
-                    # C27: 640x480 to match Default's OpenCV cap res.
-                    # Higher res introduced a persistent 1-2 s live-
-                    # viewer lag through the frame-copy pipeline.
-                    # v1.1.7.1: luma_min_threshold=50 auto-downshifts
-                    # 60→30 fps if the driver responds by cutting
-                    # shutter too aggressively (see camera_utils.py
-                    # EOS path for the full rationale).
+                    # Same 1280x720 pin as GPU ffmpeg — 640x480@60 is
+                    # not native on Kiyo Pro and DShow latches ~20 fps.
                     ffmpeg_cap = open_ffmpeg_cap_with_fps_fallback(
-                        device_name, width=640, height=480,
+                        device_name, width=1280, height=720,
                         luma_min_threshold=50.0,
                     )
                 except Exception:
@@ -669,6 +895,9 @@ def try_open_camera_url(url: str, read_attempts: int = 12) -> Optional[cv2.Video
     if not clean:
         return None
     with _quiet_opencv_probe():
+        # r18 review: URL captures resolve to FFMPEG/MSMF; CAP_DSHOW is
+        # index-only and never touches g_VI. This constructor can block
+        # up to OpenCV's 30 s open timeout - do not hold the graph lock.
         try:
             cap = cv2.VideoCapture(clean)
         except Exception:
@@ -686,7 +915,7 @@ def try_open_camera_url(url: str, read_attempts: int = 12) -> Optional[cv2.Video
                 # responsive while the open path succeeds.
                 return cap
             time.sleep(0.08)
-        cap.release()
+        release_capture_serialised(cap)
         return None
 
 

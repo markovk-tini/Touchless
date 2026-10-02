@@ -612,6 +612,19 @@ class Updater(QObject):
             from PySide6.QtWidgets import QApplication
             app = QApplication.instance()
             if app is not None:
+                # v1.1.9.2 (r18): Qt 6 quit() delivers closeEvent to the
+                # main window, which (r17) shows the "Save debug bundle?"
+                # prompt. During an update apply that prompt would sit
+                # under the 1.5 s os._exit below and die mid-dialog, so
+                # suppress it in memory for this quit only.
+                try:
+                    for w in app.topLevelWidgets():
+                        try:
+                            w._suppress_debug_bundle_prompt = True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 app.quit()
                 # Give Qt a moment to flush; if it doesn't exit
                 # within 1.5s, force it.

@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import sys
 import threading
+
+from ..utils.subprocess_utils import hidden_subprocess_kwargs
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -619,7 +621,7 @@ def _detect_nvidia_gpu() -> bool:
             timeout=4.0,
             encoding="utf-8",
             errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            **hidden_subprocess_kwargs(),
         )
     except (subprocess.SubprocessError, OSError):
         return False
@@ -638,7 +640,7 @@ def _detect_vulkan() -> bool:
             timeout=4.0,
             encoding="utf-8",
             errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            **hidden_subprocess_kwargs(),
         )
     except (subprocess.SubprocessError, OSError):
         return False

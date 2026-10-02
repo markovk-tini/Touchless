@@ -34,67 +34,29 @@ import csv
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+
+from hgr.app.ui.main_window import MainWindow
 
 
-# ---------- Replica of _parse_ffmpeg_clip_audio_manifest ----------
 
 def parse_audio_manifest(list_path: Path, cache_dir: Path) -> list[dict]:
-    """1-to-1 algorithmic copy of MainWindow._parse_ffmpeg_clip_audio_manifest
-    so the probe runs without importing the heavy app module."""
-    if not list_path.exists():
-        return []
-    entries: list[dict] = []
-    with list_path.open("r", newline="", encoding="utf-8") as handle:
-        reader = csv.reader(handle)
-        for row in reader:
-            if len(row) < 3:
-                continue
-            raw_path = (row[0] or "").strip()
-            try:
-                start_time = float(row[1])
-                end_time = float(row[2])
-            except Exception:
-                continue
-            path = Path(raw_path)
-            if not path.is_absolute():
-                path = cache_dir / path
-            if not path.exists() or path.stat().st_size <= 0:
-                continue
-            try:
-                wall_end_mtime = float(path.stat().st_mtime)
-            except Exception:
-                wall_end_mtime = 0.0
-            file_duration = max(0.0, end_time - start_time)
-            entries.append({
-                "path": path,
-                "start_time": start_time,
-                "end_time": end_time,
-                "file_duration": file_duration,
-                "wall_end_mtime": wall_end_mtime,
-                "wall_start_mtime": (
-                    wall_end_mtime - file_duration
-                    if wall_end_mtime > 0 else 0.0
-                ),
-            })
-    latest_by_path: dict[str, dict] = {}
-    for entry in entries:
-        key = str(entry["path"])
-        prior = latest_by_path.get(key)
-        if prior is None or entry["end_time"] > prior["end_time"]:
-            latest_by_path[key] = entry
-    ordered = sorted(latest_by_path.values(), key=lambda e: e["end_time"])
-    prev_wall_end = 0.0
-    for entry in ordered:
-        wall_end = float(entry.get("wall_end_mtime", 0.0) or 0.0)
-        file_duration = float(entry.get("file_duration", 0.0) or 0.0)
-        if wall_end <= 0:
-            continue
-        if prev_wall_end > 0:
-            entry["wall_start_mtime"] = prev_wall_end
-        else:
-            entry["wall_start_mtime"] = wall_end - file_duration
-        prev_wall_end = wall_end
-    return ordered
+    """Call the SHIPPED parser, `MainWindow._parse_ffmpeg_clip_audio_manifest_at`.
+
+    This used to be a 1-to-1 algorithmic copy, justified by not wanting
+    to import the heavy app module. But a copy cannot fail when
+    production changes, so the probe was reporting the replica's
+    behaviour under the shipped parser's name -- and of all files, this
+    is the one whose numbers the clip-audio checkpoint says not to
+    regress. `main_window` imports headless (five other test modules
+    already do it), so the copy bought nothing.
+
+    The method touches `self` only for `_clip_cache_dir()`, used to
+    resolve relative manifest rows, so an unbound call with a stub is
+    the entire adapter.
+    """
+    stub = SimpleNamespace(_clip_cache_dir=lambda: cache_dir)
+    return MainWindow._parse_ffmpeg_clip_audio_manifest_at(stub, list_path)
 
 
 # ---------- Synthetic-scenario builder ----------
@@ -188,7 +150,31 @@ def run_scenario(
         # Compute expected wall_starts from the scenario parameters
         # and compare to what the parser produced.
         errors = []
-        for entry in parsed:
+        # Two tolerances, not one flat 0.5 s, because the parser has two
+        # genuinely different cases and the old flat bound tested neither
+        # of them well.
+        #
+        # The FIRST entry in wall order is the only one that cannot chain
+        # off a real mtime, so production falls back to
+        # `wall_end - file_duration` with `file_duration` taken from the
+        # CSV -- a NOMINAL 10 s. When the capture clock runs slow the real
+        # wall duration is `10 / rate_factor`, so that one entry is off by
+        # exactly `segment_seconds * (1/rate_factor - 1)`: 0.526 s at
+        # rate 0.95. `_parse_ffmpeg_clip_audio_manifest_at` says so in its
+        # own comment ("not perfect ... may be ~5 % longer due to rate
+        # drift, but better than the per-segment-anchor approaches I
+        # tried, which produce ~10 s errors"). The flat 0.5 s bound sat
+        # just under that arithmetic, so the three drift scenarios failed
+        # by 26 ms while reporting nothing production did not intend.
+        #
+        # EVERY LATER entry chains off the previous segment's real mtime,
+        # so its error should be zero, drift or no drift. Holding those to
+        # 0.05 s instead of 0.5 s is what actually guards the design: if
+        # anyone reinstates a per-segment-anchor scheme, the errors go to
+        # ~10 s and every entry after the first goes red.
+        first_entry_tolerance = segment_seconds * (1.0 / rate_factor - 1.0) + 0.05
+        chained_entry_tolerance = 0.05
+        for idx, entry in enumerate(parsed):
             path = entry["path"]
             slot = int(path.stem.split("_")[-1])
             expected_wall_start = real_wall_start_for_slot_last_write(
@@ -204,7 +190,9 @@ def run_scenario(
             entry["_expected_wall_start"] = expected_wall_start
             entry["_actual_wall_start"] = actual_wall_start
             entry["_error_seconds"] = err
-            if abs(err) > 0.5:  # half-second tolerance
+            tolerance = first_entry_tolerance if idx == 0 else chained_entry_tolerance
+            entry["_tolerance_seconds"] = tolerance
+            if abs(err) > tolerance:
                 errors.append((path.name, err, expected_wall_start, actual_wall_start))
         # Simulate the export's window-selection for 60 s / 2 m / 5 m
         # clips ending at "now" (cache_started_wall + elapsed_wall).
@@ -226,7 +214,21 @@ def run_scenario(
                 # actual clip output is clamped to clip_seconds).
                 full_span = last["wall_end_mtime"] - first["wall_start_mtime"]
                 covered = min(full_span, float(clip_seconds))
-                expected_min_coverage = min(clip_seconds, elapsed_wall) * 0.95
+                # Only CLOSED segments are in the manifest: at any moment
+                # one segment is still filling and has no CSV row, so the
+                # newest content available to an export is up to one whole
+                # segment old. At rate 1.0 with a 600 s session that is
+                # invisible (600 / 10 divides exactly, so the last segment
+                # closes right at "now"), which is why only the drift
+                # scenarios tripped the old flat `clip_seconds * 0.95`
+                # floor -- a 60 s window over a 5 %-slow clock holds
+                # 52.6 s of closed content, and the floor demanded 57 s.
+                # Subtract the in-flight segment, then keep a 2 % margin
+                # (tighter than the old 5 %).
+                in_flight_seconds = segment_seconds / rate_factor
+                expected_min_coverage = max(
+                    0.0, min(clip_seconds, elapsed_wall) - in_flight_seconds
+                ) * 0.98
                 window_results[clip_seconds] = {
                     "n_selected": len(selected),
                     "first_wall_start": first["wall_start_mtime"] - cache_started_wall,
@@ -243,6 +245,8 @@ def run_scenario(
             "rate_factor": rate_factor,
             "n_segments_parsed": len(parsed),
             "max_chain_error_seconds": max((abs(e["_error_seconds"]) for e in parsed), default=0.0),
+            "first_entry_tolerance_seconds": first_entry_tolerance,
+            "chained_entry_tolerance_seconds": chained_entry_tolerance,
             "errors": errors,
             "window_results": window_results,
         }
@@ -284,7 +288,9 @@ def test_audio_manifest_wrap_scenarios():
                 print(f"      {fname}: error={err:+.3f}s (expected={exp:.3f}, got={act:.3f})")
             overall_failures.append(name)
         else:
-            print(f"  [ok] chain consistent (all entries within 0.5s tolerance)")
+            print(f"  [ok] chain consistent (first entry within "
+                  f"{result['first_entry_tolerance_seconds']:.3f}s, chained "
+                  f"within {result['chained_entry_tolerance_seconds']:.3f}s)")
         # Window-selection failures
         for clip_s, info in result["window_results"].items():
             if not info["coverage_ok"] and clip_s <= int(elapsed * 0.95):

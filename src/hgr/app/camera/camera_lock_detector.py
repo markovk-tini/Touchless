@@ -27,6 +27,8 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
+from ...utils.subprocess_utils import hidden_subprocess_kwargs
+
 
 # Known camera-holding processes. Names matched against `tasklist`
 # image name (case-insensitive). Grouped by publisher so the
@@ -98,7 +100,7 @@ def _enumerate_running_processes() -> list[tuple[int, str]]:
             ["tasklist", "/fo", "csv", "/nh"],
             stderr=subprocess.DEVNULL,
             timeout=4.0,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **hidden_subprocess_kwargs(),
         )
     except (subprocess.SubprocessError, OSError):
         return []
@@ -198,7 +200,7 @@ def close_processes(processes: list[HoldingProcess]) -> tuple[int, int, list[str
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=4.0,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                **hidden_subprocess_kwargs(),
             )
             killed += 1
         except subprocess.CalledProcessError:

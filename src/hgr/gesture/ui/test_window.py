@@ -2372,10 +2372,10 @@ class GestureTestWindow(QMainWindow):
                 "mode": "selection",
                 "success": False,
                 "target": "voice",
-                "heard_text": str(number),
+                "heard_text": str(selection_key),
                 "control_text": f"command failed: {type(exc).__name__}",
                 "info_text": "-",
-                "display_text": str(number),
+                "display_text": str(selection_key),
             }))
             return
         self._voice_queue.put((self._voice_request_id, {

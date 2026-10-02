@@ -120,6 +120,7 @@ class SpotifyController:
         self._executable_paths = executable_paths or self._default_executable_paths()
         self._handles_cache: list[int] = []
         self._handles_cache_until = 0.0
+        self._handles_refresh_in_flight = False
         self._launch_in_flight = False
         self._launch_lock = threading.Lock()
         # Cache the "is an active Spotify device available?" answer
@@ -193,8 +194,20 @@ class SpotifyController:
         # network, etc.), we silently fall through — the popup gate
         # in main_window._check_spotify_at_startup will notice
         # has_authorization=False and fire the reconnect prompt.
-        try:
-            if self._refresh_token and self._client_id:
+        #
+        # v1.1.9.2: refresh moved off the constructing thread. Was
+        # blocking noop_engine.__init__ (GUI thread) for up to 5 s
+        # + DNS/connect on slow networks — showed up in field logs
+        # as a paint gap at engine build time. urllib_request +
+        # token JSON parse are thread-safe; the only shared state
+        # written is _access_token / _token_issue_time, atomic
+        # references under the GIL. The gesture pipeline treats
+        # _access_token=None as "not yet ready" and falls back to
+        # _refresh_access_token() on demand, so this refresh
+        # racing with an early gesture is fine — it just eats one
+        # 401 retry the same way a cold launch does today.
+        if self._refresh_token and self._client_id:
+            def _startup_refresh() -> None:
                 try:
                     _ok = self._refresh_access_token()
                 except Exception:
@@ -209,8 +222,14 @@ class SpotifyController:
                     _sys.stderr.flush()
                 except Exception:
                     pass
-        except Exception:
-            pass
+            try:
+                threading.Thread(
+                    target=_startup_refresh,
+                    name="spotify-startup-refresh",
+                    daemon=True,
+                ).start()
+            except Exception:
+                pass
 
     @property
     def available(self) -> bool:
@@ -369,7 +388,7 @@ class SpotifyController:
     def _wait_for_spotify_process(self, *, timeout_seconds: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout_seconds)
         while time.monotonic() < deadline:
-            if self._spotify_window_handles():
+            if self._spotify_window_handles(refresh=True):
                 return True
             if self._has_real_spotify_process():
                 return True
@@ -656,7 +675,7 @@ class SpotifyController:
             self._message = "spotify already focused"
             return True
 
-        handles = self._spotify_window_handles()
+        handles = self._spotify_window_handles(refresh=True)
         if handles:
             if self._activate_window_handle(handles[0]):
                 self._message = "spotify focused"
@@ -2179,12 +2198,45 @@ class SpotifyController:
             return None
         return int(foreground) if foreground else None
 
-    def _spotify_window_handles(self) -> list[int]:
+    def _spotify_window_handles(self, *, refresh: bool = False) -> list[int]:
         if not self._available:
             return []
         now = time.monotonic()
-        if now < self._handles_cache_until:
+        if not refresh and now < self._handles_cache_until:
             return list(self._handles_cache)
+        if not refresh:
+            # Same hitch as Chrome: process_iter + EnumWindows on a
+            # cache miss used to freeze the live camera tick ~every
+            # 5 s. Gesture/debug callers keep the last answer; launch
+            # / wait paths pass refresh=True for a blocking scan.
+            self._schedule_handles_refresh()
+            return list(self._handles_cache)
+        handles = self._scan_spotify_window_handles()
+        self._handles_cache = list(handles)
+        self._handles_cache_until = time.monotonic() + 5.0
+        return handles
+
+    def _schedule_handles_refresh(self) -> None:
+        if self._handles_refresh_in_flight:
+            return
+        self._handles_refresh_in_flight = True
+        self._handles_cache_until = time.monotonic() + 5.0
+
+        def _worker() -> None:
+            try:
+                handles = self._scan_spotify_window_handles()
+                self._handles_cache = list(handles)
+            except Exception:
+                pass
+            finally:
+                self._handles_refresh_in_flight = False
+                self._handles_cache_until = time.monotonic() + 5.0
+
+        threading.Thread(
+            target=_worker, daemon=True, name="spotify-hwnd-scan"
+        ).start()
+
+    def _scan_spotify_window_handles(self) -> list[int]:
         try:
             spotify_pids = {
                 int(proc.info["pid"])
@@ -2254,30 +2306,19 @@ class SpotifyController:
         try:
             user32.EnumWindows(_enum_windows, 0)
         except Exception:
-            handles = []
-        self._handles_cache = list(handles)
-        # r42: raised TTL 1.0s -> 5.0s to match chrome/youtube
-        # controllers. Prevents the per-second cache-miss frame from
-        # blocking on psutil.process_iter + EnumWindows when the
-        # process count is inflated (e.g. Spotify's ~10-20 helper
-        # procs on launch pushing chrome_controller's scan cost up).
-        self._handles_cache_until = now + 5.0
+            return []
         return handles
 
     def _wait_for_window_handles(self, timeout_seconds: float = 15.0) -> list[int]:
         # Microsoft Store cold launches resolve the App Execution
         # Alias stub then spin up an AppContainer; on first launch
-        # of a session that can take 5-12s. The 1s cache inside
-        # _spotify_window_handles must be busted between polls or
-        # we'd spend 4-5 of every 5s window getting the same cached
-        # empty list back instead of actually re-enumerating.
+        # of a session that can take 5-12s. Poll with a blocking
+        # refresh so we don't keep reading a stale empty cache.
         deadline = time.monotonic() + timeout_seconds
-        self._handles_cache_until = 0.0
-        handles = self._spotify_window_handles()
+        handles = self._spotify_window_handles(refresh=True)
         while not handles and time.monotonic() < deadline:
             time.sleep(0.5)
-            self._handles_cache_until = 0.0
-            handles = self._spotify_window_handles()
+            handles = self._spotify_window_handles(refresh=True)
         return handles
 
     def _activate_window_handle(self, hwnd: int) -> bool:

@@ -56,14 +56,22 @@ class GestureRecognitionEngine:
         dynamic_recognizer: DynamicGestureRecognizer | None = None,
         stable_frames_required: int = 3,
         low_fps_mode: bool = False,
+        gpu_mode: bool = False,
     ) -> None:
+        # v1.1.9.2 (r9): gpu_mode threads through to the dynamic
+        # recognizer so it can drop swipe floors 15 % against noisier
+        # ONNX/DirectML landmarks.
         self.detector = detector or HandDetector()
         self.static_recognizer = static_recognizer or StaticGestureRecognizer()
-        self.dynamic_recognizer = dynamic_recognizer or DynamicGestureRecognizer(low_fps_mode=low_fps_mode)
+        self.dynamic_recognizer = dynamic_recognizer or DynamicGestureRecognizer(
+            low_fps_mode=low_fps_mode, gpu_mode=gpu_mode,
+        )
         self.stable_frames_required = int(stable_frames_required)
         self._stable_state = _StableLabelState()
         self._secondary_stable_state = _StableLabelState()
-        self._secondary_dynamic_recognizer = DynamicGestureRecognizer(low_fps_mode=low_fps_mode)
+        self._secondary_dynamic_recognizer = DynamicGestureRecognizer(
+            low_fps_mode=low_fps_mode, gpu_mode=gpu_mode,
+        )
         self._frame_index = 0
         self._last_static_scores: Dict[str, float] = {}
         self._last_dynamic_scores: Dict[str, float] = {}

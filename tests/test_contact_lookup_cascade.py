@@ -129,4 +129,45 @@ def test_cascade_helper_signature_present():
     src = (ROOT / "src" / "hgr" / "live_api" / "planner" /
            "orchestrator.py").read_text(encoding="utf-8")
     assert "def _contacts_search_cascade(" in src
-    assert "single.tool == \"contacts_search\"" in src
+
+    # Assert the WIRING, via AST, not the spelling of a local variable.
+    # This used to read `assert 'single.tool == "contacts_search"' in src`
+    # and went red when that local was renamed `single` -> `step`, while the
+    # dispatch it was guarding worked perfectly. A text match on a variable
+    # name pins something the test does not care about.
+    #
+    # What it actually cares about: somewhere there is a branch on
+    # `<something>.tool == "contacts_search"` whose body calls the cascade.
+    import ast
+
+    tree = ast.parse(src)
+
+    def _guards_on_contacts_search(node: ast.If) -> bool:
+        for cmp_node in ast.walk(node.test):
+            if not isinstance(cmp_node, ast.Compare):
+                continue
+            if not (isinstance(cmp_node.left, ast.Attribute)
+                    and cmp_node.left.attr == "tool"):
+                continue
+            for comparator in cmp_node.comparators:
+                if (isinstance(comparator, ast.Constant)
+                        and comparator.value == "contacts_search"):
+                    return True
+        return False
+
+    def _calls_cascade(node: ast.If) -> bool:
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Attribute)
+                    and sub.attr == "_contacts_search_cascade"):
+                return True
+        return False
+
+    dispatched = any(
+        _guards_on_contacts_search(node) and _calls_cascade(node)
+        for node in ast.walk(tree) if isinstance(node, ast.If)
+    )
+    assert dispatched, (
+        "no branch on `.tool == \"contacts_search\"` calls "
+        "`_contacts_search_cascade` -- the cascade exists but nothing "
+        "routes to it"
+    )

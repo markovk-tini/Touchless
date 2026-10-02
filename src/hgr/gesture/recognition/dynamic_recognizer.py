@@ -21,11 +21,20 @@ class MotionSample:
 
 
 class DynamicGestureRecognizer:
-    def __init__(self, *, low_fps_mode: bool = False) -> None:
+    def __init__(self, *, low_fps_mode: bool = False, gpu_mode: bool = False) -> None:
         self.history: Deque[MotionSample] = deque(maxlen=24)
         self._blocked_horizontal_label: str | None = None
         self._blocked_horizontal_until = 0.0
         self.low_fps_mode = bool(low_fps_mode)
+        # v1.1.9.2 (r9): GPU-mode sensitivity boost. ONNX/DirectML
+        # landmarks are systematically noisier in Y and Z than
+        # MediaPipe's — even after r2/r3/r7 equalised every direction
+        # asymmetry in the score formula, users reported swipe_right
+        # (and to a lesser extent swipe_left) remained too strict to
+        # trigger reliably in GPU mode. This flag lowers all Normal-
+        # mode swipe floors ~15 % when the engine is running GPU
+        # inference. Symmetric drop — no direction re-imbalance.
+        self.gpu_mode = bool(gpu_mode)
         # Index-only horizontal swipe for drawing undo/clear. Not
         # exposed as dynamic_label — builtin swipe_left/right are
         # open-hand only so they don't collide with custom "1 swipe".
@@ -138,8 +147,17 @@ class DynamicGestureRecognizer:
         else:
             horizontal_min_duration_gate = clamp01((duration - 0.12) / 0.08)
             horizontal_max_duration_gate = clamp01((0.78 - duration) / 0.30)
-            positive_x_gate = clamp01((positive_x_steps - negative_x_steps - 1.6) / 1.5)
-            negative_x_gate = clamp01((negative_x_steps - positive_x_steps - 1.4) / 1.6)
+            # v1.1.9.2 (r7): equalize the step-count gates. Right used
+            # to need positive_x_steps > negative_x_steps + 1.6, left
+            # only needed +1.4 — the last remaining direction bias in
+            # Normal mode (the score-formula asymmetry was equalized
+            # in r2/r3). Combined with noisier ONNX landmarks in GPU
+            # mode, that ~14% step-count penalty was enough to keep
+            # swipe_right from firing on the same motion that
+            # triggered swipe_left. Both directions now use the more
+            # permissive threshold (delta > 1.4).
+            positive_x_gate = clamp01((positive_x_steps - negative_x_steps - 1.4) / 1.5)
+            negative_x_gate = clamp01((negative_x_steps - positive_x_steps - 1.4) / 1.5)
             horizontal_commit_gate = 1.0
         horizontal_duration_gate = horizontal_min_duration_gate * horizontal_max_duration_gate
 
@@ -159,29 +177,59 @@ class DynamicGestureRecognizer:
             # floors still sit well above Low-FPS's permissive
             # values (0.28/0.27, 0.44/0.40, 0.34/0.32) so idle
             # hand drift still fails the horizontal gates.
-            right_h_floor = 0.50
-            left_h_floor = 0.46
-            speed_floor_r = 0.95
-            speed_floor_l = 0.85
-            path_floor_r = 0.60
-            path_floor_l = 0.58
+            #
+            # v1.1.9.2 (r2): equalize right floors down to the left
+            # values. Every gate here was stricter for right, and in
+            # GPU mode (ONNX landmarks, noisier in Z/Y than MediaPipe)
+            # that pushed swipe_right below threshold while swipe_left
+            # still fired. Symmetric floors let right register on the
+            # same motion as left in every backend. Reversible if left
+            # starts over-firing (revert to 0.50 / 0.95 / 0.60).
+            #
+            # v1.1.9.2 (r9): additional 15 % floor drop when GPU mode
+            # is active. r2's symmetric floors closed the L/R gap on
+            # MediaPipe (Default/Lite), but ONNX/DirectML landmarks
+            # are noisier enough in Z/Y that even the symmetric
+            # thresholds felt too strict on the user's rig. The drop
+            # is symmetric so left and right stay balanced; only the
+            # overall commitment threshold moves. Reverts to Default
+            # floors the moment GPU mode is toggled off.
+            if self.gpu_mode:
+                right_h_floor = 0.39
+                left_h_floor = 0.39
+                speed_floor_r = 0.72
+                speed_floor_l = 0.72
+                path_floor_r = 0.49
+                path_floor_l = 0.49
+            else:
+                right_h_floor = 0.46
+                left_h_floor = 0.46
+                speed_floor_r = 0.85
+                speed_floor_l = 0.85
+                path_floor_r = 0.58
+                path_floor_l = 0.58
 
         def _horizontal_scores(pose_strength: float) -> tuple[float, float]:
+            # v1.1.9.2 (r2): equalize right's vertical/depth penalties
+            # and hard-cutoffs to match left. In ONNX/DirectML (GPU
+            # mode) Z-landmark noise is higher than MediaPipe's, and
+            # the old cutoffs (depth_noise / 0.20 and vertical_noise
+            # / 0.14) tripped right to zero while left still fired.
             right = clamp01(
                 (
                     0.32 * clamp01((horizontal - right_h_floor) / 0.26)
                     + 0.18 * clamp01((path - path_floor_r) / 0.46)
                     + 0.16 * clamp01((peak_horizontal_speed - speed_floor_r) / 0.95)
-                    + 0.14 * clamp01((horizontal - 1.45 * vertical - 0.66 * depth - 0.06) / 0.24)
+                    + 0.14 * clamp01((horizontal - 1.40 * vertical - 0.62 * depth - 0.06) / 0.24)
                     + 0.10 * straightness
-                    + 0.10 * clamp01((0.16 - vertical_noise) / 0.14)
+                    + 0.10 * clamp01((0.16 - vertical_noise) / 0.16)
                 )
                 * (0.28 + 0.72 * pose_strength)
                 * horizontal_duration_gate
                 * horizontal_commit_gate
                 * positive_x_gate
                 * horizontal_axis_gate
-                * clamp01((0.26 - depth_noise) / 0.20)
+                * clamp01((0.28 - depth_noise) / 0.22)
             )
             left = clamp01(
                 (

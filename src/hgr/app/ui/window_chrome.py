@@ -33,7 +33,7 @@ import sys
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFontDatabase
+from PySide6.QtGui import QColor, QFontDatabase, QPalette
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -280,6 +280,37 @@ def touchless_message_box(
 # body_container wrappers can pull the same surface color if they
 # want to match visually.
 _INDIGO_MSG_BG = "#111935"          # dark indigo body, matches app surface
+
+
+def _ensure_frameless(dialog: QWidget) -> None:
+    """Set FramelessWindowHint only when the HWND is not already frameless.
+
+    Changing window flags after Qt has created the native window recreates
+    the HWND. On Windows that can map an empty frame for 1–2 s while the
+    caller does heavy init (MediaPipe Hands). Callers that pass
+    ``Qt.FramelessWindowHint`` to ``QDialog.__init__`` hit the no-op path.
+    """
+    try:
+        if dialog.windowFlags() & Qt.FramelessWindowHint:
+            return
+    except Exception:
+        pass
+    dialog.setWindowFlag(Qt.FramelessWindowHint, True)
+
+
+def _fill_dialog_surface(dialog: QWidget) -> None:
+    """Paint a solid indigo body so a just-mapped HWND is never a clear hole."""
+    try:
+        dialog.setAttribute(Qt.WA_StyledBackground, True)
+        dialog.setAutoFillBackground(True)
+        pal = dialog.palette()
+        pal.setColor(QPalette.Window, QColor(_INDIGO_MSG_BG))
+        pal.setColor(QPalette.Base, QColor(_INDIGO_MSG_BG))
+        dialog.setPalette(pal)
+    except Exception:
+        pass
+
+
 _INDIGO_MSG_BTN = "#1F2D6B"         # button bg, matches title bar
 _INDIGO_MSG_BTN_BORDER = "#2A3B85"  # slightly lighter for definition
 _INDIGO_MSG_BTN_HOVER = "#2A3B85"
@@ -547,7 +578,8 @@ def apply_indigo_title_bar(dialog: QWidget, title_text: str) -> "_IndigoTitleBar
             dialog.setWindowIcon(icon)
         except Exception:
             pass
-    dialog.setWindowFlag(Qt.FramelessWindowHint, True)
+    _ensure_frameless(dialog)
+    _fill_dialog_surface(dialog)
     return _IndigoTitleBar(dialog, title_text)
 
 
@@ -577,7 +609,8 @@ def install_indigo_chrome(dialog: QWidget, title_text: str) -> QWidget:
 
     Renders identically on Windows 10 AND 11 (no DWM dependency).
     """
-    dialog.setWindowFlag(Qt.FramelessWindowHint, True)
+    _ensure_frameless(dialog)
+    _fill_dialog_surface(dialog)
     icon = QApplication.windowIcon()
     if not icon.isNull():
         try:

@@ -48,8 +48,12 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
         "Left Hand Four.png",
         "Face your left palm toward the monitor. Extend the index, middle, ring, and pinky fingers and fold the thumb across the palm. Hold for ~1s.",
     ),
-    # r53: left_fist retired (was Cancel voice/dictation). Left hand
-    # fist gesture no longer surfaced in bindings, guide, or picker.
+    (
+        "left_fist",
+        "Left Hand Fist",
+        "Fist.png",
+        "Face your left palm toward the monitor and close all five fingers into a tight, compact fist. Cancels voice listening, dictation, or a save prompt.",
+    ),
     (
         "right_two",
         "Right Hand Two",
@@ -116,9 +120,9 @@ _GESTURE_BIND_POSES: list[tuple[str, str, str, str]] = [
 # Each action: (action_id, display_label, default_pose_id).
 _GESTURE_BIND_ACTIONS: list[tuple[str, str, str]] = [
     ("voice_command_listen", "Start voice command listening", "left_one"),
+    ("voice_cancel", "Cancel voice command / dictation", "left_fist"),
     # r53: dictation_toggle temporarily removed; left_two now hosts
-    # instant_clip (moved from right_one). voice_cancel row also
-    # removed since its only default (left_fist) is retired.
+    # instant_clip (moved from right_one).
     ("mouse_mode_toggle", "Toggle mouse mode on/off", "left_three"),
     ("drawing_mode_toggle", "Toggle drawing mode on/off", "left_four"),
     ("open_spotify", "Open or focus Spotify", "right_two"),
@@ -128,6 +132,8 @@ _GESTURE_BIND_ACTIONS: list[tuple[str, str, str]] = [
     ("open_chrome", "Open or focus Chrome", "right_three"),
     ("open_touchless", "Open or focus Touchless", "right_four"),
     ("system_mute_toggle", "Mute or unmute system audio", "mute"),
+    ("next_track", "Next song / next track", "swipe_right"),
+    ("previous_track", "Previous song / previous track", "swipe_left"),
     ("open_gesture_wheel", "Open Spotify/Chrome wheel", "wheel_pose"),
     ("open_screen_wheel", "Open screen capture wheel", "screen_wheel"),
     ("close_active_window", "Close the focused window", "close_window"),
@@ -158,7 +164,7 @@ STATIC_POSE_LABEL_MAP: dict[str, tuple[str, str]] = {
     "left_two":   ("Left",  "two"),
     "left_three": ("Left",  "three"),
     "left_four":  ("Left",  "four"),
-    # r53: "left_fist" removed — no active binding.
+    "left_fist":  ("Left",  "fist"),
     "right_one":  ("Right", "one"),
     "right_two":  ("Right", "two"),
     "right_fist": ("Right", "fist"),
@@ -168,6 +174,8 @@ STATIC_POSE_LABEL_MAP: dict[str, tuple[str, str]] = {
     "right_four_together": ("Right", "four_together"),
     "mute":       ("Right", "mute"),
     "wheel_pose": ("Right", "wheel_pose"),
+    "volume_pose": ("Right", "volume_pose"),
+    "chrome_wheel_pose": ("Right", "chrome_wheel_pose"),
     "right_pinch": ("Right", "pinch"),
     "left_pinch":  ("Left",  "pinch"),
 }

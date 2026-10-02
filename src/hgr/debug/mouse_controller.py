@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import platform
+import weakref
 from ctypes import wintypes
 
 
@@ -26,11 +27,37 @@ class _Point(ctypes.Structure):
 
 
 class MouseController:
+    # WeakSet of every live controller so main_window's topology-change
+    # filter (WM_DISPLAYCHANGE / WM_DPICHANGED) can invalidate every
+    # bounds cache without needing to reach through the engine chain.
+    _instances: "weakref.WeakSet[MouseController]" = weakref.WeakSet()
+
+    @classmethod
+    def invalidate_all_bounds_caches(cls) -> None:
+        """Called from main_window's WM_DISPLAYCHANGE / WM_DPICHANGED
+        handler so every MouseController re-reads GetSystemMetrics
+        after a monitor topology change."""
+        for inst in list(cls._instances):
+            try:
+                inst.invalidate_bounds_cache()
+            except Exception:
+                pass
+
     def __init__(self) -> None:
         self._available = platform.system() == "Windows"
         self._message = "mouse mode off" if self._available else "mouse unavailable on this platform"
         self._left_down = False
         self._user32 = None
+        # v1.1.9.2: virtual_bounds() was called up to 4x per tick from the
+        # mouse-control hot path (16 GetSystemMetrics per tick). Under a
+        # monitor topology change or GDI lock contention each of these
+        # can stall waiting for the display-info lock. Cache the result
+        # and invalidate via WM_DISPLAYCHANGE / WM_DPICHANGED in main_window.
+        self._cached_bounds: tuple[int, int, int, int] | None = None
+        # Skip SetCursorPos when the target pixel hasn't changed — one
+        # less user32 syscall on frames where the hand is still.
+        self._last_cursor_target: tuple[int, int] | None = None
+        MouseController._instances.add(self)
         if not self._available:
             return
         try:
@@ -45,6 +72,12 @@ class MouseController:
             self._available = False
             self._user32 = None
             self._message = "mouse unavailable"
+
+    def invalidate_bounds_cache(self) -> None:
+        """Public hook: main_window's WM_DISPLAYCHANGE / WM_DPICHANGED
+        filter calls this so the next virtual_bounds() re-reads
+        GetSystemMetrics after a monitor topology change."""
+        self._cached_bounds = None
 
     @property
     def available(self) -> bool:
@@ -61,12 +94,17 @@ class MouseController:
     def virtual_bounds(self) -> tuple[int, int, int, int] | None:
         if not self.available:
             return None
+        cached = self._cached_bounds
+        if cached is not None:
+            return cached
         assert self._user32 is not None
         left = int(self._user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
         top = int(self._user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
         width = max(1, int(self._user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)))
         height = max(1, int(self._user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)))
-        return left, top, width, height
+        bounds = (left, top, width, height)
+        self._cached_bounds = bounds
+        return bounds
 
     def current_position(self) -> tuple[int, int] | None:
         if not self.available:
@@ -97,9 +135,16 @@ class MouseController:
         target_x = left + int(round(_clamp01(x) * max(width - 1, 1)))
         target_y = top + int(round(_clamp01(y) * max(height - 1, 1)))
         assert self._user32 is not None
+        # Dedupe: if the target pixel matches the last one we set, the
+        # cursor is already there — skip the syscall. Kiyo Pro at 60 Hz
+        # + a still hand produces many identical targets in a row.
+        if self._last_cursor_target == (target_x, target_y):
+            self._message = f"mouse move {target_x}, {target_y}"
+            return True
         if not self._user32.SetCursorPos(target_x, target_y):
             self._message = "mouse move failed"
             return False
+        self._last_cursor_target = (target_x, target_y)
         self._message = f"mouse move {target_x}, {target_y}"
         return True
 

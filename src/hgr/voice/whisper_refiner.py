@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+
+from ..utils.subprocess_utils import hidden_subprocess_kwargs
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -344,7 +346,6 @@ class WhisperRefiner:
                 "-nt",  # suppress timestamps
                 "-np",  # no prints
             ]
-            creation_flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             try:
                 proc = subprocess.run(
                     args,
@@ -354,7 +355,7 @@ class WhisperRefiner:
                     encoding="utf-8",
                     errors="replace",
                     timeout=30.0,
-                    creationflags=creation_flags,
+                    **hidden_subprocess_kwargs(),
                 )
             except subprocess.TimeoutExpired:
                 print("[refiner] whisper-cli timed out")

@@ -117,6 +117,25 @@ class HandDetector:
             height, width = frame_bgr.shape[:2]
         except Exception:
             height, width = 0, 0
+        # One line, once per (width, lever) pair: does the lever bite?
+        # Without it, a mode whose only job is to downscale can silently
+        # become a no-op and nothing in a field log says so.
+        try:
+            _sig = (int(width), int(self.max_process_width))
+            if getattr(self, "_logged_width_sig", None) != _sig:
+                self._logged_width_sig = _sig
+                import sys as _sys
+                _act = ("downscaling to %d" % self.max_process_width
+                        if (self.max_process_width > 0
+                            and width > self.max_process_width)
+                        else "NO downscale")
+                _sys.stderr.write(
+                    f"[detector] delivered width={width} "
+                    f"max_process_width={self.max_process_width} -> {_act}\n"
+                )
+                _sys.stderr.flush()
+        except Exception:
+            pass
         if self.max_process_width > 0 and width > self.max_process_width and height > 0:
             scaled_height = max(1, int(round(height * (self.max_process_width / float(width)))))
             processing_frame = cv2.resize(

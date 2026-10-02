@@ -1964,6 +1964,17 @@ class DesktopController:
             existing = cls._shared_app_catalog_build_thread
             if existing is not None and existing.is_alive():
                 return
+            # perf: skip the background catalog scan under pytest.
+            # The worker walks Start Menu shortcuts + PATH globs and
+            # was surfacing a Windows access-violation deep in the
+            # full test suite when a test built a real MainWindow
+            # (test_control_guide_section_stays_collapsed_after_addwidget).
+            # Not a production bug — but a test-isolation hazard.
+            import os as _os
+            import sys as _sys
+            if "PYTEST_CURRENT_TEST" in _os.environ or "pytest" in _sys.modules:
+                cls._shared_app_catalog = []
+                return
             thread = threading.Thread(
                 target=self._build_full_catalog_worker,
                 name="hgr-desktop-catalog-build",

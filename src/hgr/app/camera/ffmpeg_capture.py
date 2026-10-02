@@ -45,6 +45,9 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from ...utils.subprocess_utils import hidden_subprocess_kwargs
+from .ffmpeg_memo import KIND_BUSY, KIND_HARD, KIND_SILENT
+
 
 def locate_ffmpeg() -> str | None:
     """Find the ffmpeg executable. Prefers a copy that lives next to
@@ -90,12 +93,48 @@ def locate_ffmpeg() -> str | None:
     return shutil.which("ffmpeg") or shutil.which(exe_name)
 
 
-def list_dshow_video_devices(ffmpeg_path: str | None = None) -> list[str]:
+#: r20: short-lived cache for the DirectShow enumeration. Each call
+#: spawns an ffmpeg.exe, every spawn is an independent evaluation by
+#: consumer antivirus, and users on Norton reported a popup storm that
+#: made Lite mode unusable. The list is also stable on the timescale
+#: that matters -- a camera-open sequence enumerates it several times
+#: within a second or two, and the two mode swaps seen in the field were
+#: 33 s apart. A device appearing or disappearing invalidates the cache
+#: explicitly (QMediaDevices.videoInputsChanged and the engine's camera
+#: recovery both call invalidate_dshow_device_cache), and the callers that
+#: need ground truth -- the camera picker's Refresh, the positional
+#: index-to-device fallback, and the poll loop that watches for another
+#: app releasing the camera -- pass use_cache=False. So the TTL is a
+#: backstop rather than the primary freshness mechanism.
+_DEVICE_LIST_TTL_S = 60.0
+_device_list_cache: "tuple[float, list[str]] | None" = None
+_device_list_lock = threading.Lock()
+
+
+def invalidate_dshow_device_cache() -> None:
+    """Forget the cached enumeration (call after a device change)."""
+    global _device_list_cache
+    with _device_list_lock:
+        _device_list_cache = None
+
+
+def list_dshow_video_devices(ffmpeg_path: str | None = None,
+                             *, use_cache: bool = True) -> list[str]:
     """Ask ffmpeg for the DirectShow video device list. Returns the
     friendly names ffmpeg expects after `-i video=`. The names are
-    case- and whitespace-sensitive, so we surface them verbatim."""
+    case- and whitespace-sensitive, so we surface them verbatim.
+
+    Results are cached for a few seconds; pass `use_cache=False` to
+    force a fresh enumeration.
+    """
+    global _device_list_cache
     if not sys.platform.startswith("win"):
         return []
+    if use_cache:
+        with _device_list_lock:
+            cached = _device_list_cache
+        if cached is not None and (time.monotonic() - cached[0]) < _DEVICE_LIST_TTL_S:
+            return list(cached[1])
     path = ffmpeg_path or locate_ffmpeg()
     if not path:
         return []
@@ -105,7 +144,7 @@ def list_dshow_video_devices(ffmpeg_path: str | None = None) -> list[str]:
             capture_output=True,
             text=True,
             timeout=6.0,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            **hidden_subprocess_kwargs(),
         )
     except Exception:
         return []
@@ -120,6 +159,23 @@ def list_dshow_video_devices(ffmpeg_path: str | None = None) -> list[str]:
         name = match.group(1).strip()
         if name and name not in devices:
             devices.append(name)
+    # Only a successful enumeration is cached. An empty result is often
+    # a transient failure, and caching it would strand the app with no
+    # camera for the whole TTL.
+    if devices:
+        with _device_list_lock:
+            _device_list_cache = (time.monotonic(), list(devices))
+    # One line per REAL spawn, so an ffmpeg process count can be read
+    # straight out of any debug log. Cache hits return above and print
+    # nothing.
+    try:
+        print(
+            f"[ffmpeg_capture] enumerated {len(devices)} dshow video "
+            f"device(s) (spawned ffmpeg)",
+            file=sys.stderr, flush=True,
+        )
+    except Exception:
+        pass
     return devices
 
 
@@ -221,6 +277,8 @@ def open_ffmpeg_cap_with_fps_fallback(
     height: int = 720,
     fps_candidates: tuple[int, ...] = (60, 30),
     luma_min_threshold: float | None = None,
+    total_budget_seconds: float = 6.0,
+    failure_out: dict | None = None,
 ) -> "FfmpegMjpegCapture | None":
     """Try opening the ffmpeg MJPG cap at decreasing frame rates.
 
@@ -295,7 +353,48 @@ def open_ffmpeg_cap_with_fps_fallback(
         pass
 
     retry_used = False
-    for fps in fps_candidates:
+    # r20: hard total wall-clock budget. Every caller runs this on the
+    # GUI thread, so the per-attempt timeouts are not enough -- three
+    # failed attempts plus their teardowns cost ~13 s of frozen UI on a
+    # camera that has no MJPG pin at all. The deadline is only consulted
+    # BEFORE spending more time, never mid-attempt, so a camera that
+    # succeeds on the first candidate takes an identical path to before.
+    _deadline = time.monotonic() + float(total_budget_seconds)
+    # r20: how the attempt failed, for the per-camera memo. "hard" means
+    # ffmpeg rejected the format outright and retrying is pointless;
+    # "silent" means the startup hung with no stderr, which is the
+    # signature of another process still holding the DirectShow handle
+    # and is NEVER held against the camera.
+    _saw_hard = False
+
+    def _finish(kind: str):
+        if failure_out is not None:
+            try:
+                failure_out["kind"] = kind
+            except Exception:
+                pass
+        return None
+
+    def _budget_blown(stage: str) -> bool:
+        if time.monotonic() < _deadline:
+            return False
+        try:
+            print(
+                f"[ffmpeg_capture] total budget {float(total_budget_seconds):.1f}s "
+                f"exhausted at {stage} - bailing to OpenCV fallback",
+                file=sys.stderr, flush=True,
+            )
+        except Exception:
+            pass
+        return True
+
+    for _attempt_i, fps in enumerate(fps_candidates):
+        # The FIRST candidate is always attempted, whatever the budget
+        # says. The budget exists to stop the second, third and retry
+        # attempts piling up on a camera that has already refused once;
+        # it must never be able to turn a working open into a no-op.
+        if _attempt_i and _budget_blown(f"before {fps} fps attempt"):
+            return _finish(KIND_HARD if _saw_hard else KIND_BUSY)
         cap = FfmpegMjpegCapture(
             device_name,
             width=width,
@@ -352,11 +451,18 @@ def open_ffmpeg_cap_with_fps_fallback(
                 pass
             return cap
         silent_hang = cap._last_failure_was_silent_hang()
+        if not silent_hang:
+            # A returncode or a fatal stderr pattern: this device really
+            # does not offer this format. That is the only shape the
+            # memo is allowed to remember.
+            _saw_hard = True
         try:
             cap.release()
         except Exception:
             pass
         if silent_hang and not retry_used:
+            if _budget_blown(f"before {fps} fps silent-hang retry"):
+                return _finish(KIND_HARD if _saw_hard else KIND_BUSY)
             retry_used = True
             try:
                 print(
@@ -408,7 +514,9 @@ def open_ffmpeg_cap_with_fps_fallback(
                 )
             except Exception:
                 pass
-            return None
+            # Both attempts hung with no stderr: the device is held by
+            # someone else. Explicitly NOT the camera's fault.
+            return _finish(KIND_HARD if _saw_hard else KIND_BUSY)
         if silent_hang and retry_used:
             try:
                 print(
@@ -419,7 +527,7 @@ def open_ffmpeg_cap_with_fps_fallback(
                 )
             except Exception:
                 pass
-            return None
+            return _finish(KIND_HARD if _saw_hard else KIND_SILENT)
         try:
             print(
                 f"[ffmpeg_capture] {fps} fps unsupported by camera — trying next candidate",
@@ -428,7 +536,9 @@ def open_ffmpeg_cap_with_fps_fallback(
             )
         except Exception:
             pass
-    return None
+    # Exhausted every candidate. If any attempt was a genuine format
+    # rejection this camera earns a strike; otherwise it does not.
+    return _finish(KIND_HARD if _saw_hard else KIND_SILENT)
 
 
 class FfmpegMjpegCapture:
@@ -625,7 +735,10 @@ class FfmpegMjpegCapture:
             "-pix_fmt", "bgr24",
             "pipe:1",
         ]
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # v1.1.9.2 (r4): hidden_subprocess_kwargs() gives SW_HIDE +
+        # CREATE_NO_WINDOW, killing frozen-build ConHost flashes on
+        # first camera open.
+        _sub_kwargs = hidden_subprocess_kwargs()
         # Echo the resolved ffmpeg path + full command at startup so
         # we can rule out path-resolution issues (silently using a
         # different ffmpeg.exe than expected) and command-line typos
@@ -644,8 +757,8 @@ class FfmpegMjpegCapture:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.DEVNULL,
-                creationflags=creationflags,
                 bufsize=0,
+                **_sub_kwargs,
             )
         except Exception as exc:
             try:
@@ -877,14 +990,14 @@ class FfmpegMjpegCapture:
                 read_max_us = max(stats_read_wall_us)
                 decode_avg_us = sum(stats_decode_wall_us) // max(1, len(stats_decode_wall_us))
                 try:
-                    sys.stderr.write(
-                        f"[ffmpeg_reader] delivered: {fps:.1f} fps "
-                        f"({stats_frames} frames / {elapsed:.2f} s, drained {stats_drained}) | "
-                        f"pipe read wall avg={read_avg_us/1000.0:.1f}ms max={read_max_us/1000.0:.1f}ms | "
-                        f"decode+copy avg={decode_avg_us/1000.0:.2f}ms | "
-                        f"target={self._fps}fps interval={camera_interval_s*1000.0:.1f}ms\n"
-                    )
-                    sys.stderr.flush()
+                    if os.environ.get("HGR_TICK_DEBUG", "0") == "1":
+                        sys.stderr.write(
+                            f"[ffmpeg_reader] delivered: {fps:.1f} fps "
+                            f"({stats_frames} frames / {elapsed:.2f} s, drained {stats_drained}) | "
+                            f"pipe read wall avg={read_avg_us/1000.0:.1f}ms max={read_max_us/1000.0:.1f}ms | "
+                            f"decode+copy avg={decode_avg_us/1000.0:.2f}ms | "
+                            f"target={self._fps}fps interval={camera_interval_s*1000.0:.1f}ms\n"
+                        )
                 except Exception:
                     pass
                 stats_last_log = decoded_at

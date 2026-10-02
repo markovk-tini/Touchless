@@ -50,9 +50,43 @@ class DesktopControllerTest(unittest.TestCase):
         self.assertIn(matched_alias, {"visual studio", "visual studio code"})
 
     def test_rank_applications_in_text_ignores_generic_apps_alias_noise(self) -> None:
-        controller = DesktopController(outlook_paths=())
+        """A generic "app"/"apps" alias must not outrank a real name match.
 
-        ranked = controller.rank_applications_in_text("open kkad app")
+        The catalog is seeded rather than read off the machine.
+        `_application_catalog` caches into a CLASS-level
+        `_shared_app_catalog`, and under pytest
+        `_ensure_background_catalog_build` deliberately sets that to `[]`
+        -- the background Start Menu scan was surfacing a Windows access
+        violation deep in the suite. So the FIRST call in a process falls
+        back to the quick catalog while every later call gets the empty
+        sentinel. "kkad" scores 0.373 against "kicad", below the 0.78
+        quick-path short circuit, so this case reached the full catalog
+        and passed only while it happened to be the first test in the
+        process to ask for one. It went red the moment any other file ran
+        first, which is what made it look order-dependent. Production
+        never takes that branch ("pytest" is not in `sys.modules` there),
+        so the fix belongs in the test.
+        """
+        controller = DesktopController(outlook_paths=())
+        kicad = self._app_entry(
+            controller, "kicad", "C:/Program Files/KiCad/bin/kicad.exe"
+        )
+        # The noise this case is named for: an entry whose aliases are the
+        # bare words "app"/"apps", which the trailing "app" in the
+        # utterance would otherwise match outright.
+        noise = self._app_entry(
+            controller,
+            "Generic Apps Launcher",
+            "C:/Apps/generic.exe",
+            aliases=("app", "apps"),
+        )
+
+        with patch.object(
+            controller, "_quick_application_catalog", return_value=[kicad, noise]
+        ), patch.object(
+            controller, "_application_catalog", return_value=[kicad, noise]
+        ):
+            ranked = controller.rank_applications_in_text("open kkad app")
 
         self.assertTrue(ranked)
         self.assertEqual(ranked[0][0].display_name, "kicad")
@@ -121,12 +155,51 @@ class DesktopControllerTest(unittest.TestCase):
         self.assertEqual(controller.message, "opened app: Fallout 3")
 
     def test_open_outlook_folder_reports_partial_fallback_when_only_opening_outlook(self) -> None:
+        """With no Classic Outlook to /select into, report partial success.
+
+        `_classic_outlook_path()` scans the standard Office install
+        locations and ignores the `outlook_paths=()` constructor argument,
+        so on any machine that HAS Classic Outlook this case took the
+        success branch instead: it ran
+        `subprocess.Popen([OUTLOOK.EXE, "/select", "outlook:Sent Items"])`
+        -- actually launching Outlook on the developer's desktop on every
+        suite run -- and then failed, because `open_outlook_folder`
+        correctly returned True. "scent" is a real alias of "sent items",
+        so the mishearing path was never the problem.
+
+        Patching the path lookup pins the branch this case is named for
+        and stops the suite launching mail clients. The companion case
+        below covers the other branch with `Popen` stubbed out.
+        """
         controller = DesktopController(outlook_paths=())
 
-        with patch.object(controller, "open_outlook", return_value=True):
+        with patch.object(controller, "_classic_outlook_path", return_value=None),                 patch.object(controller, "open_outlook", return_value=True):
             self.assertFalse(controller.open_outlook_folder("scent"))
 
         self.assertEqual(controller.message, "opened outlook, but could not select Sent Items")
+
+    def test_open_outlook_folder_selects_the_folder_when_classic_outlook_exists(self) -> None:
+        """The success branch, with the launch stubbed.
+
+        Kept separate from the fallback case so neither depends on
+        whether Classic Outlook happens to be installed, and so nothing
+        here spawns a real process. Asserts the /select argument too: the
+        canonical display name is what Outlook needs, and a regression
+        that passed the raw mishearing ("scent") would still have
+        returned True.
+        """
+        controller = DesktopController(outlook_paths=())
+        fake_exe = Path("C:/Program Files/Microsoft Office/root/Office16/OUTLOOK.EXE")
+
+        with patch.object(controller, "_classic_outlook_path", return_value=fake_exe),                 patch("hgr.debug.desktop_controller.subprocess.Popen") as popen:
+            self.assertTrue(controller.open_outlook_folder("scent"))
+
+        popen.assert_called_once()
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], str(fake_exe))
+        self.assertEqual(argv[1], "/select")
+        self.assertEqual(argv[2], "outlook:Sent Items")
+        self.assertEqual(controller.message, "opened outlook folder: Sent Items")
 
     def test_open_named_file_can_resolve_plain_filename_without_folder_hint(self) -> None:
         root = self._temp_dir()

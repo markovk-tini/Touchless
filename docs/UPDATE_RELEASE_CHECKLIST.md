@@ -29,7 +29,7 @@ Partner Center action, or website deploy. Do not skip. Do not batch.
       updater is the #1 way a release ships broken.
 - [ ] Run tests: `python -m pytest tests/ -q` → 0 failed.
 - [ ] Run the popup smoke test explicitly:
-      `python -m pytest tests/test_update_dialog_smoke.py -q` → 8 passed.
+      `python -m pytest tests/test_update_dialog_smoke.py -q` → 9 passed.
       This sentinel catches the NameError class of bug that shipped in
       1.1.8 and 1.1.8.1, the 1.1.7 frameless z-order flags, and the
       dead tray-balloon fallback (`TouchlessTrayIcon.showMessage`).
@@ -87,6 +87,46 @@ independent files.
       curl -I https://pub-3116ebd541fa4ca18a84371667d029fe.r2.dev/windows/vX.Y.Z/store/Touchless_Store_Installer.exe
       curl -I https://pub-3116ebd541fa4ca18a84371667d029fe.r2.dev/windows/vX.Y.Z/Touchless_Store_Installer.exe
       ```
+
+## 3b. Submit for reputation review (do this EVERY release)
+
+A valid Authenticode signature proves **who** built the installer. It
+does not tell an antivirus engine **how many machines have seen this
+file before**, and that second question is what produces Norton's
+"we must take a closer look" and SmartScreen's "unrecognised app". The
+Azure Trusted Signing leaf we use rotates every ~3 days by design, so
+thumbprint-keyed reputation cannot accrue on its own. Two consequences:
+
+- A freshly built installer is ALWAYS low-prevalence on release day.
+  This is normal for an independent publisher and is not a build defect.
+- The stub-downloader shape (a 2 MB exe that fetches ~1.6 GB and
+  unpacks it with `tar`) is structurally similar to a dropper, so
+  heuristics score it higher than a self-contained installer would.
+
+These submissions are the only levers that actually move it. Both are
+free and take about ten minutes together.
+
+- [ ] **Norton / Symantec false-positive submission** —
+      https://submit.norton.com/ (or https://symsubmit.symantec.com/).
+      Submit the installer FILE and its public URL. Include: the signer
+      identity (`CN=Konstantin Markov`), that it is signed via Azure
+      Trusted Signing, and one plain sentence on why a small stub
+      downloads a large payload. Turnaround is typically 24-72 h.
+- [ ] **Microsoft (Defender / SmartScreen)** —
+      https://www.microsoft.com/en-us/wdsi/filesubmission, choose
+      "Software developer". Submit the installer AND `ffmpeg.exe` from
+      the payload. Defender and Norton are separate pipelines; doing one
+      does not do the other.
+- [ ] Submit `_internalfmpeg.exe` too, not just the installer. The
+      runtime SafeCam prompts the field rig reported fire on THAT
+      binary, once per spawn, and it also ships with an empty version
+      resource from upstream.
+
+**Do NOT** attempt to suppress, whitelist, or work around an antivirus
+prompt from inside the app, and do not obfuscate the installer to avoid
+detection. Both are indistinguishable from malware technique and would
+correctly get the product flagged harder. The legitimate path is
+prevalence plus the submissions above.
 
 ## 4. Submit to Microsoft Partner Center FIRST
 

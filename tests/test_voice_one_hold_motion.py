@@ -4,8 +4,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+from .helpers import seed_worker_defaults
+
 from hgr.app.integration.noop_engine import (
     GestureWorker,
+    _STATIC_GESTURE_HOLD_SECONDS,
     _VOICE_ONE_MAX_HOLD_TRAVEL_PALM,
     _palm_net_travel_exceeds,
 )
@@ -50,6 +53,7 @@ class VoiceOneHoldMotionTest(unittest.TestCase):
         )
         self.worker._start_voice_command = Mock()
         self.worker._start_voice_capture = Mock()
+        seed_worker_defaults(self.worker)
 
     def _reading(self, x: float, y: float, scale: float = 80.0):
         return SimpleNamespace(palm=SimpleNamespace(center=(x, y), scale=scale))
@@ -60,28 +64,53 @@ class VoiceOneHoldMotionTest(unittest.TestCase):
             self.worker, SimpleNamespace(stable_label="one"), t
         )
 
+    # Hold durations are derived from `_STATIC_GESTURE_HOLD_SECONDS`
+    # rather than written out. These cases used to tick to 1.55 s and
+    # 1.6 s, which cleared the ~0.5 s hold they were written against;
+    # `91c3b30` (1.1.9, live countdown) introduced the shared 1.0 s
+    # constant for every fire-once static pose, and the hardcoded
+    # timings then sat under the bar. Deriving means the next change to
+    # the constant moves these with it instead of reddening them.
+    HOLD = _STATIC_GESTURE_HOLD_SECONDS
+
     def test_still_hold_with_small_jitter_starts_voice(self) -> None:
-        self._tick(1.00, 100.0)
-        self._tick(1.20, 104.0)  # 0.05 palm
-        self._tick(1.40, 96.0)   # 0.05 palm the other way
-        self._tick(1.55, 108.0)  # 0.10 palm
+        start = 1.00
+        self._tick(start, 100.0)
+        self._tick(start + self.HOLD * 0.3, 104.0)   # 0.05 palm
+        self._tick(start + self.HOLD * 0.6, 96.0)    # 0.05 palm the other way
+        self._tick(start + self.HOLD + 0.05, 108.0)  # 0.10 palm, hold cleared
 
         self.worker._start_voice_command.assert_called_once_with()
 
+    def test_still_hold_does_not_fire_one_frame_early(self) -> None:
+        """The other side of the bar: a hold that is nearly long enough
+        must not fire. Without this, lengthening the constant would let
+        the case above pass while voice armed too eagerly in the app."""
+        start = 1.00
+        self._tick(start, 100.0)
+        self._tick(start + self.HOLD - 0.05, 102.0)
+
+        self.worker._start_voice_command.assert_not_called()
+
     def test_swipe_scale_translation_does_not_start_voice(self) -> None:
         # Index-up swipe left: pose stays "one" while palm translates.
-        self._tick(1.00, 100.0)
-        self._tick(1.15, 80.0)
-        self._tick(1.30, 55.0)
-        self._tick(1.45, 30.0)
-        self._tick(1.60, 10.0)
+        # Runs PAST the hold so translation is the only thing that can
+        # be blocking. At the old 1.6 s end point this case passed
+        # vacuously once the hold became 1.0 s -- it was under the bar,
+        # so it proved nothing about the travel gate.
+        start = 1.00
+        for step, x in enumerate((100.0, 80.0, 55.0, 30.0, 10.0)):
+            self._tick(start + step * (self.HOLD * 0.4), x)
+        self.assertGreater(start + 4 * (self.HOLD * 0.4) - start, self.HOLD)
 
         self.worker._start_voice_command.assert_not_called()
 
     def test_missing_landmarks_still_allow_stationary_hold(self) -> None:
         prediction = SimpleNamespace(stable_label="one")
         GestureWorker._handle_left_hand_voice(self.worker, prediction, 1.0)
-        GestureWorker._handle_left_hand_voice(self.worker, prediction, 1.6)
+        GestureWorker._handle_left_hand_voice(
+            self.worker, prediction, 1.0 + self.HOLD + 0.05
+        )
 
         self.worker._start_voice_command.assert_called_once_with()
 

@@ -21,7 +21,7 @@
 ;   /DMONOLITHIC=1                     (optional — switches to embedded zip)
 
 #define MyAppName "Touchless"
-#define MyAppVersion "1.1.9.1"
+#define MyAppVersion "1.1.9.2"
 #define MyAppPublisher "Konstantin Markov"
 #define MyAppExeName "Touchless.exe"
 #define DistDir "..\..\dist\Touchless"
@@ -48,6 +48,15 @@
   #ifndef PAYLOAD_FILE_COUNT
     #define PAYLOAD_FILE_COUNT "2000"
   #endif
+  ; r19: sizes used by the free-space precheck, in MEGABYTES. The build
+  ; script measures both and passes them in; the fallbacks are the
+  ; measured 1.1.9.2 values so a hand-run ISCC still checks something.
+  #ifndef PAYLOAD_ZIP_MB
+    #define PAYLOAD_ZIP_MB "1673"
+  #endif
+  #ifndef PAYLOAD_TREE_MB
+    #define PAYLOAD_TREE_MB "3408"
+  #endif
 #endif
 
 [Setup]
@@ -55,6 +64,22 @@ AppId={{2C4EE680-53F5-4D83-92A8-ADF4D2D8794E}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+; r23: identity metadata. The stub shipped with a blank version
+; resource (FileVersion 0.0.0.0, no copyright, no original name),
+; which reads as an anonymous binary to reputation engines and
+; leaves Add/Remove Programs with no publisher link. These are the
+; fields Explorer's Details tab and Norton's file record read.
+AppPublisherURL=https://touchless-control.com
+AppSupportURL=https://touchless-control.com
+AppUpdatesURL=https://touchless-control.com
+AppCopyright=Copyright (C) 2026 {#MyAppPublisher}
+VersionInfoVersion={#MyAppVersion}
+VersionInfoProductVersion={#MyAppVersion}
+VersionInfoProductName={#MyAppName}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription={#MyAppName} Setup
+VersionInfoCopyright=Copyright (C) 2026 {#MyAppPublisher}
+VersionInfoOriginalFileName=Touchless_Installer.exe
 ; Per-user install under %LOCALAPPDATA%\Programs\Touchless. Avoids
 ; UAC entirely — the app folder is user-writable, so subsequent
 ; auto-updates can replace files without prompting the user for
@@ -214,6 +239,78 @@ Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser; Check: Wizar
 var
   DownloadPage: TDownloadWizardPage;
 
+// v1.1.9.2 (r19): free-space precheck.
+//
+// The stub needs room for BOTH the downloaded zip and the extracted
+// tree at the same time:
+//     {tmp}  <- PAYLOAD_ZIP_MB   (the .zip, deleted only after setup)
+//     {app}  <- PAYLOAD_TREE_MB  (the extracted files)
+// On a default install both live on C:, so the peak is the sum.
+// Measured for 1.1.9.2: zip 1673 MB, extracted tree 3408 MB / 6031 files.
+// Before r19 there was NO check at all: a user short on space got
+// "Payload extraction failed after 3 attempts: tar.exe exit code 1"
+// with no indication that disk space was the cause.
+function DriveRoot(const Path: String): String;
+begin
+  Result := ExtractFileDrive(Path);
+  if Result <> '' then
+    Result := Result + '\';
+end;
+
+function FreeMBOn(const Path: String): Int64;
+var
+  FreeBytes, TotalBytes: Int64;
+begin
+  Result := -1;
+  if GetSpaceOnDisk64(DriveRoot(Path), FreeBytes, TotalBytes) then
+    Result := FreeBytes div 1048576;
+end;
+
+// Returns '' when there is enough room, else a user-facing message.
+function CheckFreeSpace(): String;
+var
+  TmpDir, AppDir, TmpRoot, AppRoot: String;
+  TmpFree, AppFree, NeedTmp, NeedApp, NeedBoth: Int64;
+begin
+  Result := '';
+  NeedTmp := {#PAYLOAD_ZIP_MB};
+  NeedApp := {#PAYLOAD_TREE_MB};
+  TmpDir := ExpandConstant('{tmp}');
+  AppDir := ExpandConstant('{app}');
+  TmpRoot := DriveRoot(TmpDir);
+  AppRoot := DriveRoot(AppDir);
+  TmpFree := FreeMBOn(TmpDir);
+  AppFree := FreeMBOn(AppDir);
+  // Unknown free space (network path, odd volume) -> do not block.
+  if (TmpFree < 0) or (AppFree < 0) then
+    Exit;
+  if CompareText(TmpRoot, AppRoot) = 0 then begin
+    NeedBoth := NeedTmp + NeedApp;
+    if TmpFree < NeedBoth then
+      Result :=
+        'Not enough free disk space on drive ' + TmpRoot + #13#10#13#10 +
+        'Touchless needs about ' + IntToStr(NeedBoth div 1024) + ' GB free to install:' + #13#10 +
+        '  - ' + IntToStr(NeedTmp div 1024) + ' GB for the download' + #13#10 +
+        '  - ' + IntToStr(NeedApp div 1024) + ' GB for the installed app' + #13#10#13#10 +
+        'Free space right now: ' + IntToStr(TmpFree div 1024) + ' GB' + #13#10#13#10 +
+        'Free up space (Windows Settings > System > Storage) and run the ' +
+        'installer again. The download space is released once setup finishes.';
+  end else begin
+    if TmpFree < NeedTmp then
+      Result :=
+        'Not enough free disk space on drive ' + TmpRoot + ' for the download.' + #13#10#13#10 +
+        'Needed: about ' + IntToStr(NeedTmp div 1024) + ' GB.  Free right now: ' +
+        IntToStr(TmpFree div 1024) + ' GB.' + #13#10#13#10 +
+        'Windows downloads the installer payload to this drive even when ' +
+        'Touchless is installed elsewhere.'
+    else if AppFree < NeedApp then
+      Result :=
+        'Not enough free disk space on drive ' + AppRoot + ' for the installation.' + #13#10#13#10 +
+        'Needed: about ' + IntToStr(NeedApp div 1024) + ' GB.  Free right now: ' +
+        IntToStr(AppFree div 1024) + ' GB.';
+  end;
+end;
+
 procedure InitializeWizard;
 begin
   DownloadPage := CreateDownloadPage(
@@ -228,8 +325,18 @@ var
   MaxAttempts: Integer;
   LastError: String;
   Succeeded: Boolean;
+  SpaceMsg: String;
 begin
   if CurPageID = wpReady then begin
+    // v1.1.9.2 (r19): refuse BEFORE spending a 1.6 GB download when the
+    // machine cannot hold the result. Checked here rather than in
+    // PrepareToInstall because the download happens on this click.
+    SpaceMsg := CheckFreeSpace();
+    if SpaceMsg <> '' then begin
+      SuppressibleMsgBox(SpaceMsg, mbCriticalError, MB_OK, IDOK);
+      Result := False;
+      Exit;
+    end;
     // r45: retry the 3-GB payload download up to 4 times before
     // surfacing a hard failure. Inno's DownloadPage.Download uses
     // WinInet's single-shot GET with no resume support, so any
@@ -350,10 +457,21 @@ var
   TouchlessExeSize: LongInt;
   ExeFindRec: TFindRec;
   ExtractOK: Boolean;
+  // v1.1.9.2 (r5): tar.exe fast-path (Norton-safer + faster than PS).
+  TarExe: String;
+  TarArgs: String;
+  UseTar: Boolean;
+  // v1.1.9.2 (r19): tar stderr capture (attempts 2+).
+  TarErrPath: String;
+  TarErrText: AnsiString;
+  CmdArgs: String;
+  SpaceNote: String;
+  ExecOK: Boolean;
 begin
   if CurStep = ssInstall then begin
     ZipPath := ExpandConstant('{tmp}\{#PAYLOAD_FILE}');
     ExtractDir := ExpandConstant('{app}');
+    TarErrPath := ExpandConstant('{tmp}\tar_stderr.txt');
     DoneFlag := ExpandConstant('{tmp}\extract_done.flag');
     TouchlessExePath := ExtractDir + '\' + ExpandConstant('{#MyAppExeName}');
     TotalFiles := {#PAYLOAD_FILE_COUNT};
@@ -380,6 +498,39 @@ begin
       ExpandConstant('{cmd}'),
       '/C taskkill /F /IM ' + ExpandConstant('{#MyAppExeName}') + ' /T 2>NUL & exit 0',
       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+    // v1.1.9.2 (r19): ALSO kill ORPHANED helper processes. THIS WAS THE
+    // ROOT CAUSE OF THE "failed to extract" REPORTS.
+    //
+    // Touchless spawns ffmpeg (clip cache, camera capture, audio
+    // bridges), llama-server and whisper-stream as children. `taskkill
+    // /T` above only walks the tree of a LIVE Touchless.exe, so when
+    // Touchless has already crashed or been force-killed its helpers
+    // survive as orphans with NO parent -- Task Manager shows no
+    // "Touchless", but an ffmpeg launched from
+    // <install>\_internalfmpeg.EXE is still running, writing
+    // clip-cache segments in a loop and holding an open handle on its
+    // own image file. Windows then refuses to let tar overwrite
+    // _internalfmpeg.EXE, tar returns exit code 1, and the install
+    // dies at extraction. Field-confirmed 2026-09-24: clip-cache files
+    // reappearing after deletion and an undeletable install folder on a
+    // machine with 27 GB free, so it was never a disk-space problem.
+    //
+    // Targeted ON PURPOSE: only helpers whose executable path contains
+    // "Touchless" are killed, so an ffmpeg the user installed for their
+    // own use is untouched. -Command (not -File) needs no execution
+    // policy, so there is no -ExecutionPolicy Bypass for Norton to
+    // dislike. Wholly best-effort: any failure here is ignored and the
+    // extract retry loop below still reports the real reason.
+    Exec(
+      'powershell.exe',
+      '-NoProfile -NonInteractive -Command "' +
+      '$ErrorActionPreference=''SilentlyContinue''; ' +
+      'foreach($n in @(''ffmpeg'',''llama-server'',''whisper-stream'',''whisper-server'')){ ' +
+      'foreach($p in @(Get-Process -Name $n -ErrorAction SilentlyContinue)){ ' +
+      'try{ if($p.Path -and $p.Path -match ''Touchless''){ Stop-Process -Id $p.Id -Force } }catch{} } } ' +
+      'exit 0"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     // Pause so Windows fully releases the file handles + AV finishes
     // its post-mortem scan of the killed process. Bumped 750 -> 1500 ms
     // because the workflow audit flagged that slow systems with real-
@@ -387,15 +538,68 @@ begin
     Sleep(1500);
 
     // Reconfigure Inno's progress bar to track real extraction state.
+    //
+    // r62 HONESTY FIX. Two separate things were wrong with the bar, both
+    // reported from the field as "empty, then jumps to full, or stops at
+    // 9 / 10":
+    //
+    //  (a) The live poll below only ever existed in the PowerShell
+    //      FALLBACK branch. Attempt 1 -- the path virtually every install
+    //      takes -- runs tar with ewWaitUntilTerminated, which blocks this
+    //      thread for the whole extraction, so the wizard cannot repaint at
+    //      all and the gauge is simply jammed to 100% afterwards. It is not
+    //      fixable by polling harder: going async needs either a shell in
+    //      the process tree (undoes r19's AppLocker/Norton mitigation, which
+    //      exists because installs were being BLOCKED) or a heuristic
+    //      "finished" signal. Neither is worth trading for a cosmetic bar.
+    //
+    //  (b) The numerator was wrong anyway. CountFilesRecursive counts the
+    //      files PRESENT in {app}, not the files extracted this run. On a
+    //      fresh install those coincide; on an UPGRADE {app} already holds
+    //      a full tree, so the count starts at the maximum and the bar is
+    //      full before extraction begins. A one- or two-file difference
+    //      between the old tree and the new payload is the "9 / 10".
+    //
+    // So: do not present a proportional bar we cannot honestly fill. Say
+    // what is happening and how long it takes, and warn that the window
+    // may stop responding -- which is true, and is exactly what made users
+    // think it had hung.
     WizardForm.ProgressGauge.Min := 0;
     WizardForm.ProgressGauge.Max := TotalFiles;
     WizardForm.ProgressGauge.Position := 0;
-    WizardForm.StatusLabel.Caption := 'Extracting payload (0 / ' + IntToStr(TotalFiles) + ' files)...';
+    WizardForm.StatusLabel.Caption :=
+      'Extracting ' + IntToStr(TotalFiles) + ' files (' +
+      '{#PAYLOAD_TREE_MB} MB). This takes several minutes and the window ' +
+      'may stop responding — that is normal, it is not stuck.';
     WizardForm.FilenameLabel.Caption := '';
+    WizardForm.Update;
 
-    // Build the PowerShell command once. PATHS ARE APOSTROPHE-ESCAPED
-    // so usernames / install dirs containing ' (O'Brien, Tom's Apps)
-    // don't break the PS single-quoted string literal.
+    // v1.1.9.2 (r5): Prefer bundled Windows tar.exe (libarchive) over
+    // PowerShell Expand-Archive. Rationale:
+    //   * ~2-4x faster on a ~1 GB payload (no PS startup + no progress
+    //     reflection cost — libarchive goes straight to disk).
+    //   * No powershell.exe process in the install-time tree —
+    //     unblocks AppLocker / WDAC corp-locked machines.
+    //   * Removes the -ExecutionPolicy Bypass surface Norton
+    //     occasionally flags as suspicious.
+    //   * Every supported Windows baseline (Win10 1803+ / Win11) ships
+    //     tar.exe under C:\Windows\System32\tar.exe.
+    // Falls back to the original PowerShell path if tar.exe is missing
+    // (very old Win10, custom images) or fails to launch. The 3-attempt
+    // AV-race retry wrapper stays around both branches.
+    TarExe := ExpandConstant('{sys}\tar.exe');
+    UseTar := FileExists(TarExe);
+    if UseTar then begin
+      // tar -xf <zip> -C <dir> — libarchive handles ZIP natively on
+      // Win10 1803+. Quote-wrapped paths tolerate spaces + apostrophes.
+      TarArgs := '-xf "' + ZipPath + '" -C "' + ExtractDir + '"';
+    end;
+
+    // Build the PowerShell command once (fallback path only, but still
+    // populated so the fallback branch can Exec cleanly). PATHS ARE
+    // APOSTROPHE-ESCAPED so usernames / install dirs containing '
+    // (O'Brien, Tom's Apps) don't break the PS single-quoted string
+    // literal.
     PsCmd :=
       '-NoProfile -NonInteractive -ExecutionPolicy Bypass ' +
       '-Command "try { Expand-Archive -LiteralPath ''' + PsQuoteEscape(ZipPath) + ''' ' +
@@ -404,60 +608,113 @@ begin
       'catch { $_.Exception.Message | Out-File -LiteralPath ''' + PsQuoteEscape(DoneFlag) + ''' -Encoding ascii }"';
 
     // EXTRACT RETRY LOOP (3 attempts, 3s pause between). Antivirus
-    // scanners + slow disks can race the file replace — Expand-Archive
+    // scanners + slow disks can race the file replace — extraction
     // may report overall success while having silently failed on a
     // specific locked file. Retry catches transient locks. Mirrors
     // the build-side payload retry loop in build_windows.bat.
     ExtractOK := False;
     ErrorMsg := '';
     for Attempt := 1 to 3 do begin
-      // Wipe any stale sentinel from a previous attempt.
+      // Wipe any stale sentinel from a previous attempt (PS path uses it).
       if FileExists(DoneFlag) then DeleteFile(DoneFlag);
 
       WizardForm.StatusLabel.Caption := 'Extracting payload (attempt ' +
         IntToStr(Attempt) + ' of 3)...';
       WizardForm.Update;
 
-      if not Exec('powershell.exe', PsCmd, '', SW_HIDE, ewNoWait, ResultCode) then begin
-        ErrorMsg := 'Could not launch PowerShell. Check AppLocker / WDAC policy.';
-        Break;
+      if UseTar then begin
+        // Synchronous exec — tar returns when extraction completes.
+        // ResultCode 0 = success. Progress bar jumps 0 -> 100 in one
+        // hop (no live sentinel-poll), but the "Finalizing installation
+        // — antivirus scanning..." label below already tells users what's
+        // happening, so the UX gap is small vs. the speed win.
+        //
+        // v1.1.9.2 (r19): attempt 1 runs tar DIRECTLY (no shell in the
+        // process tree, which is what AppLocker / Norton see on the
+        // happy path). Attempts 2 and 3 run it through cmd.exe with
+        // stderr redirected to a file, so a repeat failure reports the
+        // DRIVER'S OWN message ("No space left on device", "Cannot
+        // open: Permission denied", ...) instead of a bare exit code.
+        // Three field failures were diagnosed by guesswork because this
+        // output was being thrown away.
+        if Attempt = 1 then
+          ExecOK := Exec(TarExe, TarArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+        else begin
+          if FileExists(TarErrPath) then DeleteFile(TarErrPath);
+          CmdArgs := '/S /C ""' + TarExe + '" ' + TarArgs + ' 2> "' + TarErrPath + '""';
+          ExecOK := Exec(ExpandConstant('{cmd}'), CmdArgs, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+        end;
+        if not ExecOK then begin
+          // Launch failed — fall back to PowerShell on this attempt.
+          UseTar := False;
+        end else if ResultCode = 0 then begin
+          WizardForm.ProgressGauge.Position := TotalFiles;
+          // v1.1.7.10 "Finalizing installation..." label so the user
+          // doesn't think the installer hung during Defender scan.
+          WizardForm.StatusLabel.Caption :=
+            'Finalizing installation — this can take 1-3 minutes while ' +
+            'antivirus scans the new files. The installer is not stuck.';
+          WizardForm.Update;
+          ExtractOK := True;
+          Break;
+        end else begin
+          ErrorMsg := 'tar.exe exit code ' + IntToStr(ResultCode);
+          // r19: append tar's own stderr when we captured it.
+          if FileExists(TarErrPath) then begin
+            if LoadStringFromFile(TarErrPath, TarErrText) then begin
+              if Trim(String(TarErrText)) <> '' then
+                ErrorMsg := ErrorMsg + ' — ' + Trim(String(TarErrText));
+            end;
+          end;
+        end;
       end;
 
-      // Poll until the sentinel appears.
-      while not FileExists(DoneFlag) do begin
-        FileCount := CountFilesRecursive(ExtractDir);
-        if FileCount > TotalFiles then FileCount := TotalFiles;
-        WizardForm.ProgressGauge.Position := FileCount;
-        StatusText := 'Extracting payload (' + IntToStr(FileCount) + ' / ' +
-                      IntToStr(TotalFiles) + ' files, attempt ' +
-                      IntToStr(Attempt) + ')...';
-        WizardForm.StatusLabel.Caption := StatusText;
+      if not UseTar then begin
+        if not Exec('powershell.exe', PsCmd, '', SW_HIDE, ewNoWait, ResultCode) then begin
+          ErrorMsg := 'Could not launch PowerShell. Check AppLocker / WDAC policy.';
+          Break;
+        end;
+
+        // Poll until the sentinel appears (PowerShell fallback path only).
+        while not FileExists(DoneFlag) do begin
+          FileCount := CountFilesRecursive(ExtractDir);
+          if FileCount > TotalFiles then FileCount := TotalFiles;
+          WizardForm.ProgressGauge.Position := FileCount;
+          StatusText := 'Extracting payload (' + IntToStr(FileCount) + ' / ' +
+                        IntToStr(TotalFiles) + ' files, attempt ' +
+                        IntToStr(Attempt) + ')...';
+          WizardForm.StatusLabel.Caption := StatusText;
+          WizardForm.Update;
+          Sleep(500);
+        end;
+        // r62: set the CAPTION as well as the gauge. Only the gauge was
+        // pushed to TotalFiles, so the label kept whatever the final
+        // 500 ms poll read -- one tick short, and on an upgrade the count
+        // can never reach TotalFiles at all. Never leave a stale numerator
+        // on screen.
+        WizardForm.ProgressGauge.Position := TotalFiles;
+        WizardForm.StatusLabel.Caption := 'Extraction complete (' +
+          IntToStr(TotalFiles) + ' files).';
         WizardForm.Update;
-        Sleep(500);
-      end;
-      WizardForm.ProgressGauge.Position := TotalFiles;
-      // v1.1.7.10: replace the frozen "6047 / 6047 files, attempt 1..."
-      // label with an honest "still working" message. The rest of the
-      // ssInstall step (verification + rename probe + Inno's own [Icons]
-      // / [Registry] stages) can take 2-3 minutes on slower computers,
-      // mostly because Windows Defender / Norton is scanning each of the
-      // just-extracted files before letting us open them for the probe.
-      // Users seeing 6047/6047 with no motion have historically thought
-      // the installer hung — this message tells them what's actually
-      // happening. Bar stays at 100% because progress is meaningful up
-      // to this point; the sub-messages below update as we advance.
-      WizardForm.StatusLabel.Caption :=
-        'Finalizing installation — this can take 1-3 minutes while ' +
-        'antivirus scans the new files. The installer is not stuck.';
-      WizardForm.Update;
 
-      LoadStringFromFile(DoneFlag, ResultStr);
-      DeleteFile(DoneFlag);
-      if Trim(String(ResultStr)) = 'OK' then begin
-        ExtractOK := True;
-        Break;
+        // Sentinel-check on the PowerShell fallback path only. The tar
+        // path already Break'd out above on success or set ErrorMsg on
+        // failure — it has no DoneFlag file.
+        LoadStringFromFile(DoneFlag, ResultStr);
+        DeleteFile(DoneFlag);
+        if Trim(String(ResultStr)) = 'OK' then begin
+          ExtractOK := True;
+          // v1.1.7.10 "Finalizing installation..." label so the user
+          // doesn't think the installer hung during Defender scan.
+          WizardForm.StatusLabel.Caption :=
+            'Finalizing installation — this can take 1-3 minutes while ' +
+            'antivirus scans the new files. The installer is not stuck.';
+          WizardForm.Update;
+          Break;
+        end;
+        ErrorMsg := Trim(String(ResultStr));
       end;
-      ErrorMsg := Trim(String(ResultStr));
+
       if Attempt < 3 then begin
         WizardForm.StatusLabel.Caption :=
           'Extract attempt ' + IntToStr(Attempt) +
@@ -467,13 +724,21 @@ begin
       end;
     end;
 
-    if not ExtractOK then
-      RaiseException('Payload extraction failed after 3 attempts: ' + ErrorMsg
+    if not ExtractOK then begin
+      // r19: always state the free space alongside the error - "no space"
+      // is by far the most common cause and the least obvious one.
+      SpaceNote := '';
+      if FreeMBOn(ExtractDir) >= 0 then
+        SpaceNote := #13#10#13#10 + 'Free space on ' + DriveRoot(ExtractDir) +
+          IntToStr(FreeMBOn(ExtractDir)) + ' MB (about ' +
+          IntToStr({#PAYLOAD_TREE_MB}) + ' MB is needed to unpack).';
+      RaiseException('Payload extraction failed after 3 attempts: ' + ErrorMsg + SpaceNote
                      + Chr(13) + Chr(10)
                      + 'This is usually caused by antivirus software locking '
                      + 'files during install. Add ' + ExtractDir
                      + ' to Windows Defender exclusions and re-run the installer, '
                      + 'or use the offline edition from the Touchless website.');
+    end;
 
     // POST-EXTRACT VERIFICATION — three layered checks.
     //

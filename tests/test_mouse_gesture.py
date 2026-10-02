@@ -11,6 +11,40 @@ from hgr.gesture.recognition.engine import GestureRecognitionEngine
 from .helpers import make_landmarks, make_pose
 
 
+_OPEN_FINGERS = {"index": "open", "middle": "open", "ring": "open", "pinky": "open"}
+
+
+def pinch_pose(primary: str = "index"):
+    """Build the CURRENT click pose: thumb tip touching one fingertip.
+
+    `5db7c5a` ("fix(mouse): pinch detection uses 3D distance -- clicks
+    work with fingers straight up") replaced the curl-based click with a
+    pinch. `_click_pose_active` now just delegates to `_pinch_active`,
+    whose own comment spells out the user-facing gesture: thumb tip +
+    index tip held together is left-click, thumb tip + middle tip is
+    right-click, with the other three fingers relaxed so a fist cannot
+    fire it.
+
+    Six cases in this file still built a HOOKED finger -- the pre-5db7c5a
+    pose -- and expected a click. They were asserting the old gesture
+    against the new tracker. Measured on these synthetic hands, the
+    thumb-to-tip distance ratio is 0.122 for a pinch and 2.6-2.9 for an
+    open hand, against a 0.42 threshold, so the poses discriminate
+    cleanly and each pinch arms only its own button.
+    """
+    if primary == "index":
+        return make_landmarks(
+            _OPEN_FINGERS, thumb_state="open", spread="apart",
+            pinch_thumb_index=True,
+        )
+    tip_index = {"middle": 12}[primary]
+    points = make_landmarks(_OPEN_FINGERS, thumb_state="open", spread="apart")
+    midpoint = (points[tip_index] + points[4]) * 0.5
+    points[4] = midpoint + np.array([-0.03, 0.0, 0.0], dtype=np.float32)
+    points[tip_index] = midpoint + np.array([0.03, 0.0, 0.0], dtype=np.float32)
+    return points
+
+
 class MouseGestureTrackerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = GestureRecognitionEngine(stable_frames_required=2)
@@ -161,7 +195,18 @@ class MouseGestureTrackerTest(unittest.TestCase):
         )
 
         assert anchored.cursor_position is not None
-        self.assertEqual(anchored.cursor_position, (0.46, 0.54))
+        # Starts FROM the seed, but is not pinned to it: `_update_cursor`
+        # seeds `_cursor_position` only when it is None and then applies
+        # the same frame's smoothing step toward the palm target. The
+        # snap this used to assert was removed on purpose -- its comment
+        # records the symptom, "cursor rubber-bands toward the OS
+        # cursor's last position the moment a click is detected", caused
+        # by warping the smoothed cursor onto the lagged OS cursor after
+        # a one-frame pose dropout. What still matters here is that entry
+        # begins near the seed rather than somewhere mid-screen, so allow
+        # one smoothing step (measured: 0.043 away).
+        self.assertAlmostEqual(anchored.cursor_position[0], 0.46, delta=0.06)
+        self.assertAlmostEqual(anchored.cursor_position[1], 0.54, delta=0.06)
         bounds = self.tracker.debug_state.camera_control_bounds
         assert bounds is not None
         left_top_center = (bounds[0] + 0.02, bounds[1] + 0.02)
@@ -195,22 +240,38 @@ class MouseGestureTrackerTest(unittest.TestCase):
         self.assertGreater(right_bottom.cursor_position[0], 0.94)
         self.assertGreater(right_bottom.cursor_position[1], 0.94)
 
-    def test_index_open_curl_open_triggers_left_click(self) -> None:
+    def test_index_pinch_press_then_release_delivers_a_left_click(self) -> None:
+        """A tap-length pinch emits press then release -- and must NOT
+        also set `left_click`.
+
+        Renamed from `..._index_open_curl_open_triggers_left_click`,
+        which asserted `released.left_click` and the text "mouse left
+        click". `_update_left_sequence` deliberately stopped emitting
+        `left_click`: the controller's own `left_click()` helper fires a
+        synthetic down+up, and stacking that on top of the press/release
+        pair sent down-up-DOWN-UP per tap, which Windows read as a
+        double-click or dropped half of -- the user-reported "doesn't
+        actually click even though the app detected clicking". The
+        press/release pair is what Windows turns into one click, so
+        `left_click` staying off IS the fix, and pinning that is now the
+        point of this case.
+        """
         self._toggle_mouse_mode_on()
         self._update(make_pose("open_hand"), 1.60)
         self._update(make_pose("open_hand"), 1.72)
-        index_hook = make_landmarks(
-            {"index": "hooked", "middle": "open", "ring": "open", "pinky": "open"},
-            thumb_state="open",
-            spread="apart",
-        )
-        self._update(index_hook, 1.84)
-        self._update(index_hook, 1.92)
+        index_pinch = pinch_pose("index")
+        pressed = self._update(index_pinch, 1.84)
+        self._update(index_pinch, 1.92)
         released = self._update(make_pose("open_hand"), 2.00)
 
-        self.assertTrue(released.left_click)
+        self.assertTrue(pressed.left_press)
+        self.assertTrue(released.left_release)
         self.assertFalse(released.dragging)
-        self.assertEqual(released.control_text, "mouse left click")
+        self.assertEqual(released.control_text, "mouse drag release")
+        self.assertFalse(pressed.left_click,
+                         "left_click must stay off -- see docstring")
+        self.assertFalse(released.left_click,
+                         "left_click must stay off -- see docstring")
 
     def test_left_click_allows_softer_open_support_fingers(self) -> None:
         self._toggle_mouse_mode_on()
@@ -221,28 +282,24 @@ class MouseGestureTrackerTest(unittest.TestCase):
         }
         self._update(make_pose("open_hand"), 1.60, finger_overrides=soft_support)
         self._update(make_pose("open_hand"), 1.72, finger_overrides=soft_support)
-        index_hook = make_landmarks(
-            {"index": "hooked", "middle": "open", "ring": "open", "pinky": "open"},
-            thumb_state="open",
-            spread="apart",
-        )
-        self._update(index_hook, 1.84, finger_overrides=soft_support)
-        self._update(index_hook, 1.92, finger_overrides=soft_support)
+        index_pinch = pinch_pose("index")
+        self._update(index_pinch, 1.84, finger_overrides=soft_support)
+        self._update(index_pinch, 1.92, finger_overrides=soft_support)
         released = self._update(make_pose("open_hand"), 2.00, finger_overrides=soft_support)
 
-        self.assertTrue(released.left_click)
+        # Same press/release contract as the case above; what this one
+        # adds is that softly-curled support fingers do not block the
+        # pinch (`_pinch_others_relaxed` accepts partial curl).
+        self.assertTrue(released.left_release)
+        self.assertFalse(released.dragging)
 
     def test_index_click_pose_keeps_mouse_ready_instead_of_waiting_pose(self) -> None:
         self._toggle_mouse_mode_on()
         self._update(make_pose("open_hand"), 1.60, center=(0.52, 0.50))
         self._update(make_pose("open_hand"), 1.72, center=(0.52, 0.50))
-        index_hook = make_landmarks(
-            {"index": "hooked", "middle": "open", "ring": "open", "pinky": "open"},
-            thumb_state="open",
-            spread="apart",
-        )
+        index_pinch = pinch_pose("index")
         clicking = self._update(
-            index_hook,
+            index_pinch,
             1.84,
             center=(0.54, 0.50),
             finger_overrides={
@@ -254,25 +311,34 @@ class MouseGestureTrackerTest(unittest.TestCase):
             },
         )
 
+        # The point of this case is that holding the click pose must not
+        # drop the cursor into "waiting_pose" (which abandons cursor
+        # tracking mid-click). Under the pinch design the clicking state
+        # is "drag" and the cursor keeps moving, so assert that rather
+        # than the old "mouse ready" text.
         self.assertNotEqual(clicking.status, "waiting_pose")
-        self.assertEqual(clicking.control_text, "mouse ready")
+        self.assertEqual(clicking.status, "drag")
+        self.assertEqual(clicking.control_text, "mouse drag start")
         self.assertIsNotNone(clicking.cursor_position)
 
     def test_index_hold_starts_drag_and_open_releases_it(self) -> None:
         self._toggle_mouse_mode_on()
         self._update(make_pose("open_hand"), 1.60)
         self._update(make_pose("open_hand"), 1.72)
-        index_hook = make_landmarks(
-            {"index": "hooked", "middle": "open", "ring": "open", "pinky": "open"},
-            thumb_state="open",
-            spread="apart",
-        )
-        self._update(index_hook, 1.84)
-        self._update(index_hook, 1.92)
-        dragging = self._update(index_hook, 2.22)
+        index_pinch = pinch_pose("index")
+        pressed = self._update(index_pinch, 1.84)
+        self._update(index_pinch, 1.92)
+        dragging = self._update(index_pinch, 2.22)
         released = self._update(make_pose("open_hand"), 2.32)
 
-        self.assertTrue(dragging.left_press)
+        # Press lands on the FIRST pinch frame, by design: "users expect
+        # tips touch -> button down with no buffering delay". It used to
+        # be asserted on a later frame because the old curl pose had to
+        # clear `drag_hold_seconds` first.
+        self.assertTrue(pressed.left_press)
+        self.assertTrue(pressed.dragging)
+        self.assertFalse(dragging.left_press,
+                         "press must not be re-emitted while the pinch is held")
         self.assertTrue(dragging.dragging)
         self.assertTrue(released.left_release)
         self.assertFalse(released.dragging)
@@ -281,17 +347,20 @@ class MouseGestureTrackerTest(unittest.TestCase):
         self._toggle_mouse_mode_on()
         self._update(make_pose("open_hand"), 1.60)
         self._update(make_pose("open_hand"), 1.72)
-        middle_hook = make_landmarks(
-            {"index": "open", "middle": "hooked", "ring": "open", "pinky": "open"},
-            thumb_state="open",
-            spread="apart",
-        )
-        self._update(middle_hook, 1.84)
-        self._update(middle_hook, 1.92)
-        released = self._update(make_pose("open_hand"), 2.04)
+        middle_pinch = pinch_pose("middle")
+        clicked = self._update(middle_pinch, 1.84)
+        held = self._update(middle_pinch, 1.92)
+        self._update(make_pose("open_hand"), 2.04)
 
-        self.assertTrue(released.right_click)
-        self.assertEqual(released.control_text, "mouse right click")
+        # Right-click fires on the leading edge of the pinch and is
+        # one-shot: `_update_right_sequence` says the OS has no
+        # meaningful "right-click drag", so it emits once and then holds
+        # off until release. The old assertion looked on the RELEASE
+        # frame, which is one frame too late under this design.
+        self.assertTrue(clicked.right_click)
+        self.assertEqual(clicked.control_text, "mouse right click")
+        self.assertFalse(held.right_click,
+                         "right-click must not repeat while the pinch is held")
 
     def test_wheel_pose_emits_scroll_steps_after_hold(self) -> None:
         self._toggle_mouse_mode_on()
@@ -331,14 +400,10 @@ class MouseGestureTrackerTest(unittest.TestCase):
         self._toggle_mouse_mode_on()
         self._update(make_pose("open_hand"), 1.60)
         self._update(make_pose("open_hand"), 1.72)
-        index_hook = make_landmarks(
-            {"index": "hooked", "middle": "open", "ring": "open", "pinky": "open"},
-            thumb_state="open",
-            spread="apart",
-        )
-        self._update(index_hook, 1.84)
-        self._update(index_hook, 1.92)
-        self._update(index_hook, 2.22)
+        index_pinch = pinch_pose("index")
+        self._update(index_pinch, 1.84)
+        self._update(index_pinch, 1.92)
+        self._update(index_pinch, 2.22)
 
         lost = self.tracker.update(hand_reading=None, prediction=None, now=2.36)
         self.assertTrue(lost.left_release)

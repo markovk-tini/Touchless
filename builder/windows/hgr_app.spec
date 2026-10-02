@@ -2,6 +2,7 @@
 # Place this file at builder/windows/hgr_app.spec and run from the repo root.
 
 import os
+import re
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all, collect_submodules, collect_dynamic_libs, collect_data_files
 
@@ -12,6 +13,47 @@ GESTURE_GUIDE = ROOT / "GestureGuide"
 WHISPER_BUNDLES = [ROOT / "whisper.cpp", ROOT / "whisper_bundle"]
 LLAMA_ROOT = ROOT / "llama.cpp"
 ICON = ASSETS / "icons" / "touchless_icon.ico"
+
+# r23: Touchless.exe shipped with a COMPLETELY empty version resource -
+# no ProductName, CompanyName, FileVersion or copyright. Explorer's
+# Details tab, Task Manager and every reputation engine read those
+# fields, so a signed binary that declares nothing about itself scores
+# as anonymous. Version is read from src/hgr/__init__.py so it can
+# never drift from the app's own __version__ (tools/validate_release.py
+# already pins that value).
+def _app_version():
+    txt = (SRC / "hgr" / "__init__.py").read_text(encoding="utf-8")
+    m = re.search(r"""^__version__\s*=\s*['"]([^'"]+)['"]""", txt, re.M)
+    if not m:
+        raise SystemExit("hgr_app.spec: could not read __version__ from src/hgr/__init__.py")
+    return m.group(1)
+
+APP_VERSION = _app_version()
+_vparts = [int(x) for x in APP_VERSION.split(".")[:4]]
+_vparts += [0] * (4 - len(_vparts))
+VERSION_TUPLE = tuple(_vparts)
+VERSION_RES = ROOT / "build" / "touchless_version_info.txt"
+VERSION_RES.parent.mkdir(parents=True, exist_ok=True)
+VERSION_RES.write_text(f"""VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers={VERSION_TUPLE}, prodvers={VERSION_TUPLE},
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', 'Konstantin Markov'),
+      StringStruct('FileDescription', 'Touchless - hand gesture and voice desktop control'),
+      StringStruct('FileVersion', '{APP_VERSION}'),
+      StringStruct('InternalName', 'Touchless'),
+      StringStruct('LegalCopyright', 'Copyright (C) 2026 Konstantin Markov'),
+      StringStruct('OriginalFilename', 'Touchless.exe'),
+      StringStruct('ProductName', 'Touchless'),
+      StringStruct('ProductVersion', '{APP_VERSION}'),
+    ])]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+""", encoding="utf-8")
 
 datas = []
 binaries = []
@@ -185,6 +227,27 @@ _channel_marker = ROOT / "build" / "build_channel.txt"
 _channel_marker.parent.mkdir(parents=True, exist_ok=True)
 _channel_marker.write_text(_channel, encoding="utf-8")
 datas.append((str(_channel_marker), "."))
+
+# v1.1.9.2 (r11): ship a stand-alone "Safe Mode" debug launcher next
+# to Touchless.exe. Dad-PC-class installs that hit the ONNX+DirectML
+# native crash class OR the clip-cache freeze cascade can double-click
+# Touchless_Debug.bat instead of Touchless.exe; the .bat spawns a
+# hidden PowerShell running the sibling .ps1 which sets the three
+# safe-mode env vars (HGR_DISABLE_DIRECTML=1, HGR_DISABLE_CLIP_CACHE=1,
+# PYTHONFAULTHANDLER=1), launches Touchless.exe, waits for it to exit,
+# and then shows a Windows Forms popup with a clickable link to
+# %LOCALAPPDATA%\Touchless\crash\faulthandler.log so any native fault
+# trace is one click away for the user to email back.
+#
+# BOTH files must ship — the .bat is the double-click surface and the
+# .ps1 has the real launch + popup logic. .ps1 alone won't run from a
+# double click on stock Windows ExecutionPolicy defaults.
+_debug_bat = ROOT / "installers" / "windows" / "Touchless_Debug.bat"
+_debug_ps1 = ROOT / "installers" / "windows" / "Touchless_Debug.ps1"
+if _debug_bat.exists():
+    datas.append((str(_debug_bat), "."))
+if _debug_ps1.exists():
+    datas.append((str(_debug_ps1), "."))
 
 # Bundle ffmpeg.exe alongside Touchless.exe so the camera fallback
 # path can use it. Why we need ffmpeg in the bundle: cv2.VideoCapture
@@ -449,6 +512,7 @@ exe = EXE(
     name="Touchless",
     console=False,
     icon=str(ICON) if ICON.exists() else None,
+    version=str(VERSION_RES),
     disable_windowed_traceback=False,
     upx=False,
 )

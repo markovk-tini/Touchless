@@ -264,15 +264,51 @@ class VoiceCommandProcessorTest(unittest.TestCase):
         self.assertEqual(intent.query, "kicad")
 
     def test_parse_generic_open_recovers_kicad_even_when_chrome_is_preferred(self) -> None:
+        """A catalog match must beat `preferred_app`.
+
+        "kkad" is not in the mishearing table (unlike "key card", which
+        the sibling case covers), so recovery goes through
+        `_best_fuzzy_launch_match` -> `rank_applications_in_text`, which
+        reads the machine's REAL installed-app index. That made this case
+        depend on whether KiCad happened to be installed on whoever ran
+        it: with an empty catalog there is nothing to recover, the Chrome
+        handler claims any utterance containing "open" while
+        `preferred_app="chrome"`, and the assertion failed on a
+        difference in the dev machine rather than in the code.
+
+        Seeding one entry through the same `_app_entry` + `patch.object`
+        pattern the ambiguous-prompt cases above use makes it
+        deterministic and actually tests the precedence rule.
+
+        `query` is compared case-insensitively on purpose: this path
+        returns the catalog entry's display name ("KiCad"), whereas the
+        mishearing-table path returns the normalized "kicad".
+        """
         with self._profile_dir() as tmp_dir:
             processor = self._make_processor(tmp_dir / "voice_profile.json")
+            kicad = self._app_entry(
+                processor,
+                "KiCad",
+                "C:/Program Files/KiCad/bin/kicad.exe",
+                aliases=("kicad",),
+                category="engineering",
+            )
 
-            intent = processor.parse("open kkad app", context=VoiceCommandContext(preferred_app="chrome"))
+            with patch.object(
+                processor.desktop_controller,
+                "rank_applications_in_text",
+                return_value=[(kicad, 0.86, "kicad")],
+            ):
+                intent = processor.parse(
+                    "open kkad app",
+                    context=VoiceCommandContext(preferred_app="chrome"),
+                )
 
         self.assertIsNotNone(intent)
         assert intent is not None
         self.assertEqual(intent.app_name, "system")
-        self.assertEqual(intent.query, "kicad")
+        assert intent.query is not None
+        self.assertEqual(intent.query.lower(), "kicad")
 
     def test_parse_catalog_open_falls_back_to_best_matching_app(self) -> None:
         with self._profile_dir() as tmp_dir:

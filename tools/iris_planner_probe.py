@@ -46,7 +46,7 @@ _SYNTHETIC_CATALOG = [
      "tools": ["ms_mail_send", "ms_mail_list", "ms_mail_search", "ms_mail_read",
                "ms_mail_mark_read", "ms_calendar_list", "ms_calendar_create",
                "onedrive_upload", "onedrive_list", "teams_send",
-               "teams_channel_post", "excel_create", "excel_set_cell",
+               "teams_channel_post", "excel_create", "excel_set_cell_online",
                "todo_add", "onenote_create", "contacts_search",
                "ms_list_accounts", "ms_use_account"]},
     {"id": "outlook", "description": "Outlook desktop quick-actions",

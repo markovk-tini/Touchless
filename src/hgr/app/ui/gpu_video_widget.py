@@ -23,11 +23,12 @@ that on some Windows setups silently coalesces frames and produces
 through Qt's D3D11 paint backend, with much less driver-stack risk.
 
 Includes a paint-rate counter that logs `[gpu_video] paint rate: N
-fps` every 2 s, so display rate can be observed independently of
-the worker's `actual self._fps`.
+fps` every 2 s when `HGR_PAINT_DEBUG=1`, so display rate can be
+observed independently of the worker's `actual self._fps`.
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -36,6 +37,11 @@ import numpy as np
 from PySide6.QtCore import QLineF, QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QGuiApplication, QImage, QPainter, QPaintEvent, QPen, QPixmap
 from PySide6.QtWidgets import QSizePolicy, QWidget
+
+# Opt-in paint-rate stderr log. The default path used to flush the
+# console from paintEvent every 2 s, which hitch the live view
+# (especially with a hand overlay in the same paint).
+_PAINT_DEBUG = os.environ.get("HGR_PAINT_DEBUG", "0") == "1"
 
 # MediaPipe's 21-landmark hand connections (pairs of indices).
 # Same topology the cv2-based draw_hand_overlay used to draw on the
@@ -64,6 +70,11 @@ class GpuVideoWidget(QWidget):
         self._image: Optional[QImage] = None
         self._image_w: int = 0
         self._image_h: int = 0
+        # Numpy buffer backing `_image`. QImage wrapping external
+        # bits does not copy; we keep this array alive until the next
+        # frame so paintEvent can read it. Avoids a 2.76 MB
+        # QImage.copy() every tick at 720p.
+        self._frame_keep: Optional[np.ndarray] = None
         # Per-hand display info — list of dicts with keys:
         #   landmarks: list[(x, y)] normalized
         #   bbox:      (x, y, w, h) normalized | None
@@ -115,9 +126,9 @@ class GpuVideoWidget(QWidget):
         self._idle_color = QColor(180, 200, 220)
         self._background = QColor(7, 19, 29)
         # Paint-rate diagnostic — prints `[gpu_video] paint rate:`
-        # every 2 s so we can see whether the actual on-screen
-        # update rate matches the worker's emit rate. If they
-        # diverge, paint events are coalescing somewhere.
+        # every 2 s when HGR_PAINT_DEBUG=1 so we can see whether the
+        # actual on-screen update rate matches the worker's emit
+        # rate. If they diverge, paint events are coalescing.
         self._paint_count = 0
         self._paint_log_at = 0.0
         # C1 (v1.1.7 diagnostic): per-section paintEvent timing +
@@ -222,20 +233,19 @@ class GpuVideoWidget(QWidget):
 
     def update_frame(self, bgr_frame: np.ndarray) -> None:
         """Hand the widget a new BGR frame. The GPU paint will pick
-        it up on the next paintGL. We `.copy()` so the worker's
-        reader thread can safely overwrite its source buffer."""
+        it up on the next paintGL.
+
+        The ffmpeg reader already copies each decoded frame, and
+        `_tick` selfie-flips into a new array, so this widget can
+        wrap that buffer without another QImage.copy(). We keep
+        `_frame_keep` alive for as long as `_image` points at it.
+        """
         if bgr_frame is None or bgr_frame.size == 0:
             return
-        # v1.1.7 event-loop optimization (Step 4): skip the QImage
-        # construction + .copy() when the widget isn't currently
-        # visible. Camera frames arrive at ~30-60 fps regardless of
-        # whether the mini viewer is on screen — copying 2.76 MB of
-        # pixel data every frame for a widget the user can't see is
-        # pure waste. Qt's update() is a no-op on hidden widgets
-        # anyway, so nothing user-visible changes when we bail early.
-        # Restarts cleanly when the widget becomes visible again
-        # because the next raw_frame_ready emit runs this method
-        # with a fresh frame.
+        # Skip QImage work when the widget isn't on screen. Camera
+        # frames arrive at ~30-60 fps regardless; wrapping pixels
+        # for a hidden viewer is pure waste. Restarts on the next
+        # raw_frame_ready once the widget is visible again.
         try:
             visible = self.isVisible()
         except Exception:
@@ -243,26 +253,26 @@ class GpuVideoWidget(QWidget):
         if not visible:
             return
         try:
-            h, w = bgr_frame.shape[:2]
+            keep = np.ascontiguousarray(bgr_frame)
+            h, w = keep.shape[:2]
         except Exception:
             return
-        if h <= 0 or w <= 0:
+        if h <= 0 or w <= 0 or keep.ndim != 3 or keep.shape[2] < 3:
             return
         # Format_BGR888 stores 3 bytes/pixel B,G,R in that order
-        # — same as the cv2 numpy buffer. Qt's GL paint engine
+        # — same as the cv2 numpy buffer. Qt's raster paint engine
         # handles the BGR-vs-RGB sampler swizzle on the GPU, so
         # we skip the CPU cv2.cvtColor pass entirely.
-        self._image = QImage(
-            bgr_frame.data, w, h, 3 * w, QImage.Format_BGR888
-        ).copy()
+        image = QImage(keep.data, w, h, 3 * w, QImage.Format_BGR888)
+        if image.isNull():
+            return
+        self._image = image
+        self._frame_keep = keep
         self._image_w = w
         self._image_h = h
         self._idle_text = ""
-        # C3: stamp slot-fire time BEFORE update() so paintEvent's
-        # slot→paint delta measures from the moment this widget was
-        # asked for a new frame to the moment Qt got around to
-        # actually painting it.
-        self._last_slot_fire_perf = time.perf_counter()
+        if _PAINT_DEBUG:
+            self._last_slot_fire_perf = time.perf_counter()
         self.update()
 
     def update_landmarks(self, payload: Optional[object]) -> None:
@@ -357,6 +367,7 @@ class GpuVideoWidget(QWidget):
 
     def clear_video(self, idle_text: str = "") -> None:
         self._image = None
+        self._frame_keep = None
         self._image_w = 0
         self._image_h = 0
         self._hands_info = []
@@ -371,11 +382,7 @@ class GpuVideoWidget(QWidget):
         # already GPU-accelerated. drawImage with Format_BGR888
         # uploads to a texture and samples on the GPU; no CPU
         # colour conversion needed.
-        # C1 (v1.1.7 diagnostic): time each section so the 2 s log
-        # emission below can distinguish drawImage cost from overlay
-        # cost from total, and can compare paint duration vs paint-
-        # to-paint wall delta.
-        t_start = time.perf_counter()
+        t_start = time.perf_counter() if _PAINT_DEBUG else 0.0
         painter = QPainter(self)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.fillRect(self.rect(), self._background)
@@ -383,10 +390,11 @@ class GpuVideoWidget(QWidget):
         drawimage_us = 0
         overlay_us = 0
         if self._image is not None and not self._image.isNull():
-            t_before_drawimage = time.perf_counter()
+            if _PAINT_DEBUG:
+                t_before_drawimage = time.perf_counter()
             painter.drawImage(target, self._image)
-            t_after_drawimage = time.perf_counter()
-            drawimage_us = int((t_after_drawimage - t_before_drawimage) * 1_000_000)
+            if _PAINT_DEBUG:
+                drawimage_us = int((time.perf_counter() - t_before_drawimage) * 1_000_000)
             # In lite paint mode (a fullscreen game is foreground)
             # we keep the cheap parts of the overlay — the hand
             # skeleton + joint dots, which are 2 batched draw calls
@@ -403,9 +411,11 @@ class GpuVideoWidget(QWidget):
             # (baked into the frame, with its fingertip cursor) show — the
             # drawing is the top layer and the hand-reading graphics vanish.
             if not self._hide_hand_overlay:
-                t_before_overlay = time.perf_counter()
+                if _PAINT_DEBUG:
+                    t_before_overlay = time.perf_counter()
                 self._draw_landmarks(painter, target)
-                overlay_us = int((time.perf_counter() - t_before_overlay) * 1_000_000)
+                if _PAINT_DEBUG:
+                    overlay_us = int((time.perf_counter() - t_before_overlay) * 1_000_000)
         elif self._idle_text:
             painter.setPen(QPen(self._idle_color, 1))
             painter.setFont(self._idle_font)
@@ -415,6 +425,8 @@ class GpuVideoWidget(QWidget):
                 self._idle_text,
             )
         painter.end()
+        if not _PAINT_DEBUG:
+            return
         t_end = time.perf_counter()
         total_us = int((t_end - t_start) * 1_000_000)
         # Paint-rate diagnostic. Prints actual on-screen update

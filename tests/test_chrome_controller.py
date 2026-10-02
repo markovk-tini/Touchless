@@ -80,4 +80,26 @@ class ChromeControllerTest(unittest.TestCase):
 
         self.assertEqual(query, "youtube")
 
+    def test_stale_handle_cache_does_not_scan_on_hot_path(self) -> None:
+        controller = ChromeController(executable_paths=())
+        controller._available = True
+        controller._handles_cache = [42]
+        controller._handles_cache_until = 0.0
+        with patch.object(controller, "_schedule_handles_refresh") as sched:
+            got = controller._chrome_window_handles()
+        self.assertEqual(got, [42])
+        sched.assert_called_once()
+
+    def test_refresh_scans_on_caller_thread(self) -> None:
+        controller = ChromeController(executable_paths=())
+        controller._available = True
+        with patch.object(
+            controller, "_scan_chrome_window_handles", return_value=[7]
+        ) as scan:
+            got = controller._chrome_window_handles(refresh=True)
+        self.assertEqual(got, [7])
+        scan.assert_called_once()
+        self.assertEqual(controller._handles_cache, [7])
+
+
 # Author: Konstantin Markov
